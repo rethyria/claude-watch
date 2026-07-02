@@ -1169,6 +1169,9 @@ function handleEvents(req, res) {
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
   });
+  // Node buffers headers until the first body write; without this a client
+  // with nothing to replay receives no bytes until the first heartbeat (10s).
+  res.write(":connected\n\n");
 
   // Replay from Last-Event-ID if provided
   const lastIdHeader = req.headers["last-event-id"];
@@ -1480,8 +1483,11 @@ async function startServer() {
 
   const code = generatePairingCode();
 
-  // Bonjour
-  bonjourInstance = new Bonjour();
+  // Bonjour (error callback: mDNS failures — bound 5353, no multicast — must
+  // not crash the bridge; discovery degrades to manual IP entry)
+  bonjourInstance = new Bonjour(undefined, (err) => {
+    log("warn", `Bonjour/mDNS error (discovery disabled): ${err?.message || err}`);
+  });
   bonjourService = bonjourInstance.publish({
     name: `Agent Watch Bridge (${os.hostname()})`,
     type: "claude-watch",
