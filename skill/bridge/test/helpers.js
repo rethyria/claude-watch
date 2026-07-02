@@ -69,7 +69,7 @@ export async function request(port, method, path, { token, body } = {}) {
 }
 
 // Minimal SSE client: collects parsed events, lets tests await a matching one.
-export function connectSse(port, token, { lastEventId } = {}) {
+export function connectSse(port, token, { lastEventId, path = "/events" } = {}) {
   const events = [];
   const waiters = [];
   let connected;
@@ -80,7 +80,7 @@ export function connectSse(port, token, { lastEventId } = {}) {
   if (lastEventId !== undefined) headers["Last-Event-ID"] = String(lastEventId);
 
   const req = http.request(
-    { host: "127.0.0.1", port, path: "/events", method: "GET", headers },
+    { host: "127.0.0.1", port, path, method: "GET", headers },
     (res) => {
       connected(res.statusCode);
       let buffer = "";
