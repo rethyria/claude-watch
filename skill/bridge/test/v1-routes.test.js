@@ -71,3 +71,44 @@ test("legacy unprefixed paths keep working alongside /v1", { timeout: 60_000 }, 
   assert.equal(pair.status, 200);
   assert.ok(pair.body.token, "legacy pair response carries a token");
 });
+
+// The realistic production topology: hook scripts installed by setup-hooks.sh
+// POST to the legacy unprefixed paths while a /v1 watch client answers.
+// Permission state and tokens are shared across the two surfaces.
+test("cross-surface: /v1-paired client answers a legacy hook; tokens interchangeable", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const { port, pairingCode } = bridge;
+
+  const pair = await request(port, "POST", "/v1/pair", { body: { code: pairingCode } });
+  assert.equal(pair.status, 200);
+  const token = pair.body.token;
+
+  // A /v1-issued token is valid on the legacy event stream
+  const legacySse = connectSse(port, token);
+  t.after(() => legacySse.close());
+  assert.equal(await legacySse.statusCode(), 200);
+
+  // A /v1 watch client is also connected
+  const v1Sse = connectSse(port, token, { path: "/v1/events" });
+  t.after(() => v1Sse.close());
+  assert.equal(await v1Sse.statusCode(), 200);
+
+  // Claude Code's installed hook posts to the LEGACY path and blocks
+  const hookResponse = request(port, "POST", "/hooks/permission", {
+    body: { tool_name: "Edit", cwd: "/tmp/e2e-cross", tool_input: { file_path: "a.txt" } },
+  });
+
+  // The prompt reaches the /v1 stream, and the /v1 decision resolves the legacy hook
+  const promptEvent = await v1Sse.waitFor(
+    (e) => e.event === "permission-request" && e.parsed?.tool_name === "Edit",
+  );
+  const decision = await request(port, "POST", "/v1/command", {
+    token,
+    body: { permissionId: promptEvent.parsed.permissionId, decision: { behavior: "allow" } },
+  });
+  assert.equal(decision.status, 200);
+
+  const hook = await hookResponse;
+  assert.equal(hook.status, 200);
+  assert.equal(hook.body.hookSpecificOutput.decision.behavior, "allow");
+});

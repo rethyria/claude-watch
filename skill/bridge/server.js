@@ -50,22 +50,22 @@ async function onRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   // /v1 routing skeleton: every endpoint is also reachable under a /v1 prefix
-  // (e.g. /v1/pair → /pair) with byte-identical behavior. The unprefixed
-  // legacy surface stays frozen for existing clients; future protocol-shape
-  // changes land on dedicated /v1 handlers only (see ARCHITECTURE.md).
-  let pathname = url.pathname;
-  if (pathname === "/v1" || pathname.startsWith("/v1/")) {
-    pathname = pathname.slice(3) || "/";
+  // (e.g. /v1/pair → /pair). The unprefixed legacy surface stays frozen for
+  // existing clients; when a /v1 endpoint needs to diverge, add its exact
+  // "METHOD /v1/..." key to the routes table — exact matches win over the
+  // prefix-stripped fallback (see ARCHITECTURE.md).
+  let routeKey = `${req.method} ${url.pathname}`;
+  let handler = routes[routeKey];
+  if (!handler && (url.pathname === "/v1" || url.pathname.startsWith("/v1/"))) {
+    routeKey = `${req.method} ${url.pathname.slice(3) || "/"}`;
+    handler = routes[routeKey];
   }
 
-  const routeKey = `${req.method} ${pathname}`;
-
-  const handler = routes[routeKey];
   if (handler) {
     try {
       await handler(req, res);
     } catch (err) {
-      log("error", `Unhandled error in ${routeKey}:`, err.message);
+      log("error", `Unhandled error in ${routeKey} (requested: ${url.pathname}):`, err.message);
       if (!res.headersSent) {
         jsonResponse(res, 500, { error: "Internal server error" });
       }

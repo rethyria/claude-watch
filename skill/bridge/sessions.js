@@ -15,10 +15,14 @@ export const sessions = new Map();
 // Invoked when a PTY-backed session ends so codex.js can clear its synthetic
 // permission state without a circular import (codex.js imports sessions.js,
 // so the dependency must not also point the other way).
-let sessionCleanupHook = () => {};
+const sessionCleanupHooks = [];
 
 export function registerSessionCleanupHook(fn) {
-  sessionCleanupHook = fn;
+  sessionCleanupHooks.push(fn);
+}
+
+function runSessionCleanupHooks(sessionId, reason) {
+  for (const hook of sessionCleanupHooks) hook(sessionId, reason);
 }
 
 export function spawnInteractiveProcess(agent, cwd, args = []) {
@@ -58,7 +62,7 @@ export function bindPtyProcess(slot, proc) {
     log("info", `Session ${sessionId} (${slot.agent}) PTY exited: code=${exitCode} signal=${signal}`);
     slot.state = "ended";
     slot.ptyProcess = null;
-    sessionCleanupHook(sessionId, "pty-closed");
+    runSessionCleanupHooks(sessionId, "pty-closed");
     pushSseEvent("session", { state: "ended", exitCode, signal, agent: slot.agent, folderName: slot.folderName }, sessionId);
   });
 
@@ -66,7 +70,7 @@ export function bindPtyProcess(slot, proc) {
     log("error", `Session ${sessionId} PTY spawn error: ${err.message}`);
     slot.state = "ended";
     slot.ptyProcess = null;
-    sessionCleanupHook(sessionId, "pty-error");
+    runSessionCleanupHooks(sessionId, "pty-error");
     pushSseEvent("session", { state: "ended", error: err.message, agent: slot.agent, folderName: slot.folderName }, sessionId);
   });
 }
