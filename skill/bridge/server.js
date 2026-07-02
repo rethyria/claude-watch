@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { spawn as childSpawn } from "node:child_process";
+import { spawnPtyProcess } from "./pty.js";
 import { Bonjour } from "bonjour-service";
 
 // ---------------------------------------------------------------------------
@@ -262,15 +263,16 @@ function spawnInteractiveProcess(agent, cwd, args = []) {
   const cols = parseInt(process.env.COLUMNS, 10) || 120;
   const rows = parseInt(process.env.LINES, 10) || 40;
 
-  return childSpawn("script", ["-q", "/dev/null", bin, ...args], {
+  return spawnPtyProcess(bin, args, {
     cwd,
+    cols,
+    rows,
     env: {
       ...process.env,
       TERM: "xterm-256color",
       COLUMNS: String(cols),
       LINES: String(rows),
     },
-    stdio: ["pipe", "pipe", "pipe"],
   });
 }
 
