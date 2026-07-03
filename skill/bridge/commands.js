@@ -2,19 +2,20 @@
 // (spawn/kill/permission-decision/PTY injection), and GET /status.
 import { spawn as childSpawn } from "node:child_process";
 import { log, jsonResponse, readBody } from "./util.js";
-import { BRIDGE_ID, CLAUDE_BIN, CODEX_BIN, availableAgentsList } from "./config.js";
+import { BRIDGE_ID, CLAUDE_BIN, CODEX_BIN, CLI_CWD, availableAgentsList } from "./config.js";
 import {
   generatePairingCode,
-  generateSessionToken,
-  isRateLimited,
-  recordRateLimitAttempt,
+  issueToken,
   requireAuth,
+  isPairingOpen,
+  lockPairing,
   isPairingCodeExpired,
   matchesPairingCode,
   clearPairingCode,
   getBridgeState,
   setBridgeState,
 } from "./credentials.js";
+import { isRateLimited, recordRateLimitAttempt } from "./rate-limit.js";
 import { pushSseEvent, sseClients, sseBuffer } from "./transport-sse.js";
 import {
   sessions,
@@ -32,7 +33,8 @@ export async function handlePair(req, res) {
     return jsonResponse(res, 405, { error: "Method not allowed" });
   }
 
-  if (isRateLimited()) {
+  const remoteIp = req.socket?.remoteAddress || "unknown";
+  if (isRateLimited(remoteIp)) {
     return jsonResponse(res, 429, { error: "Too many pairing attempts. Try again later." });
   }
 
@@ -43,11 +45,19 @@ export async function handlePair(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
-  recordRateLimitAttempt();
+  recordRateLimitAttempt(remoteIp);
 
-  const { code } = body;
+  const { code, deviceName } = body;
   if (!code || typeof code !== "string") {
     return jsonResponse(res, 400, { error: "Missing 'code' field" });
+  }
+
+  // Pairing lockout: after any successful pair the surface locks (on both
+  // /pair and /v1/pair) until the operator reopens it via SIGUSR1 or a
+  // restart with --allow-pairing. Before per-device tokens, a re-pair here
+  // silently overwrote the token and deauthenticated the current device.
+  if (!isPairingOpen()) {
+    return jsonResponse(res, 403, { error: "Already paired. Re-pairing requires explicit authorization on the bridge." });
   }
 
   if (isPairingCodeExpired()) {
@@ -59,9 +69,12 @@ export async function handlePair(req, res) {
     return jsonResponse(res, 401, { error: "Invalid pairing code" });
   }
 
-  // Success
-  const token = generateSessionToken();
+  // Success: mint a per-device token (only its SHA-256 hash is persisted) and
+  // lock the pairing surface until the next explicit reopen.
+  const surface = req.url === "/v1/pair" || req.url?.startsWith("/v1/pair?") ? "v1" : "legacy";
+  const token = issueToken({ deviceName, surface });
   clearPairingCode();
+  lockPairing();
   setBridgeState("connected");
   pushSseEvent("session", { state: "connected" });
 
@@ -109,7 +122,7 @@ export async function handleCommand(req, res) {
     if (!validAgents.includes(spawnRequest)) {
       return jsonResponse(res, 400, { error: `Invalid agent: ${spawnRequest}. Use: ${validAgents.join(", ")}` });
     }
-    const cwd = body.cwd || process.argv[2] || process.env.HOME || process.cwd();
+    const cwd = body.cwd || CLI_CWD || process.env.HOME || process.cwd();
     const newId = spawnSession(spawnRequest, cwd);
     if (!newId) {
       return jsonResponse(res, 500, { error: `Failed to spawn ${spawnRequest}` });
@@ -218,7 +231,7 @@ export async function handleCommand(req, res) {
     if (!targetSession) {
       // Auto-spawn a new session
       const requestedAgent = agent || "claude";
-      const cwd = body.cwd || process.argv[2] || process.env.HOME || process.cwd();
+      const cwd = body.cwd || CLI_CWD || process.env.HOME || process.cwd();
       const newId = spawnSession(requestedAgent, cwd);
       if (!newId) {
         return jsonResponse(res, 500, { error: `Failed to spawn ${requestedAgent}` });

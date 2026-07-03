@@ -1,25 +1,87 @@
-// Pairing and authentication state: session token, pairing-code
-// generation/validation, pairing rate limiting, and bridge-level state.
+// Pairing and authentication state: the per-device token store (SHA-256
+// hashes persisted to credentials.json), pairing-code generation/validation,
+// the pairing lockout latch, requireAuth(), and bridge-level state.
 // All mutable state is module-private; other modules go through the accessor
-// functions below.
+// functions below. Per-IP pairing rate limiting lives in rate-limit.js.
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { log } from "./util.js";
 import {
   PAIRING_CODE_TTL_MS,
-  RATE_LIMIT_WINDOW_MS,
-  RATE_LIMIT_MAX_ATTEMPTS,
+  CREDENTIALS_DIR,
+  CREDENTIALS_FILE,
 } from "./config.js";
 
-let sessionToken = null;
+// Token store: [{hash, deviceName?, createdAt, surface}], hash = SHA-256 hex
+// of the bearer token. Plaintext tokens are returned to the client at pair
+// time and never stored. Loaded lazily so unit tests that import this module
+// don't read the real ~/.claude-watch unless they exercise auth.
+let tokens = [];
+let storeLoaded = false;
+
 let pairingCode = null;
 let pairingCodeExpiresAt = 0;
 
-// Rate limiting
-let rateLimitAttempts = 0;
-let rateLimitWindowStart = Date.now();
+// Pairing lockout latch: once any device pairs successfully, the pairing
+// surface locks until an explicit operator action (SIGUSR1 or --allow-pairing
+// at startup) reopens it. server.js decides the initial state at startup.
+let pairingOpen = true;
 
 // Bridge-level state: "idle" | "connected"
 let bridgeState = "idle";
+
+function sha256Hex(input) {
+  return crypto.createHash("sha256").update(input, "utf-8").digest("hex");
+}
+
+function isValidEntry(entry) {
+  return (
+    entry &&
+    typeof entry.hash === "string" &&
+    /^[0-9a-f]{64}$/.test(entry.hash)
+  );
+}
+
+function ensureStoreLoaded() {
+  if (storeLoaded) return;
+  storeLoaded = true;
+  try {
+    const raw = fs.readFileSync(CREDENTIALS_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+    const entries = Array.isArray(parsed?.tokens) ? parsed.tokens : [];
+    tokens = entries.filter(isValidEntry);
+    if (tokens.length > 0) {
+      bridgeState = "connected";
+      log("info", `Loaded ${tokens.length} paired device credential(s) from ${CREDENTIALS_FILE}`);
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      log("warn", `Could not read credentials file ${CREDENTIALS_FILE}: ${err.message}`);
+    }
+  }
+}
+
+// Atomic persist: write a 0600 temp file in the same directory, then rename
+// over the real file so a crash mid-write can never truncate the store.
+function persistStore(nextTokens) {
+  fs.mkdirSync(CREDENTIALS_DIR, { recursive: true, mode: 0o700 });
+  const tmpFile = `${CREDENTIALS_FILE}.tmp`;
+  const payload = JSON.stringify({ version: 1, tokens: nextTokens }, null, 2) + "\n";
+  fs.writeFileSync(tmpFile, payload, { mode: 0o600 });
+  fs.renameSync(tmpFile, CREDENTIALS_FILE);
+}
+
+// Explicit startup load so server.js can decide the initial pairing lockout
+// state (and log) before binding. Returns the number of stored credentials.
+export function loadTokenStore() {
+  ensureStoreLoaded();
+  return tokens.length;
+}
+
+export function hasTokens() {
+  ensureStoreLoaded();
+  return tokens.length > 0;
+}
 
 export function generatePairingCode() {
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
@@ -29,35 +91,58 @@ export function generatePairingCode() {
   return code;
 }
 
-export function generateSessionToken() {
+// Issue a fresh per-device token: the plaintext goes back to the client, only
+// the SHA-256 hash is stored. The in-memory store is committed only after the
+// persist succeeds, so a disk failure surfaces as a pair error instead of a
+// token that silently vanishes on restart.
+export function issueToken({ deviceName, surface } = {}) {
+  ensureStoreLoaded();
   const token = crypto.randomBytes(32).toString("hex");
-  sessionToken = token;
+  const entry = {
+    hash: sha256Hex(token),
+    createdAt: new Date().toISOString(),
+    surface: surface === "v1" ? "v1" : "legacy",
+  };
+  if (typeof deviceName === "string" && deviceName.length > 0) {
+    entry.deviceName = deviceName.slice(0, 200);
+  }
+  const nextTokens = [...tokens, entry];
+  persistStore(nextTokens);
+  tokens = nextTokens;
   return token;
 }
 
-export function isRateLimited() {
-  const now = Date.now();
-  if (now - rateLimitWindowStart > RATE_LIMIT_WINDOW_MS) {
-    rateLimitAttempts = 0;
-    rateLimitWindowStart = now;
-  }
-  return rateLimitAttempts >= RATE_LIMIT_MAX_ATTEMPTS;
-}
-
-export function recordRateLimitAttempt() {
-  const now = Date.now();
-  if (now - rateLimitWindowStart > RATE_LIMIT_WINDOW_MS) {
-    rateLimitAttempts = 0;
-    rateLimitWindowStart = now;
-  }
-  rateLimitAttempts++;
-}
-
 export function requireAuth(req) {
+  ensureStoreLoaded();
   const auth = req.headers["authorization"];
   if (!auth || !auth.startsWith("Bearer ")) return false;
-  const token = auth.slice(7);
-  return token === sessionToken && sessionToken !== null;
+  const presented = Buffer.from(sha256Hex(auth.slice(7)), "hex");
+  // Compare against every stored hash without short-circuiting, using a
+  // constant-time comparison on the hash buffers.
+  let matched = false;
+  for (const entry of tokens) {
+    const stored = Buffer.from(entry.hash, "hex");
+    if (stored.length === presented.length && crypto.timingSafeEqual(stored, presented)) {
+      matched = true;
+    }
+  }
+  return matched;
+}
+
+export function isPairingOpen() {
+  return pairingOpen;
+}
+
+export function lockPairing() {
+  pairingOpen = false;
+  clearPairingCode();
+}
+
+// Operator reopen (SIGUSR1 / --allow-pairing): unlock the pairing surface and
+// mint a fresh code with the normal TTL, logged exactly like startup.
+export function reopenPairing() {
+  pairingOpen = true;
+  return generatePairingCode();
 }
 
 export function isPairingCodeExpired() {

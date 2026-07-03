@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { spawnPtyProcess } from "./pty.js";
 import { log } from "./util.js";
-import { CLAUDE_BIN, CODEX_BIN } from "./config.js";
+import { CLAUDE_BIN, CODEX_BIN, CLI_CWD } from "./config.js";
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
 // Multi-session: each entry is a session slot
@@ -195,7 +195,7 @@ export function resolveHookSession(body) {
 
   // No session exists — auto-create one for this external Claude/Codex instance
   const agent = source === "codex" ? "codex" : "claude";
-  const resolvedCwd = cwd || process.argv[2] || process.env.HOME || process.cwd();
+  const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
   const sessionId = crypto.randomUUID();
 
