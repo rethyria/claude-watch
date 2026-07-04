@@ -47,6 +47,20 @@ if (CODEX_BIN) {
 // Configuration
 // ---------------------------------------------------------------------------
 
+// CLI arguments. The bridge historically takes one optional positional
+// argument (the default working directory for spawned sessions); flags are
+// filtered out so `node server.js --allow-pairing` doesn't turn the flag into
+// a cwd.
+const cliArgs = process.argv.slice(2);
+export const ALLOW_PAIRING_FLAG = cliArgs.includes("--allow-pairing");
+export const CLI_CWD = cliArgs.find((a) => !a.startsWith("--")) || null;
+
+// Credential persistence. Overridable via env var so tests (and multi-bridge
+// setups) never touch the real ~/.claude-watch.
+export const CREDENTIALS_DIR =
+  process.env.CLAUDE_WATCH_CREDENTIALS_DIR || path.join(os.homedir(), ".claude-watch");
+export const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "credentials.json");
+
 export const PORT_RANGE_START = 7860;
 export const PORT_RANGE_END = 7869;
 export const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;

@@ -11,8 +11,14 @@ import {
   BRIDGE_ID,
   CLAUDE_BIN,
   CODEX_BIN,
+  ALLOW_PAIRING_FLAG,
 } from "./config.js";
-import { generatePairingCode } from "./credentials.js";
+import {
+  generatePairingCode,
+  loadTokenStore,
+  lockPairing,
+  reopenPairing,
+} from "./credentials.js";
 import { sseClients, handleEvents } from "./transport-sse.js";
 import { sessions } from "./sessions.js";
 import { pendingPermissions } from "./permissions.js";
@@ -113,7 +119,25 @@ async function startServer() {
 
   log("info", `Bridge server listening on 0.0.0.0:${boundPort}`);
 
-  const code = generatePairingCode();
+  // Pairing lockout at startup: with persisted device credentials the bridge
+  // comes back paired, so the pairing surface starts locked unless the
+  // operator explicitly asked to pair a new device via --allow-pairing.
+  const storedCredentials = loadTokenStore();
+  let code = null;
+  if (storedCredentials > 0 && !ALLOW_PAIRING_FLAG) {
+    lockPairing();
+    log("info", `Pairing locked (${storedCredentials} device(s) paired). Send SIGUSR1 or restart with --allow-pairing to pair a new device.`);
+  } else {
+    code = generatePairingCode();
+  }
+
+  // Scriptable reopen: SIGUSR1 unlocks the pairing surface and mints a fresh
+  // code with the normal TTL; the surface locks again after the next
+  // successful pair.
+  process.on("SIGUSR1", () => {
+    log("info", "SIGUSR1 received: reopening pairing for a new device");
+    reopenPairing();
+  });
 
   // Bonjour (error callback: mDNS failures — bound 5353, no multicast — must
   // not crash the bridge; discovery degrades to manual IP entry)
@@ -155,11 +179,16 @@ async function startServer() {
   }
 
   const agentLine = agents.length ? agents.join(" + ") : "none";
+  // Unlocked banner line is byte-identical to the historical output (test
+  // helpers and operator muscle memory scrape it); the locked variant is new.
+  const pairingLine = code !== null
+    ? `║  Pairing Code:  ${code}                ║`
+    : `║  Pairing:       ${"locked (SIGUSR1)".padEnd(22)}║`;
   console.log("");
   console.log("╔═══════════════════════════════════════╗");
   console.log("║        AGENT WATCH BRIDGE             ║");
   console.log("╠═══════════════════════════════════════╣");
-  console.log(`║  Pairing Code:  ${code}                ║`);
+  console.log(pairingLine);
   console.log(`║  IP Address:    ${lanIP.padEnd(20)}║`);
   console.log(`║  Port:          ${String(boundPort).padEnd(20)}║`);
   console.log(`║  Agents:        ${agentLine.padEnd(20)}║`);
