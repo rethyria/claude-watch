@@ -32,6 +32,39 @@ import {
   handleHookError,
 } from "./hooks.js";
 
+// ---------------------------------------------------------------------------
+// Process-level guards
+// ---------------------------------------------------------------------------
+// Last-resort safety net: a stray rejection or exception anywhere in the
+// bridge must not kill the process — that would tear down every PTY session
+// and strand every in-flight permission hook. Log loudly and keep serving.
+
+process.on("unhandledRejection", (reason) => {
+  log(
+    "error",
+    "Unhandled promise rejection (bridge kept alive):",
+    reason instanceof Error ? reason.stack : String(reason),
+  );
+});
+
+process.on("uncaughtException", (err) => {
+  log(
+    "error",
+    "Uncaught exception (bridge kept alive):",
+    err instanceof Error ? err.stack : String(err),
+  );
+});
+
+// Test-only fault injection (test/crash-resilience.test.js): fires a stray
+// rejection/exception shortly after startup so the guards above have black-box
+// coverage. Inert unless the env var is set.
+const TEST_FAULT = process.env.CLAUDE_WATCH_TEST_FAULT;
+if (TEST_FAULT === "unhandledRejection") {
+  setTimeout(() => { Promise.reject(new Error("injected test fault: unhandled rejection")); }, 50);
+} else if (TEST_FAULT === "uncaughtException") {
+  setTimeout(() => { throw new Error("injected test fault: uncaught exception"); }, 50);
+}
+
 // Bonjour
 let bonjourInstance = null;
 let bonjourService = null;
@@ -53,7 +86,18 @@ const routes = {
 };
 
 async function onRequest(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  // The Host header is attacker-controlled and reaches this parse pre-auth:
+  // a malformed value (e.g. "bad host" via a raw socket) must yield a 400,
+  // not an unhandled rejection that kills the bridge. RFC 9112 §3.2 mandates
+  // 400 for an invalid Host field. Only `pathname` is used for routing, so
+  // well-formed requests behave exactly as before.
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host}`);
+  } catch {
+    jsonResponse(res, 400, { error: "Bad request" });
+    return;
+  }
 
   // /v1 routing skeleton: every endpoint is also reachable under a /v1 prefix
   // (e.g. /v1/pair → /pair). The unprefixed legacy surface stays frozen for
