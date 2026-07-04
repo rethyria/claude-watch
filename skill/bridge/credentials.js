@@ -67,7 +67,9 @@ function persistStore(nextTokens) {
   fs.mkdirSync(CREDENTIALS_DIR, { recursive: true, mode: 0o700 });
   const tmpFile = `${CREDENTIALS_FILE}.tmp`;
   const payload = JSON.stringify({ version: 1, tokens: nextTokens }, null, 2) + "\n";
+  fs.rmSync(tmpFile, { force: true }); // a stale tmp would keep its old mode
   fs.writeFileSync(tmpFile, payload, { mode: 0o600 });
+  fs.chmodSync(tmpFile, 0o600); // writeFileSync's mode is ignored on reuse
   fs.renameSync(tmpFile, CREDENTIALS_FILE);
 }
 
