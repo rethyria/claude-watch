@@ -4,12 +4,18 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { spawnPtyProcess } from "./pty.js";
 import { log } from "./util.js";
-import { CLAUDE_BIN, CODEX_BIN, CLI_CWD } from "./config.js";
+import {
+  CLAUDE_BIN,
+  CODEX_BIN,
+  CLI_CWD,
+  SESSION_PRUNE_GRACE_MS,
+  SESSION_PRUNE_INTERVAL_MS,
+} from "./config.js";
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
 // Multi-session: each entry is a session slot
-// { id, agent, cwd, folderName, ptyProcess, state, createdAt }
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number}>} */
+// { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt? }
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number}>} */
 export const sessions = new Map();
 
 // Invoked when a PTY-backed session ends so codex.js can clear its synthetic
@@ -61,6 +67,7 @@ export function bindPtyProcess(slot, proc) {
   proc.on("close", (exitCode, signal) => {
     log("info", `Session ${sessionId} (${slot.agent}) PTY exited: code=${exitCode} signal=${signal}`);
     slot.state = "ended";
+    slot.endedAt = Date.now();
     slot.ptyProcess = null;
     runSessionCleanupHooks(sessionId, "pty-closed");
     pushSseEvent("session", { state: "ended", exitCode, signal, agent: slot.agent, folderName: slot.folderName }, sessionId);
@@ -69,6 +76,7 @@ export function bindPtyProcess(slot, proc) {
   proc.on("error", (err) => {
     log("error", `Session ${sessionId} PTY spawn error: ${err.message}`);
     slot.state = "ended";
+    slot.endedAt = Date.now();
     slot.ptyProcess = null;
     runSessionCleanupHooks(sessionId, "pty-error");
     pushSseEvent("session", { state: "ended", error: err.message, agent: slot.agent, folderName: slot.folderName }, sessionId);
@@ -131,6 +139,7 @@ export function killSession(sessionId) {
     try { slot.ptyProcess.kill(); } catch { /* ignore */ }
   }
   slot.state = "ended";
+  slot.endedAt = Date.now();
   slot.ptyProcess = null;
   pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, killed: true }, sessionId);
   log("info", `Session ${sessionId} killed`);
@@ -179,6 +188,27 @@ export function getSessionsSnapshot() {
     createdAt: s.createdAt,
   }));
 }
+
+// Ended sessions stay visible in snapshots for SESSION_PRUNE_GRACE_MS so
+// clients observe the "ended" state, then get deleted — otherwise the map
+// (and every /status and /pair snapshot) grows forever. `now` is injectable
+// so tests can exercise the cutoff without waiting out the grace period.
+// Sessions ended before this code existed carry no endedAt; fall back to
+// createdAt so they still age out.
+export function pruneEndedSessions(now = Date.now()) {
+  for (const [id, slot] of sessions) {
+    if (slot.state !== "ended") continue;
+    const endedAt = slot.endedAt ?? slot.createdAt;
+    if (now - endedAt >= SESSION_PRUNE_GRACE_MS) {
+      sessions.delete(id);
+      log("info", `Pruned ended session ${id} (${slot.agent}, ${slot.folderName}) after grace period`);
+    }
+  }
+}
+
+// unref() so importing this module (e.g. from an in-process unit test) never
+// keeps the process alive on its own.
+setInterval(() => pruneEndedSessions(), SESSION_PRUNE_INTERVAL_MS).unref();
 
 // Hooks come from Claude Code instances. We match by cwd to find the session.
 export function resolveHookSession(body) {

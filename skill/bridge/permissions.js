@@ -12,6 +12,9 @@ export function waitForPermission(permissionId) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingPermissions.delete(permissionId);
+      // The suggestion body stored by hooks.js would otherwise leak forever:
+      // the decision path (commands.js) deletes it, but nobody answers here.
+      pendingPermissionBodies.delete(permissionId);
       log("warn", `Permission ${permissionId} timed out after ${PERMISSION_TIMEOUT_MS / 1000}s, auto-denying`);
       resolve({ behavior: "deny", reason: "Timed out waiting for watch response" });
     }, PERMISSION_TIMEOUT_MS);

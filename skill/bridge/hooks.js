@@ -10,8 +10,9 @@ export async function handleHookToolOutput(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   let body;
   try {
-    body = await readBody(req);
-  } catch {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
@@ -26,8 +27,9 @@ export async function handleHookPermission(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   let body;
   try {
-    body = await readBody(req);
-  } catch {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
@@ -82,8 +84,9 @@ export async function handleHookStop(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   let body;
   try {
-    body = await readBody(req);
-  } catch {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
@@ -97,8 +100,9 @@ export async function handleHookTaskComplete(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   let body;
   try {
-    body = await readBody(req);
-  } catch {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
@@ -112,8 +116,9 @@ export async function handleHookError(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   let body;
   try {
-    body = await readBody(req);
-  } catch {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 

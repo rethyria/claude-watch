@@ -5,13 +5,13 @@
 | Module | Responsibility |
 |---|---|
 | `server.js` | Entry point: routes table, `/v1` prefix normalization, port binding, pairing banner, Bonjour advertisement, graceful shutdown. |
-| `util.js` | Shared low-level helpers: `log()`, `jsonResponse()`, `readBody()`. No bridge-module imports. |
+| `util.js` | Shared low-level helpers: `log()`, `jsonResponse()`, `readBody()` (1 MiB body cap: oversized requests get a 413 and a destroyed socket before auth runs — the cap constant lives here because this module must not import `config.js`). No bridge-module imports. |
 | `config.js` | Configuration constants, `BRIDGE_ID`, and `claude`/`codex` binary discovery (logs at startup). |
 | `credentials.js` | Per-device token store (SHA-256 hashes persisted to `credentials.json`), pairing-code generation/validation, pairing lockout latch, `requireAuth()`, bridge state. |
 | `rate-limit.js` | Per-IP pairing rate limiter (fixed window per remote address, expired windows pruned on every call). |
-| `transport-sse.js` | SSE event ring buffer, connected clients, `pushSseEvent()` broadcast, and the `GET /events` handler (replay, connect-time sync, heartbeat). |
-| `permissions.js` | Pending permission maps and the blocking `waitForPermission()` / `resolvePermission()` pair (10-minute auto-deny timeout). |
-| `sessions.js` | Sessions map, PTY spawn/attach/kill lifecycle (via `pty.js`), session lookup helpers, snapshot, and hook-to-session resolution. |
+| `transport-sse.js` | SSE event ring buffer, connected clients, `pushSseEvent()` broadcast (evicts clients whose response write buffer exceeds `SSE_MAX_BUFFERED_BYTES`), and the `GET /events` handler (replay, connect-time sync, heartbeat, TCP keepalive on the socket). |
+| `permissions.js` | Pending permission maps and the blocking `waitForPermission()` / `resolvePermission()` pair (10-minute auto-deny timeout, which also clears any stored suggestion body). |
+| `sessions.js` | Sessions map, PTY spawn/attach/kill lifecycle (via `pty.js`), session lookup helpers, snapshot, hook-to-session resolution, and ended-session pruning (ended slots stay in snapshots for `SESSION_PRUNE_GRACE_MS`, then get deleted). |
 | `codex.js` | All Codex integration: `~/.codex/sessions` JSONL scanner, TUI log monitor, synthetic exec-approval permissions, keystroke resolution into the Codex PTY. |
 | `hooks.js` | HTTP handlers for the `/hooks/*` surface (permission, tool-output, stop, task-complete, error). |
 | `commands.js` | HTTP handlers for the watch-client API surface (`/pair`, `/command`, `/status`). |
