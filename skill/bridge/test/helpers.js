@@ -16,8 +16,9 @@ const BRIDGE_DIR = fileURLToPath(new URL("..", import.meta.url));
 //     A path: reuse that dir (restart-persistence tests); caller owns cleanup.
 //     false: opt out — inherit the parent env untouched.
 //   args — extra CLI arguments (e.g. ["--allow-pairing"]).
-//   env — extra environment variables merged over the inherited ones
-//     (e.g. { CLAUDE_WATCH_TEST_FAULT: "unhandledRejection" }).
+//   env — extra environment variables merged over the inherited ones, e.g.
+//     the CLAUDE_WATCH_* test-only overrides from config.js, or
+//     { CLAUDE_WATCH_TEST_FAULT: "unhandledRejection" }.
 export async function startBridge(t, { credentialsDir, args = [], env: extraEnv } = {}) {
   const env = { ...process.env, ...extraEnv };
   let ownedTempDir = null;

@@ -1,7 +1,12 @@
 // SSE transport: event ring buffer, connected clients, broadcast, and the
 // GET /events handler (including replay, connect-time sync, and heartbeat).
 import { log, jsonResponse } from "./util.js";
-import { SSE_BUFFER_SIZE, SSE_HEARTBEAT_INTERVAL_MS } from "./config.js";
+import {
+  SSE_BUFFER_SIZE,
+  SSE_HEARTBEAT_INTERVAL_MS,
+  SSE_MAX_BUFFERED_BYTES,
+  SSE_TCP_KEEPALIVE_MS,
+} from "./config.js";
 import { requireAuth } from "./credentials.js";
 
 let sseEventId = 0;
@@ -54,6 +59,17 @@ export function pushSseEvent(event, data, sessionId = null) {
   for (const client of sseClients) {
     try {
       client.write(formatted);
+      // Backpressure bound: write() on a stalled or silently-dead client
+      // keeps buffering into the response stream (a destroyed response
+      // returns false rather than throwing), so events would pile up there
+      // for ~15 minutes. A client this far behind gets destroyed; it can
+      // reconnect and catch up via Last-Event-ID replay.
+      if (client.writableLength > SSE_MAX_BUFFERED_BYTES) {
+        const buffered = client.writableLength;
+        sseClients.delete(client);
+        try { client.destroy(); } catch { /* already gone */ }
+        log("warn", `SSE client evicted: ${buffered} buffered bytes exceeds ${SSE_MAX_BUFFERED_BYTES} (total: ${sseClients.size})`);
+      }
     } catch {
       sseClients.delete(client);
     }
@@ -77,6 +93,12 @@ export function handleEvents(req, res) {
   if (!requireAuth(req)) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
+
+  // TCP keepalive: a peer that vanishes without FIN/RST (network loss, watch
+  // out of range) otherwise looks connected for ~15 minutes while events
+  // buffer into the dead socket. Keepalive probes surface the drop, which
+  // fires the 'close' handler below and cleans the client up.
+  req.socket.setKeepAlive(true, SSE_TCP_KEEPALIVE_MS);
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",

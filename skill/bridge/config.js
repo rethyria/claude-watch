@@ -68,7 +68,48 @@ export const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_MAX_ATTEMPTS = 5;
 export const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 export const SSE_BUFFER_SIZE = 500;
-export const PERMISSION_TIMEOUT_MS = 600_000; // 10 minutes
+
+// Test-only override hook: lets the test suite shorten long production
+// timeouts/bounds via environment variables so timeout/pruning paths can be
+// exercised in seconds instead of minutes. Production deployments must never
+// set these variables; any unset/invalid value falls back to the production
+// default.
+function testOverridableMs(envName, productionValue) {
+  const raw = process.env[envName];
+  if (raw === undefined) return productionValue;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : productionValue;
+}
+
+// Overridable via CLAUDE_WATCH_PERMISSION_TIMEOUT_MS (test-only).
+export const PERMISSION_TIMEOUT_MS = testOverridableMs(
+  "CLAUDE_WATCH_PERMISSION_TIMEOUT_MS",
+  600_000, // 10 minutes
+);
+
+// Maximum bytes allowed to queue in a single SSE client's response stream.
+// writableLength only grows once the kernel socket buffers are full, so a
+// client this far behind is stalled or dead — it gets destroyed and can
+// reconnect with Last-Event-ID replay.
+export const SSE_MAX_BUFFERED_BYTES = 1024 * 1024; // 1 MiB
+
+// TCP keepalive probe delay for SSE sockets: detects silently-dropped peers
+// (network loss, no FIN/RST) instead of waiting ~15 minutes for the OS
+// default to notice.
+export const SSE_TCP_KEEPALIVE_MS = 30_000;
+
+// Ended sessions stay in the sessions map (and thus in /status and /pair
+// snapshots) for this grace period so clients observe the "ended" state,
+// then get pruned. Overridable via CLAUDE_WATCH_SESSION_PRUNE_GRACE_MS /
+// CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS (test-only).
+export const SESSION_PRUNE_GRACE_MS = testOverridableMs(
+  "CLAUDE_WATCH_SESSION_PRUNE_GRACE_MS",
+  5 * 60 * 1000,
+);
+export const SESSION_PRUNE_INTERVAL_MS = testOverridableMs(
+  "CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS",
+  60_000,
+);
 export const CODEX_SESSION_SCAN_INTERVAL_MS = 1_500;
 export const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 export const CODEX_SESSION_SCAN_LIMIT = 25;

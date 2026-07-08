@@ -40,8 +40,9 @@ export async function handlePair(req, res) {
 
   let body;
   try {
-    body = await readBody(req);
-  } catch {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
@@ -98,8 +99,9 @@ export async function handleCommand(req, res) {
 
   let body;
   try {
-    body = await readBody(req);
-  } catch {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
