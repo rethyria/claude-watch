@@ -4,7 +4,7 @@
 
 | Module | Responsibility |
 |---|---|
-| `server.js` | Entry point: routes table, `/v1` prefix normalization, port binding, pairing banner, Bonjour advertisement, graceful shutdown. |
+| `server.js` | Entry point: routes table, `/v1` prefix normalization, process-level crash guards (`unhandledRejection`/`uncaughtException` log instead of dying), port binding, pairing banner, Bonjour advertisement, graceful shutdown. |
 | `util.js` | Shared low-level helpers: `log()`, `jsonResponse()`, `readBody()` (1 MiB body cap: oversized requests get a 413 and a destroyed socket before auth runs — the cap constant lives here because this module must not import `config.js`). No bridge-module imports. |
 | `config.js` | Configuration constants, `BRIDGE_ID`, and `claude`/`codex` binary discovery (logs at startup). |
 | `credentials.js` | Per-device token store (SHA-256 hashes persisted to `credentials.json`), pairing-code generation/validation, pairing lockout latch, `requireAuth()`, bridge state. |
