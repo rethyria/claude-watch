@@ -259,6 +259,13 @@ export async function handleCommand(req, res) {
       const slot = sessions.get(newId);
       const ready = await waitForFirstPtyOutput(slot, SPAWN_INJECT_TIMEOUT_MS);
       if (!ready) {
+        // The failure must not be sticky: a never-ready session left
+        // registered as "running" with a live PTY would be selected by the
+        // no-session-id fallback on the next command, which then blind-writes
+        // into it and returns ok:true — silently swallowing the command (the
+        // exact bug the ready gate exists to prevent) and wedging auto-spawn
+        // until the zombie process dies on its own.
+        killSession(newId);
         log("error", `Session ${newId} (${requestedAgent}) produced no output; command not injected`);
         return jsonResponse(res, 500, {
           error: `Spawned ${requestedAgent} session but it produced no output; command not injected`,
@@ -268,6 +275,8 @@ export async function handleCommand(req, res) {
         });
       }
       if (!writeToSessionStdin(slot, command)) {
+        // Same sticky-failure hazard as the !ready path above.
+        killSession(newId);
         log("error", `Session ${newId} (${requestedAgent}) PTY unavailable; command not injected`);
         return jsonResponse(res, 500, {
           error: `Spawned ${requestedAgent} session but its PTY is not writable; command not injected`,
