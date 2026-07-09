@@ -66,9 +66,11 @@ final class BonjourDiscovery: ObservableObject {
     }
 
     /// Tries to connect to a specific IP on ports 7860-7869.
+    /// Probes GET /ping — the unauthenticated discovery endpoint; /status
+    /// requires the bearer token and would 401 before pairing.
     func discoverAtIP(_ ip: String) async throws -> DiscoveredService {
         for port in UInt16(7860)...UInt16(7869) {
-            let url = URL(string: "http://\(ip):\(port)/status")!
+            let url = URL(string: "http://\(ip):\(port)/ping")!
             var request = URLRequest(url: url)
             request.timeoutInterval = 3
             do {
@@ -89,9 +91,11 @@ final class BonjourDiscovery: ObservableObject {
     }
 
     /// Tries to connect to localhost:7860-7869 directly.
+    /// Probes GET /ping — the unauthenticated discovery endpoint; /status
+    /// requires the bearer token and would 401 before pairing.
     private func localhostFallback() async throws -> DiscoveredService {
         for port in UInt16(7860)...UInt16(7869) {
-            let url = URL(string: "http://127.0.0.1:\(port)/status")!
+            let url = URL(string: "http://127.0.0.1:\(port)/ping")!
             var request = URLRequest(url: url)
             request.timeoutInterval = 2
             do {

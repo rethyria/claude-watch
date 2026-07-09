@@ -55,21 +55,29 @@ test("legacy unprefixed paths keep working alongside /v1", { timeout: 60_000 }, 
   const bridge = await startBridge(t);
   const { port, pairingCode } = bridge;
 
-  // Both surfaces answer /status with the same bridge identity
-  const v1Status = await request(port, "GET", "/v1/status");
-  assert.equal(v1Status.status, 200);
-  const legacyStatus = await request(port, "GET", "/status");
-  assert.equal(legacyStatus.status, 200);
-  assert.equal(legacyStatus.body.bridgeId, v1Status.body.bridgeId);
-
-  // Unknown paths under /v1 are 404, same as legacy
-  const missing = await request(port, "GET", "/v1/does-not-exist");
-  assert.equal(missing.status, 404);
-
   // Legacy pairing still works after the /v1 skeleton landed
   const pair = await request(port, "POST", "/pair", { body: { code: pairingCode } });
   assert.equal(pair.status, 200);
   assert.ok(pair.body.token, "legacy pair response carries a token");
+  const token = pair.body.token;
+
+  // Both surfaces answer /status (now authenticated) with the same identity
+  const v1Status = await request(port, "GET", "/v1/status", { token });
+  assert.equal(v1Status.status, 200);
+  const legacyStatus = await request(port, "GET", "/status", { token });
+  assert.equal(legacyStatus.status, 200);
+  assert.equal(legacyStatus.body.bridgeId, v1Status.body.bridgeId);
+
+  // Both surfaces answer the unauthenticated /ping discovery probe
+  const v1Ping = await request(port, "GET", "/v1/ping");
+  assert.equal(v1Ping.status, 200);
+  const legacyPing = await request(port, "GET", "/ping");
+  assert.equal(legacyPing.status, 200);
+  assert.equal(legacyPing.body.bridgeId, v1Ping.body.bridgeId);
+
+  // Unknown paths under /v1 are 404, same as legacy
+  const missing = await request(port, "GET", "/v1/does-not-exist");
+  assert.equal(missing.status, 404);
 });
 
 // The realistic production topology: hook scripts installed by setup-hooks.sh

@@ -113,7 +113,9 @@ struct OnboardingView: View {
 
         Task {
             for port in 7860...7869 {
-                let url = URL(string: "http://\(ip):\(port)/status")!
+                // Probe GET /ping — the unauthenticated discovery endpoint;
+                // /status requires the bearer token and would 401 here.
+                let url = URL(string: "http://\(ip):\(port)/ping")!
                 var request = URLRequest(url: url)
                 request.timeoutInterval = 3
                 do {

@@ -1,7 +1,7 @@
 // HTTP handlers for the /hooks/* surface: Claude Code (and Codex wrapper)
 // hook scripts POST here; the permission hook blocks until the watch decides.
 import crypto from "node:crypto";
-import { log, jsonResponse, readBody } from "./util.js";
+import { log, jsonResponse, readBody, isLoopbackAddress } from "./util.js";
 import { pushSseEvent, sseClients } from "./transport-sse.js";
 import { resolveHookSession } from "./sessions.js";
 import {
@@ -38,8 +38,22 @@ function collectAskUserQuestionAnswers(questions, decision) {
   return Object.keys(answers).length > 0 ? answers : null;
 }
 
+// Hooks are called exclusively by hook scripts that Claude Code (or the Codex
+// wrapper) runs on this machine, so they always originate from loopback. On a
+// 0.0.0.0 bind this surface is otherwise open to any LAN peer, who could
+// spoof permission prompts and terminal output onto the trusted watch UI —
+// reject anything that didn't come from localhost before reading the body.
+function requireLoopback(req, res) {
+  const addr = req.socket?.remoteAddress;
+  if (isLoopbackAddress(addr)) return true;
+  log("warn", `Hook request rejected: non-loopback source ${addr || "unknown"}`);
+  jsonResponse(res, 403, { error: "Hooks are only accepted from localhost" });
+  return false;
+}
+
 export async function handleHookToolOutput(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
   let body;
   try {
     body = await readBody(req, res);
@@ -57,6 +71,7 @@ export async function handleHookToolOutput(req, res) {
 
 export async function handleHookPermission(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
   let body;
   try {
     body = await readBody(req, res);
@@ -170,6 +185,7 @@ export async function handleHookPermission(req, res) {
 
 export async function handleHookStop(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
   let body;
   try {
     body = await readBody(req, res);
@@ -186,6 +202,7 @@ export async function handleHookStop(req, res) {
 
 export async function handleHookTaskComplete(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
   let body;
   try {
     body = await readBody(req, res);
@@ -225,6 +242,7 @@ export async function handleHookNotification(req, res) {
 
 export async function handleHookError(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
   let body;
   try {
     body = await readBody(req, res);
