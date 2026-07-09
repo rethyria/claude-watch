@@ -11,9 +11,9 @@
 | `rate-limit.js` | Per-IP pairing rate limiter (fixed window per remote address, expired windows pruned on every call). |
 | `transport-sse.js` | SSE event ring buffer, connected clients, `pushSseEvent()` broadcast (evicts clients whose response write buffer exceeds `SSE_MAX_BUFFERED_BYTES`), and the `GET /events` handler (replay, connect-time sync, heartbeat, TCP keepalive on the socket). |
 | `permissions.js` | Pending permission maps and the blocking `waitForPermission()` / `resolvePermission()` pair (10-minute auto-deny timeout, which also clears any stored suggestion body). |
-| `sessions.js` | Sessions map, PTY spawn/attach/kill lifecycle (via `pty.js`), session lookup helpers, snapshot, hook-to-session resolution, and ended-session pruning (ended slots stay in snapshots for `SESSION_PRUNE_GRACE_MS`, then get deleted). |
+| `sessions.js` | Sessions map, PTY spawn/attach/kill lifecycle (via `pty.js`), session lookup helpers, snapshot, hook-to-session resolution (keyed on the hook payload's `session_id`, bound to PTY-backed slots on the first cwd-matched event; cwd is the only heuristic when `session_id` is absent, and a cwd mismatch auto-creates an external slot instead of attaching to another session), SessionEnd handling for external slots, and ended-session pruning (ended slots stay in snapshots for `SESSION_PRUNE_GRACE_MS`, then get deleted). |
 | `codex.js` | All Codex integration: `~/.codex/sessions` JSONL scanner, TUI log monitor, synthetic exec-approval permissions, keystroke resolution into the Codex PTY. |
-| `hooks.js` | HTTP handlers for the `/hooks/*` surface (permission, tool-output, stop, task-complete, error). |
+| `hooks.js` | HTTP handlers for the `/hooks/*` surface (permission, tool-output, stop, session-end, task-complete, error). Stop fires per turn and never ends a session; SessionEnd ends the matching external session. |
 | `commands.js` | HTTP handlers for the watch-client API surface (`/pair`, `/command`, `/status`). |
 | `pty.js` | Platform-specific PTY spawning via the system `script` utility. |
 

@@ -115,6 +115,13 @@ new_hooks = {
             'timeout': 5
         }]
     }],
+    'SessionEnd': [{
+        'hooks': [{
+            'type': 'http',
+            'url': f'{BRIDGE}/hooks/session-end',
+            'timeout': 5
+        }]
+    }],
     'PostToolUseFailure': [{
         'hooks': [{
             'type': 'http',

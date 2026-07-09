@@ -28,6 +28,7 @@ import {
   handleHookToolOutput,
   handleHookPermission,
   handleHookStop,
+  handleHookSessionEnd,
   handleHookTaskComplete,
   handleHookError,
 } from "./hooks.js";
@@ -80,6 +81,7 @@ const routes = {
   "POST /hooks/tool-output": handleHookToolOutput,
   "POST /hooks/permission": handleHookPermission,
   "POST /hooks/stop": handleHookStop,
+  "POST /hooks/session-end": handleHookSessionEnd,
   "POST /hooks/task-complete": handleHookTaskComplete,
   "POST /hooks/error": handleHookError,
   "GET /status": handleStatus,

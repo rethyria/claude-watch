@@ -14,9 +14,21 @@ import {
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
 // Multi-session: each entry is a session slot
-// { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt? }
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number}>} */
+// { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId? }
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string}>} */
 export const sessions = new Map();
+
+// Claude Code hook payloads carry the emitting instance's own session_id.
+// Attribution is keyed on it: a slot remembers which hook session it
+// represents (slot.hookSessionId) and this index maps session_id → slot id
+// so every subsequent event for that instance routes to the same slot.
+/** @type {Map<string, string>} */
+const hookSessionIndex = new Map();
+
+function bindHookSession(slot, hookSessionId) {
+  slot.hookSessionId = hookSessionId;
+  hookSessionIndex.set(hookSessionId, slot.id);
+}
 
 // Invoked when a PTY-backed session ends so codex.js can clear its synthetic
 // permission state without a circular import (codex.js imports sessions.js,
@@ -201,6 +213,7 @@ export function pruneEndedSessions(now = Date.now()) {
     const endedAt = slot.endedAt ?? slot.createdAt;
     if (now - endedAt >= SESSION_PRUNE_GRACE_MS) {
       sessions.delete(id);
+      if (slot.hookSessionId) hookSessionIndex.delete(slot.hookSessionId);
       log("info", `Pruned ended session ${id} (${slot.agent}, ${slot.folderName}) after grace period`);
     }
   }
@@ -210,20 +223,9 @@ export function pruneEndedSessions(now = Date.now()) {
 // keeps the process alive on its own.
 setInterval(() => pruneEndedSessions(), SESSION_PRUNE_INTERVAL_MS).unref();
 
-// Hooks come from Claude Code instances. We match by cwd to find the session.
-export function resolveHookSession(body) {
-  const cwd = body.session_cwd || body.cwd || null;
-  const source = body.source || "claude";
-
-  // Try exact cwd match first
-  const match = findSessionByCwd(cwd);
-  if (match) return match.id;
-
-  // Fallback: if exactly one running session, use it
-  const active = findMostRecentActiveSession();
-  if (active) return active.id;
-
-  // No session exists — auto-create one for this external Claude/Codex instance
+// Auto-create a slot for an agent instance the bridge does not own (started
+// outside the bridge, or a bridge-owned PTY whose cwd no longer matches).
+function createExternalSession({ source, cwd, hookSessionId }) {
   const agent = source === "codex" ? "codex" : "claude";
   const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
@@ -238,12 +240,88 @@ export function resolveHookSession(body) {
     state: "running",
     createdAt: Date.now(),
   };
+  if (hookSessionId) bindHookSession(slot, hookSessionId);
   sessions.set(sessionId, slot);
 
   log("info", `Auto-created session ${sessionId} for external ${agent} (${folderName})`);
   pushSseEvent("session", { state: "running", agent, cwd: resolvedCwd, folderName }, sessionId);
 
   return sessionId;
+}
+
+function hookSessionIdOf(body) {
+  return typeof body.session_id === "string" && body.session_id ? body.session_id : null;
+}
+
+// Hooks come from Claude Code instances. Attribution keys on the payload's
+// session_id (present in every Claude Code hook event); cwd is a tie-breaker
+// used only to bind a fresh session_id to a bridge-spawned PTY slot, and the
+// sole heuristic for legacy payloads that carry no session_id. A cwd that
+// matches no session NEVER falls back to "most recent active" — that used to
+// let project B's permission prompts surface under project A.
+export function resolveHookSession(body) {
+  const cwd = body.session_cwd || body.cwd || null;
+  const source = body.source || "claude";
+  const hookSessionId = hookSessionIdOf(body);
+
+  if (hookSessionId) {
+    // A known session_id always routes to the slot it was bound to.
+    const boundId = hookSessionIndex.get(hookSessionId);
+    if (boundId) {
+      const bound = sessions.get(boundId);
+      if (bound) return bound.id;
+      hookSessionIndex.delete(hookSessionId); // slot was pruned
+    }
+
+    // First event for this session_id: bind it to a running PTY-backed slot
+    // in the same cwd that no other session_id has claimed yet.
+    if (cwd) {
+      for (const [, slot] of sessions) {
+        if (slot.state === "running" && slot.ptyProcess && slot.cwd === cwd && !slot.hookSessionId) {
+          bindHookSession(slot, hookSessionId);
+          return slot.id;
+        }
+      }
+    }
+
+    // No claimable slot — this is an external instance; give it its own slot.
+    return createExternalSession({ source, cwd, hookSessionId });
+  }
+
+  // Legacy payload without session_id: exact-cwd match only. Resolve the cwd
+  // fallback chain first so repeated cwd-less events (e.g. the codex-watch
+  // wrapper's turn.completed posts) reuse one slot instead of minting one per
+  // event.
+  const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
+  const match = findSessionByCwd(resolvedCwd);
+  if (match) return match.id;
+
+  return createExternalSession({ source, cwd: resolvedCwd, hookSessionId: null });
+}
+
+// SessionEnd hook: the Claude Code instance behind this session_id exited.
+// Lookup only — a SessionEnd for an unknown session must never create one.
+// Only external (non-PTY) slots are ended here: bridge-owned slots end when
+// their PTY closes, and Stop (which fires per turn) is deliberately NOT
+// mapped to this. Returns the affected slot id, or null if nothing matched.
+export function endHookSession(body) {
+  const hookSessionId = hookSessionIdOf(body);
+  let slot = null;
+  if (hookSessionId) {
+    const boundId = hookSessionIndex.get(hookSessionId);
+    if (boundId) slot = sessions.get(boundId) || null;
+  } else {
+    slot = findSessionByCwd(body.session_cwd || body.cwd || null);
+  }
+  if (!slot || slot.state === "ended") return slot?.id ?? null;
+  if (slot.ptyProcess) return slot.id; // bridge-owned: PTY close ends it
+
+  slot.state = "ended";
+  slot.endedAt = Date.now();
+  runSessionCleanupHooks(slot.id, "session-end-hook");
+  pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, reason: "session-end" }, slot.id);
+  log("info", `External session ${slot.id} ended (SessionEnd hook)`);
+  return slot.id;
 }
 
 // Send current sessions state so late-connecting SSE clients see existing
