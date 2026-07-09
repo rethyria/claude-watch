@@ -3,7 +3,7 @@
 import crypto from "node:crypto";
 import { log, jsonResponse, readBody, isLoopbackAddress } from "./util.js";
 import { pushSseEvent, sseClients } from "./transport-sse.js";
-import { resolveHookSession } from "./sessions.js";
+import { resolveHookSession, endHookSession } from "./sessions.js";
 import {
   waitForPermission,
   cancelPermission,
@@ -197,6 +197,26 @@ export async function handleHookStop(req, res) {
   const sid = resolveHookSession(body);
   log("info", `Hook: Stop received${sid ? ` session=${sid}` : ""}`);
   pushSseEvent("stop", body, sid);
+  return jsonResponse(res, 200, { ok: true });
+}
+
+// SessionEnd fires once when a Claude Code instance exits (Stop fires per
+// turn and must NOT end sessions). Ends the matching external session so
+// hook-created slots don't accumulate as permanent "running" zombies;
+// endHookSession never creates a session for an unknown SessionEnd.
+export async function handleHookSessionEnd(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
+  let body;
+  try {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
+    return jsonResponse(res, 400, { error: "Invalid JSON" });
+  }
+
+  const sid = endHookSession(body);
+  log("info", `Hook: SessionEnd received${sid ? ` session=${sid}` : " (no matching session)"}`);
   return jsonResponse(res, 200, { ok: true });
 }
 
