@@ -39,8 +39,14 @@ class BridgeViewModel : ViewModel() {
     private var token: String? = null
     private var eventSource: EventSource? = null
 
+    // Seeded to "0" so the very first /v1/events connect sends Last-Event-ID: 0
+    // and the bridge replays its whole ring buffer. Without it, an event pushed
+    // between pair success and the stream actually opening is lost forever: the
+    // first connect carries no Last-Event-ID (no replay), and the connect-time
+    // sync event reuses the newest buffered id, so a later reconnect's
+    // "id > lastId" replay can never recover the miss.
     @Volatile
-    private var lastEventId: String? = null
+    private var lastEventId: String? = "0"
 
     @Volatile
     private var stopped = false
@@ -73,7 +79,10 @@ class BridgeViewModel : ViewModel() {
                         }
                     }
                 }
-                _state.update { it.copy(status = "paired", paired = true, sessionId = sessionId) }
+                // Don't report "paired" yet: the stream isn't open, so events
+                // can still be missed. onOpen below is the ready signal (and
+                // what the e2e test gates on before firing hooks).
+                _state.update { it.copy(status = "pair ok, opening stream", paired = true, sessionId = sessionId) }
                 connectEvents()
             } catch (e: Exception) {
                 _state.update { it.copy(status = "pair error: ${e.message}") }

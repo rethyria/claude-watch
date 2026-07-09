@@ -84,7 +84,11 @@ class WalkingSkeletonTest {
         fill("port", bridgePort.toString())
         fill("code", pairingCode)
         compose.onNodeWithTag("pairButton").performScrollTo().performClick()
-        waitForText("status", "paired")
+        // Gate on the SSE stream being open, not on pair success: a hook fired
+        // in the pair-to-stream-open window would race the connect. (The app
+        // also requests a full replay on first connect, but the stream-open
+        // signal is the honest go-signal for the steps below.)
+        waitForText("status", "paired, stream open")
 
         // --- An SSE event arrives and renders as raw text -----------------
         // The tool-output hook also auto-creates a bridge session, whose
