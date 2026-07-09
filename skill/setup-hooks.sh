@@ -141,7 +141,7 @@ new_hooks = {
         'matcher': 'idle_prompt|permission_prompt',
         'hooks': [{
             'type': 'http',
-            'url': f'{BRIDGE}/hooks/stop',
+            'url': f'{BRIDGE}/hooks/notification',
             'timeout': 5
         }]
     }]

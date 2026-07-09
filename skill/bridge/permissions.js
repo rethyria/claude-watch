@@ -10,6 +10,54 @@ export const pendingPermissions = new Map();
 /** @type {Map<string, Array>} */
 export const pendingPermissionBodies = new Map();
 
+// ---------------------------------------------------------------------------
+// Machine-readable decision semantics (/v1 contract)
+// ---------------------------------------------------------------------------
+// Every permission option the bridge broadcasts carries a `behavior` field so
+// clients act on machine-readable semantics, never on option position or
+// English label substrings (which silently invert an approval into a denial
+// when wording or ordering changes):
+//   allow        — approve this request once
+//   allow-always — approve AND persist the hook's permission suggestions
+//                  (exactly the legacy iOS `allowAll` path)
+//   deny         — reject the request
+export const PERMISSION_BEHAVIORS = new Set(["allow", "allow-always", "deny"]);
+
+// Normalize an option list to the canonical shape {behavior, label,
+// description?}. Every permission surface (the Claude hook prompt and the
+// Codex synthetic exec-approval menu) builds its options through here.
+// Throwing on a behavior-less option beats silently broadcasting one that a
+// client could only interpret by guessing from its position or wording.
+export function canonicalPermissionOptions(entries) {
+  return entries.map((entry) => {
+    if (!entry || !PERMISSION_BEHAVIORS.has(entry.behavior)) {
+      throw new Error(`Permission option without machine-readable behavior: ${JSON.stringify(entry)}`);
+    }
+    const option = { behavior: entry.behavior, label: String(entry.label ?? "") };
+    if (entry.description !== undefined) option.description = String(entry.description);
+    return option;
+  });
+}
+
+// Canonical option list for a Claude Code permission prompt. The allow-always
+// option is only offered when the hook supplied permission suggestions to
+// persist — offering it without any would be the old "Yes, allow all" lie
+// (nothing gets remembered and the prompt recurs on the next tool call).
+export function defaultPermissionOptions({ canAllowAlways = false } = {}) {
+  const entries = [
+    { behavior: "allow", label: "Yes", description: "Allow this once" },
+  ];
+  if (canAllowAlways) {
+    entries.push({
+      behavior: "allow-always",
+      label: "Yes, don't ask again",
+      description: "Allow and apply the suggested permission rules",
+    });
+  }
+  entries.push({ behavior: "deny", label: "No", description: "Deny this request" });
+  return canonicalPermissionOptions(entries);
+}
+
 // `sessionId` and `payload` (the permission-request event body) are kept on
 // the pending entry so connect-time snapshots can re-send the prompt to a
 // client that missed it — a pending permission-request can be evicted from

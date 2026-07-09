@@ -4,7 +4,39 @@ import crypto from "node:crypto";
 import { log, jsonResponse, readBody } from "./util.js";
 import { pushSseEvent, sseClients } from "./transport-sse.js";
 import { resolveHookSession } from "./sessions.js";
-import { waitForPermission, cancelPermission, pendingPermissionBodies } from "./permissions.js";
+import {
+  waitForPermission,
+  cancelPermission,
+  pendingPermissionBodies,
+  defaultPermissionOptions,
+} from "./permissions.js";
+
+// Assemble the updatedInput.answers map for an AskUserQuestion decision.
+// Preferred (/v1) form: `decision.answers` as an array aligned with the
+// questions, or an object keyed by question text — EVERY question gets its
+// answer. Legacy form (frozen): a single `selectedOption` that answers the
+// first question only.
+function collectAskUserQuestionAnswers(questions, decision) {
+  const answers = {};
+  if (Array.isArray(decision.answers)) {
+    questions.forEach((question, index) => {
+      const answer = decision.answers[index];
+      if (question?.question && answer !== undefined && answer !== null) {
+        answers[question.question] = answer;
+      }
+    });
+  } else if (decision.answers && typeof decision.answers === "object") {
+    for (const question of questions) {
+      const answer = question?.question ? decision.answers[question.question] : undefined;
+      if (answer !== undefined && answer !== null) {
+        answers[question.question] = answer;
+      }
+    }
+  } else if (decision.selectedOption !== undefined && questions[0]?.question) {
+    answers[questions[0].question] = decision.selectedOption;
+  }
+  return Object.keys(answers).length > 0 ? answers : null;
+}
 
 export async function handleHookToolOutput(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
@@ -57,12 +89,25 @@ export async function handleHookPermission(req, res) {
     pendingPermissionBodies.set(permissionId, body.permission_suggestions);
   }
 
+  // Canonical /v1 semantics: the event carries a server-normalized option
+  // list where every option has a machine-readable `behavior` (see
+  // permissions.js) — clients never infer approve/deny from position or
+  // wording. AskUserQuestion prompts are content, not permission decisions:
+  // they carry their own per-question option lists in tool_input.questions
+  // (forwarded verbatim, ALL of them), so they get no top-level options.
+  const eventPayload = { permissionId, ...body };
+  if (body.tool_name !== "AskUserQuestion") {
+    eventPayload.options = defaultPermissionOptions({
+      canAllowAlways: Array.isArray(body.permission_suggestions) && body.permission_suggestions.length > 0,
+    });
+  }
+
   // Register the pending entry (with its event payload, so connect-time
   // snapshots can re-send the prompt) BEFORE broadcasting, so an answer can
   // never race the registration.
   const decisionPromise = waitForPermission(permissionId, {
     sessionId: sid,
-    payload: { permissionId, ...body },
+    payload: eventPayload,
   });
 
   // Claude Code can abort this blocking request before a decision arrives
@@ -79,7 +124,7 @@ export async function handleHookPermission(req, res) {
     }
   });
 
-  pushSseEvent("permission-request", { permissionId, ...body }, sid);
+  pushSseEvent("permission-request", eventPayload, sid);
 
   const decision = await decisionPromise;
 
@@ -103,14 +148,20 @@ export async function handleHookPermission(req, res) {
     hookResponse.hookSpecificOutput.decision.message = decision.message;
   }
 
-  // For AskUserQuestion: forward the watch-selected option as the answer so Claude
-  // Code doesn't fall back to waiting for terminal input.
-  if (decision.selectedOption !== undefined && body.tool_name === "AskUserQuestion") {
-    const questions = body.tool_input?.questions;
-    if (questions && questions.length > 0 && questions[0]?.question) {
-      const answers = { [questions[0].question]: decision.selectedOption };
+  // For AskUserQuestion: forward the watch answers so Claude Code doesn't
+  // fall back to waiting for terminal input. Multi-question payloads get an
+  // answer per question (decision.answers); the legacy single selectedOption
+  // path keeps answering only the first question.
+  if (body.tool_name === "AskUserQuestion") {
+    const questions = Array.isArray(body.tool_input?.questions) ? body.tool_input.questions : [];
+    const answers = collectAskUserQuestionAnswers(questions, decision);
+    if (answers) {
       hookResponse.hookSpecificOutput.decision.updatedInput = { questions, answers };
-      log("info", `AskUserQuestion answer forwarded: "${decision.selectedOption}"`);
+      if (decision.answers !== undefined) {
+        log("info", `AskUserQuestion answers forwarded for ${Object.keys(answers).length} question(s)`);
+      } else {
+        log("info", `AskUserQuestion answer forwarded: "${decision.selectedOption}"`);
+      }
     }
   }
 
@@ -146,6 +197,29 @@ export async function handleHookTaskComplete(req, res) {
   const sid = resolveHookSession(body);
   log("info", `Hook: TaskCompleted received${sid ? ` session=${sid}` : ""}`);
   pushSseEvent("task-complete", body, sid);
+  return jsonResponse(res, 200, { ok: true });
+}
+
+// Notification hook events (permission_prompt / idle_prompt / ...): forwarded
+// as a dedicated `notification` SSE event that always carries
+// `notification_type`, so clients can render "waiting on you" instead of
+// "stopped". setup-hooks.sh points the Notification hook here; older installs
+// that still post Notification bodies to /hooks/stop keep the frozen legacy
+// behavior (a plain `stop` event).
+export async function handleHookNotification(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  let body;
+  try {
+    body = await readBody(req, res);
+  } catch (err) {
+    if (err?.tooLarge) return; // readBody already sent 413 and destroyed the socket
+    return jsonResponse(res, 400, { error: "Invalid JSON" });
+  }
+
+  const sid = resolveHookSession(body);
+  const notificationType = body.notification_type ?? null;
+  log("info", `Hook: Notification received${sid ? ` session=${sid}` : ""}`, notificationType || "");
+  pushSseEvent("notification", { ...body, notification_type: notificationType }, sid);
   return jsonResponse(res, 200, { ok: true });
 }
 

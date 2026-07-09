@@ -13,6 +13,7 @@ import {
   CODEX_LOG_FILE,
 } from "./config.js";
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
+import { canonicalPermissionOptions, PERMISSION_BEHAVIORS } from "./permissions.js";
 import {
   sessions,
   attachPtyToSession,
@@ -191,27 +192,34 @@ function truncateText(value, maxLength = 80) {
   return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
 }
 
-function buildCodexApprovalOptions(prefixRule = []) {
-  const options = [
+// Canonical option list for the Codex synthetic exec-approval menu — built
+// through the same canonicalPermissionOptions() as the Claude hook prompts,
+// so every option carries a machine-readable behavior. Exported for the unit
+// tests in test/permission-semantics-unit.test.js.
+export function buildCodexApprovalOptions(prefixRule = []) {
+  const entries = [
     {
+      behavior: "allow",
       label: "Yes, proceed",
       description: "Run this command once",
     },
   ];
 
   if (Array.isArray(prefixRule) && prefixRule.length > 0) {
-    options.push({
+    entries.push({
+      behavior: "allow-always",
       label: "Yes, don't ask again",
       description: `Trust ${prefixRule.join(" ")} in future`,
     });
   }
 
-  options.push({
+  entries.push({
+    behavior: "deny",
     label: "No",
     description: "Deny this command and return to Codex",
   });
 
-  return options;
+  return canonicalPermissionOptions(entries);
 }
 
 function recordCodexExecApprovalCandidate(line) {
@@ -250,6 +258,9 @@ function surfaceCodexExecApproval(sessionId) {
     permissionId,
     source: "codex",
     tool_name: "ExecApproval",
+    // Top-level canonical options mirror the question's option list so /v1
+    // clients read one uniform shape across Claude and Codex prompts.
+    options,
     tool_input: {
       command: candidate.command,
       workdir: candidate.workdir,
@@ -281,7 +292,7 @@ export function clearCodexSyntheticPermissionForSession(sessionId, reason = "cle
   return true;
 }
 
-export function resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex) {
+export function resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex, behavior) {
   const synthetic = codexSyntheticPermissions.get(permissionId);
   if (!synthetic) return false;
 
@@ -291,16 +302,32 @@ export function resolveCodexSyntheticPermission(permissionId, selectedOption, op
   const proc = slot.ptyProcess || attachPtyToSession(slot);
   if (!proc || !proc.stdin) return false;
 
-  let input = "\u001b";
-  const normalizedIndex = Number.isInteger(optionIndex) ? optionIndex : -1;
+  // Resolve the answer to a canonical behavior. A machine-readable behavior
+  // wins outright; legacy index/label answers are looked up in the canonical
+  // option list the bridge itself broadcast — never re-derived from position
+  // or wording heuristics that could invert an approval into a denial.
+  const options = Array.isArray(synthetic.payload?.options) ? synthetic.payload.options : [];
+  let resolvedBehavior = "deny";
+  if (typeof behavior === "string" && PERMISSION_BEHAVIORS.has(behavior)) {
+    resolvedBehavior = behavior;
+  } else {
+    const normalizedIndex = Number.isInteger(optionIndex) ? optionIndex : -1;
+    const chosen = options[normalizedIndex]
+      || (selectedOption != null
+        ? options.find((opt) => opt.label.toLowerCase() === String(selectedOption).trim().toLowerCase())
+        : undefined);
+    if (chosen) resolvedBehavior = chosen.behavior;
+  }
 
-  if (normalizedIndex === 0 || /^yes,?\s*proceed/i.test(String(selectedOption || ""))) {
+  // Keystrokes into the Codex TUI approval menu: "y" approves once, "2\n"
+  // selects the trust-this-prefix entry (only present when the menu offers
+  // it — allow-always degrades to a single allow otherwise), Esc denies and
+  // returns to Codex.
+  let input = "\u001b";
+  if (resolvedBehavior === "allow") {
     input = "y";
-  } else if (
-    synthetic.optionCount === 3
-    && (normalizedIndex === 1 || /^yes,?\s*don't ask again/i.test(String(selectedOption || "")))
-  ) {
-    input = "2\n";
+  } else if (resolvedBehavior === "allow-always") {
+    input = options.some((opt) => opt.behavior === "allow-always") ? "2\n" : "y";
   }
 
   proc.stdin.write(input);
