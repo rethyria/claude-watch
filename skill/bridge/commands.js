@@ -1,8 +1,17 @@
 // HTTP handlers for the watch-client API surface: POST /pair, POST /command
-// (spawn/kill/permission-decision/PTY injection), and GET /status.
+// (spawn/kill/permission-decision/PTY injection), GET /status, and the
+// unauthenticated GET /ping discovery probe.
 import { spawn as childSpawn } from "node:child_process";
+import os from "node:os";
 import { log, jsonResponse, readBody } from "./util.js";
-import { BRIDGE_ID, CLAUDE_BIN, CODEX_BIN, CLI_CWD, availableAgentsList } from "./config.js";
+import {
+  BRIDGE_ID,
+  CLAUDE_BIN,
+  CODEX_BIN,
+  CLI_CWD,
+  PROTOCOL_VERSION,
+  availableAgentsList,
+} from "./config.js";
 import {
   generatePairingCode,
   issueToken,
@@ -260,7 +269,27 @@ export async function handleCommand(req, res) {
   return jsonResponse(res, 400, { error: "Missing 'command', 'spawn', 'kill', or 'permissionId'+'decision'" });
 }
 
-export function handleStatus(_req, res) {
+// Unauthenticated discovery probe: this is what watch clients hit to verify a
+// candidate bridge address (localhost fallback, manual IP entry, or the
+// Android emulator's 10.0.2.2 host alias) before they hold a token. It
+// deliberately exposes only the bridge identity — no session snapshot, no
+// project paths, no client counts. Everything richer lives behind auth on
+// /status.
+export function handlePing(_req, res) {
+  return jsonResponse(res, 200, {
+    proto: PROTOCOL_VERSION,
+    bridgeId: BRIDGE_ID,
+    machineName: os.hostname(),
+  });
+}
+
+export function handleStatus(req, res) {
+  // The session snapshot enumerates every project's absolute path; on a
+  // 0.0.0.0 bind that must not be readable by arbitrary LAN peers. Discovery
+  // probes use the unauthenticated GET /ping instead.
+  if (!requireAuth(req)) {
+    return jsonResponse(res, 401, { error: "Unauthorized" });
+  }
   const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
     bridgeId: BRIDGE_ID,

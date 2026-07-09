@@ -55,6 +55,26 @@ const cliArgs = process.argv.slice(2);
 export const ALLOW_PAIRING_FLAG = cliArgs.includes("--allow-pairing");
 export const CLI_CWD = cliArgs.find((a) => !a.startsWith("--")) || null;
 
+// Protocol version advertised over Bonjour (txt.version) and returned by the
+// unauthenticated GET /ping discovery endpoint.
+export const PROTOCOL_VERSION = "2";
+
+// Extra Host-header allow-list entries beyond the built-ins (localhost,
+// loopback, this machine's interface addresses, and 10.0.2.2 — the Android
+// emulator's alias for its host). Extensible two ways:
+//   env:  CLAUDE_WATCH_ALLOWED_HOSTS="bridge.lan,192.168.7.7" (comma-separated)
+//   flag: --allow-host=bridge.lan (repeatable)
+export const EXTRA_ALLOWED_HOSTS = [
+  ...(process.env.CLAUDE_WATCH_ALLOWED_HOSTS || "")
+    .split(",")
+    .map((h) => h.trim())
+    .filter(Boolean),
+  ...cliArgs
+    .filter((a) => a.startsWith("--allow-host="))
+    .map((a) => a.slice("--allow-host=".length))
+    .filter(Boolean),
+];
+
 // Credential persistence. Overridable via env var so tests (and multi-bridge
 // setups) never touch the real ~/.claude-watch.
 export const CREDENTIALS_DIR =

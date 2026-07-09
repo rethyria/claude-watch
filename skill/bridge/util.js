@@ -21,6 +21,21 @@ export function jsonResponse(res, status, body) {
   res.end(payload);
 }
 
+// Loopback detection for socket remote addresses. Used to restrict the
+// /hooks/* surface to callers on this machine: Claude Code hook scripts
+// always POST from localhost, so any other source is a LAN peer trying to
+// spoof permission prompts or terminal output onto the trusted watch UI.
+// Handles plain IPv4 loopback (the whole 127.0.0.0/8 block), IPv6 loopback,
+// and IPv4-mapped IPv6 addresses ("::ffff:127.0.0.1") as Node reports them.
+export function isLoopbackAddress(addr) {
+  if (typeof addr !== "string" || addr.length === 0) return false;
+  let a = addr.toLowerCase();
+  if (a.startsWith("::ffff:")) a = a.slice(7);
+  if (a === "::1") return true;
+  const m = a.match(/^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  return m !== null && m.slice(1).every((octet) => Number(octet) <= 255);
+}
+
 // Maximum request body size. Bodies are buffered in memory before JSON.parse
 // on unauthenticated endpoints (/pair, /hooks/*), so without a cap a single
 // multi-GB POST OOMs the bridge before auth even runs. No legitimate client

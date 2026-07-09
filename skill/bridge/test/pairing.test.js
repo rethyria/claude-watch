@@ -130,7 +130,7 @@ test("bridge restart: persisted tokens still authenticate; pairing starts locked
   assert.equal(await sse.statusCode(), 200, "token from before the restart authenticates");
   sse.close();
 
-  const status = await request(bridge2.port, "GET", "/status");
+  const status = await request(bridge2.port, "GET", "/status", { token });
   assert.equal(status.body.state, "connected", "restored credentials restore paired state");
 
   const refused = await request(bridge2.port, "POST", "/pair", { body: { code: "000000" } });

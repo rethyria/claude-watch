@@ -50,7 +50,7 @@ test("malformed Host header gets 400; bridge, sessions, and pending permissions 
   assert.equal(bridge.proc.exitCode, null, "bridge process must survive");
 
   // A subsequent well-formed request is served normally.
-  const status = await request(port, "GET", "/status");
+  const status = await request(port, "GET", "/status", { token });
   assert.equal(status.status, 200);
   assert.ok(status.body.bridgeId, "well-formed request served after the attack");
 
@@ -71,8 +71,8 @@ test("unhandledRejection guard logs and keeps the bridge alive", { timeout: 60_0
   });
   await bridge.waitForOutput(/Unhandled promise rejection \(bridge kept alive\)/);
   assert.equal(bridge.proc.exitCode, null, "bridge must survive a stray rejection");
-  const status = await request(bridge.port, "GET", "/status");
-  assert.equal(status.status, 200);
+  const ping = await request(bridge.port, "GET", "/ping");
+  assert.equal(ping.status, 200);
 });
 
 test("uncaughtException guard logs and keeps the bridge alive", { timeout: 60_000 }, async (t) => {
@@ -81,6 +81,6 @@ test("uncaughtException guard logs and keeps the bridge alive", { timeout: 60_00
   });
   await bridge.waitForOutput(/Uncaught exception \(bridge kept alive\)/);
   assert.equal(bridge.proc.exitCode, null, "bridge must survive a stray exception");
-  const status = await request(bridge.port, "GET", "/status");
-  assert.equal(status.status, 200);
+  const ping = await request(bridge.port, "GET", "/ping");
+  assert.equal(ping.status, 200);
 });

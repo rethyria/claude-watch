@@ -127,6 +127,8 @@ In Xcode:
 
 **Apple Watch:** The app auto-discovers the bridge via Bonjour. If that fails, enter the IP address shown in the bridge banner manually.
 
+**Discovery probe:** When a watch client verifies a candidate bridge address — the localhost fallback, a manually entered IP, or `10.0.2.2` from an Android emulator — it probes the unauthenticated `GET /ping` endpoint, which answers with `{proto, bridgeId, machineName}`. `GET /status` requires the paired device's bearer token and cannot be used for discovery.
+
 ### 6. Use Claude Code normally
 
 Start any Claude Code session in a terminal. Every tool use (Read, Edit, Bash, Grep) streams to the watch and phone in real-time. Permission prompts appear as interactive cards.
@@ -272,7 +274,7 @@ The `setup-hooks.sh` script installs these HTTP hooks globally in `~/.claude/set
 - Deploy via paired iPhone destination if direct watch deployment fails
 
 ### iPhone shows "Connection failed"
-- Check that the bridge is running (`curl http://127.0.0.1:7860/status`)
+- Check that the bridge is running (`curl http://127.0.0.1:7860/ping`)
 - The bridge must be on the same LAN as the iPhone
 
 ### Permission prompts don't appear on watch
