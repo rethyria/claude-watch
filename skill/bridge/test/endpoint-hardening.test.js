@@ -8,6 +8,7 @@ import http from "node:http";
 import os from "node:os";
 import { startBridge, request, connectSse } from "./helpers.js";
 import { isLoopbackAddress } from "../util.js";
+import { createHostAllowList } from "../host-guard.js";
 
 // First non-internal IPv4 address of this machine, or null when the test
 // machine only has loopback (e.g. a bare CI container).
@@ -171,6 +172,61 @@ test("unknown Host header is rejected; localhost, bound LAN IP, and 10.0.2.2 pas
   // A malformed Host still gets the frozen 400 from the URL-parse guard.
   const badPing = await hostRequest(port, "/ping", "bad host");
   assert.equal(badPing.status, 400);
+});
+
+test("host allow-list self-heals when the machine's addresses change mid-run", () => {
+  // Regression: the guard used to snapshot os.networkInterfaces() once at
+  // startup, so a DHCP re-lease or network switch 403'd every request on the
+  // new IP — including from already-paired, token-bearing clients — until a
+  // manual restart.
+  let interfaces = { eth0: [{ address: "192.168.1.10" }, { address: "fe80::1%eth0" }] };
+  const isAllowedHost = createHostAllowList({
+    extraHosts: ["bridge.lan", "[2001:db8::7]"],
+    getNetworkInterfaces: () => interfaces,
+    refreshMinIntervalMs: 0,
+  });
+
+  // Startup snapshot plus statics and operator additions.
+  assert.equal(isAllowedHost("192.168.1.10"), true);
+  assert.equal(isAllowedHost("fe80::1"), true, "zone id is stripped from interface addresses");
+  assert.equal(isAllowedHost("localhost"), true);
+  assert.equal(isAllowedHost("[::1]"), true, "bracketed IPv6 literal from the URL parse");
+  assert.equal(isAllowedHost("10.0.2.2"), true);
+  assert.equal(isAllowedHost("BRIDGE.LAN"), true, "hostnames compare case-insensitively");
+  assert.equal(isAllowedHost("[2001:db8::7]"), true, "operator entry may be bracketed");
+  assert.equal(isAllowedHost("evil.example.com"), false);
+
+  // The machine moves to a new network while the bridge keeps running.
+  interfaces = { wlan0: [{ address: "10.0.30.7" }] };
+  assert.equal(isAllowedHost("10.0.30.7"), true, "new address passes without a restart");
+  assert.equal(isAllowedHost("192.168.1.10"), false, "abandoned address drops off the list");
+  assert.equal(isAllowedHost("bridge.lan"), true, "static entries survive refreshes");
+  assert.equal(isAllowedHost("evil.example.com"), false);
+});
+
+test("host allow-list refresh on miss is throttled", () => {
+  let t = 0;
+  let interfaces = { eth0: [{ address: "192.168.1.10" }] };
+  let snapshots = 0;
+  const isAllowedHost = createHostAllowList({
+    getNetworkInterfaces: () => { snapshots++; return interfaces; },
+    refreshMinIntervalMs: 1000,
+    now: () => t,
+  });
+  assert.equal(snapshots, 1, "one snapshot at construction");
+
+  interfaces = { eth0: [{ address: "10.0.30.7" }] };
+
+  // Misses inside the throttle window don't hit os.networkInterfaces().
+  t = 500;
+  assert.equal(isAllowedHost("10.0.30.7"), false);
+  assert.equal(isAllowedHost("evil.example.com"), false);
+  assert.equal(snapshots, 1, "no re-snapshot inside the window");
+
+  // Once the window elapses, the next miss re-snapshots and self-heals.
+  t = 1500;
+  assert.equal(isAllowedHost("10.0.30.7"), true);
+  assert.equal(snapshots, 2);
 });
 
 test("Host allow-list is extensible via env var and --allow-host flag", { timeout: 60_000 }, async (t) => {

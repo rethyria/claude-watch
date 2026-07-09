@@ -5,6 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import { Bonjour } from "bonjour-service";
 import { log, jsonResponse } from "./util.js";
+import { createHostAllowList } from "./host-guard.js";
 import {
   PORT_RANGE_START,
   PORT_RANGE_END,
@@ -91,36 +92,11 @@ const routes = {
 // ---------------------------------------------------------------------------
 // Host-header allow-list (DNS-rebinding guard)
 // ---------------------------------------------------------------------------
-// A browser on the LAN can be lured to a hostname whose DNS answer is later
-// switched to this bridge's IP; same-origin policy doesn't help because the
-// origin *is* the attacker's hostname. Rejecting requests whose Host header
-// isn't one of the addresses this machine is actually reachable as closes
-// that hole. The allow-list: localhost/loopback, every local interface
-// address, 10.0.2.2 (the Android emulator's alias for its host — required so
-// emulator-based Wear clients can reach a bridge on the same machine), and
-// any operator additions via CLAUDE_WATCH_ALLOWED_HOSTS / --allow-host=.
+// See host-guard.js for the rationale and the self-healing refresh: the
+// interface-derived entries are re-snapshotted on a Host miss (throttled), so
+// a bridge whose LAN IP changes mid-run keeps serving without a restart.
 
-function buildAllowedHosts() {
-  const allowed = new Set(["localhost", "127.0.0.1", "::1", "10.0.2.2"]);
-  for (const addrs of Object.values(os.networkInterfaces())) {
-    for (const addr of addrs || []) {
-      // Strip any IPv6 zone id; Host headers never carry one.
-      allowed.add(addr.address.split("%")[0].toLowerCase());
-    }
-  }
-  for (const host of EXTRA_ALLOWED_HOSTS) {
-    allowed.add(host.toLowerCase().replace(/^\[|\]$/g, ""));
-  }
-  return allowed;
-}
-
-const allowedHosts = buildAllowedHosts();
-
-// `hostname` comes from the WHATWG URL parse in onRequest: lowercased, port
-// stripped, IPv6 still bracketed ("[::1]").
-function isAllowedHost(hostname) {
-  return allowedHosts.has(hostname.replace(/^\[|\]$/g, ""));
-}
+const isAllowedHost = createHostAllowList({ extraHosts: EXTRA_ALLOWED_HOSTS });
 
 async function onRequest(req, res) {
   // The Host header is attacker-controlled and reaches this parse pre-auth:
@@ -138,7 +114,7 @@ async function onRequest(req, res) {
 
   // DNS-rebinding guard: a well-formed but unknown Host header (an absent
   // header parses to the literal hostname "undefined" and is likewise
-  // rejected) never reaches a handler. See buildAllowedHosts() above.
+  // rejected) never reaches a handler. See host-guard.js.
   if (!isAllowedHost(url.hostname)) {
     log("warn", `Request rejected: unknown Host header ${JSON.stringify(req.headers.host ?? null)}`);
     jsonResponse(res, 403, { error: "Forbidden Host header" });

@@ -179,11 +179,14 @@ final class BridgeClient {
 
     // MARK: - Status
 
-    /// Fetches the current bridge status.
+    /// Fetches the current bridge status. GET /status requires the bearer
+    /// token (its session snapshot enumerates project paths); unpaired
+    /// reachability checks belong on GET /ping instead.
     func fetchStatus() async throws -> BridgeStatus {
-        guard let baseURL else { throw BridgeError.networkError }
+        guard let baseURL, let token else { throw BridgeError.networkError }
         let url = baseURL.appendingPathComponent("status")
-        let request = URLRequest(url: url)
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, _) = try await performRequest(request)
         return try JSONDecoder().decode(BridgeStatus.self, from: data)
     }

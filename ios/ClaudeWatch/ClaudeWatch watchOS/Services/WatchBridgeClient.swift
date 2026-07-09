@@ -48,7 +48,9 @@ class WatchBridgeClient: ObservableObject {
 
     private func discoverLocalhost() async -> URL? {
         for port in UInt16(7860)...UInt16(7869) {
-            let url = URL(string: "http://127.0.0.1:\(port)/status")!
+            // Probe GET /ping — the unauthenticated discovery endpoint;
+            // /status requires the bearer token and would 401 here.
+            let url = URL(string: "http://127.0.0.1:\(port)/ping")!
             var request = URLRequest(url: url)
             request.timeoutInterval = 2
             do {
