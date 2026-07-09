@@ -5,6 +5,7 @@ import {
   SSE_BUFFER_SIZE,
   SSE_HEARTBEAT_INTERVAL_MS,
   SSE_MAX_BUFFERED_BYTES,
+  SSE_SYNC_TERMINAL_BACKLOG,
   SSE_TCP_KEEPALIVE_MS,
 } from "./config.js";
 import { requireAuth } from "./credentials.js";
@@ -15,12 +16,12 @@ export const sseBuffer = [];
 /** @type {Set<import("node:http").ServerResponse>} */
 export const sseClients = new Set();
 
-// Connect-time sync providers. Higher-level modules (sessions.js, codex.js)
-// register generators that yield {event, data} entries to write to a newly
-// connected client, so this module never has to import them (which would
-// create an import cycle — they import pushSseEvent from here). Registration
-// order is evaluation order: sessions.js evaluates before codex.js because
-// codex.js imports sessions.js.
+// Connect-time sync providers. Higher-level modules (sessions.js,
+// permissions.js, codex.js) register generators that yield {event, data}
+// entries to write to a newly connected client, so this module never has to
+// import them (which would create an import cycle — they import from here).
+// Registration order is evaluation order: sessions.js evaluates before
+// codex.js because codex.js imports sessions.js.
 /** @type {Array<() => Iterable<{event: string, data: string}>>} */
 const sseSyncProviders = [];
 
@@ -112,9 +113,11 @@ export function handleEvents(req, res) {
 
   // Replay from Last-Event-ID if provided
   const lastIdHeader = req.headers["last-event-id"];
+  let replayed = false;
   if (lastIdHeader) {
     const lastId = parseInt(lastIdHeader, 10);
     if (!isNaN(lastId)) {
+      replayed = true;
       for (const entry of sseBuffer) {
         if (entry.id > lastId) {
           res.write(formatSseMessage(entry));
@@ -126,8 +129,26 @@ export function handleEvents(req, res) {
   sseClients.add(res);
   log("info", `SSE client connected (total: ${sseClients.size})`);
 
-  // Send current state so late-connecting clients see existing sessions and
-  // pending Codex synthetic permissions (contributed by sessions.js/codex.js).
+  // Connect-time snapshot, part 1: recent terminal backlog. A fresh client
+  // (no Last-Event-ID — new pair, app reinstall) would otherwise start with a
+  // blank terminal until the next output arrives. Replaying clients already
+  // received everything after their last id, so resending would duplicate
+  // terminal output for them.
+  if (!replayed) {
+    const backlog = sseBuffer
+      .filter((e) => e.event === "pty-output" || e.event === "tool-output")
+      .slice(-SSE_SYNC_TERMINAL_BACKLOG);
+    for (const entry of backlog) {
+      try { res.write(formatSseMessage(entry)); } catch { /* ignore */ }
+    }
+  }
+
+  // Connect-time snapshot, part 2: authoritative current state, sent on EVERY
+  // connect (replay or not) — running sessions (sessions.js), pending hook
+  // permissions (permissions.js), and pending Codex synthetic permissions
+  // (codex.js). Pending permissions in particular must not rely on the ring
+  // buffer: ordinary pty-output can evict a permission-request before a
+  // disconnected watch reconnects.
   for (const provider of sseSyncProviders) {
     for (const { event, data } of provider()) {
       const syncEntry = formatSseMessage({ id: sseEventId++, event, data });
