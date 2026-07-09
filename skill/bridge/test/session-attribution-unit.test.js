@@ -129,6 +129,70 @@ test("endHookSession ends external sessions only and never creates one", async (
   }
 });
 
+test("SessionEnd on a PTY slot releases the binding so the successor session_id (/clear) re-claims it", async () => {
+  const { sessions, resolveHookSession, endHookSession } = await import("../sessions.js");
+
+  try {
+    sessions.set("pty-clear", ptySlot("pty-clear", "/tmp/attr-clear"));
+    assert.equal(resolveHookSession({ session_id: "cc-before-clear", cwd: "/tmp/attr-clear" }), "pty-clear");
+
+    // /clear fires SessionEnd for the old session_id while the PTY (and its
+    // slot) keeps running.
+    assert.equal(endHookSession({ session_id: "cc-before-clear", reason: "clear" }), "pty-clear");
+    const slot = sessions.get("pty-clear");
+    assert.equal(slot.state, "running", "PTY-backed slot stays alive across /clear");
+    assert.equal(slot.hookSessionId, undefined, "stale session_id binding is released");
+
+    // The successor instance in the same PTY (same cwd) re-claims the slot
+    // instead of minting a phantom external session.
+    assert.equal(resolveHookSession({ session_id: "cc-after-clear", cwd: "/tmp/attr-clear" }), "pty-clear");
+    assert.equal(sessions.size, 1, "no phantom external session for the successor");
+
+    // ...and keeps routing there even without cwd once bound.
+    assert.equal(resolveHookSession({ session_id: "cc-after-clear" }), "pty-clear");
+  } finally {
+    sessions.clear();
+  }
+});
+
+test("hook-created external sessions are capped; oldest slot is evicted, ended ones first", async () => {
+  const { sessions, resolveHookSession, endHookSession } = await import("../sessions.js");
+  const { MAX_EXTERNAL_SESSIONS } = await import("../config.js");
+
+  try {
+    // A PTY-backed slot must never be evicted by hook floods.
+    sessions.set("pty-keep", ptySlot("pty-keep", "/tmp/attr-cap-pty", { hookSessionId: "cc-keep" }));
+
+    const firstId = resolveHookSession({ session_id: "flood-0", cwd: "/tmp/attr-cap" });
+    // One slot is ended and waiting out the prune grace period: it is the
+    // preferred eviction victim.
+    const endedId = resolveHookSession({ session_id: "flood-ended", cwd: "/tmp/attr-cap" });
+    endHookSession({ session_id: "flood-ended" });
+
+    for (let i = 1; i <= MAX_EXTERNAL_SESSIONS + 5; i++) {
+      resolveHookSession({ session_id: `flood-${i}`, cwd: "/tmp/attr-cap" });
+    }
+
+    const external = Array.from(sessions.values()).filter((s) => s.hookCreated);
+    assert.ok(
+      external.length <= MAX_EXTERNAL_SESSIONS,
+      `hook-created sessions stay capped (got ${external.length})`,
+    );
+    assert.equal(sessions.has(endedId), false, "ended slot is evicted before running ones");
+    assert.equal(sessions.has(firstId), false, "oldest running slot is evicted once no ended ones remain");
+    assert.ok(sessions.has("pty-keep"), "PTY-backed slot survives the flood");
+    assert.equal(sessions.get("pty-keep").hookSessionId, "cc-keep", "PTY binding untouched by eviction");
+
+    // The evicted slot's session_id binding died with it: re-resolving mints
+    // a fresh slot (no dangling index entry pointing at a deleted slot).
+    const again = resolveHookSession({ session_id: "flood-0", cwd: "/tmp/attr-cap" });
+    assert.notEqual(again, firstId);
+    assert.equal(sessions.get(again).state, "running");
+  } finally {
+    sessions.clear();
+  }
+});
+
 test("ended external sessions are pruned after the grace period", async () => {
   const { sessions, resolveHookSession, endHookSession, pruneEndedSessions } = await import("../sessions.js");
   const { SESSION_PRUNE_GRACE_MS } = await import("../config.js");

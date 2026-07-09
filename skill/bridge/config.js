@@ -110,6 +110,13 @@ export const SESSION_PRUNE_INTERVAL_MS = testOverridableMs(
   "CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS",
   60_000,
 );
+// Hard cap on hook-created (external) session slots. /hooks/* is
+// unauthenticated, so without a bound every unique session_id (or cwd) in a
+// hook payload would mint a permanent "running" slot — unbounded memory, SSE
+// broadcasts, and /status snapshot growth. Beyond the cap the oldest
+// hook-created slot is evicted (ended ones first).
+export const MAX_EXTERNAL_SESSIONS = 32;
+
 export const CODEX_SESSION_SCAN_INTERVAL_MS = 1_500;
 export const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 export const CODEX_SESSION_SCAN_LIMIT = 25;

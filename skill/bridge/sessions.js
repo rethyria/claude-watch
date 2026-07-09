@@ -10,12 +10,13 @@ import {
   CLI_CWD,
   SESSION_PRUNE_GRACE_MS,
   SESSION_PRUNE_INTERVAL_MS,
+  MAX_EXTERNAL_SESSIONS,
 } from "./config.js";
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
 // Multi-session: each entry is a session slot
-// { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId? }
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string}>} */
+// { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId?, hookCreated? }
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -223,9 +224,45 @@ export function pruneEndedSessions(now = Date.now()) {
 // keeps the process alive on its own.
 setInterval(() => pruneEndedSessions(), SESSION_PRUNE_INTERVAL_MS).unref();
 
+// /hooks/* is unauthenticated, so hook-created slots must be bounded: before
+// minting a new one, evict the oldest hook-created slot once the cap is hit.
+// Ended slots (waiting out the prune grace period) go first — they are
+// already dead; only then a running one. PTY-backed and codex-scanner slots
+// are never evicted here: they come from the user or the local filesystem,
+// not from the network.
+function evictExternalSessionIfAtCap() {
+  let count = 0;
+  let oldestEnded = null;
+  let oldestRunning = null;
+  for (const [, slot] of sessions) {
+    if (!slot.hookCreated) continue;
+    count++;
+    if (slot.state === "ended") {
+      if (!oldestEnded || (slot.endedAt ?? slot.createdAt) < (oldestEnded.endedAt ?? oldestEnded.createdAt)) {
+        oldestEnded = slot;
+      }
+    } else if (!oldestRunning || slot.createdAt < oldestRunning.createdAt) {
+      oldestRunning = slot;
+    }
+  }
+  if (count < MAX_EXTERNAL_SESSIONS) return;
+
+  const victim = oldestEnded || oldestRunning;
+  if (!victim) return;
+  sessions.delete(victim.id);
+  if (victim.hookSessionId) hookSessionIndex.delete(victim.hookSessionId);
+  if (victim.state !== "ended") {
+    runSessionCleanupHooks(victim.id, "evicted");
+    pushSseEvent("session", { state: "ended", agent: victim.agent, folderName: victim.folderName, reason: "evicted" }, victim.id);
+  }
+  log("warn", `External session cap (${MAX_EXTERNAL_SESSIONS}) reached — evicted ${victim.state} session ${victim.id} (${victim.folderName})`);
+}
+
 // Auto-create a slot for an agent instance the bridge does not own (started
 // outside the bridge, or a bridge-owned PTY whose cwd no longer matches).
 function createExternalSession({ source, cwd, hookSessionId }) {
+  evictExternalSessionIfAtCap();
+
   const agent = source === "codex" ? "codex" : "claude";
   const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
@@ -239,6 +276,7 @@ function createExternalSession({ source, cwd, hookSessionId }) {
     ptyProcess: null, // External process — no PTY owned by bridge
     state: "running",
     createdAt: Date.now(),
+    hookCreated: true,
   };
   if (hookSessionId) bindHookSession(slot, hookSessionId);
   sessions.set(sessionId, slot);
@@ -314,7 +352,19 @@ export function endHookSession(body) {
     slot = findSessionByCwd(body.session_cwd || body.cwd || null);
   }
   if (!slot || slot.state === "ended") return slot?.id ?? null;
-  if (slot.ptyProcess) return slot.id; // bridge-owned: PTY close ends it
+  if (slot.ptyProcess) {
+    // Bridge-owned: the PTY close handler ends the slot, not this hook. But
+    // the Claude Code instance behind this session_id is gone — /clear and
+    // /login fire SessionEnd and start a successor with a fresh session_id in
+    // the SAME still-running PTY. Release the binding so the successor's
+    // first cwd-matched event re-claims this slot instead of minting a
+    // phantom external session that all later events would misroute to.
+    if (slot.hookSessionId) {
+      hookSessionIndex.delete(slot.hookSessionId);
+      slot.hookSessionId = undefined;
+    }
+    return slot.id;
+  }
 
   slot.state = "ended";
   slot.endedAt = Date.now();
