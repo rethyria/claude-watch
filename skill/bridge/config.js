@@ -67,24 +67,48 @@ export const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_MAX_ATTEMPTS = 5;
 export const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
-export const SSE_BUFFER_SIZE = 500;
 
 // Test-only override hook: lets the test suite shorten long production
-// timeouts/bounds via environment variables so timeout/pruning paths can be
-// exercised in seconds instead of minutes. Production deployments must never
-// set these variables; any unset/invalid value falls back to the production
-// default.
-function testOverridableMs(envName, productionValue) {
+// timeouts/bounds via environment variables so timeout/pruning/eviction paths
+// can be exercised in seconds instead of minutes. Production deployments must
+// never set these variables; any unset/invalid value falls back to the
+// production default.
+function testOverridable(envName, productionValue) {
   const raw = process.env[envName];
   if (raw === undefined) return productionValue;
   const parsed = parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : productionValue;
 }
 
+// Overridable via CLAUDE_WATCH_SSE_BUFFER_SIZE (test-only): lets eviction
+// tests roll the ring buffer over without pushing 500+ events.
+export const SSE_BUFFER_SIZE = testOverridable("CLAUDE_WATCH_SSE_BUFFER_SIZE", 500);
+
+// How many recent terminal events (pty-output / tool-output) a freshly
+// connected SSE client receives as part of the connect-time snapshot, so a
+// new pair (no Last-Event-ID to replay from) is not blind to what the agent
+// was just doing.
+export const SSE_SYNC_TERMINAL_BACKLOG = 50;
+
+// Client-side timeout of the blocking PermissionRequest hook, as installed by
+// setup-hooks.sh (its PERMISSION_HOOK_TIMEOUT_S, in seconds — a test asserts
+// the two stay equal). Claude Code aborts the hook request after this window.
+// Overridable via CLAUDE_WATCH_HOOK_PERMISSION_TIMEOUT_MS (test-only).
+export const HOOK_PERMISSION_TIMEOUT_MS = testOverridable(
+  "CLAUDE_WATCH_HOOK_PERMISSION_TIMEOUT_MS",
+  600_000, // 10 minutes — keep in sync with setup-hooks.sh
+);
+
+// Bridge-side auto-deny for unanswered permissions. This MUST fire before the
+// hook's client-side timeout above: when both were exactly 600 s, expiry
+// raced nondeterministically — sometimes the hook aborted first and the
+// bridge's deny went into a dead socket. The margin keeps the bridge
+// deterministically first while degrading gracefully when tests shorten the
+// hook window below the production margin.
 // Overridable via CLAUDE_WATCH_PERMISSION_TIMEOUT_MS (test-only).
-export const PERMISSION_TIMEOUT_MS = testOverridableMs(
+export const PERMISSION_TIMEOUT_MS = testOverridable(
   "CLAUDE_WATCH_PERMISSION_TIMEOUT_MS",
-  600_000, // 10 minutes
+  Math.max(HOOK_PERMISSION_TIMEOUT_MS - 30_000, Math.ceil(HOOK_PERMISSION_TIMEOUT_MS / 2)),
 );
 
 // Maximum bytes allowed to queue in a single SSE client's response stream.
@@ -102,11 +126,11 @@ export const SSE_TCP_KEEPALIVE_MS = 30_000;
 // snapshots) for this grace period so clients observe the "ended" state,
 // then get pruned. Overridable via CLAUDE_WATCH_SESSION_PRUNE_GRACE_MS /
 // CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS (test-only).
-export const SESSION_PRUNE_GRACE_MS = testOverridableMs(
+export const SESSION_PRUNE_GRACE_MS = testOverridable(
   "CLAUDE_WATCH_SESSION_PRUNE_GRACE_MS",
   5 * 60 * 1000,
 );
-export const SESSION_PRUNE_INTERVAL_MS = testOverridableMs(
+export const SESSION_PRUNE_INTERVAL_MS = testOverridable(
   "CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS",
   60_000,
 );

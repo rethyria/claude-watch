@@ -13,6 +13,13 @@ PORT="${1:-7860}"
 BRIDGE_URL="http://127.0.0.1:${PORT}"
 SETTINGS="$HOME/.claude/settings.json"
 
+# Client-side timeout (seconds) for the blocking PermissionRequest hook.
+# MUST equal HOOK_PERMISSION_TIMEOUT_MS in bridge/config.js (a bridge test
+# asserts this): the bridge auto-denies a safety margin BEFORE this window so
+# the hook always receives a deterministic response instead of racing its own
+# timeout.
+PERMISSION_HOOK_TIMEOUT_S=600
+
 # ── Remove mode ──────────────────────────────────────────────────────────────
 if [ "$1" = "--remove" ]; then
   # Remove codex wrapper
@@ -84,6 +91,7 @@ python3 -c "
 import json
 
 BRIDGE = '${BRIDGE_URL}'
+PERMISSION_TIMEOUT_S = ${PERMISSION_HOOK_TIMEOUT_S}
 
 # The hooks we want to install
 new_hooks = {
@@ -105,7 +113,7 @@ new_hooks = {
         'hooks': [{
             'type': 'http',
             'url': f'{BRIDGE}/hooks/permission',
-            'timeout': 600
+            'timeout': PERMISSION_TIMEOUT_S
         }]
     }],
     'Stop': [{

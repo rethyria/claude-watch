@@ -1,14 +1,21 @@
 // Permission flow: pending permission requests from Claude Code hooks that
-// block until the watch responds (or the timeout auto-denies).
+// block until the watch responds (or the timeout auto-denies, or the hook
+// request itself goes away and the pending entry is canceled).
 import { log } from "./util.js";
 import { PERMISSION_TIMEOUT_MS } from "./config.js";
+import { registerSseSyncProvider } from "./transport-sse.js";
 
-/** @type {Map<string, {resolve: Function, timer: ReturnType<typeof setTimeout>, sessionId: string | null}>} */
+/** @type {Map<string, {resolve: Function, timer: ReturnType<typeof setTimeout>, sessionId: string | null, payload: Record<string, any> | null}>} */
 export const pendingPermissions = new Map();
 /** @type {Map<string, Array>} */
 export const pendingPermissionBodies = new Map();
 
-export function waitForPermission(permissionId) {
+// `sessionId` and `payload` (the permission-request event body) are kept on
+// the pending entry so connect-time snapshots can re-send the prompt to a
+// client that missed it — a pending permission-request can be evicted from
+// the SSE ring buffer by ordinary pty-output before a disconnected watch
+// reconnects.
+export function waitForPermission(permissionId, { sessionId = null, payload = null } = {}) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingPermissions.delete(permissionId);
@@ -19,7 +26,7 @@ export function waitForPermission(permissionId) {
       resolve({ behavior: "deny", reason: "Timed out waiting for watch response" });
     }, PERMISSION_TIMEOUT_MS);
 
-    pendingPermissions.set(permissionId, { resolve, timer });
+    pendingPermissions.set(permissionId, { resolve, timer, sessionId, payload });
   });
 }
 
@@ -31,3 +38,31 @@ export function resolvePermission(permissionId, decision) {
   pending.resolve(decision);
   return true;
 }
+
+// Cancel a pending permission whose blocking hook request went away (Claude
+// Code answered in the terminal, the user pressed Esc, or the hook-side
+// timeout aborted the request). The resolved decision is marked `canceled` so
+// the hook handler knows there is no live socket to answer on. Returns false
+// if the permission was already resolved/timed out (cancel is a no-op then).
+export function cancelPermission(permissionId) {
+  const pending = pendingPermissions.get(permissionId);
+  if (!pending) return false;
+  clearTimeout(pending.timer);
+  pendingPermissions.delete(permissionId);
+  pendingPermissionBodies.delete(permissionId);
+  pending.resolve({ behavior: "deny", reason: "Hook request aborted", canceled: true });
+  return true;
+}
+
+// Connect-time snapshot: re-send every pending hook permission to a newly
+// connected SSE client. Runs on EVERY connect (mirroring the Codex synthetic
+// permission sync in codex.js) so late joiners and fresh pairs always see the
+// full set of prompts awaiting an answer, even after ring-buffer eviction.
+registerSseSyncProvider(function* pendingPermissionsSync() {
+  for (const [permissionId, pending] of pendingPermissions) {
+    if (!pending.payload) continue;
+    const payload = { ...pending.payload, permissionId };
+    if (pending.sessionId != null) payload.sessionId = pending.sessionId;
+    yield { event: "permission-request", data: JSON.stringify(payload) };
+  }
+});
