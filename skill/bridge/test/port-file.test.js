@@ -40,13 +40,24 @@ function runScript(scriptPath, args, envOverride) {
 }
 
 // Occupy a port with a bare TCP listener (stands in for Gradio on 7860).
+// Accepted sockets get an error swallower — a probing client (curl) that
+// gives up mid-request RSTs the connection, and an unhandled socket "error"
+// would crash the whole test process.
 async function startDecoy(t, port) {
-  const decoy = net.createServer();
+  const sockets = new Set();
+  const decoy = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => { /* probing client hung up — expected */ });
+    socket.on("close", () => sockets.delete(socket));
+  });
   await new Promise((resolve, reject) => {
     decoy.once("error", reject);
     decoy.listen(port, "0.0.0.0", resolve);
   });
-  t.after(() => new Promise((resolve) => decoy.close(resolve)));
+  t.after(() => new Promise((resolve) => {
+    for (const socket of sockets) socket.destroy();
+    decoy.close(resolve);
+  }));
   return decoy;
 }
 
@@ -105,6 +116,10 @@ test("installer-written hook URLs use the port-file value; explicit argument sti
     CLAUDE_WATCH_CREDENTIALS_DIR: "",
   });
   assert.equal(install.code, 0, install.output);
+  assert.ok(
+    !install.output.includes("WARNING"),
+    `port-file resolution is not a guess — no fallback warning expected, got: ${install.output}`,
+  );
   let urls = installedHookUrls(home);
   assert.ok(urls.length > 0, "installer must write hook URLs");
   for (const url of urls) {
@@ -126,6 +141,58 @@ test("installer-written hook URLs use the port-file value; explicit argument sti
     assert.ok(
       url.startsWith("http://127.0.0.1:7777/hooks/"),
       `explicit port argument must win, got: ${url}`,
+    );
+  }
+});
+
+// The documented first-install flow used to hit this silently: no port file
+// yet (bridge never started), so the installer guessed 7860 and promised the
+// hooks "will work once you start the bridge" — false exactly when 7860 is
+// occupied, since the bridge walks to 7861+ while the hooks stay pinned.
+// The installer must now warn loudly and tell the user to re-run it.
+//
+// The installer's fallback default mirrors CLAUDE_WATCH_PORT_RANGE_START, so
+// the test moves the whole scenario into a private range instead of racing
+// parallel test files for the real 7860.
+test("installer warns loudly when it falls back to the default port with no port file and no bridge", { timeout: 60_000 }, async (t) => {
+  const home = tempDir(t, "claude-watch-home-");
+  // No ~/.claude-watch/port exists in this HOME: the fresh-install scenario.
+
+  // Occupy the default port with a raw TCP decoy: stands in for a non-bridge
+  // squatter (Gradio), and proves the reachability probe neither hangs on a
+  // server that never responds nor mistakes it for the bridge.
+  await startDecoy(t, 37860);
+
+  const install = await runScript(SETUP_HOOKS, [], {
+    HOME: home,
+    CLAUDE_WATCH_CREDENTIALS_DIR: "",
+    CLAUDE_WATCH_PORT_RANGE_START: "37860",
+  });
+  assert.equal(install.code, 0, install.output);
+
+  // The guess must be loud, not a soft "hooks will work once you start the bridge".
+  assert.ok(install.output.includes("WARNING"), `expected a loud warning, got: ${install.output}`);
+  assert.ok(
+    install.output.includes("re-run"),
+    `warning must tell the user to re-run the installer after starting the bridge, got: ${install.output}`,
+  );
+  assert.ok(
+    !install.output.includes("hooks will work once you start the bridge"),
+    `the old false promise must be gone on the guessed path, got: ${install.output}`,
+  );
+  // A non-bridge listener on the port must not read as a running bridge.
+  assert.ok(
+    !install.output.includes("Bridge status: RUNNING"),
+    `raw squatter on the default port must not be mistaken for the bridge, got: ${install.output}`,
+  );
+
+  // Documented fallback still applies: hooks are written, pinned to the default.
+  const urls = installedHookUrls(home);
+  assert.ok(urls.length > 0, "installer must still write hook URLs on the fallback path");
+  for (const url of urls) {
+    assert.ok(
+      url.startsWith("http://127.0.0.1:37860/hooks/"),
+      `fallback hook URL must use the default port, got: ${url}`,
     );
   }
 });
