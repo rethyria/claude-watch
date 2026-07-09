@@ -63,7 +63,13 @@ export const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "credentials.json");
 
 export const PORT_RANGE_START = 7860;
 export const PORT_RANGE_END = 7869;
-export const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
+// Overridable via CLAUDE_WATCH_PAIRING_CODE_TTL_MS (test-only, see
+// testOverridableMs below) so code-expiry paths can be exercised in
+// milliseconds instead of minutes.
+export const PAIRING_CODE_TTL_MS = testOverridableMs(
+  "CLAUDE_WATCH_PAIRING_CODE_TTL_MS",
+  5 * 60 * 1000,
+);
 export const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_MAX_ATTEMPTS = 5;
 export const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
