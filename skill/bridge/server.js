@@ -1,6 +1,7 @@
 // Bridge server entry point: router, startup (port binding, pairing banner,
 // Bonjour advertisement, Codex monitor), and graceful shutdown.
 // All domain logic lives in the focused modules — see ARCHITECTURE.md.
+import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import { Bonjour } from "bonjour-service";
@@ -12,6 +13,8 @@ import {
   CLAUDE_BIN,
   CODEX_BIN,
   ALLOW_PAIRING_FLAG,
+  CREDENTIALS_DIR,
+  PORT_FILE,
 } from "./config.js";
 import {
   generatePairingCode,
@@ -126,6 +129,37 @@ async function onRequest(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// Port file
+// ---------------------------------------------------------------------------
+// The bridge walks PORT_RANGE_START..END, so the port it actually binds is
+// not knowable ahead of time (7860 is Gradio's default and frequently taken).
+// The bound port is published to PORT_FILE as the single source of truth: the
+// hook installer (setup-hooks.sh) reads it when writing hook URLs and the
+// codex-watch wrapper reads it at launch. Written (and thus refreshed after a
+// port change or a stale crash leftover) on every startup; removed on
+// graceful shutdown.
+
+function writePortFile(port) {
+  try {
+    fs.mkdirSync(CREDENTIALS_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(PORT_FILE, `${port}\n`, { mode: 0o600 });
+    log("info", `Bound port ${port} written to ${PORT_FILE}`);
+  } catch (err) {
+    log("warn", `Could not write port file ${PORT_FILE}: ${err.message}`);
+  }
+}
+
+// Guarded removal: only delete the file if it still records OUR port. A
+// sibling bridge started later overwrites the file with its own port; when
+// this instance exits it must not wipe the sibling's entry.
+function removePortFile(port) {
+  try {
+    const recorded = parseInt(fs.readFileSync(PORT_FILE, "utf-8").trim(), 10);
+    if (recorded === port) fs.unlinkSync(PORT_FILE);
+  } catch { /* already gone or unreadable — nothing to clean up */ }
+}
+
+// ---------------------------------------------------------------------------
 // Server startup
 // ---------------------------------------------------------------------------
 
@@ -162,6 +196,7 @@ async function startServer() {
   }
 
   log("info", `Bridge server listening on 0.0.0.0:${boundPort}`);
+  writePortFile(boundPort);
 
   // Pairing lockout at startup: with persisted device credentials the bridge
   // comes back paired, so the pairing surface starts locked unless the
@@ -247,6 +282,8 @@ async function startServer() {
     if (shuttingDown) return;
     shuttingDown = true;
     log("info", `Received ${signal}, shutting down gracefully...`);
+
+    removePortFile(boundPort);
 
     for (const client of sseClients) {
       try { client.end(); } catch { /* ignore */ }

@@ -61,8 +61,19 @@ export const CREDENTIALS_DIR =
   process.env.CLAUDE_WATCH_CREDENTIALS_DIR || path.join(os.homedir(), ".claude-watch");
 export const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "credentials.json");
 
-export const PORT_RANGE_START = 7860;
-export const PORT_RANGE_END = 7869;
+// Port file: the bridge publishes its ACTUAL bound port here on startup
+// (single source of truth). The bridge walks PORT_RANGE_START..END when the
+// default is taken (7860 is Gradio's default, notably), so the hook installer
+// (setup-hooks.sh) and the codex-watch wrapper must read this file instead of
+// assuming 7860 — otherwise every hook, including the blocking permission
+// hook, posts to the wrong instance.
+export const PORT_FILE = path.join(CREDENTIALS_DIR, "port");
+
+// Test-only override hook (see testOverridableInt below): lets the test suite
+// move the bridge into a private port range so a decoy listener on the range
+// start can't collide with parallel test files. Production never sets these.
+export const PORT_RANGE_START = testOverridableInt("CLAUDE_WATCH_PORT_RANGE_START", 7860);
+export const PORT_RANGE_END = testOverridableInt("CLAUDE_WATCH_PORT_RANGE_END", 7869);
 export const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_MAX_ATTEMPTS = 5;
@@ -70,11 +81,12 @@ export const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 export const SSE_BUFFER_SIZE = 500;
 
 // Test-only override hook: lets the test suite shorten long production
-// timeouts/bounds via environment variables so timeout/pruning paths can be
-// exercised in seconds instead of minutes. Production deployments must never
-// set these variables; any unset/invalid value falls back to the production
-// default.
-function testOverridableMs(envName, productionValue) {
+// timeouts/bounds (and relocate the port range) via environment variables so
+// timeout/pruning/port-walk paths can be exercised deterministically.
+// Production deployments must never set these variables; any unset/invalid
+// value falls back to the production default. (Function declaration — hoisted
+// above the PORT_RANGE_* uses earlier in this module.)
+function testOverridableInt(envName, productionValue) {
   const raw = process.env[envName];
   if (raw === undefined) return productionValue;
   const parsed = parseInt(raw, 10);
@@ -82,7 +94,7 @@ function testOverridableMs(envName, productionValue) {
 }
 
 // Overridable via CLAUDE_WATCH_PERMISSION_TIMEOUT_MS (test-only).
-export const PERMISSION_TIMEOUT_MS = testOverridableMs(
+export const PERMISSION_TIMEOUT_MS = testOverridableInt(
   "CLAUDE_WATCH_PERMISSION_TIMEOUT_MS",
   600_000, // 10 minutes
 );
@@ -102,11 +114,11 @@ export const SSE_TCP_KEEPALIVE_MS = 30_000;
 // snapshots) for this grace period so clients observe the "ended" state,
 // then get pruned. Overridable via CLAUDE_WATCH_SESSION_PRUNE_GRACE_MS /
 // CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS (test-only).
-export const SESSION_PRUNE_GRACE_MS = testOverridableMs(
+export const SESSION_PRUNE_GRACE_MS = testOverridableInt(
   "CLAUDE_WATCH_SESSION_PRUNE_GRACE_MS",
   5 * 60 * 1000,
 );
-export const SESSION_PRUNE_INTERVAL_MS = testOverridableMs(
+export const SESSION_PRUNE_INTERVAL_MS = testOverridableInt(
   "CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS",
   60_000,
 );

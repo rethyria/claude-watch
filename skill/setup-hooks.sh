@@ -2,15 +2,14 @@
 # Agent Watch — Install global hooks so ALL Claude Code sessions stream to the bridge.
 #
 # Usage: ./setup-hooks.sh [port]
-#   port: bridge server port (default: 7860)
+#   port: bridge server port (default: the port file written by a running
+#         bridge at ~/.claude-watch/port, falling back to 7860)
 #
 # This writes HTTP hooks to ~/.claude/settings.json (global, all projects).
 # To remove: ./setup-hooks.sh --remove
 
 set -e
 
-PORT="${1:-7860}"
-BRIDGE_URL="http://127.0.0.1:${PORT}"
 SETTINGS="$HOME/.claude/settings.json"
 
 # ── Remove mode ──────────────────────────────────────────────────────────────
@@ -60,6 +59,24 @@ else:
 fi
 
 # ── Install mode ─────────────────────────────────────────────────────────────
+
+# Port resolution: the bridge may not be on 7860 — it walks 7860-7869 when the
+# default is taken (Gradio's default port, notably) and publishes its ACTUAL
+# bound port to a port file on startup. That file is the single source of
+# truth for hook URLs. Precedence: explicit argument > port file > 7860.
+PORT_FILE="${CLAUDE_WATCH_CREDENTIALS_DIR:-$HOME/.claude-watch}/port"
+if [ -n "$1" ]; then
+  PORT="$1"
+elif [ -f "$PORT_FILE" ]; then
+  PORT="$(tr -cd '0-9' < "$PORT_FILE")"
+  echo "Using bridge port ${PORT} from ${PORT_FILE}"
+else
+  PORT=""
+fi
+case "$PORT" in
+  ''|*[!0-9]*) PORT=7860 ;;
+esac
+BRIDGE_URL="http://127.0.0.1:${PORT}"
 
 echo "Installing Agent Watch hooks..."
 echo "  Bridge URL: ${BRIDGE_URL}"
@@ -192,7 +209,21 @@ if command -v codex &>/dev/null; then
 #!/bin/bash
 # codex-watch: Runs Codex and streams events to Agent Watch bridge.
 # Drop-in replacement for `codex` — use `codex-watch` instead.
-BRIDGE_URL="http://127.0.0.1:${CLAUDE_WATCH_PORT:-7860}"
+#
+# The bridge may not be on 7860 (it walks up when the default port is taken)
+# and publishes its actual bound port to a port file on startup. Resolve at
+# launch: CLAUDE_WATCH_PORT env > port file > default 7860.
+BRIDGE_PORT="$CLAUDE_WATCH_PORT"
+if [ -z "$BRIDGE_PORT" ]; then
+  PORT_FILE="${CLAUDE_WATCH_CREDENTIALS_DIR:-$HOME/.claude-watch}/port"
+  if [ -f "$PORT_FILE" ]; then
+    BRIDGE_PORT="$(tr -cd '0-9' < "$PORT_FILE")"
+  fi
+fi
+case "$BRIDGE_PORT" in
+  ''|*[!0-9]*) BRIDGE_PORT=7860 ;;
+esac
+BRIDGE_URL="http://127.0.0.1:${BRIDGE_PORT}"
 
 # If bridge isn't running, just run codex normally
 if ! curl -s --connect-timeout 1 "${BRIDGE_URL}/status" > /dev/null 2>&1; then
