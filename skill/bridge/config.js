@@ -22,13 +22,17 @@ function findBinary(name, candidates) {
   return null;
 }
 
-export const CLAUDE_BIN = findBinary("claude", [
+// CLAUDE_WATCH_CLAUDE_BIN / CLAUDE_WATCH_CODEX_BIN are test-only overrides:
+// they point the bridge at stub agent binaries so the suite can exercise
+// spawn/injection paths deterministically. Production deployments must never
+// set them; unset falls back to normal discovery.
+export const CLAUDE_BIN = process.env.CLAUDE_WATCH_CLAUDE_BIN || findBinary("claude", [
   `${os.homedir()}/.local/bin/claude`,
   "/usr/local/bin/claude",
   "/opt/homebrew/bin/claude",
 ]);
 
-export const CODEX_BIN = findBinary("codex", [
+export const CODEX_BIN = process.env.CLAUDE_WATCH_CODEX_BIN || findBinary("codex", [
   `${os.homedir()}/.local/bin/codex`,
   "/usr/local/bin/codex",
   "/opt/homebrew/bin/codex",
@@ -109,6 +113,15 @@ export const SESSION_PRUNE_GRACE_MS = testOverridableMs(
 export const SESSION_PRUNE_INTERVAL_MS = testOverridableMs(
   "CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS",
   60_000,
+);
+// Auto-spawned command injection waits for the new PTY's first output (the
+// ready signal) before writing the command, bounded by this timeout. A blind
+// timer used to fire the write at 500 ms whether or not the agent was up,
+// silently dropping the command when it wasn't. Overridable via
+// CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS (test-only).
+export const SPAWN_INJECT_TIMEOUT_MS = testOverridableMs(
+  "CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS",
+  15_000,
 );
 export const CODEX_SESSION_SCAN_INTERVAL_MS = 1_500;
 export const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;

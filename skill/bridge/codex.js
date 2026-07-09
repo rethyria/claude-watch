@@ -17,6 +17,7 @@ import {
   sessions,
   attachPtyToSession,
   registerSessionCleanupHook,
+  writeToSessionStdin,
 } from "./sessions.js";
 
 /** @type {Map<string, {offset: number, remainder: string, sessionId: string | null, cwd?: string, createdAt?: number, initialized: boolean}>} */
@@ -303,7 +304,9 @@ export function resolveCodexSyntheticPermission(permissionId, selectedOption, op
     input = "2\n";
   }
 
-  proc.stdin.write(input);
+  // Guarded write: a keystroke racing PTY death must not crash the bridge or
+  // report a resolution that never reached Codex.
+  if (!writeToSessionStdin(slot, input)) return false;
   clearCodexSyntheticPermissionForSession(synthetic.sessionId, "resolved");
   log("info", `Resolved Codex approval ${permissionId} for session ${synthetic.sessionId}`);
   return true;
