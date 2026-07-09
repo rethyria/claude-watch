@@ -30,6 +30,7 @@ import {
   handleHookStop,
   handleHookTaskComplete,
   handleHookError,
+  handleHookNotification,
 } from "./hooks.js";
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,7 @@ const routes = {
   "POST /hooks/stop": handleHookStop,
   "POST /hooks/task-complete": handleHookTaskComplete,
   "POST /hooks/error": handleHookError,
+  "POST /hooks/notification": handleHookNotification,
   "GET /status": handleStatus,
 };
 

@@ -116,6 +116,7 @@ export async function handleCommand(req, res) {
     kill: killRequest,
     selectedOption,
     optionIndex,
+    answers,
   } = body;
 
   // --- Spawn a new session ---
@@ -143,8 +144,17 @@ export async function handleCommand(req, res) {
 
   // --- Permission response ---
   if (permissionId && (decision || selectedOption !== undefined || Number.isInteger(optionIndex))) {
+    // Capture the machine-readable behavior before normalization: the Codex
+    // fallthrough below resolves it against the synthetic menu's canonical
+    // option list, and allow-always is rewritten to allow for the hook.
+    const requestedBehavior = typeof decision?.behavior === "string" ? decision.behavior : undefined;
     if (decision) {
-      if (allowAll && decision.behavior === "allow") {
+      // allow-always is the machine-readable form of the legacy allowAll
+      // flag: both collapse to an allow that applies the permission
+      // suggestions stored when the hook arrived.
+      const allowAlways = decision.behavior === "allow-always" || (allowAll && decision.behavior === "allow");
+      if (allowAlways) {
+        decision.behavior = "allow";
         decision.updatedPermissions = pendingPermissionBodies.get(permissionId) || [];
       }
       pendingPermissionBodies.delete(permissionId);
@@ -152,15 +162,18 @@ export async function handleCommand(req, res) {
       // Forward the watch's selected option so the hook response can include it
       if (selectedOption !== undefined) decision.selectedOption = selectedOption;
       if (Number.isInteger(optionIndex)) decision.optionIndex = optionIndex;
+      // AskUserQuestion answers for every question (array aligned with the
+      // questions, or an object keyed by question text — see hooks.js).
+      if (answers !== undefined && decision.answers === undefined) decision.answers = answers;
 
       const resolved = resolvePermission(permissionId, decision);
       if (resolved) {
-        log("info", `Permission ${permissionId} resolved: ${decision.behavior}${allowAll ? " (allow all)" : ""}`);
+        log("info", `Permission ${permissionId} resolved: ${decision.behavior}${allowAll || requestedBehavior === "allow-always" ? " (allow all)" : ""}`);
         return jsonResponse(res, 200, { ok: true });
       }
     }
 
-    const resolvedSynthetic = resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex);
+    const resolvedSynthetic = resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex, requestedBehavior);
     if (resolvedSynthetic) {
       return jsonResponse(res, 200, { ok: true });
     }
