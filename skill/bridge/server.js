@@ -239,42 +239,11 @@ async function startServer() {
   log("info", `Bonjour advertising _claude-watch._tcp on port ${boundPort}`);
   startCodexMonitor();
 
-  const agents = [];
-  if (CLAUDE_BIN) agents.push("Claude");
-  if (CODEX_BIN) agents.push("Codex");
-  log("info", `Bridge ready. Available agents: ${agents.join(", ") || "none"}. Sessions spawn on demand.`);
-
-  // Get LAN IP
-  const interfaces = os.networkInterfaces();
-  let lanIP = "127.0.0.1";
-  for (const [, addrs] of Object.entries(interfaces)) {
-    for (const addr of addrs) {
-      if (addr.family === "IPv4" && !addr.internal) {
-        lanIP = addr.address;
-        break;
-      }
-    }
-    if (lanIP !== "127.0.0.1") break;
-  }
-
-  const agentLine = agents.length ? agents.join(" + ") : "none";
-  // Unlocked banner line is byte-identical to the historical output (test
-  // helpers and operator muscle memory scrape it); the locked variant is new.
-  const pairingLine = code !== null
-    ? `║  Pairing Code:  ${code}                ║`
-    : `║  Pairing:       ${"locked (SIGUSR1)".padEnd(22)}║`;
-  console.log("");
-  console.log("╔═══════════════════════════════════════╗");
-  console.log("║        AGENT WATCH BRIDGE             ║");
-  console.log("╠═══════════════════════════════════════╣");
-  console.log(pairingLine);
-  console.log(`║  IP Address:    ${lanIP.padEnd(20)}║`);
-  console.log(`║  Port:          ${String(boundPort).padEnd(20)}║`);
-  console.log(`║  Agents:        ${agentLine.padEnd(20)}║`);
-  console.log("╚═══════════════════════════════════════╝");
-  console.log("");
-
   // --- Graceful shutdown ---
+  // Registered BEFORE the startup banner prints: the banner is the readiness
+  // signal operators and test harnesses key on, so the handlers must already
+  // be live when it appears — a SIGTERM landing in that gap would otherwise
+  // hit the default action, hard-kill the process, and strand the port file.
 
   let shuttingDown = false;
 
@@ -326,6 +295,41 @@ async function startServer() {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  const agents = [];
+  if (CLAUDE_BIN) agents.push("Claude");
+  if (CODEX_BIN) agents.push("Codex");
+  log("info", `Bridge ready. Available agents: ${agents.join(", ") || "none"}. Sessions spawn on demand.`);
+
+  // Get LAN IP
+  const interfaces = os.networkInterfaces();
+  let lanIP = "127.0.0.1";
+  for (const [, addrs] of Object.entries(interfaces)) {
+    for (const addr of addrs) {
+      if (addr.family === "IPv4" && !addr.internal) {
+        lanIP = addr.address;
+        break;
+      }
+    }
+    if (lanIP !== "127.0.0.1") break;
+  }
+
+  const agentLine = agents.length ? agents.join(" + ") : "none";
+  // Unlocked banner line is byte-identical to the historical output (test
+  // helpers and operator muscle memory scrape it); the locked variant is new.
+  const pairingLine = code !== null
+    ? `║  Pairing Code:  ${code}                ║`
+    : `║  Pairing:       ${"locked (SIGUSR1)".padEnd(22)}║`;
+  console.log("");
+  console.log("╔═══════════════════════════════════════╗");
+  console.log("║        AGENT WATCH BRIDGE             ║");
+  console.log("╠═══════════════════════════════════════╣");
+  console.log(pairingLine);
+  console.log(`║  IP Address:    ${lanIP.padEnd(20)}║`);
+  console.log(`║  Port:          ${String(boundPort).padEnd(20)}║`);
+  console.log(`║  Agents:        ${agentLine.padEnd(20)}║`);
+  console.log("╚═══════════════════════════════════════╝");
+  console.log("");
 
   return { server, port: boundPort };
 }
