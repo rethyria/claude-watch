@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Response
 import okhttp3.sse.EventSource
@@ -130,7 +132,13 @@ class ConnectionEngine(
     private var token: String? = null
     private var eventSource: EventSource? = null
     private var reconnectJob: Job? = null
+    private var reconnectEpoch = 0 // last stream epoch a reconnect was scheduled for
     private var stopped = true
+
+    // Serializes credential persistence (pair's save vs stop/401's clear) so
+    // a stop() racing an in-flight pair() can never leave the wiped pairing's
+    // token persisted at rest.
+    private val persistMutex = Mutex()
 
     @Volatile
     private var lastEventId: String = PersistedConnection.FULL_REPLAY_EVENT_ID
@@ -223,26 +231,39 @@ class ConnectionEngine(
                 return@withContext null
             }
 
-            store.saveCredentials(
-                BridgeCredentials(
-                    token = newToken,
-                    hostIp = hostIp,
-                    port = port,
-                    bridgeId = body.optString("bridgeId").takeUnless { it.isEmpty() },
-                ),
-            )
-            synchronized(lock) {
-                // A stop() or a second pair() raced this one: don't commit.
-                if (epoch != pairEpoch) return@withContext null
-                client = candidate
-                token = newToken
-                stopped = false
-                attempt = 0
-                // Fresh pairing: request a full ring-buffer replay so events
-                // pushed between pair success and the stream registering are
-                // never lost (see BridgeViewModelTest for the war story).
-                lastEventId = PersistedConnection.FULL_REPLAY_EVENT_ID
+            // Commit + persist under the persistence mutex: the epoch check
+            // decides whether this pairing is still current, and the same
+            // critical section writes the store, so a stop()/unpair that raced
+            // the /v1/pair roundtrip can never end up with this pairing's
+            // token persisted at rest (its clear() is serialized either fully
+            // before the check — which then fails — or fully after our save).
+            val committed = persistMutex.withLock {
+                val current = synchronized(lock) {
+                    // A stop() or a second pair() raced this one: don't commit.
+                    if (epoch != pairEpoch) return@synchronized false
+                    client = candidate
+                    token = newToken
+                    stopped = false
+                    attempt = 0
+                    // Fresh pairing: request a full ring-buffer replay so events
+                    // pushed between pair success and the stream registering are
+                    // never lost (see BridgeViewModelTest for the war story).
+                    lastEventId = PersistedConnection.FULL_REPLAY_EVENT_ID
+                    true
+                }
+                if (current) {
+                    store.saveCredentials(
+                        BridgeCredentials(
+                            token = newToken,
+                            hostIp = hostIp,
+                            port = port,
+                            bridgeId = body.optString("bridgeId").takeUnless { it.isEmpty() },
+                        ),
+                    )
+                }
+                current
             }
+            if (!committed) return@withContext null
             connect()
             body
         }
@@ -257,7 +278,7 @@ class ConnectionEngine(
             teardownLocked()
             _state.value = ConnectionState.Stopped
         }
-        scope.launch { store.clear() }
+        scope.launch { persistMutex.withLock { store.clear() } }
     }
 
     /**
@@ -283,15 +304,17 @@ class ConnectionEngine(
     private suspend fun authedCall(
         block: (BridgeClient, String) -> BridgeClient.ApiResult,
     ): BridgeClient.ApiResult? = withContext(io) {
-        val (c, t) = synchronized(lock) {
+        val (c, t, myEpoch) = synchronized(lock) {
             val currentClient = client
             val currentToken = token
             if (stopped || currentClient == null || currentToken == null) return@withContext null
-            currentClient to currentToken
+            Triple(currentClient, currentToken, epoch)
         }
         val result = block(c, t)
-        // A definitive 401 on any authed call means the token is dead.
-        if (result.status == 401) onDefinitiveAuthFailure()
+        // A definitive 401 on any authed call means the token it was sent
+        // with is dead — the epoch guard ensures a delayed 401 earned by an
+        // OLD token never wipes a pairing established while it was in flight.
+        if (result.status == 401) onDefinitiveAuthFailure(myEpoch)
         result
     }
 
@@ -341,16 +364,16 @@ class ConnectionEngine(
 
         override fun onClosed(eventSource: EventSource) {
             if (!isCurrent(myEpoch)) return
-            scheduleReconnect("stream closed")
+            scheduleReconnect(myEpoch, "stream closed")
         }
 
         override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
             if (!isCurrent(myEpoch)) return
             if (response?.code == 401) {
-                onDefinitiveAuthFailure()
+                onDefinitiveAuthFailure(myEpoch)
             } else {
                 // Timeouts, resets, refusals, airplane mode: all transient.
-                scheduleReconnect("stream failure: ${t?.message ?: response?.code}")
+                scheduleReconnect(myEpoch, "stream failure: ${t?.message ?: response?.code}")
             }
         }
     }
@@ -359,13 +382,19 @@ class ConnectionEngine(
         !stopped && epoch == myEpoch
     }
 
-    private fun scheduleReconnect(reason: String) {
-        val nextAttempt: Int
+    private fun scheduleReconnect(myEpoch: Int, reason: String) {
         synchronized(lock) {
-            if (stopped) return
-            if (reconnectJob?.isActive == true) return // single flight
+            if (stopped || epoch != myEpoch) return
+            // Single flight, keyed on the FAILING STREAM's epoch — never on
+            // reconnectJob liveness. connect() runs inside the reconnect job,
+            // and a refused connect can fail on an OkHttp thread before the
+            // job finishes connect()'s tail; a liveness check would swallow
+            // that failure and leave the engine permanently deaf in
+            // Connecting. Each stream epoch gets exactly one reconnect.
+            if (reconnectEpoch == myEpoch) return
+            reconnectEpoch = myEpoch
             attempt += 1
-            nextAttempt = attempt
+            val nextAttempt = attempt
             val delayMs = backoff.delayMsFor(nextAttempt)
             reconnectJob = scope.launch {
                 delay(delayMs)
@@ -375,16 +404,22 @@ class ConnectionEngine(
         }
     }
 
-    private fun onDefinitiveAuthFailure() {
+    /**
+     * [myEpoch] pins the 401 to the pairing generation that earned it: a
+     * delayed 401 for an OLD token, landing after a successful re-pair, must
+     * never tear down the fresh valid pairing (the watchOS app erased a valid
+     * pairing exactly this way).
+     */
+    private fun onDefinitiveAuthFailure(myEpoch: Int) {
         synchronized(lock) {
-            if (stopped) return
+            if (stopped || epoch != myEpoch) return
             teardownLocked()
             _state.value = ConnectionState.AuthExpired(
                 "The bridge rejected this watch's token (401) — for example after " +
                     "its stored credentials were reset. Pair again to continue.",
             )
         }
-        scope.launch { store.clear() }
+        scope.launch { persistMutex.withLock { store.clear() } }
     }
 
     private fun teardownLocked() {

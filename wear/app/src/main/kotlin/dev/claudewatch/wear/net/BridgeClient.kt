@@ -28,7 +28,7 @@ import java.util.concurrent.TimeUnit
  * More than 25 s of wire silence fails the stream, and the ConnectionEngine
  * turns that failure into a reconnect.
  */
-class BridgeClient(
+open class BridgeClient(
     hostIp: String,
     port: Int,
     heartbeatTimeoutMs: Long = DEFAULT_HEARTBEAT_TIMEOUT_MS,
@@ -97,8 +97,12 @@ class BridgeClient(
         return postJson("/v1/command", token, JSONObject().put("permissionId", permissionId).put("decision", decision))
     }
 
-    /** GET /v1/events — opens the SSE stream, replaying from [lastEventId] when set. */
-    fun openEvents(token: String, lastEventId: String?, listener: EventSourceListener): EventSource {
+    /**
+     * GET /v1/events — opens the SSE stream, replaying from [lastEventId]
+     * when set. Open so tests can widen the window between the stream
+     * starting to connect and this call returning (the connect-tail race).
+     */
+    open fun openEvents(token: String, lastEventId: String?, listener: EventSourceListener): EventSource {
         val request = Request.Builder()
             .url("$baseUrl/v1/events")
             .header("Authorization", "Bearer $token")

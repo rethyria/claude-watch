@@ -7,9 +7,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import okhttp3.sse.EventSource
+import okhttp3.sse.EventSourceListener
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
@@ -82,6 +85,32 @@ class ConnectionEngineTest {
             backoff = BackoffPolicy(baseMs = 40, maxMs = 200, random = Random(7)),
         ).also { engine = it }
 
+    /**
+     * Engine whose client blocks inside openEvents for [openDelayMs] AFTER
+     * the stream has started connecting — deterministically widening the
+     * window in which a refused connect's onFailure races connect()'s tail
+     * while the reconnect job that issued it is still active.
+     */
+    private fun newEngineWithSlowOpen(openDelayMs: Long) =
+        ConnectionEngine(
+            store = store,
+            scope = scope,
+            clientFactory = { hostIp, port ->
+                object : BridgeClient(hostIp, port) {
+                    override fun openEvents(
+                        token: String,
+                        lastEventId: String?,
+                        listener: EventSourceListener,
+                    ): EventSource {
+                        val source = super.openEvents(token, lastEventId, listener)
+                        Thread.sleep(openDelayMs)
+                        return source
+                    }
+                }
+            },
+            backoff = BackoffPolicy(baseMs = 40, maxMs = 200, random = Random(7)),
+        ).also { engine = it }
+
     private fun pingResponse(proto: String = "2") =
         MockResponse().setBody("""{"proto":"$proto","bridgeId":"b-1","machineName":"m"}""")
 
@@ -98,11 +127,13 @@ class ConnectionEngineTest {
      * open with 2 s of dead air between padding comments — comfortably past
      * the injected sub-2 s heartbeat window when a test wants the watchdog to
      * fire, and frequent enough that the server-side writer notices a closed
-     * socket promptly at shutdown.
+     * socket promptly at shutdown. [pads] bounds the stream's natural
+     * lifetime (pads × 2 s); raise it when a test must prove the CLIENT ended
+     * the stream rather than the body merely running out.
      */
-    private fun sseHeld(events: String) = MockResponse()
+    private fun sseHeld(events: String, pads: Int = 50) = MockResponse()
         .setHeader("Content-Type", "text/event-stream")
-        .setBody(events + ":pad\n\n".repeat(50))
+        .setBody(events + ":pad\n\n".repeat(pads))
         .throttleBody(events.toByteArray().size.toLong(), 2, TimeUnit.SECONDS)
 
     private fun awaitCondition(timeoutMs: Long = 30_000, condition: () -> Boolean) {
@@ -163,6 +194,29 @@ class ConnectionEngineTest {
         assertNotNull(credentialsInStore())
     }
 
+    // -- Connect-tail race --------------------------------------------------
+
+    @Test
+    fun failureWhileReconnectJobStillInConnectTailIsNotSwallowed() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        // Three consecutive refused connects, each failing while connect()
+        // is still blocked inside openEvents — i.e. while the reconnect job
+        // that issued it is still active. A single-flight guard keyed on job
+        // liveness (instead of stream epoch) swallows these callbacks and
+        // leaves the engine permanently deaf in Connecting.
+        repeat(3) { server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START)) }
+        server.enqueue(sseHeld(":connected\n\n"))
+
+        val engine = newEngineWithSlowOpen(openDelayMs = 500)
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+
+        // Every failure must schedule the next attempt: the engine reaches
+        // the healthy stream instead of stalling with nothing left to retry.
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        assertNotNull(credentialsInStore())
+    }
+
     // -- Heartbeat watchdog -------------------------------------------------
 
     @Test
@@ -170,9 +224,12 @@ class ConnectionEngineTest {
         server.enqueue(pingResponse())
         server.enqueue(pairResponse())
         // Delivers one event, then dead air with the socket held open — the
-        // exact failure the iOS run-loop-less timers never caught.
-        server.enqueue(sseHeld("id: 3\nevent: tool-output\ndata: {}\n\n"))
-        server.enqueue(sseHeld("id: 4\nevent: tool-output\ndata: {}\n\n"))
+        // exact failure the iOS run-loop-less timers never caught. 600 pads
+        // × 2 s ≈ 20 min of natural stream lifetime: only the watchdog can
+        // end this stream within the bounded wait below, so the test fails
+        // if the watchdog is removed instead of passing on the body's end.
+        server.enqueue(sseHeld("id: 3\nevent: tool-output\ndata: {}\n\n", pads = 600))
+        server.enqueue(sseHeld("id: 4\nevent: tool-output\ndata: {}\n\n", pads = 600))
 
         val engine = newEngine(heartbeatMs = 1_500)
         assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
@@ -182,11 +239,13 @@ class ConnectionEngineTest {
         assertEquals("0", takeRequest().getHeader("Last-Event-ID"))
 
         // Silence beyond the heartbeat window must surface as a reconnect,
-        // resuming from the event the silent stream had delivered.
-        takeRequest().let {
-            assertEquals("/v1/events", it.path)
-            assertEquals("3", it.getHeader("Last-Event-ID"))
-        }
+        // resuming from the event the silent stream had delivered. The wait
+        // is bounded WELL under the stream's ~20 min natural end but stays
+        // generous against the 1.5 s injected window (loaded machine).
+        val reconnect = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("heartbeat watchdog did not trigger a reconnect within 10 s")
+        assertEquals("/v1/events", reconnect.path)
+        assertEquals("3", reconnect.getHeader("Last-Event-ID"))
         awaitCondition { engine.state.value == ConnectionState.Connected }
 
         // Production watchdog window: two missed 10 s bridge heartbeats.
@@ -227,6 +286,33 @@ class ConnectionEngineTest {
         // Authed calls refuse locally instead of hitting the network.
         assertNull(runBlocking { engine.sendCommand("s-1", "hello") })
         assertEquals(requestsBeforeStop, server.requestCount)
+    }
+
+    @Test
+    fun unpairDuringInFlightPairNeverPersistsItsCredentials() {
+        server.enqueue(pingResponse())
+        // The pair response is held for 5 s so stop() deterministically lands
+        // while the /v1/pair roundtrip is still in flight.
+        server.enqueue(pairResponse().setBodyDelay(5, TimeUnit.SECONDS))
+
+        val engine = newEngine()
+        val pending = scope.async { engine.pair("127.0.0.1", server.port, "123456", "wear-test") }
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+
+        // The user unpairs while the pair roundtrip is in flight.
+        engine.stop()
+        awaitCondition { engine.state.value == ConnectionState.Stopped }
+
+        // The racing pair() must observe it lost: no commit, no persistence —
+        // otherwise the next cold start silently resumes the wiped pairing.
+        assertNull(runBlocking { pending.await() })
+        Thread.sleep(500) // let any stray persistence land before asserting
+        assertNull(
+            "unpair must not leave the racing pair()'s credentials persisted",
+            credentialsInStore(),
+        )
+        assertEquals(ConnectionState.Stopped, engine.state.value)
     }
 
     // -- Cold start ---------------------------------------------------------
@@ -271,6 +357,51 @@ class ConnectionEngineTest {
         awaitCondition { credentialsInStore() == null }
         Thread.sleep(1_000)
         assertEquals("a definitive 401 is re-onboarding, not a retry loop", 1, server.requestCount)
+    }
+
+    @Test
+    fun stale401ForOldTokenAfterRepairDoesNotWipeFreshPairing() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse()) // tok-1
+        server.enqueue(sseHeld(":connected\n\n"))
+        // A command sent with the OLD token earns a definitive 401 — but the
+        // response is delayed so it lands only after the re-pair below.
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(401)
+                .setBody("""{"error":"Unauthorized"}""")
+                .setHeadersDelay(5, TimeUnit.SECONDS),
+        )
+        server.enqueue(pingResponse())
+        server.enqueue(MockResponse().setBody("""{"token":"tok-new","bridgeId":"b-1","sessions":[]}"""))
+        server.enqueue(sseHeld(":connected\n\n"))
+
+        val engine = newEngine()
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("/v1/events", takeRequest().path)
+
+        val staleCall = scope.async { engine.sendCommand("s-1", "hello") }
+        // Ensure the command reached the server (now waiting out the delayed
+        // 401) before re-pairing.
+        assertEquals("/v1/command", takeRequest().path)
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "654321", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        awaitCondition { credentialsInStore()?.token == "tok-new" }
+
+        // The stale 401 lands: its caller still sees the status, but it must
+        // never tear down the pairing established while it was in flight.
+        assertEquals(401, runBlocking { staleCall.await() }?.status)
+        Thread.sleep(500) // window for any wrongful teardown to surface
+        assertEquals(
+            "a stale 401 for the old token must not wipe the fresh pairing",
+            ConnectionState.Connected,
+            engine.state.value,
+        )
+        assertEquals("tok-new", credentialsInStore()?.token)
     }
 
     // -- Pairing gates ------------------------------------------------------
