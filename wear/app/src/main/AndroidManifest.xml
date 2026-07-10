@@ -4,6 +4,10 @@
     <uses-feature android:name="android.hardware.type.watch" />
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Held-Wi-Fi escalation when the BT-proxy path to the bridge is broken:
+         ConnectivityManager.requestNetwork(TRANSPORT_WIFI) in WifiNetworkEscalator. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
 
     <application
         android:label="@string/app_name"

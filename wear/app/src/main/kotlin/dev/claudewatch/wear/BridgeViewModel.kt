@@ -10,6 +10,8 @@ import dev.claudewatch.wear.net.BackoffPolicy
 import dev.claudewatch.wear.net.BridgeClient
 import dev.claudewatch.wear.net.ConnectionEngine
 import dev.claudewatch.wear.net.ConnectionState
+import dev.claudewatch.wear.net.NetworkEscalator
+import dev.claudewatch.wear.net.WifiNetworkEscalator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -29,6 +31,7 @@ class BridgeViewModel(
     store: CredentialStore,
     clientFactory: (String, Int) -> BridgeClient = { hostIp, port -> BridgeClient(hostIp, port) },
     backoff: BackoffPolicy = BackoffPolicy(),
+    escalator: NetworkEscalator = NetworkEscalator.NOOP,
 ) : ViewModel() {
 
     data class PendingPermission(val permissionId: String, val toolName: String, val raw: String)
@@ -51,7 +54,7 @@ class BridgeViewModel(
     // Owns the engine's lifetime; viewModelScope is avoided on purpose (it
     // requires Dispatchers.Main, which plain JVM unit tests don't have).
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val engine = ConnectionEngine(store, engineScope, clientFactory, backoff)
+    private val engine = ConnectionEngine(store, engineScope, clientFactory, backoff, escalator = escalator)
 
     init {
         engineScope.launch {
@@ -197,6 +200,7 @@ class BridgeViewModel(
         ConnectionState.Connected -> "paired, stream open"
         is ConnectionState.Reconnecting -> "paired, reconnecting (${connection.reason})"
         is ConnectionState.AuthExpired -> "re-pair required"
+        is ConnectionState.BridgeMismatch -> "re-pair required (different bridge)"
     }
 
     private fun repairExplanation(connection: ConnectionState): String? = when (connection) {
@@ -204,6 +208,10 @@ class BridgeViewModel(
         is ConnectionState.ProtoMismatch ->
             "This bridge speaks protocol ${connection.bridgeProto ?: "unknown"} but the app needs " +
                 "${connection.minProto} or newer. Update the bridge skill on your computer, then pair again."
+        is ConnectionState.BridgeMismatch ->
+            "A different bridge (${connection.actualBridgeId ?: "unknown"}) answered at the paired " +
+                "address — expected ${connection.expectedBridgeId ?: "unknown"}. Nothing was sent to it. " +
+                "If your computer's address changed, pair again from the bridge banner."
         else -> null
     }
 
@@ -222,9 +230,17 @@ class BridgeViewModel(
     companion object {
         private const val EVENT_LOG_LIMIT = 30
 
-        /** Production wiring: Keystore-encrypted store in app-private files. */
+        /**
+         * Production wiring: Keystore-encrypted store in app-private files,
+         * held-Wi-Fi escalation through the real ConnectivityManager.
+         */
         fun factory(context: Context): ViewModelProvider.Factory = viewModelFactory {
-            initializer { BridgeViewModel(CredentialStore.singleton(context)) }
+            initializer {
+                BridgeViewModel(
+                    CredentialStore.singleton(context),
+                    escalator = WifiNetworkEscalator(context.applicationContext),
+                )
+            }
         }
     }
 }

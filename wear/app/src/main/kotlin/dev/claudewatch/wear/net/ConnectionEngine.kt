@@ -63,6 +63,22 @@ sealed interface ConnectionState {
      * a pairing — transient network errors never do.
      */
     data class AuthExpired(val reason: String) : ConnectionState
+
+    /**
+     * A bridge at the paired address answered /v1/ping with a DIFFERENT
+     * bridgeId than the one pinned at pair time, and the port probe found no
+     * relocated bridge on that host either. Reconnecting is refused so the
+     * pinned token is never offered to a stranger's bridge (both existing
+     * clients pair with the first mDNS hit and can nondeterministically talk
+     * to the wrong Mac — this state is that bug's tombstone). Terminal until
+     * the user re-pairs; credentials are deliberately NOT wiped, because the
+     * real bridge may still exist elsewhere (e.g. DHCP handed its IP to
+     * another machine running its own bridge).
+     */
+    data class BridgeMismatch(
+        val expectedBridgeId: String?,
+        val actualBridgeId: String?,
+    ) : ConnectionState
 }
 
 /**
@@ -107,6 +123,17 @@ class BackoffPolicy(
  *    does, landing in [ConnectionState.AuthExpired] with an explanation.
  *  - There is deliberately NO polling fallback: a broken stream is shown as
  *    broken and retried, never silently degraded to a one-way channel.
+ *
+ * Discovery (issue #22): every reconnect and cold start begins with an
+ * unauthenticated /v1/ping preflight whose reply must pass [BridgePing] shape
+ * validation (a decoy HTTP server on the bridge's port — Gradio also defaults
+ * to 7860 — is never mistaken for the bridge) and whose bridgeId must match
+ * the one pinned at pair time. A refused/decoy'd known port triggers the port
+ * probe ladder over [probePorts] on the same host, relocating to a changed
+ * port only when the pinned bridgeId answers there. A preflight failure that
+ * is NOT a refusal (timeout, unreachable) is a broken PATH, not a stopped
+ * bridge: the engine escalates via [NetworkEscalator.escalate] (held Wi-Fi)
+ * and releases the hold once the stream is healthy again.
  */
 class ConnectionEngine(
     private val store: CredentialStore,
@@ -116,6 +143,8 @@ class ConnectionEngine(
     private val backoff: BackoffPolicy = BackoffPolicy(),
     private val minProto: Int = MIN_PROTO_VERSION,
     private val io: CoroutineDispatcher = Dispatchers.IO,
+    private val escalator: NetworkEscalator = NetworkEscalator.NOOP,
+    private val probePorts: List<Int> = DEFAULT_PROBE_PORTS,
 ) {
 
     data class SseEvent(val id: String?, val type: String, val data: String)
@@ -147,6 +176,12 @@ class ConnectionEngine(
     // serve here: every reconnect of a still-live engine bumps it, and a live
     // engine now keeps running while pair() does its network I/O.)
     private var pairGeneration = 0
+
+    // Discovery state: where the pairing lives and which bridge identity was
+    // pinned when it was established (verified by every reconnect preflight).
+    private var pairedHost: String? = null
+    private var pairedPort: Int = 0
+    private var pinnedBridgeId: String? = null
 
     // Serializes credential persistence (pair's save vs stop/401's clear) so
     // a stop() racing an in-flight pair() can never leave the wiped pairing's
@@ -184,9 +219,14 @@ class ConnectionEngine(
                 lastEventId = persisted.lastEventId
                 client = clientFactory(credentials.hostIp, credentials.port)
                 token = credentials.token
+                pairedHost = credentials.hostIp
+                pairedPort = credentials.port
+                pinnedBridgeId = credentials.bridgeId
                 stopped = false
                 attempt = 0
             }
+            // verifyIdentity default: a cold start must notice a replaced
+            // bridge (or one that moved ports) before offering the token.
             connect()
         }
     }
@@ -220,20 +260,32 @@ class ConnectionEngine(
                 return@withContext null
             }
 
-            // Proto gate: refuse to pair with a bridge older than we support,
-            // with an explanation instead of undefined behavior later.
-            val ping = try {
+            // Discovery gates, in order: reachability, then response SHAPE (a
+            // decoy HTTP server on the bridge's port — Gradio also defaults
+            // to 7860 — must never be pair-able), then the proto min-version
+            // gate with an explanation instead of undefined behavior later.
+            val pingResult = try {
                 candidate.ping()
             } catch (e: Exception) {
                 failPair(myPairGeneration, ConnectionState.PairFailed("bridge unreachable: ${e.message}"))
                 return@withContext null
             }
-            val proto = ping.body?.optString("proto")?.toIntOrNull()
-            if (!ping.ok || proto == null || proto < minProto) {
+            val ping = BridgePing.from(pingResult)
+            if (ping == null) {
+                failPair(
+                    myPairGeneration,
+                    ConnectionState.PairFailed(
+                        "no bridge at $hostIp:$port — the service there does not " +
+                            "answer /v1/ping like a bridge (HTTP ${pingResult.status})",
+                    ),
+                )
+                return@withContext null
+            }
+            if (ping.proto < minProto) {
                 failPair(
                     myPairGeneration,
                     ConnectionState.ProtoMismatch(
-                        bridgeProto = ping.body?.optString("proto")?.takeUnless { it.isEmpty() },
+                        bridgeProto = ping.proto.toString(),
                         minProto = minProto,
                     ),
                 )
@@ -261,6 +313,10 @@ class ConnectionEngine(
             // pairing's token persisted at rest (its clear() is serialized
             // either fully before the check — which then fails — or fully
             // after our save).
+            // Pin the bridge's identity at pair time: every future reconnect
+            // verifies it, so a different bridge later squatting this address
+            // is refused instead of silently trusted (the wrong-Mac bug).
+            val bridgeId = body.optString("bridgeId").takeUnless { it.isEmpty() } ?: ping.bridgeId
             val committed = persistMutex.withLock {
                 val current = synchronized(lock) {
                     // A stop() or a second pair() raced this one: don't commit.
@@ -271,6 +327,9 @@ class ConnectionEngine(
                     teardownLocked()
                     client = candidate
                     token = newToken
+                    pairedHost = hostIp
+                    pairedPort = port
+                    pinnedBridgeId = bridgeId
                     stopped = false
                     attempt = 0
                     // Fresh pairing: request a full ring-buffer replay so events
@@ -285,14 +344,17 @@ class ConnectionEngine(
                             token = newToken,
                             hostIp = hostIp,
                             port = port,
-                            bridgeId = body.optString("bridgeId").takeUnless { it.isEmpty() },
+                            bridgeId = bridgeId,
                         ),
                     )
                 }
                 current
             }
             if (!committed) return@withContext null
-            connect()
+            // The identity preflight is skipped for the connect right after a
+            // successful pair: the very bridge that just answered /v1/ping
+            // and issued this token IS the pinned identity.
+            connect(verifyIdentity = false)
             body
         }
 
@@ -361,11 +423,24 @@ class ConnectionEngine(
         result
     }
 
-    private fun connect() {
+    /**
+     * Opens the SSE stream, preceded (unless [verifyIdentity] is false, i.e.
+     * right after a successful pair) by the discovery preflight: an
+     * unauthenticated /v1/ping that must pass [BridgePing] shape validation
+     * and match the pinned bridgeId BEFORE the token is offered. The
+     * preflight is also the bridge-down vs path-broken classifier — see
+     * [preflight]. Always called from a coroutine (pair/start/reconnect
+     * jobs), so the blocking probe I/O never lands on an OkHttp callback
+     * thread.
+     */
+    private fun connect(verifyIdentity: Boolean = true) {
         val myEpoch: Int
-        val currentClient: BridgeClient
+        var currentClient: BridgeClient
         val currentToken: String
         val currentAttempt: Int
+        val currentHost: String?
+        val currentPort: Int
+        val pinned: String?
         synchronized(lock) {
             if (stopped) return
             // Single flight: tear the previous stream down before opening a
@@ -377,7 +452,47 @@ class ConnectionEngine(
             currentClient = client ?: return
             currentToken = token ?: return
             currentAttempt = attempt
+            currentHost = pairedHost
+            currentPort = pairedPort
+            pinned = pinnedBridgeId
             _state.value = ConnectionState.Connecting(currentAttempt)
+        }
+        if (verifyIdentity) {
+            when (val outcome = preflight(currentClient, currentHost, currentPort, pinned)) {
+                is Preflight.Proceed -> Unit
+                is Preflight.Relocated -> {
+                    // Same bridge, new port (its old one was taken after a
+                    // restart): follow it and persist the move — WITHOUT
+                    // resetting the replay cursor, it is the same bridge.
+                    synchronized(lock) {
+                        if (stopped || epoch != myEpoch) return
+                        client = outcome.client
+                        pairedPort = outcome.port
+                    }
+                    currentClient = outcome.client
+                    persistRelocatedPort(outcome.port)
+                }
+                is Preflight.Mismatch -> {
+                    synchronized(lock) {
+                        if (stopped || epoch != myEpoch) return
+                        teardownLocked()
+                        _state.value = ConnectionState.BridgeMismatch(
+                            expectedBridgeId = pinned,
+                            actualBridgeId = outcome.actualBridgeId,
+                        )
+                    }
+                    return
+                }
+                is Preflight.Retry -> {
+                    // Path-broken (unreachable/timeout, NOT refused): the
+                    // host itself is unreachable — on Wear that usually means
+                    // the BT phone proxy cannot see the LAN. Escalate to a
+                    // held Wi-Fi network; released again on stream recovery.
+                    if (outcome.pathBroken) escalator.escalate()
+                    scheduleReconnect(myEpoch, outcome.reason)
+                    return
+                }
+            }
         }
         val source = currentClient.openEvents(currentToken, lastEventId, listenerFor(myEpoch))
         synchronized(lock) {
@@ -389,11 +504,129 @@ class ConnectionEngine(
         }
     }
 
+    private sealed interface Preflight {
+        /** The pinned bridge answered at the known address: open the stream. */
+        data object Proceed : Preflight
+
+        /** The pinned bridge answered on a DIFFERENT port of the same host. */
+        data class Relocated(val client: BridgeClient, val port: Int) : Preflight
+
+        /** A different bridge answered and the probe found ours nowhere. */
+        data class Mismatch(val actualBridgeId: String) : Preflight
+
+        /** Transient: back off and try again. */
+        data class Retry(val reason: String, val pathBroken: Boolean) : Preflight
+    }
+
+    /**
+     * The discovery preflight, classifying what is actually at the paired
+     * address before any token is sent:
+     *
+     *  - valid [BridgePing] + pinned bridgeId → [Preflight.Proceed]
+     *  - connection refused (host up, nothing listening — bridge-down) or a
+     *    decoy answering (wrong service on the bridge's port) → probe
+     *    [probePorts] on the same host for the pinned bridgeId; relocate on a
+     *    match, otherwise retry with backoff
+     *  - valid ping but a FOREIGN bridgeId → probe for ours; when it is
+     *    nowhere on that host, [Preflight.Mismatch] (refused, re-pair prompt)
+     *  - any other I/O failure (timeout, unreachable) → the PATH is broken,
+     *    not the bridge: retry with [Preflight.Retry.pathBroken] set so the
+     *    engine holds a Wi-Fi network
+     */
+    private fun preflight(
+        client: BridgeClient,
+        host: String?,
+        currentPort: Int,
+        pinned: String?,
+    ): Preflight {
+        val result = try {
+            client.ping()
+        } catch (e: Exception) {
+            return if (isConnectionRefused(e)) {
+                probeForRelocatedBridge(host, currentPort, pinned)
+                    ?: Preflight.Retry("bridge down: ${e.message}", pathBroken = false)
+            } else {
+                Preflight.Retry("path broken: ${e.message}", pathBroken = true)
+            }
+        }
+        val ping = BridgePing.from(result)
+            ?: return probeForRelocatedBridge(host, currentPort, pinned)
+                ?: Preflight.Retry(
+                    "not a bridge at the paired address (HTTP ${result.status})",
+                    pathBroken = false,
+                )
+        if (pinned != null && ping.bridgeId != pinned) {
+            return probeForRelocatedBridge(host, currentPort, pinned)
+                ?: Preflight.Mismatch(ping.bridgeId)
+        }
+        return Preflight.Proceed
+    }
+
+    /**
+     * The unicast port-probe rung of the discovery ladder: ping every
+     * candidate port on the known [host] (cheap — a bridge-down
+     * classification means the host answers, so dead ports refuse instantly)
+     * and relocate ONLY to a responder that both passes [BridgePing] shape
+     * validation and carries the pinned bridgeId. A decoy or a foreign bridge
+     * on a probed port is skipped, never trusted.
+     */
+    private fun probeForRelocatedBridge(
+        host: String?,
+        currentPort: Int,
+        pinned: String?,
+    ): Preflight.Relocated? {
+        if (host == null || pinned == null) return null
+        for (candidate in probePorts) {
+            if (candidate == currentPort) continue
+            if (synchronized(lock) { stopped }) return null
+            val probe = try {
+                clientFactory(host, candidate)
+            } catch (_: IllegalArgumentException) {
+                continue
+            }
+            val ping = try {
+                BridgePing.from(probe.ping())
+            } catch (_: Exception) {
+                null
+            } ?: continue
+            if (ping.bridgeId == pinned) return Preflight.Relocated(probe, candidate)
+        }
+        return null
+    }
+
+    /** Refused = the host answered with a reset: something is THERE, the bridge is not. */
+    private fun isConnectionRefused(e: Exception): Boolean {
+        var cause: Throwable? = e
+        while (cause != null) {
+            if (cause is java.net.ConnectException &&
+                cause.message?.contains("refused", ignoreCase = true) == true
+            ) {
+                return true
+            }
+            cause = cause.cause
+        }
+        return false
+    }
+
+    private fun persistRelocatedPort(newPort: Int) {
+        scope.launch {
+            persistMutex.withLock {
+                // Only persist while the relocation is still the engine's
+                // live view — a stop() or re-pair that raced us wins.
+                val current = synchronized(lock) { !stopped && pairedPort == newPort }
+                if (current) store.savePort(newPort)
+            }
+        }
+    }
+
     private fun listenerFor(myEpoch: Int) = object : EventSourceListener() {
         override fun onOpen(eventSource: EventSource, response: Response) {
             if (!isCurrent(myEpoch)) return
             synchronized(lock) { attempt = 0 }
             _state.value = ConnectionState.Connected
+            // The stream is healthy again: drop any held Wi-Fi escalation so
+            // the platform can return to the battery-friendly BT-proxy path.
+            escalator.release()
         }
 
         override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
@@ -486,12 +719,25 @@ class ConnectionEngine(
         eventSource = null
         client = null
         token = null
+        pairedHost = null
+        pairedPort = 0
+        pinnedBridgeId = null
         attempt = 0
         lastEventId = PersistedConnection.FULL_REPLAY_EVENT_ID
+        // A torn-down engine must not keep the Wi-Fi radio pinned up.
+        escalator.release()
     }
 
     companion object {
         /** Oldest bridge protocol this client can talk to. */
         const val MIN_PROTO_VERSION = 2
+
+        /**
+         * The bridge walks 7860..7869 at startup (7860 is Gradio's default,
+         * so it is often taken) — the probe ladder walks the same range.
+         * Single source of truth on the bridge side: PORT_RANGE_START/END in
+         * skill/bridge/config.js.
+         */
+        val DEFAULT_PROBE_PORTS: List<Int> = (7860..7869).toList()
     }
 }

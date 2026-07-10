@@ -65,6 +65,46 @@ a seamless resume (the token survives and the stream replays from the
 persisted `lastEventId`). Against an older bridge whose token store resets on
 restart, the same event is a definitive 401 → re-onboard.
 
+## Discovery (issue #22 — the emulator-verifiable rungs)
+
+Manual IP entry is the first-class pairing path (host + port + code on the
+pairing screen), not a buried fallback. Everything else builds on the
+unauthenticated `GET /v1/ping` probe:
+
+- **Shape validation (`BridgePing`):** a responder only counts as a bridge
+  when `/v1/ping` returns 2xx JSON with a positive integer `proto`, a
+  non-empty `bridgeId` and a non-empty `machineName`. The bridge's default
+  port (7860) is also Gradio's default, so "an HTTP server answered" proves
+  nothing — a decoy is rejected at pair time and at reconnect time, and never
+  receives a token.
+- **bridgeId pinning:** the bridge's `bridgeId` is pinned when pairing and
+  verified by a `/v1/ping` preflight on every reconnect and cold start
+  (`ConnectionEngine.connect`). A host that answers with a foreign `bridgeId`
+  lands in the terminal `BridgeMismatch` state: a clear re-pair prompt, the
+  token is never offered to the stranger, and credentials are deliberately
+  NOT wiped (the real bridge may still exist — e.g. DHCP handed its IP to
+  another machine). Both legacy clients paired with the first mDNS hit and
+  could nondeterministically talk to the wrong Mac; this is that bug's fix.
+- **Port probe ladder:** when the known port refuses the connection
+  (bridge-down: the host answered, the bridge is gone) or a decoy answers on
+  it, the engine pings the bridge's port-walk range (7860–7869, mirroring
+  `PORT_RANGE_START/END` in `skill/bridge/config.js`) on the same host and
+  relocates ONLY to a responder whose `bridgeId` matches the pinned one. The
+  move persists (same token, same replay cursor, new port).
+- **Bridge-down vs path-broken:** a preflight failure that is a connection
+  REFUSAL means the host is reachable → ordinary backoff (+ port probe).
+  Anything else (timeout, unreachable) is a broken PATH — on the watch,
+  typically the Bluetooth phone proxy not seeing the workstation's LAN — and
+  retrying down the same dead route cannot help. The engine then escalates
+  via `WifiNetworkEscalator`: `ConnectivityManager.requestNetwork` with
+  `TRANSPORT_WIFI`, held until the SSE stream is healthy again, then released
+  so the platform can return to the battery-friendly BT-proxy path. (This
+  held-Wi-Fi hook is also the prerequisite for the battery matrix's held-Wi-Fi
+  scenario.)
+
+mDNS/NSD zero-typing discovery is a separate HITL issue: the emulator's NAT
+drops LAN multicast, so it cannot be verified here.
+
 ## Storage
 
 Credentials (token, host, port, bridgeId) and the SSE replay cursor

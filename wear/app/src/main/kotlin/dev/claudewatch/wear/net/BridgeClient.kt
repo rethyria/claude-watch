@@ -66,9 +66,12 @@ open class BridgeClient(
     /**
      * GET /v1/ping — unauthenticated discovery/version probe. Returns the
      * bridge's protocol version ("proto"), bridgeId and machineName; used for
-     * the client-side proto min-version gate before pairing.
+     * the client-side proto min-version gate before pairing, and by the
+     * ConnectionEngine's reconnect preflight (identity check + bridge-down vs
+     * path-broken classification — see [BridgePing]). Open so tests can
+     * simulate a broken network path deterministically.
      */
-    fun ping(): ApiResult {
+    open fun ping(): ApiResult {
         val request = Request.Builder().url("$baseUrl/v1/ping").build()
         return execute(request)
     }

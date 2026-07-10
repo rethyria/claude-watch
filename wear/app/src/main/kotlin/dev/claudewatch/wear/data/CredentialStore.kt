@@ -66,6 +66,20 @@ class CredentialStore(
     }
 
     /**
+     * The paired bridge relocated to a new port on the same host (discovery
+     * probe matched its pinned bridgeId there — e.g. its old port was taken
+     * by another service after a restart). Rewrites ONLY the port: token,
+     * bridgeId and the replay cursor survive, because it is the same bridge.
+     * A no-op when unpaired.
+     */
+    suspend fun savePort(port: Int) {
+        dataStore.updateData { current ->
+            val credentials = current.credentials ?: return@updateData current
+            current.copy(credentials = credentials.copy(port = port))
+        }
+    }
+
+    /**
      * Advances the replay cursor. A no-op once credentials are cleared so a
      * late in-flight event from a torn-down stream cannot resurrect state
      * after unpair.

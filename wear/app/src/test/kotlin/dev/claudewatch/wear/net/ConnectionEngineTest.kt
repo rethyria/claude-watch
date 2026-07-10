@@ -77,12 +77,16 @@ class ConnectionEngineTest {
         }
     }
 
+    // probePorts is empty in the lifecycle tests: the default 7860..7869
+    // ladder would ping real bridges running on this machine's loopback.
+    // DiscoveryTest covers the probe ladder with injected candidate ports.
     private fun newEngine(heartbeatMs: Long = BridgeClient.DEFAULT_HEARTBEAT_TIMEOUT_MS) =
         ConnectionEngine(
             store = store,
             scope = scope,
             clientFactory = { hostIp, port -> BridgeClient(hostIp, port, heartbeatTimeoutMs = heartbeatMs) },
             backoff = BackoffPolicy(baseMs = 40, maxMs = 200, random = Random(7)),
+            probePorts = emptyList(),
         ).also { engine = it }
 
     /**
@@ -109,6 +113,7 @@ class ConnectionEngineTest {
                 }
             },
             backoff = BackoffPolicy(baseMs = 40, maxMs = 200, random = Random(7)),
+            probePorts = emptyList(),
         ).also { engine = it }
 
     private fun pingResponse(proto: String = "2") =
@@ -159,14 +164,17 @@ class ConnectionEngineTest {
         // Bridge killed: the stream delivers event 7 and then dies.
         server.enqueue(sseEnding("id: 7\nevent: tool-output\ndata: {\"n\":1}\n\n"))
         // Bridge still down / airplane mode: connects are torn down at accept.
+        // These are consumed by the reconnects' discovery preflight pings.
         server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
         server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
-        // Bridge back: a healthy stream delivering event 8. The real bridge's
-        // ids are wall-clock-seeded so they stay monotonic ACROSS restarts —
-        // a restarted bridge never re-issues ids below the client's resumed
+        // Bridge back: the preflight ping succeeds (same bridgeId), then a
+        // healthy stream delivering event 8. The real bridge's ids are
+        // wall-clock-seeded so they stay monotonic ACROSS restarts — a
+        // restarted bridge never re-issues ids below the client's resumed
         // cursor (skill/bridge/test/sse-restart-replay.test.js pins that
         // contract against the real process; a same-process mock whose ids
         // only grow cannot).
+        server.enqueue(pingResponse())
         server.enqueue(sseHeld("id: 8\nevent: tool-output\ndata: {\"n\":2}\n\n"))
 
         val engine = newEngine()
@@ -188,11 +196,21 @@ class ConnectionEngineTest {
             assertEquals("/v1/events", it.path)
             assertEquals("0", it.getHeader("Last-Event-ID"))
         }
-        // Every reconnect resumes from the last event actually seen.
-        repeat(3) {
-            takeRequest().let {
-                assertEquals("/v1/events", it.path)
-                assertEquals("7", it.getHeader("Last-Event-ID"))
+        // Every reconnect attempt starts with a discovery preflight ping and,
+        // once the bridge answers again, the stream resumes from the last
+        // event actually seen (never a full replay, never skipping ahead).
+        // The exact ping count is left loose: OkHttp may fold a torn-down
+        // connect into its own transparent retry on a loaded machine.
+        var resumed = false
+        while (!resumed) {
+            val request = takeRequest()
+            when (request.path) {
+                "/v1/ping" -> Unit // preflight against the down bridge
+                "/v1/events" -> {
+                    assertEquals("7", request.getHeader("Last-Event-ID"))
+                    resumed = true
+                }
+                else -> throw AssertionError("unexpected request ${request.path}")
             }
         }
         // Transient failures never wiped the pairing.
@@ -209,8 +227,13 @@ class ConnectionEngineTest {
         // is still blocked inside openEvents — i.e. while the reconnect job
         // that issued it is still active. A single-flight guard keyed on job
         // liveness (instead of stream epoch) swallows these callbacks and
-        // leaves the engine permanently deaf in Connecting.
-        repeat(3) { server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START)) }
+        // leaves the engine permanently deaf in Connecting. Each reconnect's
+        // discovery preflight ping gets a healthy answer (interleaved below)
+        // so every torn-down response is consumed by openEvents itself.
+        repeat(3) {
+            server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
+            server.enqueue(pingResponse())
+        }
         server.enqueue(sseHeld(":connected\n\n"))
 
         val engine = newEngineWithSlowOpen(openDelayMs = 500)
@@ -234,6 +257,7 @@ class ConnectionEngineTest {
         // end this stream within the bounded wait below, so the test fails
         // if the watchdog is removed instead of passing on the body's end.
         server.enqueue(sseHeld("id: 3\nevent: tool-output\ndata: {}\n\n", pads = 600))
+        server.enqueue(pingResponse()) // the reconnect's discovery preflight
         server.enqueue(sseHeld("id: 4\nevent: tool-output\ndata: {}\n\n", pads = 600))
 
         val engine = newEngine(heartbeatMs = 1_500)
@@ -243,12 +267,16 @@ class ConnectionEngineTest {
         assertEquals("/v1/pair", takeRequest().path)
         assertEquals("0", takeRequest().getHeader("Last-Event-ID"))
 
-        // Silence beyond the heartbeat window must surface as a reconnect,
-        // resuming from the event the silent stream had delivered. The wait
-        // is bounded WELL under the stream's ~20 min natural end but stays
-        // generous against the 1.5 s injected window (loaded machine).
-        val reconnect = server.takeRequest(10, TimeUnit.SECONDS)
+        // Silence beyond the heartbeat window must surface as a reconnect —
+        // first the discovery preflight ping, then the stream reopening from
+        // the event the silent stream had delivered. The waits are bounded
+        // WELL under the stream's ~20 min natural end but stay generous
+        // against the 1.5 s injected window (loaded machine).
+        val preflight = server.takeRequest(10, TimeUnit.SECONDS)
             ?: throw AssertionError("heartbeat watchdog did not trigger a reconnect within 10 s")
+        assertEquals("/v1/ping", preflight.path)
+        val reconnect = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no stream reopen after the preflight ping")
         assertEquals("/v1/events", reconnect.path)
         assertEquals("3", reconnect.getHeader("Last-Event-ID"))
         awaitCondition { engine.state.value == ConnectionState.Connected }
@@ -350,6 +378,10 @@ class ConnectionEngineTest {
         runBlocking {
             store.saveCredentials(BridgeCredentials("tok-stale", "127.0.0.1", server.port, "b-1"))
         }
+        // Cold start: the discovery preflight ping confirms the SAME bridge
+        // (pinned bridgeId) is answering — so the 401 that follows is a
+        // definitive verdict on the token, not a stranger rejecting it.
+        server.enqueue(pingResponse())
         server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":"Unauthorized"}"""))
         repeat(3) {
             server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":"Unauthorized"}"""))
@@ -361,7 +393,7 @@ class ConnectionEngineTest {
         awaitCondition { engine.state.value is ConnectionState.AuthExpired }
         awaitCondition { credentialsInStore() == null }
         Thread.sleep(1_000)
-        assertEquals("a definitive 401 is re-onboarding, not a retry loop", 1, server.requestCount)
+        assertEquals("a definitive 401 is re-onboarding, not a retry loop", 2, server.requestCount)
     }
 
     @Test
