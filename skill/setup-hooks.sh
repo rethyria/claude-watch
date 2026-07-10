@@ -95,7 +95,15 @@ def write_settings_atomically(path, data):
     umask-derived mode would win), and settings.json can carry secrets (env
     vars, apiKeyHelper config) that users protect with e.g. chmod 600 — so
     replicate the existing mode onto the temp file BEFORE the rename. A brand
-    new settings file keeps the umask default, same as a plain open(path, 'w')."""
+    new settings file keeps the umask default, same as a plain open(path, 'w').
+
+    Resolve symlinks first: dotfiles managers (stow, chezmoi, ...) commonly
+    make ~/.claude/settings.json a symlink into a repo. os.replace on the
+    symlink itself would swap the link for a regular file, silently detaching
+    the user's dotfiles setup — so rewrite the link's TARGET instead, exactly
+    like the plain open(path, 'w') this replaced used to. (os.stat below
+    follows symlinks anyway, so the mode logic is unaffected.)"""
+    path = os.path.realpath(path)
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:
@@ -317,7 +325,15 @@ def write_settings_atomically(path, data):
     umask-derived mode would win), and settings.json can carry secrets (env
     vars, apiKeyHelper config) that users protect with e.g. chmod 600 — so
     replicate the existing mode onto the temp file BEFORE the rename. A brand
-    new settings file keeps the umask default, same as a plain open(path, 'w')."""
+    new settings file keeps the umask default, same as a plain open(path, 'w').
+
+    Resolve symlinks first: dotfiles managers (stow, chezmoi, ...) commonly
+    make ~/.claude/settings.json a symlink into a repo. os.replace on the
+    symlink itself would swap the link for a regular file, silently detaching
+    the user's dotfiles setup — so rewrite the link's TARGET instead, exactly
+    like the plain open(path, 'w') this replaced used to. (os.stat below
+    follows symlinks anyway, so the mode logic is unaffected.)"""
+    path = os.path.realpath(path)
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:

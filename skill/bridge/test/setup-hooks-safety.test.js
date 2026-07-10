@@ -247,6 +247,49 @@ test("a hardened settings.json keeps its permissions across install and --remove
     "settings content must survive alongside its permissions");
 });
 
+test("a symlinked settings.json (dotfiles-managed) stays a symlink and writes through to its target", { timeout: 60_000 }, async (t) => {
+  // stow/chezmoi users symlink ~/.claude/settings.json into a dotfiles repo.
+  // A naive temp-file + os.replace on the symlink path swaps the link for a
+  // regular file: the live settings and the dotfiles copy silently diverge.
+  // The atomic rewrite must resolve the link and replace its TARGET instead.
+  const home = tempDir(t, "claude-watch-safety-home-");
+  const dotfiles = tempDir(t, "claude-watch-dotfiles-");
+  const target = path.join(dotfiles, "claude-settings.json");
+  const original = {
+    model: "opus",
+    hooks: { PostToolUse: [{ hooks: [{ type: "command", command: "user-thing" }] }] },
+  };
+  fs.writeFileSync(target, JSON.stringify(original, null, 2));
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.symlinkSync(target, settingsPath(home));
+
+  const install = await runScript(SETUP_HOOKS, ["47877"], {
+    HOME: home,
+    CLAUDE_WATCH_CREDENTIALS_DIR: "",
+  });
+  assert.equal(install.code, 0, install.output);
+  assert.ok(fs.lstatSync(settingsPath(home)).isSymbolicLink(),
+    "settings.json must still be a symlink after install");
+  assert.equal(fs.readlinkSync(settingsPath(home)), target,
+    "the symlink must still point at the dotfiles target");
+  const written = JSON.parse(fs.readFileSync(target, "utf-8"));
+  assert.equal(written.model, "opus", "existing settings survive in the dotfiles target");
+  assert.ok(
+    installedHookUrls(home).includes("http://127.0.0.1:47877/hooks/permission"),
+    "hooks must land in the dotfiles target through the symlink",
+  );
+
+  const remove = await runScript(SETUP_HOOKS, ["--remove"], {
+    HOME: home,
+    CLAUDE_WATCH_CREDENTIALS_DIR: "",
+  });
+  assert.equal(remove.code, 0, remove.output);
+  assert.ok(fs.lstatSync(settingsPath(home)).isSymbolicLink(),
+    "settings.json must still be a symlink after --remove");
+  assert.deepEqual(JSON.parse(fs.readFileSync(target, "utf-8")), original,
+    "--remove must restore the dotfiles target to its original content");
+});
+
 test("install and --remove work from a HOME containing a quote character", { timeout: 60_000 }, async (t) => {
   const base = tempDir(t, "claude-watch-safety-quote-");
   const home = path.join(base, "it's home");
