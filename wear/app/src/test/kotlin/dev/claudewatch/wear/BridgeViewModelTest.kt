@@ -146,4 +146,93 @@ class BridgeViewModelTest {
         assertTrue("typed tool-output line must carry the payload text: $log", log.contains("marker-xyz"))
         assertTrue("session line must be rendered from the typed model: $log", log.contains("session running proj"))
     }
+
+    private fun permissionRequestFrame(id: Int, permissionId: String, toolName: String): String =
+        "id: $id\nevent: permission-request\n" +
+            """data: {"permissionId":"$permissionId","tool_name":"$toolName","tool_input":{},""" +
+            """"options":[{"behavior":"allow","label":"Yes","description":"Allow this once"},""" +
+            """{"behavior":"deny","label":"No","description":"Deny this request"}],"sessionId":"s-1"}""" +
+            "\n\n"
+
+    /**
+     * The bridge pushes NO permission-cleared when a prompt is resolved from
+     * another paired device via /v1/command or times out server-side, so an
+     * older pending entry can go stale in client state. The screen must show
+     * the newest pending prompt — a stale entry must never shadow a live
+     * prompt that arrived after it.
+     */
+    @Test
+    fun newestPendingPermissionIsDisplayedOverAStaleOlderOne() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append(permissionRequestFrame(1, "perm-stale", "Bash"))
+            append(permissionRequestFrame(2, "perm-live", "Read"))
+            // Keep the stream open while the assertions below run.
+            append(":pad\n\n".repeat(40))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+
+        val state = awaitState { it.bridge.pendingPermissions.size == 2 }
+        assertEquals(
+            "the newest prompt must be displayed, not the possibly-stale oldest one",
+            "perm-live",
+            state.pendingPermission?.permissionId,
+        )
+        assertEquals("Read", state.pendingPermission?.toolName)
+    }
+
+    /**
+     * Regression: answering a permission that no longer exists on the bridge
+     * (resolved by another paired device, or timed out server-side) returns
+     * 404 and no permission-cleared event ever arrives for it. The client
+     * must treat that 404 as authoritative-gone and drop the prompt locally;
+     * keeping it would wedge a zombie prompt in state forever.
+     */
+    @Test
+    fun a404AnswerRemovesTheZombiePermissionLocally() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append(permissionRequestFrame(1, "perm-zombie", "Bash"))
+            // Keep the stream open so the reconnect path can't steal the
+            // queued 404 response from the answer below.
+            append(":pad\n\n".repeat(60))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.pendingPermission?.permissionId == "perm-zombie" }
+
+        // The prompt was resolved elsewhere in the meantime: the bridge
+        // answers the decision with 404 and pushes no cleared event.
+        server.enqueue(
+            MockResponse().setResponseCode(404).setBody("""{"error":"No pending permission with that ID"}"""),
+        )
+        viewModel.answerPermission("allow")
+
+        val state = awaitState {
+            it.decisionResult == "decision:404" && it.pendingPermission == null
+        }
+        assertTrue(
+            "a 404-answered permission must leave bridge state entirely",
+            state.bridge.pendingPermissions.isEmpty(),
+        )
+    }
 }

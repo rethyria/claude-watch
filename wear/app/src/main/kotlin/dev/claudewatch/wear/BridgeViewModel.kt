@@ -120,9 +120,17 @@ class BridgeViewModel : ViewModel() {
                 val result = currentClient.answerPermission(currentToken, pending.permissionId, behavior, message)
                 _state.update { ui ->
                     val next = ui.copy(decisionResult = "decision:${result.status}")
-                    // The bridge only pushes permission-cleared for prompts
-                    // resolved elsewhere; one we answered is removed locally.
-                    if (result.ok) next.withBridge(next.bridge.resolvePermission(pending.permissionId)) else next
+                    // The bridge pushes no permission-cleared when a prompt is
+                    // resolved via /v1/command from another paired device, or
+                    // when it times out server-side — only hook-abort and
+                    // Codex clears broadcast. So both outcomes here mean the
+                    // prompt is gone and must be dropped locally:
+                    //  - ok: we resolved it ourselves.
+                    //  - 404: the bridge says it no longer exists (answered
+                    //    elsewhere or timed out). Keeping it would wedge a
+                    //    zombie prompt in state forever.
+                    val gone = result.ok || result.status == 404
+                    if (gone) next.withBridge(next.bridge.resolvePermission(pending.permissionId)) else next
                 }
             } catch (e: Exception) {
                 _state.update { it.copy(decisionResult = "decision:error ${e.message}") }
@@ -192,7 +200,11 @@ class BridgeViewModel : ViewModel() {
         // Sticky fallback: keep targeting the last known session when none is
         // currently running (matches the skeleton's previous behavior).
         sessionId = bridge.currentSessionId ?: sessionId,
-        pendingPermission = bridge.pendingPermissions.firstOrNull()?.let {
+        // Show the NEWEST pending prompt. The bridge pushes no
+        // permission-cleared for prompts resolved from another paired device
+        // or timed out server-side, so an older entry can go stale in state;
+        // it must never shadow a live prompt that arrived after it.
+        pendingPermission = bridge.pendingPermissions.lastOrNull()?.let {
             PendingPermission(it.permissionId, it.toolName ?: "?")
         },
     )

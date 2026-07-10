@@ -67,9 +67,12 @@ data class BridgeState(
             ?: sessions.keys.lastOrNull()
 
     /**
-     * Drop a pending permission this client answered itself. The bridge only
-     * pushes `permission-cleared` for prompts resolved elsewhere (hook abort,
-     * Codex), so a locally answered prompt is removed locally.
+     * Drop a pending permission the client has learned is gone. The bridge
+     * pushes `permission-cleared` only for hook aborts and Codex clears — NOT
+     * for prompts resolved from another paired device via /v1/command, and
+     * NOT for server-side timeouts. So the client must call this both for a
+     * prompt it answered itself (2xx) and for one the bridge reports as no
+     * longer existing (404), or the entry lives in state forever.
      */
     fun resolvePermission(permissionId: String): BridgeState =
         copy(pendingPermissions = pendingPermissions.filterNot { it.permissionId == permissionId })
