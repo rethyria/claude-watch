@@ -2,15 +2,14 @@
 # Agent Watch — Install global hooks so ALL Claude Code sessions stream to the bridge.
 #
 # Usage: ./setup-hooks.sh [port]
-#   port: bridge server port (default: 7860)
+#   port: bridge server port (default: the port file written by a running
+#         bridge at ~/.claude-watch/port, falling back to 7860)
 #
 # This writes HTTP hooks to ~/.claude/settings.json (global, all projects).
 # To remove: ./setup-hooks.sh --remove
 
 set -e
 
-PORT="${1:-7860}"
-BRIDGE_URL="http://127.0.0.1:${PORT}"
 SETTINGS="$HOME/.claude/settings.json"
 
 # Client-side timeout (seconds) for the blocking PermissionRequest hook.
@@ -68,16 +67,67 @@ fi
 
 # ── Install mode ─────────────────────────────────────────────────────────────
 
+# Port resolution: the bridge may not be on 7860 — it walks 7860-7869 when the
+# default is taken (Gradio's default port, notably) and publishes its ACTUAL
+# bound port to a port file on startup. That file is the single source of
+# truth for hook URLs. Precedence: explicit argument > port file > 7860.
+PORT_FILE="${CLAUDE_WATCH_CREDENTIALS_DIR:-$HOME/.claude-watch}/port"
+
+# The fallback default mirrors the bridge's port-range start. The env override
+# is test-only (same convention as CLAUDE_WATCH_PORT_RANGE_START in config.js):
+# it lets the test suite exercise the fallback path in a private port range
+# instead of racing other tests for the real 7860. Production never sets it.
+DEFAULT_PORT="${CLAUDE_WATCH_PORT_RANGE_START:-7860}"
+case "$DEFAULT_PORT" in
+  ''|*[!0-9]*) DEFAULT_PORT=7860 ;;
+esac
+
+PORT_SOURCE="default"
+if [ -n "$1" ]; then
+  PORT="$1"
+  PORT_SOURCE="argument"
+elif [ -f "$PORT_FILE" ]; then
+  PORT="$(tr -cd '0-9' < "$PORT_FILE")"
+  if [ -n "$PORT" ]; then
+    PORT_SOURCE="port-file"
+    echo "Using bridge port ${PORT} from ${PORT_FILE}"
+  fi
+else
+  PORT=""
+fi
+case "$PORT" in
+  ''|*[!0-9]*) PORT="$DEFAULT_PORT"; [ "$PORT_SOURCE" = "argument" ] || PORT_SOURCE="default" ;;
+esac
+BRIDGE_URL="http://127.0.0.1:${PORT}"
+
 echo "Installing Agent Watch hooks..."
 echo "  Bridge URL: ${BRIDGE_URL}"
 echo "  Settings:   ${SETTINGS}"
 echo ""
 
-# Verify bridge is reachable
-if curl -s --connect-timeout 2 "${BRIDGE_URL}/status" > /dev/null 2>&1; then
+# Verify the bridge (not just anything — Gradio answers HTTP too) is reachable:
+# the bridge's unauthenticated /ping identity probe always carries a bridgeId
+# (/status requires a bearer token). --max-time bounds the whole request so a
+# non-HTTP squatter on the port can't hang the installer.
+if curl -s --connect-timeout 2 --max-time 4 "${BRIDGE_URL}/ping" 2>/dev/null | grep -q '"bridgeId"'; then
   echo "  Bridge status: RUNNING"
+elif [ "$PORT_SOURCE" = "default" ]; then
+  # No explicit port, no port file, nothing answering on 7860: we are guessing.
+  # If 7860 is (or later gets) occupied by something else — Gradio, notably —
+  # the bridge will bind 7861+ and hooks pinned to 7860 will post to the wrong
+  # instance. Warn loudly instead of promising the hooks will "just work".
+  echo "  Bridge status: NOT RUNNING"
+  echo ""
+  echo "  WARNING: no bridge port file found at ${PORT_FILE} and nothing is"
+  echo "  answering on the default port ${DEFAULT_PORT}, so the hook URLs above are a"
+  echo "  GUESS. If ${DEFAULT_PORT} is taken when the bridge starts (e.g. by Gradio),"
+  echo "  the bridge will bind a different port and these hooks will post to"
+  echo "  the wrong place."
+  echo ""
+  echo "  Fix: start the bridge first (cd skill/bridge && node server.js),"
+  echo "  then re-run ./skill/setup-hooks.sh so it reads the actual port."
 else
-  echo "  Bridge status: NOT RUNNING (hooks will work once you start the bridge)"
+  echo "  Bridge status: NOT RUNNING (hooks will work once you start the bridge on port ${PORT})"
 fi
 
 # Create settings file if it doesn't exist
@@ -207,10 +257,26 @@ if command -v codex &>/dev/null; then
 #!/bin/bash
 # codex-watch: Runs Codex and streams events to Agent Watch bridge.
 # Drop-in replacement for `codex` — use `codex-watch` instead.
-BRIDGE_URL="http://127.0.0.1:${CLAUDE_WATCH_PORT:-7860}"
+#
+# The bridge may not be on 7860 (it walks up when the default port is taken)
+# and publishes its actual bound port to a port file on startup. Resolve at
+# launch: CLAUDE_WATCH_PORT env > port file > default 7860.
+BRIDGE_PORT="$CLAUDE_WATCH_PORT"
+if [ -z "$BRIDGE_PORT" ]; then
+  PORT_FILE="${CLAUDE_WATCH_CREDENTIALS_DIR:-$HOME/.claude-watch}/port"
+  if [ -f "$PORT_FILE" ]; then
+    BRIDGE_PORT="$(tr -cd '0-9' < "$PORT_FILE")"
+  fi
+fi
+case "$BRIDGE_PORT" in
+  ''|*[!0-9]*) BRIDGE_PORT=7860 ;;
+esac
+BRIDGE_URL="http://127.0.0.1:${BRIDGE_PORT}"
 
-# If bridge isn't running, just run codex normally
-if ! curl -s --connect-timeout 1 "${BRIDGE_URL}/status" > /dev/null 2>&1; then
+# If the bridge isn't running (a bridgeId in the unauthenticated /ping probe
+# is the tell — some other service like Gradio may hold the port, and /status
+# requires a bearer token), just run codex normally.
+if ! curl -s --connect-timeout 1 --max-time 3 "${BRIDGE_URL}/ping" 2>/dev/null | grep -q '"bridgeId"'; then
   exec codex "$@"
 fi
 

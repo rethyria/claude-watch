@@ -85,11 +85,20 @@ export const CREDENTIALS_DIR =
   process.env.CLAUDE_WATCH_CREDENTIALS_DIR || path.join(os.homedir(), ".claude-watch");
 export const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "credentials.json");
 
-export const PORT_RANGE_START = 7860;
-// The production range is fixed (installed hooks and clients probe it), but
-// the test suite runs bridges from many concurrent test-runner processes and
-// ten ports are not enough headroom. Overridable via
-// CLAUDE_WATCH_PORT_RANGE_END (test-only).
+// Port file: the bridge publishes its ACTUAL bound port here on startup
+// (single source of truth). The bridge walks PORT_RANGE_START..END when the
+// default is taken (7860 is Gradio's default, notably), so the hook installer
+// (setup-hooks.sh) and the codex-watch wrapper must read this file instead of
+// assuming 7860 — otherwise every hook, including the blocking permission
+// hook, posts to the wrong instance.
+export const PORT_FILE = path.join(CREDENTIALS_DIR, "port");
+
+// Test-only override hook (see testOverridable below): lets the test suite
+// move the bridge into a private port range (so a decoy listener on the range
+// start can't collide with parallel test files) and widen it (many concurrent
+// test-runner processes exhaust the ten production ports). Production never
+// sets these.
+export const PORT_RANGE_START = testOverridable("CLAUDE_WATCH_PORT_RANGE_START", 7860);
 export const PORT_RANGE_END = testOverridable("CLAUDE_WATCH_PORT_RANGE_END", 7869);
 export const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
@@ -97,10 +106,11 @@ export const RATE_LIMIT_MAX_ATTEMPTS = 5;
 export const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 
 // Test-only override hook: lets the test suite shorten long production
-// timeouts/bounds via environment variables so timeout/pruning/eviction paths
-// can be exercised in seconds instead of minutes. Production deployments must
-// never set these variables; any unset/invalid value falls back to the
-// production default.
+// timeouts/bounds (and relocate/widen the port range) via environment
+// variables so timeout/pruning/eviction/port-walk paths can be exercised
+// deterministically. Production deployments must never set these variables;
+// any unset/invalid value falls back to the production default. (Function
+// declaration — hoisted above the PORT_RANGE_* uses earlier in this module.)
 function testOverridable(envName, productionValue) {
   const raw = process.env[envName];
   if (raw === undefined) return productionValue;

@@ -80,17 +80,7 @@ cd skill/bridge
 npm install
 ```
 
-### 2. Install Claude Code hooks
-
-This configures all Claude Code sessions to stream events to the bridge:
-
-```bash
-./skill/setup-hooks.sh
-```
-
-To remove hooks later: `./skill/setup-hooks.sh --remove`
-
-### 3. Start the bridge server
+### 2. Start the bridge server
 
 ```bash
 cd skill/bridge
@@ -107,6 +97,25 @@ You'll see:
 ║  Port:          7860                  ║
 ╚═══════════════════════════════════════╝
 ```
+
+Start the bridge **before** installing hooks: if the default port 7860 is
+taken (Gradio's default, notably), the bridge binds the next free port and
+publishes it to `~/.claude-watch/port` — the hook installer reads that file
+to write correct hook URLs.
+
+### 3. Install Claude Code hooks
+
+This configures all Claude Code sessions to stream events to the bridge:
+
+```bash
+./skill/setup-hooks.sh
+```
+
+If you run it before the bridge has ever started, it falls back to port 7860
+and warns loudly — re-run it once the bridge is up so the hook URLs match the
+bridge's actual port.
+
+To remove hooks later: `./skill/setup-hooks.sh --remove`
 
 ### 4. Build the iOS + watchOS apps
 

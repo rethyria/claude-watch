@@ -4,7 +4,7 @@
 
 | Module | Responsibility |
 |---|---|
-| `server.js` | Entry point: routes table, `/v1` prefix normalization, Host-header check (via `host-guard.js`, runs pre-auth on every route), process-level crash guards (`unhandledRejection`/`uncaughtException` log instead of dying), port binding, pairing banner, Bonjour advertisement, graceful shutdown. |
+| `server.js` | Entry point: routes table, `/v1` prefix normalization, Host-header check (via `host-guard.js`, runs pre-auth on every route), process-level crash guards (`unhandledRejection`/`uncaughtException` log instead of dying), port binding, port-file publication (writes the actual bound port to `~/.claude-watch/port` on startup — the single source of truth read by `setup-hooks.sh` and the `codex-watch` wrapper; removed on graceful shutdown only if it still records this instance's port), pairing banner, Bonjour advertisement, graceful shutdown. |
 | `util.js` | Shared low-level helpers: `log()`, `jsonResponse()`, `readBody()` (1 MiB body cap: oversized requests get a 413 and a destroyed socket before auth runs — the cap constant lives here because this module must not import `config.js`), `isLoopbackAddress()`. No bridge-module imports. |
 | `host-guard.js` | `createHostAllowList()`: the Host-header allow-list behind the DNS-rebinding guard — static entries (localhost/loopback, `10.0.2.2`, operator additions) plus the machine's interface addresses, re-snapshotted on a Host miss (throttled) so an IP change mid-run self-heals. No bridge-module imports. |
 | `config.js` | Configuration constants, `BRIDGE_ID`, and `claude`/`codex` binary discovery (logs at startup). |
