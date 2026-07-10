@@ -10,6 +10,7 @@ import {
   CODEX_BIN,
   CLI_CWD,
   PROTOCOL_VERSION,
+  SPAWN_INJECT_TIMEOUT_MS,
   availableAgentsList,
 } from "./config.js";
 import {
@@ -33,6 +34,8 @@ import {
   findMostRecentActiveSession,
   findMostRecentRunningSession,
   getSessionsSnapshot,
+  waitForFirstPtyOutput,
+  writeToSessionStdin,
 } from "./sessions.js";
 import { pendingPermissions, pendingPermissionBodies, resolvePermission } from "./permissions.js";
 import { codexSyntheticPermissions, resolveCodexSyntheticPermission } from "./codex.js";
@@ -96,6 +99,58 @@ export async function handlePair(req, res) {
     availableAgents: availableAgentsList(),
     sessions: getSessionsSnapshot(),
   });
+}
+
+// Run a dictated prompt for a session the bridge owns no PTY for (external
+// hook-created sessions): invoke the agent CLI headlessly in the session's
+// cwd and stream its output as pty-output events. Used both when the client
+// names such a session explicitly and when the no-session-id fallback selects
+// one — the session's own id attributes the output, never the request's.
+function runHeadlessPrompt(res, targetSession, command) {
+  const targetSessionId = targetSession.id;
+  const promptText = command.replace(/\n$/, "").trim();
+  if (!promptText) {
+    return jsonResponse(res, 400, { error: "Empty command" });
+  }
+
+  const bin = targetSession.agent === "codex" ? CODEX_BIN : CLAUDE_BIN;
+  if (!bin) {
+    return jsonResponse(res, 500, { error: `No binary found for ${targetSession.agent}` });
+  }
+
+  const args = targetSession.agent === "codex"
+    ? ["exec", promptText]
+    : ["-p", promptText, "--continue"];
+
+  log("info", `Running ${targetSession.agent} prompt in ${targetSession.cwd}: "${promptText.slice(0, 80)}"`);
+
+  targetSession.state = "running";
+  pushSseEvent("session", { state: "running", agent: targetSession.agent, cwd: targetSession.cwd, folderName: targetSession.folderName }, targetSessionId);
+
+  const proc = childSpawn(bin, args, {
+    cwd: targetSession.cwd,
+    env: { ...process.env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  proc.stdout.on("data", (data) => {
+    const text = data.toString().trim();
+    if (text) pushSseEvent("pty-output", { text }, targetSessionId);
+  });
+  proc.stderr.on("data", (data) => {
+    const text = data.toString().trim();
+    if (text && !text.includes("tcgetattr")) {
+      pushSseEvent("pty-output", { text }, targetSessionId);
+    }
+  });
+  proc.on("close", (exitCode) => {
+    log("info", `Prompt process exited (code ${exitCode}) for session ${targetSessionId}`);
+  });
+  proc.on("error", (err) => {
+    log("error", `Prompt process error for session ${targetSessionId}: ${err.message}`);
+  });
+
+  return jsonResponse(res, 200, { ok: true, sessionId: targetSessionId, agent: targetSession.agent, prompt: true });
 }
 
 export async function handleCommand(req, res) {
@@ -197,53 +252,6 @@ export async function handleCommand(req, res) {
 
     if (sessionId) {
       targetSession = sessions.get(sessionId);
-      if (targetSession && !targetSession.ptyProcess) {
-        // Session exists but has no PTY (external hook-created session).
-        // Run the prompt via CLI in non-interactive mode — hooks will forward output.
-        const promptText = command.replace(/\n$/, "").trim();
-        if (!promptText) {
-          return jsonResponse(res, 400, { error: "Empty command" });
-        }
-
-        const bin = targetSession.agent === "codex" ? CODEX_BIN : CLAUDE_BIN;
-        if (!bin) {
-          return jsonResponse(res, 500, { error: `No binary found for ${targetSession.agent}` });
-        }
-
-        const args = targetSession.agent === "codex"
-          ? ["exec", promptText]
-          : ["-p", promptText, "--continue"];
-
-        log("info", `Running ${targetSession.agent} prompt in ${targetSession.cwd}: "${promptText.slice(0, 80)}"`);
-
-        targetSession.state = "running";
-        pushSseEvent("session", { state: "running", agent: targetSession.agent, cwd: targetSession.cwd, folderName: targetSession.folderName }, sessionId);
-
-        const proc = childSpawn(bin, args, {
-          cwd: targetSession.cwd,
-          env: { ...process.env },
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-
-        proc.stdout.on("data", (data) => {
-          const text = data.toString().trim();
-          if (text) pushSseEvent("pty-output", { text }, sessionId);
-        });
-        proc.stderr.on("data", (data) => {
-          const text = data.toString().trim();
-          if (text && !text.includes("tcgetattr")) {
-            pushSseEvent("pty-output", { text }, sessionId);
-          }
-        });
-        proc.on("close", (exitCode) => {
-          log("info", `Prompt process exited (code ${exitCode}) for session ${sessionId}`);
-        });
-        proc.on("error", (err) => {
-          log("error", `Prompt process error for session ${sessionId}: ${err.message}`);
-        });
-
-        return jsonResponse(res, 200, { ok: true, sessionId, agent: targetSession.agent, prompt: true });
-      }
       if (!targetSession) {
         return jsonResponse(res, 404, { error: "No session with that ID" });
       }
@@ -252,8 +260,19 @@ export async function handleCommand(req, res) {
       targetSession = findMostRecentActiveSession() || findMostRecentRunningSession();
     }
 
+    // Session exists but has no PTY (external hook-created session) — whether
+    // it was named explicitly or selected by the no-session-id fallback. Run
+    // the prompt via CLI in non-interactive mode; hooks will forward output.
+    // (Injecting into targetSession.ptyProcess here would dereference null.)
+    if (targetSession && !targetSession.ptyProcess) {
+      return runHeadlessPrompt(res, targetSession, command);
+    }
+
     if (!targetSession) {
-      // Auto-spawn a new session
+      // Auto-spawn a new session. Inject the command only once the PTY has
+      // produced its first output (the agent is actually up); a blind timed
+      // write silently dropped the command when the PTY died or wasn't ready,
+      // while the client still saw ok:true.
       const requestedAgent = agent || "claude";
       const cwd = body.cwd || CLI_CWD || process.env.HOME || process.cwd();
       const newId = spawnSession(requestedAgent, cwd);
@@ -261,22 +280,43 @@ export async function handleCommand(req, res) {
         return jsonResponse(res, 500, { error: `Failed to spawn ${requestedAgent}` });
       }
       const slot = sessions.get(newId);
-      setTimeout(() => {
-        if (slot && slot.ptyProcess) {
-          slot.ptyProcess.stdin.write(command);
-          log("info", `Command injected into new ${requestedAgent} session ${newId} (${command.length} chars)`);
-        }
-      }, 500);
+      const ready = await waitForFirstPtyOutput(slot, SPAWN_INJECT_TIMEOUT_MS);
+      if (!ready) {
+        // The failure must not be sticky: a never-ready session left
+        // registered as "running" with a live PTY would be selected by the
+        // no-session-id fallback on the next command, which then blind-writes
+        // into it and returns ok:true — silently swallowing the command (the
+        // exact bug the ready gate exists to prevent) and wedging auto-spawn
+        // until the zombie process dies on its own.
+        killSession(newId);
+        log("error", `Session ${newId} (${requestedAgent}) produced no output; command not injected`);
+        return jsonResponse(res, 500, {
+          error: `Spawned ${requestedAgent} session but it produced no output; command not injected`,
+          sessionId: newId,
+          agent: requestedAgent,
+          spawned: true,
+        });
+      }
+      if (!writeToSessionStdin(slot, command)) {
+        // Same sticky-failure hazard as the !ready path above.
+        killSession(newId);
+        log("error", `Session ${newId} (${requestedAgent}) PTY unavailable; command not injected`);
+        return jsonResponse(res, 500, {
+          error: `Spawned ${requestedAgent} session but its PTY is not writable; command not injected`,
+          sessionId: newId,
+          agent: requestedAgent,
+          spawned: true,
+        });
+      }
+      log("info", `Command injected into new ${requestedAgent} session ${newId} (${command.length} chars)`);
       return jsonResponse(res, 200, { ok: true, sessionId: newId, agent: requestedAgent, spawned: true });
     }
 
-    try {
-      targetSession.ptyProcess.stdin.write(command);
-      log("info", `Command injected into session ${targetSession.id} (${command.length} chars)`);
-      return jsonResponse(res, 200, { ok: true, sessionId: targetSession.id, agent: targetSession.agent });
-    } catch (err) {
-      return jsonResponse(res, 500, { error: err.message });
+    if (!writeToSessionStdin(targetSession, command)) {
+      return jsonResponse(res, 500, { error: `Session ${targetSession.id} PTY is not writable; command not injected` });
     }
+    log("info", `Command injected into session ${targetSession.id} (${command.length} chars)`);
+    return jsonResponse(res, 200, { ok: true, sessionId: targetSession.id, agent: targetSession.agent });
   }
 
   return jsonResponse(res, 400, { error: "Missing 'command', 'spawn', 'kill', or 'permissionId'+'decision'" });

@@ -54,7 +54,12 @@ function fakeCodexSession(sessions, id, writes) {
     folderName: "codex-unit",
     state: "running",
     createdAt: Date.now(),
-    ptyProcess: { stdin: { write: (data) => writes.push(data) } },
+    // Shaped like a live ChildProcess: writeToSessionStdin's liveness guard
+    // checks writable/destroyed/exitCode before writing.
+    ptyProcess: {
+      stdin: { write: (data) => writes.push(data), writable: true, destroyed: false },
+      exitCode: null,
+    },
   });
 }
 

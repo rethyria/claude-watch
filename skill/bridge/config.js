@@ -22,13 +22,17 @@ function findBinary(name, candidates) {
   return null;
 }
 
-export const CLAUDE_BIN = findBinary("claude", [
+// CLAUDE_WATCH_CLAUDE_BIN / CLAUDE_WATCH_CODEX_BIN are test-only overrides:
+// they point the bridge at stub agent binaries so the suite can exercise
+// spawn/injection paths deterministically. Production deployments must never
+// set them; unset falls back to normal discovery.
+export const CLAUDE_BIN = process.env.CLAUDE_WATCH_CLAUDE_BIN || findBinary("claude", [
   `${os.homedir()}/.local/bin/claude`,
   "/usr/local/bin/claude",
   "/opt/homebrew/bin/claude",
 ]);
 
-export const CODEX_BIN = findBinary("codex", [
+export const CODEX_BIN = process.env.CLAUDE_WATCH_CODEX_BIN || findBinary("codex", [
   `${os.homedir()}/.local/bin/codex`,
   "/usr/local/bin/codex",
   "/opt/homebrew/bin/codex",
@@ -82,7 +86,11 @@ export const CREDENTIALS_DIR =
 export const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "credentials.json");
 
 export const PORT_RANGE_START = 7860;
-export const PORT_RANGE_END = 7869;
+// The production range is fixed (installed hooks and clients probe it), but
+// the test suite runs bridges from many concurrent test-runner processes and
+// ten ports are not enough headroom. Overridable via
+// CLAUDE_WATCH_PORT_RANGE_END (test-only).
+export const PORT_RANGE_END = testOverridable("CLAUDE_WATCH_PORT_RANGE_END", 7869);
 export const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_MAX_ATTEMPTS = 5;
@@ -161,6 +169,15 @@ export const SESSION_PRUNE_INTERVAL_MS = testOverridable(
 // hook-created slot is evicted (ended ones first).
 export const MAX_EXTERNAL_SESSIONS = 32;
 
+// Auto-spawned command injection waits for the new PTY's first output (the
+// ready signal) before writing the command, bounded by this timeout. A blind
+// timer used to fire the write at 500 ms whether or not the agent was up,
+// silently dropping the command when it wasn't. Overridable via
+// CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS (test-only).
+export const SPAWN_INJECT_TIMEOUT_MS = testOverridable(
+  "CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS",
+  15_000,
+);
 export const CODEX_SESSION_SCAN_INTERVAL_MS = 1_500;
 export const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 export const CODEX_SESSION_SCAN_LIMIT = 25;

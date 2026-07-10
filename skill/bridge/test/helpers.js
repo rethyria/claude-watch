@@ -20,7 +20,11 @@ const BRIDGE_DIR = fileURLToPath(new URL("..", import.meta.url));
 //     the CLAUDE_WATCH_* test-only overrides from config.js, or
 //     { CLAUDE_WATCH_TEST_FAULT: "unhandledRejection" }.
 export async function startBridge(t, { credentialsDir, args = [], env: extraEnv } = {}) {
-  const env = { ...process.env, ...extraEnv };
+  // Widen the port range for tests: the runner executes test files in
+  // parallel processes, each spawning bridges, and the production range of
+  // ten ports gets exhausted (bridge exits 1, flaky suite). Callers can still
+  // override with their own value.
+  const env = { CLAUDE_WATCH_PORT_RANGE_END: "7929", ...process.env, ...extraEnv };
   let ownedTempDir = null;
   if (credentialsDir === undefined) {
     ownedTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-test-creds-"));

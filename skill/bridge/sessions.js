@@ -65,15 +65,78 @@ export function spawnInteractiveProcess(agent, cwd, args = []) {
   });
 }
 
+// --- First-output readiness -------------------------------------------------
+// A freshly spawned agent PTY produces no output until the agent has actually
+// started; injecting a command before then (or after the PTY died) silently
+// drops it. bindPtyProcess marks the slot on its first stdout/stderr byte;
+// waitForFirstPtyOutput resolves true then, or false when the PTY ends first
+// or the bounded wait expires.
+
+function flushReadyWaiters(slot, ready) {
+  if (ready) slot.firstOutputSeen = true;
+  const waiters = slot.readyWaiters;
+  if (!waiters || waiters.length === 0) return;
+  slot.readyWaiters = [];
+  for (const waiter of waiters) waiter(ready);
+}
+
+export function waitForFirstPtyOutput(slot, timeoutMs) {
+  if (!slot) return Promise.resolve(false);
+  if (slot.firstOutputSeen) return Promise.resolve(true);
+  if (!slot.ptyProcess) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const waiters = slot.readyWaiters ?? (slot.readyWaiters = []);
+    const timer = setTimeout(() => {
+      const idx = waiters.indexOf(waiter);
+      if (idx !== -1) waiters.splice(idx, 1);
+      resolve(false);
+    }, timeoutMs);
+    timer.unref();
+    const waiter = (ready) => {
+      clearTimeout(timer);
+      resolve(ready);
+    };
+    waiters.push(waiter);
+  });
+}
+
+// Guarded stdin write: returns false instead of throwing (or blind-firing)
+// when the PTY is gone, its stdin is unusable, or the write itself throws.
+// The async-failure case — a write racing child death that surfaces as a
+// later EPIPE 'error' event — is absorbed by the stdin error listener that
+// bindPtyProcess attaches.
+export function writeToSessionStdin(slot, data) {
+  const proc = slot?.ptyProcess;
+  if (!proc || !proc.stdin || proc.stdin.destroyed || !proc.stdin.writable || proc.exitCode !== null) {
+    return false;
+  }
+  try {
+    proc.stdin.write(data);
+    return true;
+  } catch (err) {
+    log("error", `Session ${slot.id} stdin write failed: ${err.message}`);
+    return false;
+  }
+}
+
 export function bindPtyProcess(slot, proc) {
   const sessionId = slot.id;
   slot.ptyProcess = proc;
+  slot.firstOutputSeen = slot.firstOutputSeen || false;
+
+  // Without an 'error' listener, a stdin write racing child death raises the
+  // resulting EPIPE as an uncaught exception and can take the bridge down.
+  proc.stdin?.on("error", (err) => {
+    log("warn", `Session ${sessionId} stdin write error: ${err.code || err.message}`);
+  });
 
   proc.stdout.on("data", (data) => {
+    if (!slot.firstOutputSeen) flushReadyWaiters(slot, true);
     pushSseEvent("pty-output", { text: data.toString() }, sessionId);
   });
 
   proc.stderr.on("data", (data) => {
+    if (!slot.firstOutputSeen) flushReadyWaiters(slot, true);
     pushSseEvent("pty-output", { text: data.toString() }, sessionId);
   });
 
@@ -82,6 +145,7 @@ export function bindPtyProcess(slot, proc) {
     slot.state = "ended";
     slot.endedAt = Date.now();
     slot.ptyProcess = null;
+    flushReadyWaiters(slot, false);
     runSessionCleanupHooks(sessionId, "pty-closed");
     pushSseEvent("session", { state: "ended", exitCode, signal, agent: slot.agent, folderName: slot.folderName }, sessionId);
   });
@@ -91,6 +155,7 @@ export function bindPtyProcess(slot, proc) {
     slot.state = "ended";
     slot.endedAt = Date.now();
     slot.ptyProcess = null;
+    flushReadyWaiters(slot, false);
     runSessionCleanupHooks(sessionId, "pty-error");
     pushSseEvent("session", { state: "ended", error: err.message, agent: slot.agent, folderName: slot.folderName }, sessionId);
   });
