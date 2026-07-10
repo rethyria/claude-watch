@@ -77,12 +77,31 @@ test("hook endpoints reject non-loopback sources; loopback keeps working", { tim
   }
 
   // The attack: a LAN peer POSTs to the hook surface. Connecting to our own
-  // LAN address gives the bridge a genuine non-loopback remoteAddress.
-  for (const path of ["/hooks/tool-output", "/hooks/permission", "/hooks/stop"]) {
+  // LAN address gives the bridge a genuine non-loopback remoteAddress. Every
+  // hook route must 403 — a single unguarded handler (regression: /hooks/
+  // notification shipped without requireLoopback) lets a LAN peer push
+  // spoofed events to the trusted watch UI. A spoofed Host header must not
+  // help either: requireLoopback keys off remoteAddress, not Host.
+  const hookPaths = [
+    "/hooks/tool-output",
+    "/hooks/permission",
+    "/hooks/stop",
+    "/hooks/session-end",
+    "/hooks/task-complete",
+    "/hooks/error",
+    "/hooks/notification",
+    "/v1/hooks/notification",
+  ];
+  for (const path of hookPaths) {
     const res = await fetch(`http://${lanIP}:${port}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /" } }),
+      headers: { "Content-Type": "application/json", Host: "localhost" },
+      body: JSON.stringify({
+        tool_name: "Bash",
+        tool_input: { command: "rm -rf /" },
+        notification_type: "permission_prompt",
+        message: "spoofed from the LAN",
+      }),
       signal: AbortSignal.timeout(10_000),
     });
     assert.equal(res.status, 403, `${path} must reject a non-loopback source`);
@@ -102,6 +121,10 @@ test("hook endpoints reject non-loopback sources; loopback keeps working", { tim
   assert.ok(
     !sse.events.some((e) => e.event === "permission-request"),
     "spoofed permission prompt must never reach the watch",
+  );
+  assert.ok(
+    !sse.events.some((e) => e.event === "notification"),
+    "spoofed notification must never reach the watch",
   );
 });
 
