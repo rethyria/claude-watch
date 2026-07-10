@@ -3,11 +3,27 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const BRIDGE_DIR = fileURLToPath(new URL("..", import.meta.url));
+
+// Send raw bytes over a plain TCP socket and return the raw response text.
+// fetch/http.request refuse to emit framing some tests need — a malformed
+// Host header (crash-resilience) or an absolute-form request target
+// (protocol-version) — so those are written on the wire by hand.
+export function rawRequest(port, payload, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1", () => socket.write(payload));
+    let data = "";
+    socket.setTimeout(timeoutMs, () => { socket.destroy(); resolve(data); });
+    socket.on("data", (chunk) => { data += chunk.toString(); });
+    socket.on("close", () => resolve(data));
+    socket.on("error", reject);
+  });
+}
 
 // Options:
 //   credentialsDir — directory for the bridge's persisted credentials.

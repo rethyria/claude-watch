@@ -118,6 +118,14 @@ async function onRequest(req, res) {
     return;
   }
 
+  // Handlers that behave differently per surface (legacy vs /v1 — see
+  // handlePair/handleStatus) must classify from the SAME pathname the router
+  // routes on. Re-deriving it from the raw req.url string in a handler is a
+  // bug: an absolute-form request target ("POST http://host:port/v1/pair",
+  // legal HTTP/1.1) routes as /v1 here but has no "/v1..." string prefix,
+  // which once let such a request skip the /v1 min-version gate entirely.
+  req.pathname = url.pathname;
+
   // DNS-rebinding guard: a well-formed but unknown Host header (an absent
   // header parses to the literal hostname "undefined" and is likewise
   // rejected) never reaches a handler. See host-guard.js.

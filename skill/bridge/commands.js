@@ -69,8 +69,11 @@ export async function handlePair(req, res) {
 
   // Which surface this pair request arrived on. Legacy /pair is frozen; the
   // /v1 divergences below (min-version gate, proto in the response, no
-  // top-level sessionId alias) apply only to /v1/pair.
-  const surface = req.url === "/v1/pair" || req.url?.startsWith("/v1/pair?") ? "v1" : "legacy";
+  // top-level sessionId alias) apply only to /v1/pair. Classified from the
+  // router-parsed pathname (server.js), NOT the raw req.url string: an
+  // absolute-form request target would otherwise route as /v1 but classify
+  // as legacy, bypassing the min-version gate.
+  const surface = req.pathname === "/v1/pair" ? "v1" : "legacy";
 
   // /v1 min-version gate (PROTOCOL.md "Versioning"): the request must declare
   // the client's protocol version, and it must meet the bridge's minimum.
@@ -389,9 +392,10 @@ export function handleStatus(req, res) {
   if (!requireAuth(req)) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
-  // /v1 disambiguation (mirrors handlePair): no top-level `sessionId` alias —
-  // that name means an agent-session slot id everywhere on /v1.
-  const isV1 = req.url === "/v1/status" || req.url?.startsWith("/v1/status?");
+  // /v1 disambiguation (mirrors handlePair, including the router-parsed
+  // pathname rationale): no top-level `sessionId` alias — that name means an
+  // agent-session slot id everywhere on /v1.
+  const isV1 = req.pathname === "/v1/status";
   const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
     bridgeId: BRIDGE_ID,
