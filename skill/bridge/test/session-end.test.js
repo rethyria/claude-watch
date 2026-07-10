@@ -21,12 +21,12 @@ async function pairAndConnect(t, bridge) {
   const sse = connectSse(bridge.port, pair.body.token);
   t.after(() => sse.close());
   assert.equal(await sse.statusCode(), 200);
-  return sse;
+  return { sse, token: pair.body.token };
 }
 
 test("two external sessions in the same cwd stay separate; events route by session_id", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
-  const sse = await pairAndConnect(t, bridge);
+  const { sse } = await pairAndConnect(t, bridge);
   const cwd = "/tmp/e2e-same-cwd";
 
   // Two Claude Code instances in the same directory post hook events.
@@ -62,7 +62,7 @@ test("SessionEnd ends the external session and it is later pruned; Stop does not
       CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS: "100",
     },
   });
-  const sse = await pairAndConnect(t, bridge);
+  const { sse, token } = await pairAndConnect(t, bridge);
   const cwd = "/tmp/e2e-session-end";
 
   // A hook event auto-creates the external session.
@@ -77,7 +77,7 @@ test("SessionEnd ends the external session and it is later pruned; Stop does not
   const stopped = await request(bridge.port, "POST", "/hooks/stop", { body: { session_id: "cc-ender", cwd } });
   assert.equal(stopped.status, 200);
   await sse.waitFor((e) => e.event === "stop" && e.parsed?.session_id === "cc-ender");
-  let status = await request(bridge.port, "GET", "/status");
+  let status = await request(bridge.port, "GET", "/status", { token });
   let snapshot = status.body.sessions.find((s) => s.id === sessionId);
   assert.equal(snapshot?.state, "running", "Stop must not end the session");
   assert.equal(
@@ -91,7 +91,7 @@ test("SessionEnd ends the external session and it is later pruned; Stop does not
     body: { session_id: "cc-somebody-else", cwd: "/tmp/e2e-elsewhere" },
   });
   assert.equal(unrelated.status, 200);
-  status = await request(bridge.port, "GET", "/status");
+  status = await request(bridge.port, "GET", "/status", { token });
   assert.equal(status.body.sessions.find((s) => s.id === sessionId)?.state, "running");
   assert.equal(
     status.body.sessions.some((s) => s.cwd === "/tmp/e2e-elsewhere"),
@@ -110,7 +110,7 @@ test("SessionEnd ends the external session and it is later pruned; Stop does not
   // ...and the pruner deletes it after the (shortened) grace period.
   const deadline = Date.now() + 10_000;
   for (;;) {
-    status = await request(bridge.port, "GET", "/status");
+    status = await request(bridge.port, "GET", "/status", { token });
     if (!status.body.sessions.some((s) => s.id === sessionId)) break;
     assert.ok(Date.now() < deadline, `ended external session was never pruned: ${JSON.stringify(status.body.sessions)}`);
     await new Promise((r) => setTimeout(r, 100).unref());
