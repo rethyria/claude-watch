@@ -227,9 +227,14 @@ async function startServer() {
   // Pairing lockout at startup: with persisted device credentials the bridge
   // comes back paired, so the pairing surface starts locked unless the
   // operator explicitly asked to pair a new device via --allow-pairing.
-  const storedCredentials = loadTokenStore();
+  // A store file that EXISTS but is unreadable/invalid also locks (fail
+  // closed): corrupting the file must not grant a fresh pairing window.
+  const { count: storedCredentials, corrupt: storeCorrupt } = loadTokenStore();
   let code = null;
-  if (storedCredentials > 0 && !ALLOW_PAIRING_FLAG) {
+  if (storeCorrupt && !ALLOW_PAIRING_FLAG) {
+    lockPairing();
+    log("error", "Pairing LOCKED: credentials store exists but is unreadable/invalid (fail closed). Restore or delete the file, then restart — or restart with --allow-pairing to pair a new device.");
+  } else if (storedCredentials > 0 && !ALLOW_PAIRING_FLAG) {
     lockPairing();
     log("info", `Pairing locked (${storedCredentials} device(s) paired). Send SIGUSR1 or restart with --allow-pairing to pair a new device.`);
   } else {

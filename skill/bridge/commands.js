@@ -20,6 +20,7 @@ import {
   isPairingOpen,
   lockPairing,
   isPairingCodeExpired,
+  isPairingReopened,
   matchesPairingCode,
   clearPairingCode,
   getBridgeState,
@@ -74,6 +75,16 @@ export async function handlePair(req, res) {
   }
 
   if (isPairingCodeExpired()) {
+    // A window opened by an operator reopen (SIGUSR1) relocks on expiry: a
+    // reopened-and-forgotten surface must not keep minting fresh codes
+    // forever. The initial startup window keeps regenerating (first-run UX
+    // unchanged) — an operator watching the console can still grab a fresh
+    // code by attempting a pair.
+    if (isPairingReopened()) {
+      lockPairing();
+      log("warn", "Reopened pairing window expired without a successful pair — pairing locked again");
+      return jsonResponse(res, 403, { error: "Pairing code expired and pairing is locked again. Send SIGUSR1 on the bridge to reopen." });
+    }
     generatePairingCode();
     return jsonResponse(res, 401, { error: "Pairing code expired. A new code has been generated." });
   }

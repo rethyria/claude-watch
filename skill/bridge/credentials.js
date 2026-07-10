@@ -19,6 +19,13 @@ import {
 let tokens = [];
 let storeLoaded = false;
 
+// Fail-closed corruption latch: true when credentials.json EXISTS but is
+// unreadable or yields zero valid entries. A store that exists but cannot be
+// trusted must lock the pairing surface (an attacker who can corrupt — not
+// even read — the file must not be able to force a fresh pairing window);
+// only a genuinely absent file keeps the historical fail-open first-run UX.
+let storeCorrupt = false;
+
 let pairingCode = null;
 let pairingCodeExpiresAt = 0;
 
@@ -26,6 +33,14 @@ let pairingCodeExpiresAt = 0;
 // surface locks until an explicit operator action (SIGUSR1 or --allow-pairing
 // at startup) reopens it. server.js decides the initial state at startup.
 let pairingOpen = true;
+
+// Reopen latch: true while the current pairing window was opened by a runtime
+// operator reopen (SIGUSR1) rather than the initial startup window. When a
+// reopened window's code expires without a successful pair, the surface
+// relocks instead of regenerating — an operator who reopens and forgets must
+// not leave the surface open forever. The initial startup window keeps the
+// regenerate-on-expiry behavior (first-run UX unchanged).
+let pairingReopened = false;
 
 // Bridge-level state: "idle" | "connected"
 let bridgeState = "idle";
@@ -45,19 +60,35 @@ function isValidEntry(entry) {
 function ensureStoreLoaded() {
   if (storeLoaded) return;
   storeLoaded = true;
+
+  let raw;
   try {
-    const raw = fs.readFileSync(CREDENTIALS_FILE, "utf-8");
-    const parsed = JSON.parse(raw);
-    const entries = Array.isArray(parsed?.tokens) ? parsed.tokens : [];
-    tokens = entries.filter(isValidEntry);
-    if (tokens.length > 0) {
-      bridgeState = "connected";
-      log("info", `Loaded ${tokens.length} paired device credential(s) from ${CREDENTIALS_FILE}`);
-    }
+    raw = fs.readFileSync(CREDENTIALS_FILE, "utf-8");
   } catch (err) {
-    if (err.code !== "ENOENT") {
-      log("warn", `Could not read credentials file ${CREDENTIALS_FILE}: ${err.message}`);
+    if (err.code === "ENOENT") return; // no store: historical fail-open first run
+    storeCorrupt = true;
+    log("error", `SECURITY: credentials file ${CREDENTIALS_FILE} exists but could not be read (${err.message}). Failing closed: pairing will be LOCKED. Restore or delete the file, or restart with --allow-pairing to pair a new device.`);
+    return;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    const entries = Array.isArray(parsed?.tokens) ? parsed.tokens : null;
+    if (entries === null) throw new Error("missing 'tokens' array");
+    const valid = entries.filter(isValidEntry);
+    if (valid.length === 0) {
+      throw new Error(entries.length > 0 ? "no valid token entries" : "empty token list");
     }
+    if (valid.length < entries.length) {
+      log("warn", `Ignoring ${entries.length - valid.length} invalid entr(ies) in ${CREDENTIALS_FILE}`);
+    }
+    tokens = valid;
+    bridgeState = "connected";
+    log("info", `Loaded ${tokens.length} paired device credential(s) from ${CREDENTIALS_FILE}`);
+  } catch (err) {
+    tokens = [];
+    storeCorrupt = true;
+    log("error", `SECURITY: credentials file ${CREDENTIALS_FILE} exists but is invalid (${err.message}). Failing closed: pairing will be LOCKED. Restore or delete the file, or restart with --allow-pairing to pair a new device.`);
   }
 }
 
@@ -74,10 +105,12 @@ function persistStore(nextTokens) {
 }
 
 // Explicit startup load so server.js can decide the initial pairing lockout
-// state (and log) before binding. Returns the number of stored credentials.
+// state (and log) before binding. Returns the number of stored credentials
+// and whether an existing store file had to be rejected as corrupt (which
+// must also lock the pairing surface — see storeCorrupt above).
 export function loadTokenStore() {
   ensureStoreLoaded();
-  return tokens.length;
+  return { count: tokens.length, corrupt: storeCorrupt };
 }
 
 export function hasTokens() {
@@ -137,14 +170,22 @@ export function isPairingOpen() {
 
 export function lockPairing() {
   pairingOpen = false;
+  pairingReopened = false;
   clearPairingCode();
 }
 
-// Operator reopen (SIGUSR1 / --allow-pairing): unlock the pairing surface and
-// mint a fresh code with the normal TTL, logged exactly like startup.
+// Operator reopen (SIGUSR1): unlock the pairing surface and mint a fresh code
+// with the normal TTL, logged exactly like startup. Marks the window as a
+// reopen so that code expiry relocks instead of regenerating (see
+// pairingReopened above).
 export function reopenPairing() {
   pairingOpen = true;
+  pairingReopened = true;
   return generatePairingCode();
+}
+
+export function isPairingReopened() {
+  return pairingReopened;
 }
 
 export function isPairingCodeExpired() {
