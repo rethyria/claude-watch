@@ -10,7 +10,21 @@ import {
 } from "./config.js";
 import { requireAuth } from "./credentials.js";
 
+// SSE event ids must be monotonic ACROSS bridge restarts, not merely within
+// one process: per-device tokens survive a restart (credentials.json), and
+// clients persist their Last-Event-ID replay cursor, so a restarted bridge
+// whose counter reset to 0 replayed nothing (`entry.id > lastId` never true
+// until the counter caught up) AND skipped the fresh-client terminal backlog
+// (a Last-Event-ID header was present) — the entire post-restart backlog was
+// silently dropped, with no 401 to force re-onboarding. Pinning ids to
+// wall-clock milliseconds (bumped by at least 1 per event, so bursts within
+// one millisecond stay strictly increasing) keeps every post-restart id above
+// every pre-restart id without persisting a cursor to disk on every event.
 let sseEventId = 0;
+function nextSseEventId() {
+  sseEventId = Math.max(sseEventId + 1, Date.now());
+  return sseEventId;
+}
 /** @type {Array<{id: number, event: string, data: string}>} */
 export const sseBuffer = [];
 /** @type {Set<import("node:http").ServerResponse>} */
@@ -30,8 +44,6 @@ export function registerSseSyncProvider(provider) {
 }
 
 export function pushSseEvent(event, data, sessionId = null) {
-  sseEventId++;
-
   // Inject sessionId into the data payload
   let payload;
   if (typeof data === "string") {
@@ -47,7 +59,7 @@ export function pushSseEvent(event, data, sessionId = null) {
     payload.sessionId = sessionId;
   }
 
-  const entry = { id: sseEventId, event, data: JSON.stringify(payload) };
+  const entry = { id: nextSseEventId(), event, data: JSON.stringify(payload) };
 
   // Ring buffer
   if (sseBuffer.length >= SSE_BUFFER_SIZE) {
@@ -151,7 +163,7 @@ export function handleEvents(req, res) {
   // disconnected watch reconnects.
   for (const provider of sseSyncProviders) {
     for (const { event, data } of provider()) {
-      const syncEntry = formatSseMessage({ id: sseEventId++, event, data });
+      const syncEntry = formatSseMessage({ id: nextSseEventId(), event, data });
       try { res.write(syncEntry); } catch { /* ignore */ }
     }
   }
