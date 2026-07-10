@@ -16,3 +16,10 @@
 *.swp
 *.swo
 *~
+
+# Android / Gradle (wear/)
+**/.gradle/
+**/.kotlin/
+wear/local.properties
+**/captures/
+**/*.apk.idsig
