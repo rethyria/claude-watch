@@ -152,9 +152,10 @@ test("unknown Host header is rejected; localhost, bound LAN IP, and 10.0.2.2 pas
   const noHost = await hostRequest(port, "/ping", null);
   assert.equal(noHost.status, 400);
 
-  // The allow-list: localhost (any case), plain loopback, and the Android
-  // emulator's host alias 10.0.2.2 all pass.
-  for (const host of [`localhost:${port}`, `LOCALHOST:${port}`, `127.0.0.1:${port}`, `10.0.2.2:${port}`]) {
+  // The allow-list: localhost (any case), plain loopback, the Android
+  // emulator's host alias 10.0.2.2, and the Wear client's pinned synthetic
+  // hostname bridge.internal all pass.
+  for (const host of [`localhost:${port}`, `LOCALHOST:${port}`, `127.0.0.1:${port}`, `10.0.2.2:${port}`, `bridge.internal:${port}`]) {
     const res = await hostRequest(port, "/ping", host);
     assert.equal(res.status, 200, `Host ${host} must be allowed`);
   }

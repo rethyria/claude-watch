@@ -5,8 +5,14 @@
 // isn't one of the addresses this machine is actually reachable as closes
 // that hole. The allow-list: localhost/loopback, every local interface
 // address, 10.0.2.2 (the Android emulator's alias for its host — required so
-// emulator-based Wear clients can reach a bridge on the same machine), and
-// any operator additions via CLAUDE_WATCH_ALLOWED_HOSTS / --allow-host=.
+// emulator-based Wear clients can reach a bridge on the same machine),
+// bridge.internal (the Wear client's pinned synthetic hostname: it sends all
+// bridge traffic to http://bridge.internal:<port> with DNS pinned to the
+// paired IP, so Android's network security config can scope cleartext to
+// exactly that name — .internal is ICANN-reserved for private use and never
+// resolves on public DNS, so an attacker's page cannot present it as an
+// origin), and any operator additions via CLAUDE_WATCH_ALLOWED_HOSTS /
+// --allow-host=.
 //
 // The interface-derived half of the list must NOT be a startup snapshot: a
 // laptop that switches networks or gets a new DHCP lease while the bridge
@@ -33,7 +39,7 @@ export function createHostAllowList({
   refreshMinIntervalMs = 1000,
   now = Date.now,
 } = {}) {
-  const staticHosts = new Set(["localhost", "127.0.0.1", "::1", "10.0.2.2"]);
+  const staticHosts = new Set(["localhost", "127.0.0.1", "::1", "10.0.2.2", "bridge.internal"]);
   for (const host of extraHosts) {
     staticHosts.add(normalizeHost(host));
   }
