@@ -4,8 +4,17 @@ A standalone Wear OS debug app that speaks the bridge's `/v1` protocol end to
 end: pair with the code from the bridge banner, stream events over SSE, send a
 session-id-scoped command, and answer blocking permission hooks.
 
-- **Module layout:** single `:app` module for the skeleton; later issues split
-  out `:shared` (and eventually `:phone`).
+- **Module layout:** `:app` (Compose UI + OkHttp networking) and `:shared`
+  (pure-JVM protocol layer; eventually `:phone` joins).
+- **`:shared`:** typed kotlinx.serialization wire models for the `/v1` SSE
+  contract — tolerant to unknown fields, strict on the contract (a missing
+  `permissionId` or a behavior-less permission option fails loudly) — plus the
+  pure `BridgeEventReducer` that folds frames into per-session activity/elapsed
+  state. Sessions are pruned on `session` `ended`; `lastEventId` is committed
+  only after a frame fully parses AND applies, so rejected frames are replayed
+  on reconnect. Tested against the fixture corpus in
+  `shared/src/test/resources/fixtures/bridge-events.ndjson` (bridge ring-buffer
+  entry format: `{id, event, data}` per line).
 - **Stack:** Kotlin, Compose for Wear OS, OkHttp + okhttp-sse (readTimeout 0,
   `Last-Event-ID` reconnect replay).
 - **Standalone:** `com.google.android.wearable.standalone=true` — no phone

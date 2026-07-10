@@ -5,6 +5,7 @@ import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.util.concurrent.TimeUnit
@@ -46,6 +47,19 @@ class BridgeViewModelTest {
         throw AssertionError("timed out; last status: ${viewModel.state.value.status}")
     }
 
+    private fun awaitState(
+        timeoutMs: Long = 30_000,
+        predicate: (BridgeViewModel.UiState) -> Boolean,
+    ): BridgeViewModel.UiState {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val state = viewModel.state.value
+            if (predicate(state)) return state
+            Thread.sleep(10)
+        }
+        throw AssertionError("timed out; last state: ${viewModel.state.value}")
+    }
+
     @Test
     fun firstConnectRequestsFullReplayAndPairedWaitsForStreamOpen() {
         server.enqueue(
@@ -82,5 +96,54 @@ class BridgeViewModelTest {
         )
 
         awaitStatus { it == "paired, stream open" }
+    }
+
+    /**
+     * The reducer wiring: real /v1 event frames arriving over SSE surface as
+     * typed state — session id from the `session` event, log lines rendered
+     * from typed models (not raw "$type $data" appending), pending permission
+     * from `permission-request`, and lastEventId committed per applied frame.
+     */
+    @Test
+    fun sseEventsFlowThroughTheSharedReducerIntoUiState() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append("""data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj","sessionId":"s-1"}""")
+            append("\n\n")
+            append("id: 2\nevent: tool-output\n")
+            append("""data: {"tool_name":"Read","tool_input":{"file_path":"/tmp/proj/README.md"},"tool_output":"marker-xyz","cwd":"/tmp/proj","source":"claude","sessionId":"s-1"}""")
+            append("\n\n")
+            append("id: 3\nevent: permission-request\n")
+            append(
+                """data: {"permissionId":"perm-1","tool_name":"Bash","tool_input":{"command":"ls"},""" +
+                    """"options":[{"behavior":"allow","label":"Yes","description":"Allow this once"},""" +
+                    """{"behavior":"deny","label":"No","description":"Deny this request"}],"sessionId":"s-1"}""",
+            )
+            append("\n\n")
+            // Keep the stream open while the assertions below run.
+            append(":pad\n\n".repeat(40))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+
+        val state = awaitState { it.pendingPermission != null }
+        assertEquals("perm-1", state.pendingPermission?.permissionId)
+        assertEquals("Bash", state.pendingPermission?.toolName)
+        assertEquals("s-1", state.sessionId)
+        assertEquals("3", state.bridge.lastEventId)
+        assertEquals("s-1", state.bridge.currentSessionId)
+        val log = state.eventLog.joinToString("\n")
+        assertTrue("typed tool-output line must carry the payload text: $log", log.contains("marker-xyz"))
+        assertTrue("session line must be rendered from the typed model: $log", log.contains("session running proj"))
     }
 }

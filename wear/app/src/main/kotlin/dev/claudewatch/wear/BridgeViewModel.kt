@@ -2,6 +2,9 @@ package dev.claudewatch.wear
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import dev.claudewatch.shared.protocol.SseFrame
+import dev.claudewatch.shared.state.BridgeEventReducer
+import dev.claudewatch.shared.state.BridgeState
 import dev.claudewatch.wear.net.BridgeClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -12,15 +15,17 @@ import kotlinx.coroutines.launch
 import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
-import org.json.JSONObject
 
 /**
  * State for the single debug screen: pair with the bridge, stream SSE events,
  * send a session-scoped command, answer permission prompts.
+ *
+ * All event handling goes through :shared's pure [BridgeEventReducer]: this
+ * class only does I/O and mirrors the reduced [BridgeState] into [UiState].
  */
 class BridgeViewModel : ViewModel() {
 
-    data class PendingPermission(val permissionId: String, val toolName: String, val raw: String)
+    data class PendingPermission(val permissionId: String, val toolName: String)
 
     data class UiState(
         val status: String = "unpaired",
@@ -30,6 +35,7 @@ class BridgeViewModel : ViewModel() {
         val commandResult: String? = null,
         val decisionResult: String? = null,
         val eventLog: List<String> = emptyList(),
+        val bridge: BridgeState = BridgeState(),
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -38,15 +44,6 @@ class BridgeViewModel : ViewModel() {
     private var client: BridgeClient? = null
     private var token: String? = null
     private var eventSource: EventSource? = null
-
-    // Seeded to "0" so the very first /v1/events connect sends Last-Event-ID: 0
-    // and the bridge replays its whole ring buffer. Without it, an event pushed
-    // between pair success and the stream actually opening is lost forever: the
-    // first connect carries no Last-Event-ID (no replay), and the connect-time
-    // sync event reuses the newest buffered id, so a later reconnect's
-    // "id > lastId" replay can never recover the miss.
-    @Volatile
-    private var lastEventId: String? = "0"
 
     @Volatile
     private var stopped = false
@@ -121,11 +118,11 @@ class BridgeViewModel : ViewModel() {
             try {
                 val message = if (behavior == "deny") "Denied from the watch" else null
                 val result = currentClient.answerPermission(currentToken, pending.permissionId, behavior, message)
-                _state.update {
-                    it.copy(
-                        decisionResult = "decision:${result.status}",
-                        pendingPermission = if (result.ok) null else it.pendingPermission,
-                    )
+                _state.update { ui ->
+                    val next = ui.copy(decisionResult = "decision:${result.status}")
+                    // The bridge only pushes permission-cleared for prompts
+                    // resolved elsewhere; one we answered is removed locally.
+                    if (result.ok) next.withBridge(next.bridge.resolvePermission(pending.permissionId)) else next
                 }
             } catch (e: Exception) {
                 _state.update { it.copy(decisionResult = "decision:error ${e.message}") }
@@ -139,8 +136,7 @@ class BridgeViewModel : ViewModel() {
         }
 
         override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-            if (!id.isNullOrEmpty()) lastEventId = id
-            handleEvent(type ?: "message", data)
+            handleEvent(id, type ?: "message", data)
         }
 
         override fun onClosed(eventSource: EventSource) {
@@ -156,6 +152,15 @@ class BridgeViewModel : ViewModel() {
         val currentClient = client ?: return
         val currentToken = token ?: return
         eventSource?.cancel()
+        // Before any event has parsed AND applied, connect with "0" so the
+        // bridge replays its whole ring buffer. Without it, an event pushed
+        // between pair success and the stream actually opening is lost
+        // forever: a connect with no Last-Event-ID gets no replay, and the
+        // connect-time sync event reuses the newest buffered id, so a later
+        // reconnect's "id > lastId" replay can never recover the miss. The
+        // reducer commits lastEventId only after a successful parse+apply, so
+        // a rejected frame is also replayed on reconnect instead of skipped.
+        val lastEventId = _state.value.bridge.lastEventId ?: "0"
         eventSource = currentClient.openEvents(currentToken, lastEventId, sseListener)
     }
 
@@ -168,34 +173,29 @@ class BridgeViewModel : ViewModel() {
         }
     }
 
-    private fun handleEvent(type: String, data: String) {
-        var sessionId: String? = null
-        var pending: PendingPermission? = null
-        try {
-            val parsed = JSONObject(data)
-            when (type) {
-                "session" ->
-                    if (parsed.optString("state") == "running") {
-                        sessionId = parsed.optString("sessionId").takeUnless { it.isEmpty() }
-                    }
-                "permission-request" -> {
-                    val permissionId = parsed.optString("permissionId")
-                    if (permissionId.isNotEmpty()) {
-                        pending = PendingPermission(permissionId, parsed.optString("tool_name"), data)
-                    }
-                }
+    private fun handleEvent(id: String?, type: String, data: String) {
+        val frame = SseFrame(id, type, data)
+        _state.update { ui ->
+            when (val result = BridgeEventReducer.reduce(ui.bridge, frame, System.currentTimeMillis())) {
+                is BridgeEventReducer.Applied -> ui.withBridge(result.state)
+                // Contract violation: drop the frame, leave state (incl.
+                // lastEventId) untouched so a reconnect replays it.
+                is BridgeEventReducer.Rejected -> ui
             }
-        } catch (_: Exception) {
-            // Non-JSON payload: still rendered raw below.
-        }
-        _state.update {
-            it.copy(
-                eventLog = (it.eventLog + "$type $data").takeLast(EVENT_LOG_LIMIT),
-                sessionId = sessionId ?: it.sessionId,
-                pendingPermission = pending ?: it.pendingPermission,
-            )
         }
     }
+
+    /** Mirror the reduced bridge state into the flat fields the screen renders. */
+    private fun UiState.withBridge(bridge: BridgeState): UiState = copy(
+        bridge = bridge,
+        eventLog = bridge.eventLog,
+        // Sticky fallback: keep targeting the last known session when none is
+        // currently running (matches the skeleton's previous behavior).
+        sessionId = bridge.currentSessionId ?: sessionId,
+        pendingPermission = bridge.pendingPermissions.firstOrNull()?.let {
+            PendingPermission(it.permissionId, it.toolName ?: "?")
+        },
+    )
 
     override fun onCleared() {
         stopped = true
@@ -203,7 +203,6 @@ class BridgeViewModel : ViewModel() {
     }
 
     private companion object {
-        const val EVENT_LOG_LIMIT = 30
         const val RECONNECT_DELAY_MS = 2_000L
     }
 }
