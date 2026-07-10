@@ -23,6 +23,15 @@ import java.util.concurrent.TimeUnit
  */
 class BridgeClient(hostIp: String, port: Int) {
 
+    companion object {
+        /**
+         * The bridge protocol version this client implements (PROTOCOL.md
+         * "Versioning"). Sent with every pair request; the bridge's /ping and
+         * Bonjour TXT `v` advertise the server side of the same number.
+         */
+        const val PROTO_VERSION = 3
+    }
+
     private val address: InetAddress = PrivateHosts.parsePrivateIpv4(hostIp)
         ?: throw IllegalArgumentException(
             "Bridge host must be a private (RFC1918) or loopback IPv4 address, got: $hostIp",
@@ -51,9 +60,19 @@ class BridgeClient(hostIp: String, port: Int) {
         val ok: Boolean get() = status in 200..299
     }
 
-    /** POST /v1/pair — exchanges the banner pairing code for a bearer token. */
+    /**
+     * POST /v1/pair — exchanges the banner pairing code for a bearer token.
+     * Declares [PROTO_VERSION]: the bridge refuses (426) a /v1 pair request
+     * whose protocol version is missing or below its minimum, so an outdated
+     * app fails with a clear "update the app" error instead of pairing into
+     * undetectable wire mismatches (see skill/bridge/PROTOCOL.md).
+     */
     fun pair(code: String, deviceName: String): ApiResult =
-        postJson("/v1/pair", token = null, JSONObject().put("code", code).put("deviceName", deviceName))
+        postJson(
+            "/v1/pair",
+            token = null,
+            JSONObject().put("code", code).put("deviceName", deviceName).put("proto", PROTO_VERSION),
+        )
 
     /**
      * POST /v1/command — session-id-scoped text command. The explicit session

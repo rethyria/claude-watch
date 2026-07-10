@@ -1,5 +1,11 @@
 # Bridge Architecture
 
+The wire contract for watch clients (endpoints, SSE event catalog, permission
+semantics, versioning rules) lives in [PROTOCOL.md](PROTOCOL.md); its
+executable form is the recorded fixture corpus in `test/fixtures/`, replayed
+by `test/protocol-fixtures.test.js`. This document describes the bridge's
+internals and policies.
+
 ## Module map
 
 | Module | Responsibility |
@@ -29,7 +35,8 @@ Dependency direction is strictly downward (`server.js` → handlers → sessions
 - **Hook endpoints (`/hooks/*`) are unauthenticated but loopback-only**: installed hook scripts call them from this machine on the legacy unprefixed paths, so any non-loopback `remoteAddress` gets a 403 before the body is read (a LAN peer must not be able to spoof permission prompts or terminal output onto the trusted watch UI). Permission state (`permissions.js`) is shared across surfaces: a decision posted on either surface must resolve a hook received on either surface.
 - **Auth contract:** tokens are per-device and are drawn from a single shared store — a token issued by either `/pair` or `/v1/pair` is valid on both surfaces, and legacy-issued tokens keep working everywhere. `requireAuth()` accepts a bearer token if its SHA-256 hash matches any stored credential (constant-time compare on the hash buffers). Pairing a new device never invalidates an existing one.
 - **`GET /status` requires the bearer token** (a deliberate hardening exception to the legacy freeze: its session snapshot enumerates every project's absolute path, which must not be readable by arbitrary LAN peers on a 0.0.0.0 bind). Unauthenticated 401s with `{"error": "Unauthorized"}`.
-- **`GET /ping` is the unauthenticated discovery probe.** Watch clients verifying a candidate bridge address — the localhost fallback, manual IP entry, or the Android emulator's `10.0.2.2` host alias — probe `GET /ping` instead of `/status`. It returns exactly `{proto, bridgeId, machineName}` (`proto` matches the Bonjour `txt.version`) and nothing richer; everything else stays behind auth.
+- **`GET /ping` is the unauthenticated discovery probe.** Watch clients verifying a candidate bridge address — the localhost fallback, manual IP entry, or the Android emulator's `10.0.2.2` host alias — probe `GET /ping` instead of `/status`. It returns exactly `{proto, bridgeId, machineName}` (`proto` is the numeric protocol version, the same number the Bonjour `txt.v` advertises — see PROTOCOL.md "Versioning") and nothing richer; everything else stays behind auth.
+- **Protocol versioning gate on `/v1/pair` only:** a `/v1` pair request must declare an integer `proto >= MIN_SUPPORTED_CLIENT_PROTO` or it is refused with `426 {error, proto, minProto}` before the pairing code is considered (no token minted, code not burned). The `/v1/pair` success response carries `proto` and — unlike the frozen legacy response — no top-level `sessionId` alias: on `/v1`, `bridgeId` is the only bridge-instance identity and `sessionId` always means an agent-session slot id (`handleStatus` drops the alias on `/v1/status` the same way). Legacy `/pair` performs no version check, forever.
 - **Host-header allow-list (DNS-rebinding guard):** every request is checked pre-auth against an allow-list — `localhost`, loopback addresses, every local interface address (the bound LAN IP), and `10.0.2.2` (the Android emulator's alias for its host; without it emulator-based Wear clients could not reach a bridge on the same machine). The interface-derived entries are **not** a startup snapshot: a Host miss re-snapshots `os.networkInterfaces()` (throttled to once per second) and re-checks, so a bridge whose LAN IP changes mid-run (DHCP re-lease, network switch) keeps serving without a restart. Operators extend the static entries via `CLAUDE_WATCH_ALLOWED_HOSTS` (comma-separated env var) or repeatable `--allow-host=<host>` flags. Unknown or missing Host → `403 {"error": "Forbidden Host header"}`; a syntactically invalid Host keeps its frozen 400.
 
 ## Permission decision semantics (/v1 contract)

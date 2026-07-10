@@ -10,6 +10,7 @@ import {
   CODEX_BIN,
   CLI_CWD,
   PROTOCOL_VERSION,
+  MIN_SUPPORTED_CLIENT_PROTO,
   SPAWN_INJECT_TIMEOUT_MS,
   availableAgentsList,
 } from "./config.js";
@@ -66,6 +67,32 @@ export async function handlePair(req, res) {
     return jsonResponse(res, 400, { error: "Missing 'code' field" });
   }
 
+  // Which surface this pair request arrived on. Legacy /pair is frozen; the
+  // /v1 divergences below (min-version gate, proto in the response, no
+  // top-level sessionId alias) apply only to /v1/pair.
+  const surface = req.url === "/v1/pair" || req.url?.startsWith("/v1/pair?") ? "v1" : "legacy";
+
+  // /v1 min-version gate (PROTOCOL.md "Versioning"): the request must declare
+  // the client's protocol version, and it must meet the bridge's minimum.
+  // Checked before the lockout/code paths so an outdated app always learns it
+  // must update — a clear, machine-readable refusal instead of the
+  // undetectable old-app/new-bridge wire mismatches versioning exists to
+  // prevent. The legacy /pair surface stays frozen and never checks proto.
+  if (surface === "v1") {
+    const clientProto = body.proto;
+    if (!Number.isInteger(clientProto) || clientProto < MIN_SUPPORTED_CLIENT_PROTO) {
+      const declared = Number.isInteger(clientProto)
+        ? `client protocol version ${clientProto}`
+        : "a client that does not declare its protocol version ('proto' missing from the pair request)";
+      log("warn", `Pairing refused on /v1: ${declared} is below the minimum supported version ${MIN_SUPPORTED_CLIENT_PROTO}`);
+      return jsonResponse(res, 426, {
+        error: `Unsupported protocol version: this bridge requires proto >= ${MIN_SUPPORTED_CLIENT_PROTO}, but the pair request declared ${Number.isInteger(clientProto) ? clientProto : "none"}. Update the watch app.`,
+        proto: PROTOCOL_VERSION,
+        minProto: MIN_SUPPORTED_CLIENT_PROTO,
+      });
+    }
+  }
+
   // Pairing lockout: after any successful pair the surface locks (on both
   // /pair and /v1/pair) until the operator reopens it via SIGUSR1 or a
   // restart with --allow-pairing. Before per-device tokens, a re-pair here
@@ -95,7 +122,6 @@ export async function handlePair(req, res) {
 
   // Success: mint a per-device token (only its SHA-256 hash is persisted) and
   // lock the pairing surface until the next explicit reopen.
-  const surface = req.url === "/v1/pair" || req.url?.startsWith("/v1/pair?") ? "v1" : "legacy";
   const token = issueToken({ deviceName, surface });
   clearPairingCode();
   lockPairing();
@@ -103,13 +129,22 @@ export async function handlePair(req, res) {
   pushSseEvent("session", { state: "connected" });
 
   log("info", "Watch paired successfully");
-  return jsonResponse(res, 200, {
+  const response = {
     token,
     bridgeId: BRIDGE_ID,
-    sessionId: BRIDGE_ID, // backward compat
     availableAgents: availableAgentsList(),
     sessions: getSessionsSnapshot(),
-  });
+  };
+  if (surface === "v1") {
+    // /v1 disambiguation: the top level identifies the BRIDGE INSTANCE as
+    // `bridgeId` only — `sessionId` is reserved for agent-session slot ids
+    // (SSE payloads, sessions[].id). The response also echoes the bridge's
+    // protocol version so the client can pin what it paired against.
+    response.proto = PROTOCOL_VERSION;
+  } else {
+    response.sessionId = BRIDGE_ID; // frozen legacy alias for bridgeId
+  }
+  return jsonResponse(res, 200, response);
 }
 
 // Run a dictated prompt for a session the bridge owns no PTY for (external
@@ -354,10 +389,13 @@ export function handleStatus(req, res) {
   if (!requireAuth(req)) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
+  // /v1 disambiguation (mirrors handlePair): no top-level `sessionId` alias —
+  // that name means an agent-session slot id everywhere on /v1.
+  const isV1 = req.url === "/v1/status" || req.url?.startsWith("/v1/status?");
   const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
     bridgeId: BRIDGE_ID,
-    sessionId: BRIDGE_ID, // backward compat
+    ...(isV1 ? {} : { sessionId: BRIDGE_ID }), // frozen legacy alias
     state: getBridgeState(),
     availableAgents: availableAgentsList(),
     sessions: getSessionsSnapshot(),

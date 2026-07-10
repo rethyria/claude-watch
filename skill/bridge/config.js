@@ -59,9 +59,33 @@ const cliArgs = process.argv.slice(2);
 export const ALLOW_PAIRING_FLAG = cliArgs.includes("--allow-pairing");
 export const CLI_CWD = cliArgs.find((a) => !a.startsWith("--")) || null;
 
-// Protocol version advertised over Bonjour (txt.version) and returned by the
-// unauthenticated GET /ping discovery endpoint.
-export const PROTOCOL_VERSION = "2";
+// Protocol version of the /v1 surface (see PROTOCOL.md for the versioning
+// rules). Advertised over Bonjour (txt.v, plus the legacy txt.version key),
+// returned by the unauthenticated GET /ping discovery endpoint (proto), and
+// echoed in the /v1/pair success response (proto). A JSON number everywhere;
+// TXT values are strings by mDNS nature.
+export const PROTOCOL_VERSION = 3;
+
+// Minimum client protocol version accepted at POST /v1/pair. A /v1 pair
+// request whose `proto` is missing or below this is refused with 426 before
+// the pairing code is even considered — an outdated app must fail with a
+// clear "update the app" error, never an undetectable wire mismatch. The
+// legacy /pair surface is frozen and performs no version check.
+export const MIN_SUPPORTED_CLIENT_PROTO = 3;
+
+// The Bonjour TXT record advertised on _claude-watch._tcp. `v` is the
+// canonical protocol-version key (PROTOCOL.md); `version` and `sessionId`
+// are frozen legacy aliases. Built here (next to the constants it exposes)
+// so unit tests can assert the advertised record without spawning mDNS.
+export function bonjourTxtRecord() {
+  return {
+    v: String(PROTOCOL_VERSION),
+    version: String(PROTOCOL_VERSION), // backward compat
+    bridgeId: BRIDGE_ID,
+    sessionId: BRIDGE_ID, // backward compat
+    machineName: os.hostname(),
+  };
+}
 
 // Extra Host-header allow-list entries beyond the built-ins (localhost,
 // loopback, this machine's interface addresses, and 10.0.2.2 — the Android

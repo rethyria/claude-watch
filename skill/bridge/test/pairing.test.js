@@ -56,7 +56,7 @@ test("two devices pair sequentially; both tokens work concurrently", { timeout: 
   // Operator reopens pairing via SIGUSR1; device B pairs over /v1
   const newCode = await reopenPairing(bridge);
   const pairB = await request(port, "POST", "/v1/pair", {
-    body: { code: newCode, deviceName: "watch-b" },
+    body: { code: newCode, deviceName: "watch-b", proto: 3 },
   });
   assert.equal(pairB.status, 200);
   const tokenB = pairB.body.token;
@@ -92,7 +92,7 @@ test("after a successful pair, both pairing surfaces 403 until reopen, then lock
   const legacy = await request(port, "POST", "/pair", { body: { code: pairingCode } });
   assert.equal(legacy.status, 403);
   assert.equal(legacy.body.error, LOCKOUT_ERROR);
-  const v1 = await request(port, "POST", "/v1/pair", { body: { code: pairingCode } });
+  const v1 = await request(port, "POST", "/v1/pair", { body: { code: pairingCode, proto: 3 } });
   assert.equal(v1.status, 403);
   assert.equal(v1.body.error, LOCKOUT_ERROR);
 
@@ -168,7 +168,7 @@ test("credentials.json: 0600 file in 0700 dir, hashed tokens only, per-device me
   });
   assert.equal(pairA.status, 200);
   const newCode = await reopenPairing(bridge);
-  const pairB = await request(bridge.port, "POST", "/v1/pair", { body: { code: newCode } });
+  const pairB = await request(bridge.port, "POST", "/v1/pair", { body: { code: newCode, proto: 3 } });
   assert.equal(pairB.status, 200);
 
   const file = path.join(credentialsDir, "credentials.json");

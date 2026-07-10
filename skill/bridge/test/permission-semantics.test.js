@@ -13,7 +13,7 @@ import { startBridge, request, connectSse } from "./helpers.js";
 async function pairedV1Client(t) {
   const bridge = await startBridge(t);
   const { port, pairingCode } = bridge;
-  const pair = await request(port, "POST", "/v1/pair", { body: { code: pairingCode } });
+  const pair = await request(port, "POST", "/v1/pair", { body: { code: pairingCode, proto: 3 } });
   assert.equal(pair.status, 200);
   const token = pair.body.token;
   const sse = connectSse(port, token, { path: "/v1/events" });

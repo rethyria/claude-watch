@@ -10,14 +10,13 @@ import { createHostAllowList } from "./host-guard.js";
 import {
   PORT_RANGE_START,
   PORT_RANGE_END,
-  BRIDGE_ID,
   CLAUDE_BIN,
   CODEX_BIN,
   ALLOW_PAIRING_FLAG,
-  PROTOCOL_VERSION,
   EXTRA_ALLOWED_HOSTS,
   CREDENTIALS_DIR,
   PORT_FILE,
+  bonjourTxtRecord,
 } from "./config.js";
 import {
   generatePairingCode,
@@ -259,12 +258,9 @@ async function startServer() {
     type: "claude-watch",
     protocol: "tcp",
     port: boundPort,
-    txt: {
-      version: PROTOCOL_VERSION,
-      bridgeId: BRIDGE_ID,
-      sessionId: BRIDGE_ID, // backward compat
-      machineName: os.hostname(),
-    },
+    // txt.v carries the protocol version (PROTOCOL.md "Versioning");
+    // txt.version/txt.sessionId are frozen legacy aliases.
+    txt: bonjourTxtRecord(),
   });
 
   log("info", `Bonjour advertising _claude-watch._tcp on port ${boundPort}`);

@@ -124,7 +124,7 @@ test("/status requires the bearer token; /ping answers unauthenticated with iden
   const ping = await request(port, "GET", "/ping");
   assert.equal(ping.status, 200);
   assert.deepEqual(Object.keys(ping.body).sort(), ["bridgeId", "machineName", "proto"]);
-  assert.equal(ping.body.proto, "2");
+  assert.equal(ping.body.proto, 3, "proto is the numeric protocol version (PROTOCOL.md)");
   assert.equal(ping.body.machineName, os.hostname());
   assert.match(ping.body.bridgeId, /^[0-9a-f-]{36}$/);
 
