@@ -22,6 +22,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
@@ -50,7 +51,11 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun DebugScreen(viewModel: BridgeViewModel = viewModel()) {
+fun DebugScreen(
+    viewModel: BridgeViewModel = viewModel(
+        factory = BridgeViewModel.factory(LocalContext.current.applicationContext),
+    ),
+) {
     val state by viewModel.state.collectAsState()
 
     var host by remember { mutableStateOf("10.0.2.2") }
@@ -78,12 +83,25 @@ fun DebugScreen(viewModel: BridgeViewModel = viewModel()) {
             color = Color.Gray,
             modifier = Modifier.testTag("sessionId"),
         )
+        // Re-onboarding explanation: shown only when the token was
+        // definitively rejected (401) or the bridge's protocol is too old.
+        state.repairExplanation?.let {
+            Text(
+                it,
+                fontSize = 10.sp,
+                color = Color(0xFFFF8080),
+                modifier = Modifier.testTag("repairExplanation"),
+            )
+        }
 
         Spacer(Modifier.height(6.dp))
         LabeledField("host", host, "host") { host = it }
         LabeledField("port", port, "port") { port = it }
         LabeledField("code", code, "code") { code = it }
         DebugChip("Pair", "pairButton") { viewModel.pair(host, port, code) }
+        if (state.paired) {
+            DebugChip("Unpair", "unpairButton") { viewModel.unpair() }
+        }
 
         Spacer(Modifier.height(6.dp))
         LabeledField("command", command, "commandInput") { command = it }

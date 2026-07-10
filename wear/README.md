@@ -6,8 +6,8 @@ session-id-scoped command, and answer blocking permission hooks.
 
 - **Module layout:** single `:app` module for the skeleton; later issues split
   out `:shared` (and eventually `:phone`).
-- **Stack:** Kotlin, Compose for Wear OS, OkHttp + okhttp-sse (readTimeout 0,
-  `Last-Event-ID` reconnect replay).
+- **Stack:** Kotlin, Compose for Wear OS, OkHttp + okhttp-sse
+  (`Last-Event-ID` reconnect replay, 25 s heartbeat read timeout), DataStore.
 - **Standalone:** `com.google.android.wearable.standalone=true` — no phone
   relay.
 
@@ -27,6 +27,53 @@ ranges, the RFC1918-only scope is enforced in two cooperating layers:
    never gets a socket.
 
 TLS is a separate, deferred issue.
+
+## Connection lifecycle
+
+`ConnectionEngine` owns the whole lifecycle and the derived connection state
+(`Stopped / Pairing / Connecting / Connected / Reconnecting / AuthExpired /
+ProtoMismatch`); the UI only renders it. Every design point below is pinned to
+a confirmed bug in the iOS/watchOS clients this port replaces:
+
+- **Reconnect backoff:** exponential 1 s → 30 s with jitter (`BackoffPolicy`),
+  never a fixed-cadence hammer.
+- **Heartbeat watchdog:** the bridge writes a `:heartbeat` SSE comment every
+  10 s. okhttp-sse never surfaces comments, so the watchdog is the SSE
+  socket's 25 s read timeout, enforced by OkHttp's always-live scheduler
+  threads — never an app timer that can be parked on a run-loop-less thread.
+  Silence beyond the window fails the stream, which becomes a reconnect.
+- **Single-flight reconnect:** an epoch counter plus explicit teardown means
+  at most one `EventSource` exists at a time; stale callbacks are dropped and
+  nothing leaks a connection per retry.
+- **STOPPED is not a failure:** user disconnect/unpair cancels the engine,
+  clears credentials, and is never retried — zero further requests reach the
+  bridge, and no zombie reconnect after unpair.
+- **Credential retention:** transient network errors (timeouts, resets,
+  refusals, airplane mode, cold-start probe failures) NEVER wipe credentials —
+  they land in the retry loop. Only a definitive HTTP 401 wipes the pairing,
+  with an on-screen explanation asking the user to pair again.
+- **Expired prompts:** a 404 on a permission answer clears the dead
+  Allow/Deny card and shows "expired" instead of leaving a lying button.
+- **No polling fallback, ever:** a broken stream is shown as broken and
+  retried; it is never silently degraded to a one-way channel.
+- **Proto gate:** before pairing, the client checks the bridge's `proto`
+  (unauthenticated `GET /v1/ping`) against its minimum and explains a
+  mismatch instead of failing weirdly later.
+
+Restart-matrix note: with per-device tokens on the bridge, a bridge restart is
+a seamless resume (the token survives and the stream replays from the
+persisted `lastEventId`). Against an older bridge whose token store resets on
+restart, the same event is a definitive 401 → re-onboard.
+
+## Storage
+
+Credentials (token, host, port, bridgeId) and the SSE replay cursor
+(`lastEventId`) persist in a DataStore (`CredentialStore`, custom-`Serializer`
+single-object flavor) whose on-disk bytes are wholly AES/GCM-encrypted with a
+non-exportable Android Keystore key (`KeystoreTokenCipher`). `lastEventId`
+survives process death so a relaunch resumes the replay from where it
+stopped; a blob that fails to decrypt is treated as corruption and replaced
+with the unpaired default instead of crashing.
 
 ## Emulator networking recipe
 

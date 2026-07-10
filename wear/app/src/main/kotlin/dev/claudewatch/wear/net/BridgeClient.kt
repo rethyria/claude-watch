@@ -20,8 +20,19 @@ import java.util.concurrent.TimeUnit
  * All requests go to http://bridge.internal:<port> with the hostname's DNS
  * pinned to [hostIp], which must be an RFC1918/loopback IPv4 literal — see
  * [PrivateHosts] and res/xml/network_security_config.xml for why.
+ *
+ * [heartbeatTimeoutMs] is the SSE watchdog: the bridge writes a `:heartbeat`
+ * comment every 10 s, which okhttp-sse never surfaces to the listener, so the
+ * watchdog is the socket read timeout enforced by OkHttp's own always-live
+ * scheduler threads (never an app timer that can land on a dead run loop).
+ * More than 25 s of wire silence fails the stream, and the ConnectionEngine
+ * turns that failure into a reconnect.
  */
-class BridgeClient(hostIp: String, port: Int) {
+class BridgeClient(
+    hostIp: String,
+    port: Int,
+    heartbeatTimeoutMs: Long = DEFAULT_HEARTBEAT_TIMEOUT_MS,
+) {
 
     private val address: InetAddress = PrivateHosts.parsePrivateIpv4(hostIp)
         ?: throw IllegalArgumentException(
@@ -40,15 +51,26 @@ class BridgeClient(hostIp: String, port: Int) {
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    // The SSE stream is idle between events by design: readTimeout 0.
+    // The SSE stream is comment-heartbeated every 10 s by the bridge, so a
+    // finite read timeout IS the heartbeat watchdog (see class KDoc).
     private val sseHttp = http.newBuilder()
-        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .readTimeout(heartbeatTimeoutMs, TimeUnit.MILLISECONDS)
         .build()
 
     private val baseUrl = "http://${PrivateHosts.BRIDGE_URL_HOST}:$port"
 
     data class ApiResult(val status: Int, val body: JSONObject?) {
         val ok: Boolean get() = status in 200..299
+    }
+
+    /**
+     * GET /v1/ping — unauthenticated discovery/version probe. Returns the
+     * bridge's protocol version ("proto"), bridgeId and machineName; used for
+     * the client-side proto min-version gate before pairing.
+     */
+    fun ping(): ApiResult {
+        val request = Request.Builder().url("$baseUrl/v1/ping").build()
+        return execute(request)
     }
 
     /** POST /v1/pair — exchanges the banner pairing code for a bearer token. */
@@ -91,6 +113,10 @@ class BridgeClient(hostIp: String, port: Int) {
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .apply { if (token != null) header("Authorization", "Bearer $token") }
             .build()
+        return execute(request)
+    }
+
+    private fun execute(request: Request): ApiResult {
         http.newCall(request).execute().use { response ->
             val text = response.body?.string()
             val parsed = if (text.isNullOrBlank()) null else try {
@@ -100,5 +126,10 @@ class BridgeClient(hostIp: String, port: Int) {
             }
             return ApiResult(response.code, parsed)
         }
+    }
+
+    companion object {
+        /** Two missed 10 s bridge heartbeats plus slack. */
+        const val DEFAULT_HEARTBEAT_TIMEOUT_MS = 25_000L
     }
 }
