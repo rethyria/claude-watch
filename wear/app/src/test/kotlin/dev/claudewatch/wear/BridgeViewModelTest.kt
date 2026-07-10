@@ -1,7 +1,9 @@
 package dev.claudewatch.wear
 
+import dev.claudewatch.shared.terminal.TerminalLineType
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -233,6 +235,109 @@ class BridgeViewModelTest {
         assertTrue(
             "a 404-answered permission must leave bridge state entirely",
             state.bridge.pendingPermissions.isEmpty(),
+        )
+    }
+
+    /**
+     * Spawn and kill ride POST /v1/command with the bridge's `spawn` / `kill`
+     * body shapes (commands.js handleCommand); the results surface in
+     * [BridgeViewModel.UiState.sessionActionResult] and spawn retargets the
+     * command box at the fresh session. (The full round-trip against the real
+     * bridge — spawned page appears, killed page prunes — is the instrumented
+     * WalkingSkeletonTest.)
+     */
+    @Test
+    fun spawnAndKillGoOverV1CommandWithTheBridgeBodyShapes() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(16, 250, TimeUnit.MILLISECONDS)
+                .setBody(":connected\n\n" + ":pad\n\n".repeat(400)),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitStatus { it == "paired, stream open" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        server.enqueue(MockResponse().setBody("""{"ok":true,"sessionId":"s-new","agent":"claude"}"""))
+        viewModel.spawnSession("claude")
+        val spawnRequest = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no spawn request")
+        assertEquals("/v1/command", spawnRequest.path)
+        val spawnBody = JSONObject(spawnRequest.body.readUtf8())
+        assertEquals("claude", spawnBody.getString("spawn"))
+        val afterSpawn = awaitState { it.sessionActionResult == "spawn:200" }
+        assertEquals("s-new", afterSpawn.sessionId)
+
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.killSession("s-new")
+        val killRequest = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no kill request")
+        assertEquals("/v1/command", killRequest.path)
+        val killBody = JSONObject(killRequest.body.readUtf8())
+        assertTrue(killBody.getBoolean("kill"))
+        assertEquals("s-new", killBody.getString("sessionId"))
+        awaitState { it.sessionActionResult == "kill:200" }
+    }
+
+    /**
+     * The thinking cursor: sending a command echoes `> text` into the target
+     * session's terminal and raises `thinking` immediately (before the POST
+     * resolves); the session's next SSE output clears it and lands after the
+     * echo.
+     */
+    @Test
+    fun commandSendRaisesTheThinkingCursorAndTheNextOutputClearsIt() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        // The session announcement arrives promptly; the pty-output sits
+        // behind a large throttled pad so it lands seconds AFTER the command
+        // below is sent (generous margin: the host may be under load).
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append("""data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj","sessionId":"s-1"}""")
+            append("\n\n")
+            append(":pad\n\n".repeat(2000))
+            append("id: 2\nevent: pty-output\n")
+            append("""data: {"text":"hello from the agent\r\n","sessionId":"s-1"}""")
+            append("\n\n")
+            append(":tail\n\n".repeat(40))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(1024, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.sessionId == "s-1" }
+
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.sendCommand("say hello")
+
+        // The echo is synchronous: cursor up and `> command` in the terminal
+        // before any response (let alone output) has arrived.
+        val echoed = viewModel.state.value.bridge.sessions.getValue("s-1")
+        assertTrue("thinking cursor must raise on send", echoed.thinking)
+        val echoLine = echoed.terminal.items.last()
+        assertEquals("> say hello", echoLine.text)
+        assertEquals(TerminalLineType.COMMAND, echoLine.type)
+
+        // The delayed pty-output clears the cursor and lands after the echo.
+        val cleared = awaitState(timeoutMs = 60_000) {
+            it.bridge.sessions["s-1"]?.thinking == false
+        }
+        val terminal = cleared.bridge.sessions.getValue("s-1").terminal.items
+        assertEquals(
+            listOf("> say hello", "hello from the agent"),
+            terminal.takeLast(2).map { it.text },
         )
     }
 }

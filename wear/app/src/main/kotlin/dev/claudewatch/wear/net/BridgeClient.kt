@@ -75,6 +75,18 @@ class BridgeClient(hostIp: String, port: Int) {
         return postJson("/v1/command", token, JSONObject().put("permissionId", permissionId).put("decision", decision))
     }
 
+    /**
+     * POST /v1/command — spawn a fresh agent session ("claude" or "codex") in
+     * a bridge-owned PTY. The bridge answers `{ok, sessionId, agent}` and
+     * announces the session over SSE (`session` `running`).
+     */
+    fun spawnSession(token: String, agent: String): ApiResult =
+        postJson("/v1/command", token, JSONObject().put("spawn", agent))
+
+    /** POST /v1/command — kill a session; the bridge pushes `session` `ended` with `killed: true`. */
+    fun killSession(token: String, sessionId: String): ApiResult =
+        postJson("/v1/command", token, JSONObject().put("kill", true).put("sessionId", sessionId))
+
     /** GET /v1/events — opens the SSE stream, replaying from [lastEventId] when set. */
     fun openEvents(token: String, lastEventId: String?, listener: EventSourceListener): EventSource {
         val request = Request.Builder()

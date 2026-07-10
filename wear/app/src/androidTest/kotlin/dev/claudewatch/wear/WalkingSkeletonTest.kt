@@ -1,5 +1,6 @@
 package dev.claudewatch.wear
 
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -8,6 +9,8 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeLeft
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import okhttp3.MediaType.Companion.toMediaType
@@ -76,6 +79,13 @@ class WalkingSkeletonTest {
                 .fetchSemanticsNodes().isNotEmpty()
         }
     }
+
+    private fun textOf(tag: String): String =
+        compose.onNodeWithTag(tag).fetchSemanticsNode()
+            .config[SemanticsProperties.Text].joinToString("") { it.text }
+
+    private fun tagExists(tag: String): Boolean =
+        compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().isNotEmpty()
 
     @Test
     fun pairStreamCommandApprove() {
@@ -146,5 +156,38 @@ class WalkingSkeletonTest {
         } finally {
             executor.shutdownNow()
         }
+
+        // --- Spawn a session, page over to its live terminal, kill it ----
+        // The real bridge PTY-spawns the stubbed `claude` binary (see
+        // .github/scripts/wear-e2e.sh); its ready line arrives as pty-output.
+        val hookSessionText = textOf("sessionId")
+        compose.onNodeWithTag("spawnClaudeButton").performScrollTo().performClick()
+        waitForText("sessionActionResult", "spawn:200")
+        compose.waitUntil(30_000) { textOf("sessionId") != hookSessionText }
+        val spawnedId = textOf("sessionId").removePrefix("session:")
+
+        // Pager navigation over live sessions: swipe until the spawned
+        // session's terminal page is in front (control page + the
+        // hook-created session's page come first).
+        for (unused in 0 until 4) {
+            if (tagExists("terminal-$spawnedId")) break
+            compose.onNodeWithTag("sessionPager").performTouchInput { swipeLeft() }
+            compose.waitForIdle()
+        }
+        assertTrue(
+            "spawned session's terminal page must be reachable by swiping",
+            tagExists("terminal-$spawnedId"),
+        )
+        // The spawned PTY's stub output reached this page as terminal lines
+        // (only the fronted page is composed, so the match is page-local).
+        compose.waitUntil(60_000) {
+            compose.onAllNodes(hasText("stub-claude", substring = true))
+                .fetchSemanticsNodes().isNotEmpty()
+        }
+
+        // Kill it from its page header; the bridge answers the /v1/command
+        // kill and pushes `session ended killed:true`, which prunes the page.
+        compose.onNodeWithTag("kill-$spawnedId").performClick()
+        compose.waitUntil(30_000) { !tagExists("terminal-$spawnedId") }
     }
 }

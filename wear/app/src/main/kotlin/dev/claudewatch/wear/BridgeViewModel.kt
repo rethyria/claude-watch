@@ -34,6 +34,8 @@ class BridgeViewModel : ViewModel() {
         val pendingPermission: PendingPermission? = null,
         val commandResult: String? = null,
         val decisionResult: String? = null,
+        /** Last spawn/kill outcome, e.g. "spawn:200" / "kill:200". */
+        val sessionActionResult: String? = null,
         val eventLog: List<String> = emptyList(),
         val bridge: BridgeState = BridgeState(),
     )
@@ -99,12 +101,61 @@ class BridgeViewModel : ViewModel() {
             _state.update { it.copy(commandResult = "command:no-session") }
             return
         }
+        // Echo the command into the session's terminal and raise its thinking
+        // cursor BEFORE the network round-trip (synchronously, so the send is
+        // visible immediately); the cursor clears when the session's next
+        // output event reduces in.
+        _state.update { it.withBridge(it.bridge.echoCommand(sessionId, text)) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val result = currentClient.sendCommand(currentToken, sessionId, text)
                 _state.update { it.copy(commandResult = "command:${result.status}") }
             } catch (e: Exception) {
                 _state.update { it.copy(commandResult = "command:error ${e.message}") }
+            }
+        }
+    }
+
+    /** Spawn a fresh agent session ("claude" or "codex") in a bridge-owned PTY. */
+    fun spawnSession(agent: String) {
+        val currentClient = client
+        val currentToken = token
+        if (currentClient == null || currentToken == null) {
+            _state.update { it.copy(sessionActionResult = "spawn:not-paired") }
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = currentClient.spawnSession(currentToken, agent)
+                val spawnedId = result.body?.optString("sessionId").takeUnless { it.isNullOrEmpty() }
+                _state.update {
+                    it.copy(
+                        sessionActionResult = "spawn:${result.status}",
+                        // Target the new session right away; the SSE `running`
+                        // event makes it the current session moments later.
+                        sessionId = spawnedId ?: it.sessionId,
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update { it.copy(sessionActionResult = "spawn:error ${e.message}") }
+            }
+        }
+    }
+
+    /** Kill [sessionId]; the page disappears when the bridge's `ended` event prunes it. */
+    fun killSession(sessionId: String) {
+        val currentClient = client
+        val currentToken = token
+        if (currentClient == null || currentToken == null) {
+            _state.update { it.copy(sessionActionResult = "kill:not-paired") }
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = currentClient.killSession(currentToken, sessionId)
+                _state.update { it.copy(sessionActionResult = "kill:${result.status}") }
+            } catch (e: Exception) {
+                _state.update { it.copy(sessionActionResult = "kill:error ${e.message}") }
             }
         }
     }

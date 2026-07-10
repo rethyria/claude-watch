@@ -27,6 +27,10 @@ import dev.claudewatch.shared.protocol.StopEvent
 import dev.claudewatch.shared.protocol.TaskCompleteEvent
 import dev.claudewatch.shared.protocol.ToolOutputEvent
 import dev.claudewatch.shared.protocol.UnknownEvent
+import dev.claudewatch.shared.terminal.RingBuffer
+import dev.claudewatch.shared.terminal.TerminalLine
+import dev.claudewatch.shared.terminal.TerminalLineType
+import dev.claudewatch.shared.terminal.ToolOutputFormatter
 
 /** What a session is doing right now, from this client's point of view. */
 enum class SessionActivity { WORKING, IDLE }
@@ -35,6 +39,11 @@ enum class SessionActivity { WORKING, IDLE }
  * Per-session state. The elapsed clock is per session: [activeSinceMs] is the
  * wall time the session last became [SessionActivity.WORKING], and
  * [frozenElapsedMs] preserves the final elapsed span once it went idle.
+ *
+ * [terminal] is the session's human-readable terminal history (bounded ring;
+ * see [TERMINAL_BUFFER_LINES]) and [thinking] the blinking-cursor flag: set by
+ * a locally sent command ([BridgeState.echoCommand]) and cleared by the next
+ * output/turn-end event addressed to this session.
  */
 data class SessionState(
     val sessionId: String,
@@ -44,11 +53,18 @@ data class SessionState(
     val activity: SessionActivity = SessionActivity.WORKING,
     val activeSinceMs: Long? = null,
     val frozenElapsedMs: Long? = null,
+    val terminal: RingBuffer<TerminalLine> = RingBuffer(TERMINAL_BUFFER_LINES),
+    val thinking: Boolean = false,
 ) {
     /** Elapsed working time at [nowMs]: ticking while WORKING, frozen once idle. */
     fun elapsedMs(nowMs: Long): Long? =
         if (activity == SessionActivity.WORKING && activeSinceMs != null) nowMs - activeSinceMs
         else frozenElapsedMs
+
+    companion object {
+        /** Per-session history cap (matches the watchOS app's 200-line buffer). */
+        const val TERMINAL_BUFFER_LINES = 200
+    }
 }
 
 /**
@@ -76,6 +92,23 @@ data class BridgeState(
      */
     fun resolvePermission(permissionId: String): BridgeState =
         copy(pendingPermissions = pendingPermissions.filterNot { it.permissionId == permissionId })
+
+    /**
+     * Echo a locally sent command into [sessionId]'s terminal (`> text`) and
+     * raise its thinking cursor. Commands are a client action, not an SSE
+     * event, so this is the one state transition that does not come through
+     * the reducer; the cursor clears when the next output event for the
+     * session reduces in. Unknown/absent session: no-op.
+     */
+    fun echoCommand(sessionId: String?, text: String): BridgeState {
+        val session = sessionId?.let { sessions[it] } ?: return this
+        return copy(
+            sessions = sessions + (session.sessionId to session.copy(
+                terminal = session.terminal.append(TerminalLine("> $text", TerminalLineType.COMMAND)),
+                thinking = true,
+            )),
+        )
+    }
 }
 
 object BridgeEventReducer {
@@ -124,13 +157,39 @@ object BridgeEventReducer {
     private fun apply(state: BridgeState, event: BridgeEvent, nowMs: Long): BridgeState = when (event) {
         is SessionEvent -> applySession(state, event, nowMs)
         // Only the addressed session goes idle; an event with no/unknown
-        // sessionId changes nothing (never "all sessions").
-        is TaskCompleteEvent -> markIdle(state, event.sessionId, nowMs)
-        is StopEvent -> markIdle(state, event.sessionId, nowMs)
+        // sessionId changes nothing (never "all sessions"). A finished turn
+        // also lowers the thinking cursor — nothing more is coming.
+        is TaskCompleteEvent -> appendTerminal(
+            markIdle(state, event.sessionId, nowMs),
+            event.sessionId,
+            emptyList(),
+            clearThinking = true,
+        )
+        is StopEvent -> appendTerminal(
+            markIdle(state, event.sessionId, nowMs),
+            event.sessionId,
+            listOf(TerminalLine("— stopped —", TerminalLineType.SYSTEM)),
+            clearThinking = true,
+        )
         // Output is an activity signal: a session that went idle after a turn
-        // starts a fresh elapsed span when it produces output again.
-        is PtyOutputEvent -> markWorking(state, event.sessionId, nowMs)
-        is ToolOutputEvent -> markWorking(state, event.sessionId, nowMs)
+        // starts a fresh elapsed span when it produces output again. Output is
+        // also what feeds the terminal — and what clears a raised thinking
+        // cursor (a blank PTY keepalive frame does neither).
+        is PtyOutputEvent -> {
+            val lines = ToolOutputFormatter.formatPtyOutput(event.text)
+            appendTerminal(
+                markWorking(state, event.sessionId, nowMs),
+                event.sessionId,
+                lines,
+                clearThinking = lines.isNotEmpty(),
+            )
+        }
+        is ToolOutputEvent -> appendTerminal(
+            markWorking(state, event.sessionId, nowMs),
+            event.sessionId,
+            ToolOutputFormatter.format(event),
+            clearThinking = true,
+        )
         // Keyed replace: connect-time snapshots re-send pending prompts, and
         // that must not stack duplicates.
         is PermissionRequestEvent -> state.copy(
@@ -138,7 +197,37 @@ object BridgeEventReducer {
                 .filterNot { it.permissionId == event.permissionId } + event,
         )
         is PermissionClearedEvent -> state.resolvePermission(event.permissionId)
-        is NotificationEvent, is ErrorEvent, is UnknownEvent -> state
+        // A session-addressed bridge error surfaces in that terminal; global
+        // errors stay in the event log only.
+        is ErrorEvent -> appendTerminal(
+            state,
+            event.sessionId,
+            listOfNotNull(event.error?.let { TerminalLine(it.take(ToolOutputFormatter.MAX_LINE_CHARS), TerminalLineType.ERROR) }),
+            clearThinking = true,
+        )
+        is NotificationEvent, is UnknownEvent -> state
+    }
+
+    /**
+     * Append [lines] to the addressed session's terminal ring, optionally
+     * lowering its thinking cursor. Events without a known sessionId change
+     * nothing (there is no flat "all sessions" terminal to pollute).
+     */
+    private fun appendTerminal(
+        state: BridgeState,
+        sessionId: String?,
+        lines: List<TerminalLine>,
+        clearThinking: Boolean,
+    ): BridgeState {
+        val session = sessionId?.let { state.sessions[it] } ?: return state
+        val thinking = if (clearThinking) false else session.thinking
+        if (lines.isEmpty() && thinking == session.thinking) return state
+        return state.copy(
+            sessions = state.sessions + (session.sessionId to session.copy(
+                terminal = session.terminal.appendAll(lines),
+                thinking = thinking,
+            )),
+        )
     }
 
     private fun applySession(state: BridgeState, event: SessionEvent, nowMs: Long): BridgeState =
