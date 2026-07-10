@@ -217,6 +217,36 @@ test("a write interrupted mid-flight cannot corrupt settings.json", { timeout: 6
   assert.ok(installedHookUrls(home).includes("http://127.0.0.1:47874/hooks/permission"));
 });
 
+test("a hardened settings.json keeps its permissions across install and --remove", { timeout: 60_000 }, async (t) => {
+  // settings.json can carry secrets (env vars, apiKeyHelper config); a naive
+  // temp-file-and-rename rewrite would silently replace a user's chmod 600
+  // with the temp file's umask-default 0644.
+  const home = tempDir(t, "claude-watch-safety-home-");
+  writeSettings(home, { env: { SECRET_TOKEN: "hunter2" } });
+  fs.chmodSync(settingsPath(home), 0o600);
+
+  const install = await runScript(SETUP_HOOKS, ["47876"], {
+    HOME: home,
+    CLAUDE_WATCH_CREDENTIALS_DIR: "",
+  });
+  assert.equal(install.code, 0, install.output);
+  let mode = fs.statSync(settingsPath(home)).mode & 0o777;
+  assert.equal(mode, 0o600,
+    `install must preserve settings.json permissions, got 0${mode.toString(8)}`);
+  assert.ok(installedHookUrls(home).includes("http://127.0.0.1:47876/hooks/permission"));
+
+  const remove = await runScript(SETUP_HOOKS, ["--remove"], {
+    HOME: home,
+    CLAUDE_WATCH_CREDENTIALS_DIR: "",
+  });
+  assert.equal(remove.code, 0, remove.output);
+  mode = fs.statSync(settingsPath(home)).mode & 0o777;
+  assert.equal(mode, 0o600,
+    `--remove must preserve settings.json permissions, got 0${mode.toString(8)}`);
+  assert.equal(readSettings(home).env.SECRET_TOKEN, "hunter2",
+    "settings content must survive alongside its permissions");
+});
+
 test("install and --remove work from a HOME containing a quote character", { timeout: 60_000 }, async (t) => {
   const base = tempDir(t, "claude-watch-safety-quote-");
   const home = path.join(base, "it's home");

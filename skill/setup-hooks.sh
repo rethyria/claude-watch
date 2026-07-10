@@ -48,7 +48,7 @@ if [ "$1" = "--remove" ]; then
   CLAUDE_WATCH_SETTINGS="$SETTINGS" \
   CLAUDE_WATCH_HOOK_PATHS="$HOOK_PATHS" \
   python3 - <<'PYEOF'
-import json, os, re
+import json, os, re, stat
 
 settings_path = os.environ['CLAUDE_WATCH_SETTINGS']
 hook_paths = os.environ['CLAUDE_WATCH_HOOK_PATHS'].split()
@@ -89,10 +89,22 @@ def strip_claude_watch_hooks(hooks):
 
 def write_settings_atomically(path, data):
     """Temp file in the same directory + rename: readers only ever see either
-    the old complete file or the new complete file, never a partial write."""
+    the old complete file or the new complete file, never a partial write.
+
+    The rename discards the original file's permissions (the temp file's
+    umask-derived mode would win), and settings.json can carry secrets (env
+    vars, apiKeyHelper config) that users protect with e.g. chmod 600 — so
+    replicate the existing mode onto the temp file BEFORE the rename. A brand
+    new settings file keeps the umask default, same as a plain open(path, 'w')."""
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = None
     tmp = f'{path}.tmp.{os.getpid()}'
     try:
         with open(tmp, 'w') as f:
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
@@ -195,7 +207,7 @@ CLAUDE_WATCH_BRIDGE_URL="$BRIDGE_URL" \
 CLAUDE_WATCH_HOOK_PATHS="$HOOK_PATHS" \
 CLAUDE_WATCH_PERMISSION_TIMEOUT_S="$PERMISSION_HOOK_TIMEOUT_S" \
 python3 - <<'PYEOF'
-import json, os, re
+import json, os, re, stat
 
 settings_path = os.environ['CLAUDE_WATCH_SETTINGS']
 BRIDGE = os.environ['CLAUDE_WATCH_BRIDGE_URL']
@@ -299,10 +311,22 @@ def strip_claude_watch_hooks(hooks):
 
 def write_settings_atomically(path, data):
     """Temp file in the same directory + rename: readers only ever see either
-    the old complete file or the new complete file, never a partial write."""
+    the old complete file or the new complete file, never a partial write.
+
+    The rename discards the original file's permissions (the temp file's
+    umask-derived mode would win), and settings.json can carry secrets (env
+    vars, apiKeyHelper config) that users protect with e.g. chmod 600 — so
+    replicate the existing mode onto the temp file BEFORE the rename. A brand
+    new settings file keeps the umask default, same as a plain open(path, 'w')."""
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = None
     tmp = f'{path}.tmp.{os.getpid()}'
     try:
         with open(tmp, 'w') as f:
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
