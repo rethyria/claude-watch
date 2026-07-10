@@ -39,7 +39,11 @@ sealed interface ConnectionState {
 
     data object Pairing : ConnectionState
 
-    /** Pairing was rejected or unreachable. Nothing was wiped, nothing retries. */
+    /**
+     * Pairing was rejected or unreachable. Nothing was wiped, nothing
+     * retries, and a connection that was live before the attempt is STILL
+     * live underneath — the failed attempt never tears the engine down.
+     */
     data class PairFailed(val message: String) : ConnectionState
 
     /** The bridge speaks an older protocol than this client supports. */
@@ -135,6 +139,15 @@ class ConnectionEngine(
     private var reconnectEpoch = 0 // last stream epoch a reconnect was scheduled for
     private var stopped = true
 
+    // Bumped by every action that must abort an in-flight pair() before it
+    // commits: a user stop()/unpair and a concurrent pair() winning the race.
+    // Deliberately NOT bumped by a definitive 401 tearing the previous token
+    // down — the whole point of a re-pair in flight is to replace that token,
+    // so its death must not cancel the replacement. (The stream `epoch` can't
+    // serve here: every reconnect of a still-live engine bumps it, and a live
+    // engine now keeps running while pair() does its network I/O.)
+    private var pairGeneration = 0
+
     // Serializes credential persistence (pair's save vs stop/401's clear) so
     // a stop() racing an in-flight pair() can never leave the wiped pairing's
     // token persisted at rest.
@@ -185,18 +198,25 @@ class ConnectionEngine(
      * failure — in which case state explains why and NOTHING is retried or
      * wiped (a rejected pairing code is not a reason to erase a previous
      * pairing's credentials, which stay in the store untouched).
+     *
+     * A LIVE engine keeps running until the new pairing has actually
+     * succeeded: teardown happens only inside the commit critical section.
+     * The bridge locks pairing after its first success, so a Pair tap while
+     * connected is always rejected — tearing the stream down up front turned
+     * that rejection into a dead engine (stopped, yet not in Stopped state,
+     * so start() refused to resume) until process restart, with the valid
+     * credentials still sitting in the store.
      */
     suspend fun pair(hostIp: String, port: Int, code: String, deviceName: String): JSONObject? =
         withContext(io) {
-            val pairEpoch = synchronized(lock) {
-                teardownLocked()
+            val myPairGeneration = synchronized(lock) {
                 _state.value = ConnectionState.Pairing
-                epoch
+                pairGeneration
             }
             val candidate = try {
                 clientFactory(hostIp, port)
             } catch (e: IllegalArgumentException) {
-                _state.value = ConnectionState.PairFailed(e.message ?: "invalid bridge address")
+                failPair(myPairGeneration, ConnectionState.PairFailed(e.message ?: "invalid bridge address"))
                 return@withContext null
             }
 
@@ -205,14 +225,17 @@ class ConnectionEngine(
             val ping = try {
                 candidate.ping()
             } catch (e: Exception) {
-                _state.value = ConnectionState.PairFailed("bridge unreachable: ${e.message}")
+                failPair(myPairGeneration, ConnectionState.PairFailed("bridge unreachable: ${e.message}"))
                 return@withContext null
             }
             val proto = ping.body?.optString("proto")?.toIntOrNull()
             if (!ping.ok || proto == null || proto < minProto) {
-                _state.value = ConnectionState.ProtoMismatch(
-                    bridgeProto = ping.body?.optString("proto")?.takeUnless { it.isEmpty() },
-                    minProto = minProto,
+                failPair(
+                    myPairGeneration,
+                    ConnectionState.ProtoMismatch(
+                        bridgeProto = ping.body?.optString("proto")?.takeUnless { it.isEmpty() },
+                        minProto = minProto,
+                    ),
                 )
                 return@withContext null
             }
@@ -220,27 +243,32 @@ class ConnectionEngine(
             val result = try {
                 candidate.pair(code, deviceName)
             } catch (e: Exception) {
-                _state.value = ConnectionState.PairFailed("pair error: ${e.message}")
+                failPair(myPairGeneration, ConnectionState.PairFailed("pair error: ${e.message}"))
                 return@withContext null
             }
             val body = result.body
             val newToken = body?.optString("token").takeUnless { it.isNullOrEmpty() }
             if (!result.ok || body == null || newToken == null) {
                 val error = body?.optString("error") ?: ""
-                _state.value = ConnectionState.PairFailed("${result.status} $error".trim())
+                failPair(myPairGeneration, ConnectionState.PairFailed("${result.status} $error".trim()))
                 return@withContext null
             }
 
-            // Commit + persist under the persistence mutex: the epoch check
-            // decides whether this pairing is still current, and the same
-            // critical section writes the store, so a stop()/unpair that raced
-            // the /v1/pair roundtrip can never end up with this pairing's
-            // token persisted at rest (its clear() is serialized either fully
-            // before the check — which then fails — or fully after our save).
+            // Commit + persist under the persistence mutex: the generation
+            // check decides whether this pairing is still current, and the
+            // same critical section writes the store, so a stop()/unpair that
+            // raced the /v1/pair roundtrip can never end up with this
+            // pairing's token persisted at rest (its clear() is serialized
+            // either fully before the check — which then fails — or fully
+            // after our save).
             val committed = persistMutex.withLock {
                 val current = synchronized(lock) {
                     // A stop() or a second pair() raced this one: don't commit.
-                    if (epoch != pairEpoch) return@synchronized false
+                    if (pairGeneration != myPairGeneration) return@synchronized false
+                    pairGeneration += 1
+                    // Only now — with the new pairing accepted — does the
+                    // previous engine die.
+                    teardownLocked()
                     client = candidate
                     token = newToken
                     stopped = false
@@ -269,12 +297,27 @@ class ConnectionEngine(
         }
 
     /**
+     * Records a failed pair attempt WITHOUT touching the engine: whatever was
+     * running before the attempt (a healthy stream, a retry loop) keeps
+     * running, its credentials stay persisted, and a stop() that raced the
+     * attempt keeps the Stopped state it set. Only the surfaced state flags
+     * the failure; the next stream transition of a live engine overwrites it.
+     */
+    private fun failPair(myPairGeneration: Int, failure: ConnectionState) {
+        synchronized(lock) {
+            if (pairGeneration != myPairGeneration) return
+            _state.value = failure
+        }
+    }
+
+    /**
      * User disconnect/unpair: cancel the engine, clear credentials, done.
      * Deliberately not a failure path — nothing is retried afterwards and
      * zero further requests reach the bridge.
      */
     fun stop() {
         synchronized(lock) {
+            pairGeneration += 1 // aborts any pair() still in flight
             teardownLocked()
             _state.value = ConnectionState.Stopped
         }
@@ -411,15 +454,27 @@ class ConnectionEngine(
      * pairing exactly this way).
      */
     private fun onDefinitiveAuthFailure(myEpoch: Int) {
+        val teardownEpoch: Int
         synchronized(lock) {
             if (stopped || epoch != myEpoch) return
             teardownLocked()
+            teardownEpoch = epoch
             _state.value = ConnectionState.AuthExpired(
                 "The bridge rejected this watch's token (401) — for example after " +
                     "its stored credentials were reset. Pair again to continue.",
             )
         }
-        scope.launch { persistMutex.withLock { store.clear() } }
+        // The wipe is pinned to OUR teardown's epoch: a re-pair() in flight
+        // survives the dying token's 401 (see pairGeneration), and when its
+        // commit wins the persistMutex first — bumping the epoch — the fresh
+        // credentials it just saved must not be erased by the old token's
+        // obituary. (After this teardown only a pair() commit or stop() can
+        // change the epoch; stop() runs its own clear.)
+        scope.launch {
+            persistMutex.withLock {
+                if (synchronized(lock) { epoch == teardownEpoch }) store.clear()
+            }
+        }
     }
 
     private fun teardownLocked() {

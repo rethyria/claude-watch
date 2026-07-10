@@ -161,7 +161,12 @@ class ConnectionEngineTest {
         // Bridge still down / airplane mode: connects are torn down at accept.
         server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
         server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
-        // Bridge back: a healthy stream delivering event 8.
+        // Bridge back: a healthy stream delivering event 8. The real bridge's
+        // ids are wall-clock-seeded so they stay monotonic ACROSS restarts —
+        // a restarted bridge never re-issues ids below the client's resumed
+        // cursor (skill/bridge/test/sse-restart-replay.test.js pins that
+        // contract against the real process; a same-process mock whose ids
+        // only grow cannot).
         server.enqueue(sseHeld("id: 8\nevent: tool-output\ndata: {\"n\":2}\n\n"))
 
         val engine = newEngine()
@@ -402,6 +407,62 @@ class ConnectionEngineTest {
             engine.state.value,
         )
         assertEquals("tok-new", credentialsInStore()?.token)
+    }
+
+    // -- Re-pair attempt against a healthy connection -----------------------
+
+    @Test
+    fun failedRepairAttemptDoesNotKillHealthyConnection() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse()) // tok-1
+        server.enqueue(sseHeld("id: 7\nevent: tool-output\ndata: {\"n\":1}\n\n"))
+        // The accidental re-pair attempt: the bridge locks pairing after the
+        // first success, so a Pair tap while connected is ping-OK, then 403.
+        server.enqueue(pingResponse())
+        server.enqueue(MockResponse().setResponseCode(403).setBody("""{"error":"Already paired"}"""))
+        // A command sent after the failed attempt must still reach the bridge.
+        server.enqueue(MockResponse().setBody("{}"))
+
+        val engine = newEngine()
+        val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
+        scope.launch { engine.events.collect { events.add(it) } }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        awaitCondition { events.any { it.id == "7" } }
+
+        // One accidental Pair tap while connected. It fails (pairing locked)…
+        assertNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        assertTrue(engine.state.value is ConnectionState.PairFailed)
+
+        // …and a re-pair attempt against an unreachable bridge fails too.
+        val dead = MockWebServer().also { it.start() }
+        val deadPort = dead.port
+        dead.shutdown()
+        assertNull(runBlocking { engine.pair("127.0.0.1", deadPort, "123456", "wear-test") })
+        assertTrue(engine.state.value is ConnectionState.PairFailed)
+
+        // Neither failed attempt may have torn the live engine down: the
+        // previous pairing's credentials are still persisted, and authed
+        // calls still reach the bridge with the surviving token — the engine
+        // used to be dead here (stopped, yet refusing start()) until process
+        // restart.
+        assertEquals("tok-1", credentialsInStore()?.token)
+        val result = runBlocking { engine.sendCommand("s-1", "hello") }
+        assertEquals(200, result?.status)
+
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("/v1/events", takeRequest().path)
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        takeRequest().let {
+            assertEquals("/v1/command", it.path)
+            assertEquals("Bearer tok-1", it.getHeader("Authorization"))
+        }
+        // No further /v1/events connect: the ORIGINAL stream was never torn
+        // down, so the failed attempts scheduled no reconnect.
+        assertEquals(6, server.requestCount)
     }
 
     // -- Pairing gates ------------------------------------------------------
