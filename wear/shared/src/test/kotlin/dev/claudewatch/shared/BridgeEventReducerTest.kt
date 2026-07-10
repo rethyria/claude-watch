@@ -189,6 +189,51 @@ class BridgeEventReducerTest {
     }
 
     @Test
+    fun syncResentRunningDoesNotWakeAnIdleSessionOrDropItsFrozenSpan() {
+        // running@t1 -> task-complete@t6 freezes a 5s span. The bridge's
+        // connect-time sync then re-sends `running` for the still-live slot
+        // on EVERY /v1/events connect (the ViewModel reconnects every few
+        // seconds after a drop), long after the turn ended.
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("6", "task-complete", """{"sessionId":"A","source":"claude"}"""),
+            ),
+        )
+        assertEquals(5_000L, state.sessions.getValue("A").frozenElapsedMs)
+
+        // Sync frames carry no id; reconnect happens much later (t100).
+        val syncResent = SseFrame(null, "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}""")
+        val after = (BridgeEventReducer.reduce(state, syncResent, 1_100_000L) as BridgeEventReducer.Applied).state
+
+        // Metadata refresh only: still idle, frozen span intact, no new clock.
+        val a = after.sessions.getValue("A")
+        assertEquals(SessionActivity.IDLE, a.activity)
+        assertEquals(5_000L, a.frozenElapsedMs)
+        assertNull(a.activeSinceMs)
+        assertEquals(5_000L, a.elapsedMs(2_000_000L))
+    }
+
+    @Test
+    fun resentRunningStillRefreshesSessionMetadata() {
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","sessionId":"A"}"""),
+                SseFrame("2", "task-complete", """{"sessionId":"A"}"""),
+            ),
+        )
+        // A later `running` for the known session fills in metadata the first
+        // frame lacked, without touching activity/elapsed state.
+        val resent = SseFrame(null, "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}""")
+        val after = (BridgeEventReducer.reduce(state, resent, 1_100_000L) as BridgeEventReducer.Applied).state
+        val a = after.sessions.getValue("A")
+        assertEquals("claude", a.agent)
+        assertEquals("/a", a.cwd)
+        assertEquals("a", a.folderName)
+        assertEquals(SessionActivity.IDLE, a.activity)
+    }
+
+    @Test
     fun outputAfterIdleStartsAFreshElapsedSpan() {
         val frames = listOf(
             SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),

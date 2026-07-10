@@ -144,19 +144,25 @@ object BridgeEventReducer {
             SessionRunState.RUNNING -> {
                 val id = requireNotNull(event.sessionId) // guaranteed by SessionEvent's init
                 val existing = state.sessions[id]
-                val session = SessionState(
+                // For an already-known session `running` is a metadata refresh
+                // ONLY: the bridge's connect-time sync re-sends `running` for
+                // every live slot on EVERY /v1/events connect, so flipping an
+                // IDLE session back to WORKING here would restart its elapsed
+                // clock (and drop its frozen span) on each routine reconnect.
+                // The one live re-emission of `running` for an existing slot
+                // (headless prompt run) is immediately followed by pty-output,
+                // which markWorking turns into a fresh WORKING span anyway.
+                val session = existing?.copy(
+                    agent = event.agent ?: existing.agent,
+                    cwd = event.cwd ?: existing.cwd,
+                    folderName = event.folderName ?: existing.folderName,
+                ) ?: SessionState(
                     sessionId = id,
-                    agent = event.agent ?: existing?.agent,
-                    cwd = event.cwd ?: existing?.cwd,
-                    folderName = event.folderName ?: existing?.folderName,
+                    agent = event.agent,
+                    cwd = event.cwd,
+                    folderName = event.folderName,
                     activity = SessionActivity.WORKING,
-                    // A replayed/connect-time-sync "running" for an already
-                    // working session must not reset its elapsed clock.
-                    activeSinceMs = if (existing?.activity == SessionActivity.WORKING) {
-                        existing.activeSinceMs
-                    } else {
-                        nowMs
-                    },
+                    activeSinceMs = nowMs,
                     frozenElapsedMs = null,
                 )
                 state.copy(sessions = state.sessions + (id to session))
