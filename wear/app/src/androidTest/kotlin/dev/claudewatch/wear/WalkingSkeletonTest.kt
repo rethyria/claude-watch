@@ -131,37 +131,109 @@ class WalkingSkeletonTest {
         compose.onNodeWithTag("sendButton").performScrollTo().performClick()
         waitForText("commandResult", "command:200")
 
-        // --- A blocking permission hook is answered from the watch --------
-        val executor = Executors.newSingleThreadExecutor()
-        val hookFuture = executor.submit<Pair<Int, String>> {
-            postHook(
-                "/hooks/permission",
+        // --- Concurrent blocking permission hooks (issue #17) -------------
+        // Two curl-simulated sessions ask at once: both must queue (neither
+        // orphans the other), each must be answerable, and each answer must
+        // land on the RENDERED card's permissionId — proven end-to-end by
+        // which hook unblocks with which decision.
+        val executor = Executors.newFixedThreadPool(2)
+        fun permissionHook(body: JSONObject) = executor.submit<Pair<Int, String>> {
+            postHook("/hooks/permission", body).use { it.code to (it.body?.string() ?: "") }
+        }
+
+        fun decisionOf(hookBody: String): JSONObject =
+            JSONObject(hookBody).getJSONObject("hookSpecificOutput").getJSONObject("decision")
+
+        try {
+            // Session A asks first: its Bash card fronts the approval sheet.
+            val hookA = permissionHook(
                 JSONObject()
                     .put("tool_name", "Bash")
-                    .put("cwd", "/tmp/wear-e2e-project")
+                    .put("session_id", "wear-e2e-session-a")
+                    .put("cwd", "/tmp/wear-e2e-a")
                     .put("tool_input", JSONObject().put("command", "rm -rf ./build")),
-            ).use { it.code to (it.body?.string() ?: "") }
-        }
-        try {
-            waitForText("permissionTool", "Bash")
-            // The prompt is on screen but nothing has answered it: the hook
-            // must still be blocked.
-            Thread.sleep(500)
-            assertFalse("permission hook must block until a decision arrives", hookFuture.isDone)
-
-            compose.onNodeWithTag("allowButton").performScrollTo().performClick()
-            waitForText("decisionResult", "decision:200")
-
-            val (hookStatus, hookBody) = hookFuture.get(30, TimeUnit.SECONDS)
-            assertEquals(200, hookStatus)
-            val decision = JSONObject(hookBody)
-                .getJSONObject("hookSpecificOutput")
-                .getJSONObject("decision")
-            assertEquals("allow", decision.getString("behavior"))
-            assertTrue(
-                "permission card should clear after an accepted decision",
-                compose.onAllNodes(hasTestTag("permissionTool")).fetchSemanticsNodes().isEmpty(),
             )
+            waitForText("permissionTool", "Bash")
+            // The card says WHAT is being asked, not just the tool name.
+            waitForText("permissionSummary", "rm -rf ./build")
+
+            // Session B asks while A's prompt is still up: the newest card
+            // fronts (a stale prompt must never shadow a live one) and the
+            // sheet shows the queue depth.
+            val hookB = permissionHook(
+                JSONObject()
+                    .put("tool_name", "Write")
+                    .put("session_id", "wear-e2e-session-b")
+                    .put("cwd", "/tmp/wear-e2e-b")
+                    .put("tool_input", JSONObject().put("file_path", "/tmp/wear-e2e-b/notes.txt")),
+            )
+            waitForText("permissionTool", "Write")
+            waitForText("permissionSummary", "notes.txt")
+            waitForText("permissionCount", "1 more waiting")
+
+            // Neither hook has been answered yet: both must still block.
+            Thread.sleep(500)
+            assertFalse("hook A must block until a decision arrives", hookA.isDone)
+            assertFalse("hook B must block until a decision arrives", hookB.isDone)
+
+            // Deny the RENDERED card (B's Write). Ack-gated: the card leaves
+            // only on the 2xx ack, revealing A's Bash card underneath.
+            compose.onNodeWithTag("permissionOption-deny").assertIsDisplayed().performClick()
+            val (statusB, bodyB) = hookB.get(30, TimeUnit.SECONDS)
+            assertEquals(200, statusB)
+            assertEquals(
+                "the deny must land on B — the request that was rendered",
+                "deny",
+                decisionOf(bodyB).getString("behavior"),
+            )
+            waitForText("permissionTool", "Bash")
+            assertFalse("hook A must still be blocked after B's answer", hookA.isDone)
+
+            // Allow the revealed card (A's Bash): the allow lands on A.
+            compose.onNodeWithTag("permissionOption-allow").assertIsDisplayed().performClick()
+            val (statusA, bodyA) = hookA.get(30, TimeUnit.SECONDS)
+            assertEquals(200, statusA)
+            assertEquals(
+                "the allow must land on A — the request that was rendered",
+                "allow",
+                decisionOf(bodyA).getString("behavior"),
+            )
+            compose.waitUntil(30_000) {
+                compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().isEmpty()
+            }
+
+            // --- Allow-always rides the machine-readable behavior field ---
+            // The bridge offers allow-always only when the hook supplies
+            // permission suggestions to persist; answering with it must make
+            // the bridge apply those suggestions (updatedPermissions in the
+            // hook decision) so the prompt does not recur.
+            val suggestion = JSONObject()
+                .put("type", "addRules")
+                .put("rules", org.json.JSONArray().put(JSONObject().put("toolName", "Bash")))
+            val hookC = permissionHook(
+                JSONObject()
+                    .put("tool_name", "Bash")
+                    .put("session_id", "wear-e2e-session-a")
+                    .put("cwd", "/tmp/wear-e2e-a")
+                    .put("tool_input", JSONObject().put("command", "npm test"))
+                    .put("permission_suggestions", org.json.JSONArray().put(suggestion)),
+            )
+            waitForText("permissionSummary", "npm test")
+            compose.onNodeWithTag("permissionOption-allow-always").assertIsDisplayed().performClick()
+            val (statusC, bodyC) = hookC.get(30, TimeUnit.SECONDS)
+            assertEquals(200, statusC)
+            val decisionC = decisionOf(bodyC)
+            // The bridge maps the behavior-based allow-always answer onto the
+            // hook contract: allow + the persisted suggestions.
+            assertEquals("allow", decisionC.getString("behavior"))
+            assertEquals(
+                "allow-always must persist the hook's permission suggestions",
+                1,
+                decisionC.getJSONArray("updatedPermissions").length(),
+            )
+            compose.waitUntil(30_000) {
+                compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().isEmpty()
+            }
         } finally {
             executor.shutdownNow()
         }
@@ -176,12 +248,13 @@ class WalkingSkeletonTest {
         val spawnedId = textOf("sessionId").removePrefix("session:")
 
         // Pager navigation over live sessions: swipe until the spawned
-        // session's terminal page is in FRONT (control page + the
-        // hook-created session's page come first). Gate on placement, not
-        // existence — the pager prefetches the neighbor page, so a bare
-        // existence check would stop one swipe early and the kill click
-        // below would be injected at the unplaced node's origin bounds.
-        for (unused in 0 until 4) {
+        // session's terminal page is in FRONT (control page + the pages of
+        // the hook-created sessions — including the two permission-hook
+        // sessions above — come first). Gate on placement, not existence —
+        // the pager prefetches the neighbor page, so a bare existence check
+        // would stop one swipe early and the kill click below would be
+        // injected at the unplaced node's origin bounds.
+        for (unused in 0 until 8) {
             if (tagDisplayed("terminal-$spawnedId")) break
             compose.onNodeWithTag("sessionPager").performTouchInput { swipeLeft() }
             compose.waitForIdle()

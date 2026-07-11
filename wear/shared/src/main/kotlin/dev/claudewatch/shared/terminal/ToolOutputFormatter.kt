@@ -7,6 +7,7 @@
 package dev.claudewatch.shared.terminal
 
 import dev.claudewatch.shared.protocol.ToolOutputEvent
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 
@@ -17,6 +18,26 @@ object ToolOutputFormatter {
 
     /** Hard cap per rendered line; the watch face fits ~4 wrapped rows of 11 sp mono. */
     const val MAX_LINE_CHARS = 80
+
+    /**
+     * One-line summary of a tool REQUEST (`tool_name` + `tool_input`) — what
+     * a permission card must show the user before they approve: the actual
+     * command for Bash, the target file for Read/Edit/Write, the pattern for
+     * Grep, `[ToolName]` otherwise. Same per-tool rendering rules as [format],
+     * minus outputs (a request has none yet) and the codex prefix.
+     */
+    fun describeToolRequest(toolName: String?, toolInput: JsonObject?): String {
+        fun input(key: String): String? =
+            (toolInput?.get(key) as? JsonPrimitive)?.contentOrNull
+
+        return when (toolName) {
+            "Bash" -> "$ ${input("command").orEmpty()}"
+            "Read", "Edit", "Write" -> "$toolName ${fileName(input("file_path"))}"
+            "Grep" -> "grep \"${input("pattern").orEmpty()}\""
+            null -> "[tool]"
+            else -> "[$toolName]"
+        }.take(MAX_LINE_CHARS)
+    }
 
     /** Format one `tool-output` event into terminal lines. */
     fun format(event: ToolOutputEvent): List<TerminalLine> {

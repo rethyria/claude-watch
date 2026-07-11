@@ -27,12 +27,28 @@ sessions, and answer blocking permission hooks.
   next output clears.
 - **Session pager (`:app` `ui/SessionPagerScreen.kt`):** a foundation
   `HorizontalPager` (the primitive Horologist wraps) — page 0 is the
-  control/debug page (pairing, command box, permissions, spawn actions, event
-  log), then one live terminal page per session: `ScalingLazyColumn`, 30-line
-  viewport over the 200-line ring, 11 sp monospace, design tokens
+  control/debug page (pairing, command box, spawn actions, event log), then
+  one live terminal page per session: `ScalingLazyColumn`, 30-line viewport
+  over the 200-line ring, 11 sp monospace, design tokens
   `#E87A35`/`#34C759`/`#FF3B30` on black, blinking block cursor while a
   command awaits output, kill action in the page header. Connection state is
   rendered here but owned by the connection-lifecycle layer.
+- **Approval flow (`:app` `ui/PermissionSheet.kt`):** permission prompts are
+  a per-session QUEUE keyed by `permissionId` (`BridgeState.pendingPermissions`
+  from the shared reducer), rendered by a single presenter: a full-screen,
+  gesture-undismissable sheet over the pager. The newest prompt fronts (a
+  prompt resolved from another device gets no `permission-cleared`, so a
+  stale entry must never shadow a live one), with a "N more waiting" depth
+  indicator. Each card shows WHAT is asked (tool + the actual
+  command/file/pattern via `ToolOutputFormatter.describeToolRequest`) and
+  WHICH session asks (folder name). Answers are keyed to the RENDERED card's
+  `permissionId` and dismissal is ack-gated: the card leaves only on a 2xx
+  ack or an authoritative 404 (resolved elsewhere / timed out — surfaced,
+  never a false "approved"); any other failure keeps the card on screen with
+  the error shown, so a lost POST can never silently invert an approval into
+  the 10-minute auto-deny. Option buttons come from the bridge's canonical
+  behavior-keyed option list (`allow` / `allow-always` / `deny`) — decisions
+  send the machine-readable `behavior`, never label or position matching.
 - **Stack:** Kotlin, Compose for Wear OS, OkHttp + okhttp-sse (readTimeout 0,
   `Last-Event-ID` reconnect replay).
 - **Standalone:** `com.google.android.wearable.standalone=true` — no phone
@@ -93,14 +109,22 @@ cd wear
 
 The instrumented e2e (`WalkingSkeletonTest`) drives the actual UI: it pairs,
 waits for a hook-generated SSE event to render, sends a session-scoped
-command (expects 2xx), posts a blocking `/hooks/permission` request and
-answers it with Allow — asserting the hook stays blocked until the decision
-and unblocks with `behavior: "allow"` — then spawns a session from the watch,
-swipes the pager to its live terminal (the stubbed agent's PTY output renders
-as terminal lines), and kills it from the page header, asserting the bridge's
+command (expects 2xx), then exercises the approval flow end to end — two
+curl-simulated sessions post blocking `/hooks/permission` requests
+concurrently, both queue on the sheet, and each answer unblocks exactly the
+hook whose card was rendered (deny lands on one, allow on the other), plus an
+allow-always answer for a hook with `permission_suggestions` asserting the
+bridge maps it to `behavior: "allow"` + `updatedPermissions` so the prompt
+does not recur — then spawns a session from the watch, swipes the pager to
+its live terminal (the stubbed agent's PTY output renders as terminal
+lines), and kills it from the page header, asserting the bridge's
 `session ended` prunes the page.
 
 `SessionPagerTest` (instrumented, no bridge) renders `SessionPagerScreen`
 directly from fixture events folded through the shared reducer: pager
 navigation across the control page and one terminal page per live session,
 thinking-cursor raise/clear, and page pruning on session end.
+`ApprovalFlowTest` (instrumented, no bridge) covers the sheet itself:
+what/which-session/queue-depth rendering, answers keyed to the rendered
+card's `permissionId`, swipe-immunity in all four directions, error surfacing
+without dropping the prompt, and the behavior-keyed allow-always button.

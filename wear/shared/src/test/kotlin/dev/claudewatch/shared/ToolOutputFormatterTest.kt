@@ -121,6 +121,54 @@ class ToolOutputFormatterTest {
     }
 
     // ------------------------------------------------------------------
+    // Tool REQUEST summaries (permission cards: WHAT is being asked)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun toolRequestSummaryShowsTheActualAsk() {
+        fun inputOf(json: String) =
+            (BridgeEventParser.parse("tool-output", json) as ToolOutputEvent).toolInput
+
+        assertEquals(
+            "$ rm -rf ./build",
+            ToolOutputFormatter.describeToolRequest(
+                "Bash",
+                inputOf("""{"tool_input":{"command":"rm -rf ./build"}}"""),
+            ),
+        )
+        assertEquals(
+            "Write notes.txt",
+            ToolOutputFormatter.describeToolRequest(
+                "Write",
+                inputOf("""{"tool_input":{"file_path":"/tmp/beta/notes.txt"}}"""),
+            ),
+        )
+        assertEquals(
+            "grep \"TODO\"",
+            ToolOutputFormatter.describeToolRequest(
+                "Grep",
+                inputOf("""{"tool_input":{"pattern":"TODO"}}"""),
+            ),
+        )
+        assertEquals("[WebSearch]", ToolOutputFormatter.describeToolRequest("WebSearch", null))
+        assertEquals("[tool]", ToolOutputFormatter.describeToolRequest(null, null))
+    }
+
+    @Test
+    fun toolRequestSummaryIsCappedAtMaxLineChars() {
+        val long = ToolOutputFormatter.describeToolRequest(
+            "Bash",
+            (
+                BridgeEventParser.parse(
+                    "tool-output",
+                    """{"tool_input":{"command":"${"x".repeat(300)}"}}""",
+                ) as ToolOutputEvent
+                ).toolInput,
+        )
+        assertTrue(long.length <= ToolOutputFormatter.MAX_LINE_CHARS)
+    }
+
+    // ------------------------------------------------------------------
     // PTY output
     // ------------------------------------------------------------------
 

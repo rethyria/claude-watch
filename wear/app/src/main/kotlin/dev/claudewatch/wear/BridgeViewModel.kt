@@ -2,9 +2,12 @@ package dev.claudewatch.wear
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import dev.claudewatch.shared.protocol.PermissionOption
+import dev.claudewatch.shared.protocol.PermissionRequestEvent
 import dev.claudewatch.shared.protocol.SseFrame
 import dev.claudewatch.shared.state.BridgeEventReducer
 import dev.claudewatch.shared.state.BridgeState
+import dev.claudewatch.shared.terminal.ToolOutputFormatter
 import dev.claudewatch.wear.net.BridgeClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -25,13 +28,38 @@ import okhttp3.sse.EventSourceListener
  */
 class BridgeViewModel : ViewModel() {
 
-    data class PendingPermission(val permissionId: String, val toolName: String)
+    /**
+     * One queued approval card, fully resolved for rendering: WHAT is being
+     * asked ([toolName] + [requestSummary]) and WHICH session is asking
+     * ([sessionLabel]) — the live-testing feedback on the single-slot card
+     * that only said "Bash". [options] is the bridge's canonical
+     * behavior-keyed list (never inferred from labels or position).
+     */
+    data class PendingPermission(
+        val permissionId: String,
+        val sessionId: String?,
+        val toolName: String,
+        val requestSummary: String,
+        val sessionLabel: String,
+        val options: List<PermissionOption>,
+    )
 
     data class UiState(
         val status: String = "unpaired",
         val paired: Boolean = false,
         val sessionId: String? = null,
-        val pendingPermission: PendingPermission? = null,
+        /**
+         * Approval queue, newest-first. The FRONT is the rendered card. Newest
+         * first because the bridge pushes no permission-cleared for prompts
+         * resolved from another device or timed out server-side: a stale entry
+         * must never shadow a live prompt that arrived after it (answering the
+         * stale one 404s, which drops it and reveals the next).
+         */
+        val permissionQueue: List<PendingPermission> = emptyList(),
+        /** permissionId of the answer POST currently in flight, if any. */
+        val decisionInFlightId: String? = null,
+        /** Why the last answer failed; the prompt it belongs to is still queued. */
+        val decisionError: String? = null,
         val commandResult: String? = null,
         val decisionResult: String? = null,
         /** Last spawn/kill outcome, e.g. "spawn:200" / "kill:200". */
@@ -160,17 +188,38 @@ class BridgeViewModel : ViewModel() {
         }
     }
 
-    fun answerPermission(behavior: String) {
+    /**
+     * Answer the queued prompt [permissionId] — always the id of the RENDERED
+     * card, passed down from the UI, never "whatever is globally current"
+     * (the watchOS race that approved the wrong permission). Dismissal is
+     * ack-gated: the prompt leaves the queue only on a 2xx ack or a 404
+     * (authoritative "gone": resolved elsewhere or timed out server-side —
+     * keeping it would wedge a zombie prompt forever, since the bridge pushes
+     * no permission-cleared for either). Any other failure keeps the prompt
+     * queued and surfaces the error — never a silent inversion of an approval
+     * into a 10-minute auto-deny.
+     */
+    fun answerPermission(permissionId: String, behavior: String) {
         val currentClient = client
         val currentToken = token
-        val pending = _state.value.pendingPermission ?: return
+        // Answer only a prompt that is actually still queued.
+        if (_state.value.bridge.pendingPermissions.none { it.permissionId == permissionId }) return
         if (currentClient == null || currentToken == null) return
+        _state.update { it.copy(decisionInFlightId = permissionId, decisionError = null) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val message = if (behavior == "deny") "Denied from the watch" else null
-                val result = currentClient.answerPermission(currentToken, pending.permissionId, behavior, message)
+                val result = currentClient.answerPermission(currentToken, permissionId, behavior, message)
                 _state.update { ui ->
-                    val next = ui.copy(decisionResult = "decision:${result.status}")
+                    val next = ui.copy(
+                        decisionResult = "decision:${result.status}",
+                        decisionInFlightId = null,
+                        decisionError = when {
+                            result.ok -> null
+                            result.status == 404 -> "Already resolved elsewhere"
+                            else -> "Decision failed: HTTP ${result.status}"
+                        },
+                    )
                     // The bridge pushes no permission-cleared when a prompt is
                     // resolved via /v1/command from another paired device, or
                     // when it times out server-side — only hook-abort and
@@ -181,10 +230,18 @@ class BridgeViewModel : ViewModel() {
                     //    elsewhere or timed out). Keeping it would wedge a
                     //    zombie prompt in state forever.
                     val gone = result.ok || result.status == 404
-                    if (gone) next.withBridge(next.bridge.resolvePermission(pending.permissionId)) else next
+                    if (gone) next.withBridge(next.bridge.resolvePermission(permissionId)) else next
                 }
             } catch (e: Exception) {
-                _state.update { it.copy(decisionResult = "decision:error ${e.message}") }
+                // Transport failure: the prompt stays queued (it may well still
+                // be pending server-side) and the error is surfaced on the card.
+                _state.update {
+                    it.copy(
+                        decisionResult = "decision:error ${e.message}",
+                        decisionInFlightId = null,
+                        decisionError = "Decision failed: ${e.message}",
+                    )
+                }
             }
         }
     }
@@ -251,14 +308,34 @@ class BridgeViewModel : ViewModel() {
         // Sticky fallback: keep targeting the last known session when none is
         // currently running (matches the skeleton's previous behavior).
         sessionId = bridge.currentSessionId ?: sessionId,
-        // Show the NEWEST pending prompt. The bridge pushes no
-        // permission-cleared for prompts resolved from another paired device
-        // or timed out server-side, so an older entry can go stale in state;
-        // it must never shadow a live prompt that arrived after it.
-        pendingPermission = bridge.pendingPermissions.lastOrNull()?.let {
-            PendingPermission(it.permissionId, it.toolName ?: "?")
-        },
+        // The full pending queue, newest-first (see UiState.permissionQueue
+        // for why), each entry resolved against the CURRENT session table so
+        // late-arriving session metadata still labels an earlier prompt.
+        permissionQueue = bridge.pendingPermissions.asReversed().map { it.toPending(bridge) },
     )
+
+    private fun PermissionRequestEvent.toPending(bridge: BridgeState): PendingPermission {
+        val session = sessionId?.let { bridge.sessions[it] }
+        return PendingPermission(
+            permissionId = permissionId,
+            sessionId = sessionId,
+            toolName = toolName ?: "?",
+            requestSummary = ToolOutputFormatter.describeToolRequest(toolName, toolInput),
+            sessionLabel = session?.folderName
+                ?: session?.agent
+                ?: sessionId?.take(8)
+                ?: "unknown session",
+            // Behavior-keyed options straight from the bridge; a legacy event
+            // without options still gets behavior-based allow/deny (never
+            // label matching).
+            options = options.ifEmpty {
+                listOf(
+                    PermissionOption("allow", "Yes"),
+                    PermissionOption("deny", "No"),
+                )
+            },
+        )
+    }
 
     override fun onCleared() {
         stopped = true

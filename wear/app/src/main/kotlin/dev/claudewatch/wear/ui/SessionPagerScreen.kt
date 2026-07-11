@@ -66,7 +66,8 @@ const val TERMINAL_VIEWPORT_LINES = 30
 data class SessionPagerActions(
     val onPair: (host: String, port: String, code: String) -> Unit = { _, _, _ -> },
     val onSendCommand: (String) -> Unit = {},
-    val onAnswerPermission: (behavior: String) -> Unit = {},
+    /** Answer the RENDERED card: (its permissionId, the chosen option's behavior). */
+    val onAnswerPermission: (permissionId: String, behavior: String) -> Unit = { _, _ -> },
     val onSpawn: (agent: String) -> Unit = {},
     val onKill: (sessionId: String) -> Unit = {},
 )
@@ -106,6 +107,18 @@ fun SessionPagerScreen(ui: BridgeViewModel.UiState, actions: SessionPagerActions
             }
         }
         HorizontalPageIndicator(pageIndicatorState = indicatorState)
+        // The approval sheet: the SINGLE presenter for pending permissions,
+        // drawn over everything (pager included) and never dismissable by
+        // gesture — it leaves only when the queue empties (see
+        // PermissionSheet.kt for the full defect inoculation list).
+        if (ui.permissionQueue.isNotEmpty()) {
+            PermissionSheet(
+                queue = ui.permissionQueue,
+                inFlightId = ui.decisionInFlightId,
+                error = ui.decisionError,
+                onAnswer = actions.onAnswerPermission,
+            )
+        }
     }
 }
 
@@ -212,10 +225,10 @@ private fun BlinkingCursor() {
 
 /**
  * The walking skeleton's debug controls, now page 0 of the pager: manual
- * IP:port + pairing-code entry, session-scoped command box, allow/deny for
- * permission prompts, spawn actions, and the reduced (human-readable) event
- * log. Deliberately a plain scrollable column so every node exists in the
- * semantics tree for the instrumented e2e test.
+ * IP:port + pairing-code entry, session-scoped command box, spawn actions,
+ * and the reduced (human-readable) event log. Permission prompts live in the
+ * PermissionSheet overlay, never here. Deliberately a plain scrollable column
+ * so every node exists in the semantics tree for the instrumented e2e test.
  */
 @Composable
 private fun ControlPage(ui: BridgeViewModel.UiState, actions: SessionPagerActions) {
@@ -265,17 +278,9 @@ private fun ControlPage(ui: BridgeViewModel.UiState, actions: SessionPagerAction
             Text(it, fontSize = 10.sp, color = Color(0xFF80C0FF), modifier = Modifier.testTag("sessionActionResult"))
         }
 
-        ui.pendingPermission?.let { pending ->
-            Spacer(Modifier.height(6.dp))
-            Text(
-                "Permission: ${pending.toolName}",
-                fontSize = 11.sp,
-                color = Color(0xFFFF8080),
-                modifier = Modifier.testTag("permissionTool"),
-            )
-            DebugChip("Allow", "allowButton") { actions.onAnswerPermission("allow") }
-            DebugChip("Deny", "denyButton") { actions.onAnswerPermission("deny") }
-        }
+        // Permission prompts are NOT rendered here: the PermissionSheet
+        // overlay is the single presenter (issue #17). Only the last decision
+        // outcome stays visible for debugging.
         ui.decisionResult?.let {
             Text(it, fontSize = 10.sp, color = Color(0xFF80C0FF), modifier = Modifier.testTag("decisionResult"))
         }
