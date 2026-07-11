@@ -45,11 +45,40 @@ interface NetworkEscalator {
  *
  * Escalation is best-effort: on a device/profile where the request is denied
  * it degrades to the ordinary reconnect loop over the default network.
+ *
+ * [Connectivity] is the two-call seam to [ConnectivityManager] (a framework
+ * class that cannot be faked directly — its constructor is hidden), so the
+ * instrumented WifiNetworkEscalatorTest can exercise THIS class's contract —
+ * idempotent single registration, idempotent never-throwing release,
+ * SecurityException degradation — against a recording fake, plus a smoke pass
+ * over the real system service.
  */
-class WifiNetworkEscalator(context: Context) : NetworkEscalator {
+class WifiNetworkEscalator internal constructor(
+    private val connectivity: Connectivity,
+) : NetworkEscalator {
 
-    private val connectivity =
-        context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    constructor(context: Context) : this(
+        SystemConnectivity(
+            context.applicationContext
+                .getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager,
+        ),
+    )
+
+    /** The two [ConnectivityManager] calls the escalator makes. */
+    internal interface Connectivity {
+        fun requestNetwork(request: NetworkRequest, callback: ConnectivityManager.NetworkCallback)
+        fun unregisterNetworkCallback(callback: ConnectivityManager.NetworkCallback)
+    }
+
+    private class SystemConnectivity(private val manager: ConnectivityManager) : Connectivity {
+        override fun requestNetwork(
+            request: NetworkRequest,
+            callback: ConnectivityManager.NetworkCallback,
+        ) = manager.requestNetwork(request, callback)
+
+        override fun unregisterNetworkCallback(callback: ConnectivityManager.NetworkCallback) =
+            manager.unregisterNetworkCallback(callback)
+    }
 
     private val lock = Any()
     private var callback: ConnectivityManager.NetworkCallback? = null

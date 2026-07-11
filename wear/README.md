@@ -85,6 +85,12 @@ unauthenticated `GET /v1/ping` probe:
   NOT wiped (the real bridge may still exist — e.g. DHCP handed its IP to
   another machine). Both legacy clients paired with the first mDNS hit and
   could nondeterministically talk to the wrong Mac; this is that bug's fix.
+  Pinning only works because the bridge's identity is STABLE: `BRIDGE_ID` is
+  generated once and persisted next to `credentials.json`
+  (`skill/bridge/config.js`), exactly like the bearer tokens it travels with —
+  a per-process id would turn every routine bridge restart into a terminal
+  `BridgeMismatch` (and make port relocation impossible), regressing the
+  seamless restart-resume above.
 - **Port probe ladder:** when the known port refuses the connection
   (bridge-down: the host answered, the bridge is gone) or a decoy answers on
   it, the engine pings the bridge's port-walk range (7860–7869, mirroring

@@ -488,8 +488,14 @@ class ConnectionEngine(
                     // host itself is unreachable — on Wear that usually means
                     // the BT phone proxy cannot see the LAN. Escalate to a
                     // held Wi-Fi network; released again on stream recovery.
-                    if (outcome.pathBroken) escalator.escalate()
-                    scheduleReconnect(myEpoch, outcome.reason)
+                    // The escalation happens inside scheduleReconnect's
+                    // stopped/epoch-guarded critical section: a path-broken
+                    // preflight blocks in ping() for the full socket timeout,
+                    // which is exactly the window a user stop()/unpair lands
+                    // in, and an unguarded escalate() here would re-acquire
+                    // the Wi-Fi hold AFTER teardown released it — pinning the
+                    // radio up until process death.
+                    scheduleReconnect(myEpoch, outcome.reason, escalatePath = outcome.pathBroken)
                     return
                 }
             }
@@ -658,9 +664,14 @@ class ConnectionEngine(
         !stopped && epoch == myEpoch
     }
 
-    private fun scheduleReconnect(myEpoch: Int, reason: String) {
+    private fun scheduleReconnect(myEpoch: Int, reason: String, escalatePath: Boolean = false) {
         synchronized(lock) {
             if (stopped || epoch != myEpoch) return
+            // Escalate only while the engine is still live at OUR epoch, and
+            // under the same lock teardownLocked() runs its release() under —
+            // so an escalation can never land after the teardown that was
+            // supposed to end it (see the Preflight.Retry caller).
+            if (escalatePath) escalator.escalate()
             // Single flight, keyed on the FAILING STREAM's epoch — never on
             // reconnectJob liveness. connect() runs inside the reconnect job,
             // and a refused connect can fail on an OkHttp thread before the

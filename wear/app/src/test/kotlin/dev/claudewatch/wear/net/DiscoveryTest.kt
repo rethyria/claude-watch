@@ -25,6 +25,7 @@ import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.net.SocketTimeoutException
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -339,6 +340,74 @@ class DiscoveryTest {
 
         // Transient path failures never touch the pairing.
         assertNotNull(runBlocking { store.read().credentials })
+    }
+
+    /**
+     * Regression: a stop()/unpair racing a preflight that is BLOCKED inside
+     * ping() — the normal path-broken case, where the ping only fails after
+     * the full socket timeout — must not let the late Retry outcome re-acquire
+     * the Wi-Fi hold that teardown just released. The unguarded escalate()
+     * pinned the radio up until process death ("give up and unpair while
+     * offline" is exactly when users tap stop).
+     */
+    @Test
+    fun stopDuringBlockedPreflightDoesNotLeaveWifiHeld() {
+        val escalator = RecordingEscalator()
+        val blockPing = AtomicBoolean(false)
+        val pingBlocked = CountDownLatch(1)
+        val pingGate = CountDownLatch(1)
+        val engine = newEngine(
+            escalator = escalator,
+            clientFactory = { hostIp, port ->
+                object : BridgeClient(hostIp, port) {
+                    override fun ping(): ApiResult {
+                        if (blockPing.get()) {
+                            // Model a dead route: the ping hangs (held here by
+                            // the gate instead of a wall-clock socket timeout)
+                            // and eventually fails as path-broken.
+                            pingBlocked.countDown()
+                            pingGate.await(30, TimeUnit.SECONDS)
+                            throw SocketTimeoutException("simulated broken path")
+                        }
+                        return super.ping()
+                    }
+                }
+            },
+        )
+
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        // Short-lived healthy stream (~4 s): its natural end sends the engine
+        // into the reconnect preflight, which then blocks in ping() above.
+        server.enqueue(sseHeld(":connected\n\n", pads = 2))
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+
+        // Break the path, wait for the reconnect preflight to block in ping(),
+        // then stop the engine while it is blocked — teardown releases any
+        // Wi-Fi hold as part of its "torn-down engines never pin the radio"
+        // invariant.
+        blockPing.set(true)
+        assertTrue(
+            "reconnect preflight should have blocked inside ping()",
+            pingBlocked.await(30, TimeUnit.SECONDS),
+        )
+        engine.stop()
+        awaitCondition { engine.state.value == ConnectionState.Stopped }
+
+        // Now the blocked ping fails: the stale preflight's path-broken Retry
+        // outcome lands on a stopped engine and must NOT escalate. (Escalation
+        // fires only on the Retry outcome, so in this interleaving a correct
+        // engine never escalates at all.)
+        pingGate.countDown()
+        Thread.sleep(1_000) // generous: let the stale connect() tail run out
+        assertEquals(
+            "a stopped engine must never (re-)acquire the Wi-Fi hold",
+            0,
+            escalator.escalations.get(),
+        )
+        assertEquals(ConnectionState.Stopped, engine.state.value)
     }
 
     // -- Manual IP entry ------------------------------------------------------
