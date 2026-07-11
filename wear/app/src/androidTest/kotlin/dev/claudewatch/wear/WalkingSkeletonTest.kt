@@ -1,6 +1,8 @@
 package dev.claudewatch.wear
 
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -87,6 +89,13 @@ class WalkingSkeletonTest {
     private fun tagExists(tag: String): Boolean =
         compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().isNotEmpty()
 
+    // Placement-gated existence: HorizontalPager PREFETCHES neighbor pages,
+    // composing them unplaced (semantics bounds anchored at origin), so a bare
+    // fetchSemanticsNodes existence check matches a page one swipe before it
+    // is actually in front. assertIsDisplayed rejects those unplaced nodes.
+    private fun tagDisplayed(tag: String): Boolean =
+        runCatching { compose.onNodeWithTag(tag).assertIsDisplayed() }.isSuccess
+
     @Test
     fun pairStreamCommandApprove() {
         // --- Pair via manual IP:port + code entry -------------------------
@@ -167,27 +176,36 @@ class WalkingSkeletonTest {
         val spawnedId = textOf("sessionId").removePrefix("session:")
 
         // Pager navigation over live sessions: swipe until the spawned
-        // session's terminal page is in front (control page + the
-        // hook-created session's page come first).
+        // session's terminal page is in FRONT (control page + the
+        // hook-created session's page come first). Gate on placement, not
+        // existence — the pager prefetches the neighbor page, so a bare
+        // existence check would stop one swipe early and the kill click
+        // below would be injected at the unplaced node's origin bounds.
         for (unused in 0 until 4) {
-            if (tagExists("terminal-$spawnedId")) break
+            if (tagDisplayed("terminal-$spawnedId")) break
             compose.onNodeWithTag("sessionPager").performTouchInput { swipeLeft() }
             compose.waitForIdle()
         }
         assertTrue(
-            "spawned session's terminal page must be reachable by swiping",
-            tagExists("terminal-$spawnedId"),
+            "spawned session's terminal page must be fronted by swiping",
+            tagDisplayed("terminal-$spawnedId"),
         )
-        // The spawned PTY's stub output reached this page as terminal lines
-        // (only the fronted page is composed, so the match is page-local).
+        // The spawned PTY's stub output reached THIS page as terminal lines.
+        // Scope the match to the spawned session's terminal subtree: pager
+        // prefetch composes neighbor pages too, so an unscoped hasText could
+        // match text that never rendered on the fronted page.
         compose.waitUntil(60_000) {
-            compose.onAllNodes(hasText("stub-claude", substring = true))
-                .fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodes(
+                hasText("stub-claude", substring = true) and
+                    hasAnyAncestor(hasTestTag("terminal-$spawnedId")),
+            ).fetchSemanticsNodes().isNotEmpty()
         }
 
         // Kill it from its page header; the bridge answers the /v1/command
         // kill and pushes `session ended killed:true`, which prunes the page.
-        compose.onNodeWithTag("kill-$spawnedId").performClick()
+        // assertIsDisplayed first: a click on an unplaced node would silently
+        // land at (0,0) and hit nothing.
+        compose.onNodeWithTag("kill-$spawnedId").assertIsDisplayed().performClick()
         compose.waitUntil(30_000) { !tagExists("terminal-$spawnedId") }
     }
 }
