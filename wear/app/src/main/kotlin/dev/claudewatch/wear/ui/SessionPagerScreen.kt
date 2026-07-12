@@ -66,6 +66,13 @@ const val TERMINAL_VIEWPORT_LINES = 30
 data class SessionPagerActions(
     val onPair: (host: String, port: String, code: String) -> Unit = { _, _, _ -> },
     val onSendCommand: (String) -> Unit = {},
+    /** Mirror the command box into the ViewModel-owned draft (ack-gated send lifecycle). */
+    val onCommandDraftChange: (String) -> Unit = {},
+    /**
+     * Launch voice input (RecognizerIntent.ACTION_RECOGNIZE_SPEECH, wired in
+     * MainActivity; instrumented tests stub it with a fixed transcription).
+     */
+    val onDictate: () -> Unit = {},
     /** Answer the RENDERED card: (its permissionId, the chosen option's behavior). */
     val onAnswerPermission: (permissionId: String, behavior: String) -> Unit = { _, _ -> },
     /** Drop the rendered card locally WITHOUT sending a decision (escape hatch; see PermissionSheet). */
@@ -240,7 +247,6 @@ private fun ControlPage(ui: BridgeViewModel.UiState, actions: SessionPagerAction
     var host by remember { mutableStateOf("10.0.2.2") }
     var port by remember { mutableStateOf("7860") }
     var code by remember { mutableStateOf("") }
-    var command by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -269,9 +275,30 @@ private fun ControlPage(ui: BridgeViewModel.UiState, actions: SessionPagerAction
         LabeledField("code", code, "code") { code = it }
         DebugChip("Pair", "pairButton") { actions.onPair(host, port, code) }
 
+        // Command input (issue #20): the text is the ViewModel's draft, not
+        // local state — a failed send RESTORES the text here for retry, an
+        // acked send clears it. Dictation feeds the same draft + send path.
         Spacer(Modifier.height(6.dp))
-        LabeledField("command", command, "commandInput") { command = it }
-        DebugChip("Send", "sendButton") { actions.onSendCommand(command) }
+        LabeledField("command", ui.commandDraft, "commandInput") { actions.onCommandDraftChange(it) }
+        DebugChip("Dictate", "dictateButton") { actions.onDictate() }
+        DebugChip("Send", "sendButton") { actions.onSendCommand(ui.commandDraft) }
+        // Pending until the bridge acks: the terminal echoes nothing yet.
+        ui.commandInFlightText?.let {
+            Text(
+                "sending: $it",
+                fontSize = 10.sp,
+                color = WatchTheme.TextSecondary,
+                modifier = Modifier.testTag("commandPending"),
+            )
+        }
+        ui.commandError?.let {
+            Text(
+                it,
+                fontSize = 10.sp,
+                color = WatchTheme.Error,
+                modifier = Modifier.testTag("commandError"),
+            )
+        }
         ui.commandResult?.let {
             Text(it, fontSize = 10.sp, color = Color(0xFF80C0FF), modifier = Modifier.testTag("commandResult"))
         }

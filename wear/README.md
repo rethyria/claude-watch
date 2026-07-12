@@ -49,6 +49,18 @@ sessions, and answer blocking permission hooks.
   the 10-minute auto-deny. Option buttons come from the bridge's canonical
   behavior-keyed option list (`allow` / `allow-always` / `deny`) — decisions
   send the machine-readable `behavior`, never label or position matching.
+- **Dictated/typed commands with ack-gated echo (issue #20):** voice input
+  rides `RecognizerIntent.ACTION_RECOGNIZE_SPEECH` (never a raw
+  `SpeechRecognizer` on Wear) and feeds the exact same send path as typed
+  text. The confirmed watchOS trap — echoing `> command` + a thinking cursor
+  BEFORE the network call and swallowing every failure, silently losing the
+  transcription — is inverted: the command shows as **pending** until the
+  bridge acks, the terminal echo + thinking cursor happen only on a 2xx, and
+  any failure (transport, timeout, non-2xx) echoes nothing, surfaces an error
+  and **restores the text into the input** so retry re-sends the same text.
+  Unpaired/no-session input refuses cleanly instead of pretending to send.
+  Outcomes speak a haptic grammar via `VibrationEffect` (`Haptics.kt`): one
+  crisp tick on ack, a double buzz on failure/refusal.
 - **Stack:** Kotlin, Compose for Wear OS, OkHttp + okhttp-sse (readTimeout 0,
   `Last-Event-ID` reconnect replay).
 - **Standalone:** `com.google.android.wearable.standalone=true` — no phone
@@ -128,3 +140,9 @@ thinking-cursor raise/clear, and page pruning on session end.
 what/which-session/queue-depth rendering, answers keyed to the rendered
 card's `permissionId`, swipe-immunity in all four directions, error surfacing
 without dropping the prompt, and the behavior-keyed allow-always button.
+`DictationFlowTest` (instrumented, on-device MockWebServer bridge) covers the
+dictation flow with the recognizer activity result stubbed to a fixed
+transcription (real voice cannot run headlessly; the real-voice smoke test is
+in the hardware QA checklist): stubbed result → command POSTed → echo only
+after the 2xx ack, injected 5xx → no echo + error + text restored for a retry
+that re-sends the same text, and unpaired input refusing cleanly.
