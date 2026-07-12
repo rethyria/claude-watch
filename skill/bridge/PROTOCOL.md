@@ -228,6 +228,10 @@ Authenticated snapshot:
   paired).
 - `sessions[].state`: `"running"` | `"ended"`. Ended sessions linger in
   snapshots for a grace period (~5 min), then get pruned.
+- `sessions[].title` (string, **optional, additive**): the session's
+  human-readable title, present only once the bridge has derived it from the
+  session's Claude Code transcript (see the [`session`](#session) event for
+  the derivation order). Clients must tolerate its absence.
 - `hasPty` / `activeAgent`: legacy conveniences describing the most recent
   active session; prefer `sessions[]`.
 
@@ -360,11 +364,30 @@ Lifecycle of agent sessions. Variants:
   `sessionId`; bridge-level).
 - `{ "state": "running", "agent": "claude", "cwd": "/home/u/proj",
   "folderName": "proj", "sessionId": ... }` — session started / observed
-  (also re-sent on every SSE connect for each running session).
+  (also re-sent on every SSE connect for each running session, and re-sent
+  live when the session's `title` changes).
 - `{ "state": "ended", "agent": ..., "folderName": ..., "sessionId": ... }` —
   plus, depending on how it ended: `exitCode` and `signal` (PTY exit),
   `error` (spawn failure), `killed: true` (kill command), or `reason`
   (`"session-end"`, `"evicted"`, ...).
+
+**`title`** (string, **optional, additive**): the session's human-readable
+title, carried on `running`/`ended` payloads (and the `/v1/status` and pair
+snapshots) once the bridge can derive it. Derivation order, from the Claude
+Code transcript that hook payloads reference via `transcript_path`:
+
+1. the **last** `{"type": "ai-title", "aiTitle": "…"}` record in the
+   transcript (Claude Code re-emits it as the title evolves);
+2. otherwise the first real user prompt, truncated to ~60 chars.
+
+The field is absent until a hook event has pointed the bridge at a readable
+transcript that yields a title (external `codex` sessions, unreadable or
+empty transcripts, and PTY sessions that have not emitted a hook yet have
+none). The title is refreshed opportunistically (session creation, `Stop`,
+`SessionEnd` hooks); a mid-session change is broadcast as a re-sent
+idempotent `running` event. Per the additive-field rules this does not bump
+the protocol version; clients fall back to their own label when it is
+absent.
 
 ### `pty-output`
 Raw terminal output from a bridge-owned PTY (ANSI escapes included) or from a
