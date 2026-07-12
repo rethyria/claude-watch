@@ -5,32 +5,38 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeLeft
-import androidx.compose.ui.test.swipeRight
+import androidx.compose.ui.test.swipeDown
+import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.claudewatch.shared.protocol.SseFrame
 import dev.claudewatch.shared.state.BridgeEventReducer
 import dev.claudewatch.shared.state.BridgeState
-import dev.claudewatch.wear.ui.SessionPagerActions
-import dev.claudewatch.wear.ui.SessionPagerScreen
+import dev.claudewatch.wear.ui.halo.HaloActions
+import dev.claudewatch.wear.ui.halo.HaloApp
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Pager over live sessions, fed by fixture events reduced through the shared
- * reducer (the same `{id, event, data}` frames the bridge buffers): page 0 is
- * the control page, each session gets its own terminal page with
- * human-readable lines, and the thinking cursor renders from per-session
- * state. Pure UI test — no bridge, no network.
+ * Halo navigation over live sessions (successor of the old SessionPagerTest:
+ * page-per-session coverage became ring-home → list → feed nav coverage),
+ * fed by fixture events reduced through the shared reducer — the same
+ * `{id, event, data}` frames the bridge buffers. Every session is reachable
+ * from home (swipe up → its list row → its live feed with human-readable,
+ * ANSI-stripped lines), the thinking indicator renders from per-session
+ * state, and a killed session's feed backs out instead of ghosting. Pure UI
+ * test — no bridge, no network.
  */
 @RunWith(AndroidJUnit4::class)
-class SessionPagerTest {
+class HaloNavigationTest {
 
     @get:Rule
     val compose = createComposeRule()
@@ -78,64 +84,70 @@ class SessionPagerTest {
             }
         }
 
-    private fun swipeToNextPage() {
-        compose.onNodeWithTag("sessionPager").performTouchInput { swipeLeft() }
+    private fun ui(bridge: BridgeState) =
+        BridgeViewModel.UiState(status = "paired, stream open", paired = true, bridge = bridge)
+
+    /** Home → the all-sessions list (swipe up = drill, per the handoff IA). */
+    private fun drillToList() {
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+    }
+
+    private fun openFeed(sessionId: String) {
+        compose.onNodeWithTag("haloRow-$sessionId").performScrollTo().performClick()
         compose.waitForIdle()
     }
 
     @Test
-    fun pagerNavigatesControlPageAndOneTerminalPagePerLiveSession() {
+    fun everySessionIsReachableFromHomeAndItsFeedRendersItsOwnLines() {
         val bridge = fold(fixtureFrames())
         assertEquals(2, bridge.sessions.size)
-        compose.setContent {
-            SessionPagerScreen(
-                ui = BridgeViewModel.UiState(status = "paired, stream open", bridge = bridge),
-                actions = SessionPagerActions(),
-            )
-        }
+        compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
 
-        // Page 0: the control page.
-        compose.onNodeWithTag("status").assertIsDisplayed()
+        // Home: the glance census counts both sessions across both projects.
+        compose.onNodeWithTag("haloCensus").assertIsDisplayed()
+        compose.onNodeWithText("2 projects · 2 sessions").assertIsDisplayed()
 
-        // Page 1: alpha's terminal — human-readable, ANSI-stripped lines.
-        swipeToNextPage()
-        compose.onNodeWithTag("sessionHeader-$alpha").assertIsDisplayed()
+        // Swipe up: the all-sessions list, one row per session.
+        drillToList()
+        compose.onNodeWithTag("haloRow-$alpha").assertIsDisplayed()
+        compose.onNodeWithTag("haloRow-$beta").performScrollTo().assertIsDisplayed()
+
+        // Alpha's feed — human-readable, ANSI-stripped lines, no
+        // cross-contamination from beta.
+        openFeed(alpha)
+        compose.onNodeWithTag("haloFeed-$alpha").assertIsDisplayed()
         compose.onNodeWithText("Welcome to Claude Code!").assertIsDisplayed()
         compose.onNodeWithText("Read README.md").assertIsDisplayed()
+        assertEquals(
+            0,
+            compose.onAllNodes(hasText("npm test", substring = true)).fetchSemanticsNodes().size,
+        )
 
-        // Page 2: beta's terminal — codex-prefixed, no cross-contamination.
-        swipeToNextPage()
-        compose.onNodeWithTag("sessionHeader-$beta").assertIsDisplayed()
-        compose.onNodeWithText("[codex] $ npm test").assertIsDisplayed()
-
-        // And back: swiping right returns to alpha.
-        compose.onNodeWithTag("sessionPager").performTouchInput { swipeRight() }
+        // Swipe down steps back to the list; beta's feed renders ITS lines.
+        compose.onNodeWithTag("haloFeed-$alpha").performTouchInput { swipeDown() }
         compose.waitForIdle()
-        compose.onNodeWithTag("sessionHeader-$alpha").assertIsDisplayed()
+        openFeed(beta)
+        compose.onNodeWithTag("haloFeed-$beta").assertIsDisplayed()
+        compose.onNode(hasText("npm test", substring = true)).assertIsDisplayed()
     }
 
     @Test
-    fun thinkingCursorRendersOnCommandEchoAndClearsOnNextOutput() {
+    fun thinkingIndicatorRendersOnCommandEchoAndClearsOnNextOutput() {
         val initial = fold(fixtureFrames())
         var bridge by mutableStateOf(initial)
-        compose.setContent {
-            SessionPagerScreen(
-                ui = BridgeViewModel.UiState(bridge = bridge),
-                actions = SessionPagerActions(),
-            )
-        }
-        swipeToNextPage() // alpha's page
+        compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
+        drillToList()
+        openFeed(alpha)
 
-        // No cursor while idle-on-arrival.
-        compose.onAllNodes(hasTestTag("thinkingCursor")).fetchSemanticsNodes().let {
-            assertEquals(0, it.size)
-        }
+        // No indicator while idle-on-arrival.
+        assertEquals(0, compose.onAllNodes(hasTestTag("haloThinking")).fetchSemanticsNodes().size)
 
-        // Command echo raises the cursor and shows the echoed line.
+        // Command echo raises the indicator and shows the echoed user line.
         bridge = bridge.echoCommand(alpha, "say hello")
         compose.waitForIdle()
         compose.onNodeWithText("> say hello").assertIsDisplayed()
-        compose.onNodeWithTag("thinkingCursor").assertIsDisplayed()
+        compose.onNodeWithTag("haloThinking").assertIsDisplayed()
 
         // The next output for the session clears it.
         bridge = fold(
@@ -144,20 +156,16 @@ class SessionPagerTest {
         )
         compose.waitForIdle()
         compose.onNodeWithText("hello!").assertIsDisplayed()
-        assertEquals(0, compose.onAllNodes(hasTestTag("thinkingCursor")).fetchSemanticsNodes().size)
+        assertEquals(0, compose.onAllNodes(hasTestTag("haloThinking")).fetchSemanticsNodes().size)
     }
 
     @Test
-    fun killedSessionsPageIsPrunedFromThePager() {
+    fun killedSessionsFeedBacksOutAndItsRowIsPruned() {
         var bridge by mutableStateOf(fold(fixtureFrames()))
-        compose.setContent {
-            SessionPagerScreen(
-                ui = BridgeViewModel.UiState(bridge = bridge),
-                actions = SessionPagerActions(),
-            )
-        }
-        swipeToNextPage()
-        compose.onNodeWithTag("sessionHeader-$alpha").assertIsDisplayed()
+        compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
+        drillToList()
+        openFeed(alpha)
+        compose.onNodeWithTag("haloFeed-$alpha").assertIsDisplayed()
 
         // The bridge announces alpha's death (killed via /v1/command).
         bridge = fold(
@@ -172,8 +180,10 @@ class SessionPagerTest {
         )
         compose.waitForIdle()
 
-        // Alpha's page is gone; the pager clamps onto beta's page.
-        assertEquals(0, compose.onAllNodes(hasTestTag("sessionHeader-$alpha")).fetchSemanticsNodes().size)
-        compose.onNodeWithTag("sessionHeader-$beta").assertIsDisplayed()
+        // The dead feed backs out to the list; alpha's row is gone, beta's
+        // survives — no ghost screens over a pruned session.
+        assertEquals(0, compose.onAllNodes(hasTestTag("haloFeed-$alpha")).fetchSemanticsNodes().size)
+        assertEquals(0, compose.onAllNodes(hasTestTag("haloRow-$alpha")).fetchSemanticsNodes().size)
+        compose.onNodeWithTag("haloRow-$beta").performScrollTo().assertIsDisplayed()
     }
 }

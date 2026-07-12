@@ -31,6 +31,7 @@ fun HaloAllPage(
                 color = Halo.Palette.TextSecondary,
                 textAlign = TextAlign.Center,
                 maxLines = 1,
+                modifier = Modifier.testTag("haloCensus"),
             )
         }
     }
