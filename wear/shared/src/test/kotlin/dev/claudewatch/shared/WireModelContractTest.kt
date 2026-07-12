@@ -47,6 +47,12 @@ class WireModelContractTest {
         assertEquals(BridgeEventFixtures.SESSION_ALPHA, running.sessionId)
         assertEquals("claude", running.agent)
         assertEquals("alpha", running.folderName)
+        // Additive `title` field (issue #50): parsed when present...
+        assertEquals("Fix the flaky auth tests", running.title)
+
+        // ...and absent (older bridge) stays null without failing the frame.
+        val beta = BridgeEventParser.parse(byId.getValue("5")) as SessionEvent
+        assertNull(beta.title)
 
         val toolOutput = BridgeEventParser.parse(byId.getValue("4")) as ToolOutputEvent
         assertEquals("Read", toolOutput.toolName)

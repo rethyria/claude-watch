@@ -50,6 +50,8 @@ data class SessionState(
     val agent: String? = null,
     val cwd: String? = null,
     val folderName: String? = null,
+    /** Bridge-derived session title (additive wire field); null until the bridge reports one. */
+    val title: String? = null,
     val activity: SessionActivity = SessionActivity.WORKING,
     val activeSinceMs: Long? = null,
     val frozenElapsedMs: Long? = null,
@@ -248,11 +250,15 @@ object BridgeEventReducer {
                     agent = event.agent ?: existing.agent,
                     cwd = event.cwd ?: existing.cwd,
                     folderName = event.folderName ?: existing.folderName,
+                    // The bridge re-sends `running` with a fresh title when it
+                    // changes; a payload without one must not erase the known title.
+                    title = event.title ?: existing.title,
                 ) ?: SessionState(
                     sessionId = id,
                     agent = event.agent,
                     cwd = event.cwd,
                     folderName = event.folderName,
+                    title = event.title,
                     activity = SessionActivity.WORKING,
                     activeSinceMs = nowMs,
                     frozenElapsedMs = null,

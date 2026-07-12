@@ -51,10 +51,12 @@ class BridgeEventReducerTest {
         assertEquals("claude", alpha.agent)
         assertEquals("alpha", alpha.folderName)
         assertEquals("/home/dev/projects/alpha", alpha.cwd)
+        assertEquals("Fix the flaky auth tests", alpha.title) // additive wire title (frame 2)
         assertEquals(SessionActivity.WORKING, alpha.activity)
         assertEquals(1_002_000L, alpha.activeSinceMs) // frame 2
 
         assertEquals("codex", beta.agent)
+        assertNull(beta.title) // no title reported for beta
         assertEquals(SessionActivity.WORKING, beta.activity)
         assertEquals(1_005_000L, beta.activeSinceMs) // frame 5
 
@@ -212,6 +214,28 @@ class BridgeEventReducerTest {
         assertEquals(5_000L, a.frozenElapsedMs)
         assertNull(a.activeSinceMs)
         assertEquals(5_000L, a.elapsedMs(2_000_000L))
+    }
+
+    @Test
+    fun titleUpdatesFromResentRunningAndSurvivesTitlelessResends() {
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","title":"First title","sessionId":"A"}"""),
+            ),
+        )
+        assertEquals("First title", state.sessions.getValue("A").title)
+
+        // The bridge broadcasts a title change as an idempotent re-sent
+        // `running` event: the new title replaces the old one.
+        val retitled = SseFrame("2", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","title":"Better title","sessionId":"A"}""")
+        val afterRetitle = (BridgeEventReducer.reduce(state, retitled, 1_002_000L) as BridgeEventReducer.Applied).state
+        assertEquals("Better title", afterRetitle.sessions.getValue("A").title)
+
+        // A connect-time sync resend without a title (or from an older
+        // bridge) must not erase the known title.
+        val titleless = SseFrame(null, "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}""")
+        val afterSync = (BridgeEventReducer.reduce(afterRetitle, titleless, 1_003_000L) as BridgeEventReducer.Applied).state
+        assertEquals("Better title", afterSync.sessions.getValue("A").title)
     }
 
     @Test

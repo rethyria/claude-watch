@@ -1,5 +1,5 @@
 {"id":1,"event":"session","data":{"state":"connected"}}
-{"id":2,"event":"session","data":{"state":"running","agent":"claude","cwd":"/home/dev/projects/alpha","folderName":"alpha","sessionId":"5f0d2c9a-8b1e-4c3f-9a67-2e51b4c8d0aa"}}
+{"id":2,"event":"session","data":{"state":"running","agent":"claude","cwd":"/home/dev/projects/alpha","folderName":"alpha","title":"Fix the flaky auth tests","sessionId":"5f0d2c9a-8b1e-4c3f-9a67-2e51b4c8d0aa"}}
 {"id":3,"event":"pty-output","data":{"text":"$ claude\r\n[1mWelcome to Claude Code![0m\r\n","sessionId":"5f0d2c9a-8b1e-4c3f-9a67-2e51b4c8d0aa"}}
 {"id":4,"event":"tool-output","data":{"session_id":"3a2b1c0d-9e8f-4a5b-8c7d-6e5f4a3b2c1d","transcript_path":"/home/dev/.claude/projects/-home-dev-projects-alpha/3a2b1c0d.jsonl","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"/home/dev/projects/alpha/README.md"},"tool_output":"file contents here","cwd":"/home/dev/projects/alpha","source":"claude","sessionId":"5f0d2c9a-8b1e-4c3f-9a67-2e51b4c8d0aa"}}
 {"id":5,"event":"session","data":{"state":"running","agent":"codex","cwd":"/home/dev/projects/beta","folderName":"beta","sessionId":"b7e3f1c2-4d5a-4b8e-a2f0-9c6d1e7a3b55"}}
