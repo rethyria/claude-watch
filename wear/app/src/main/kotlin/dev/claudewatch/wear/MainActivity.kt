@@ -36,7 +36,11 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun WatchApp(viewModel: BridgeViewModel = viewModel()) {
+fun WatchApp(
+    viewModel: BridgeViewModel = viewModel(
+        factory = BridgeViewModel.factory(LocalContext.current.applicationContext),
+    ),
+) {
     val context = LocalContext.current
     // Swap the no-op default for the real vibrator grammar (issue #20).
     LaunchedEffect(viewModel) { viewModel.haptics = VibratorHaptics(context) }
@@ -60,6 +64,7 @@ fun WatchApp(viewModel: BridgeViewModel = viewModel()) {
         ui = state,
         actions = SessionPagerActions(
             onPair = viewModel::pair,
+            onUnpair = viewModel::unpair,
             onSendCommand = viewModel::sendCommand,
             onCommandDraftChange = viewModel::updateCommandDraft,
             onDictate = {

@@ -222,7 +222,42 @@ export const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 export const CODEX_SESSION_SCAN_LIMIT = 25;
 export const CODEX_SESSION_ROOT = path.join(os.homedir(), ".codex", "sessions");
 export const CODEX_LOG_FILE = path.join(os.homedir(), ".codex", "log", "codex-tui.log");
-export const BRIDGE_ID = crypto.randomUUID();
+
+// The bridge's stable identity, served by the unauthenticated /ping endpoint.
+// Clients PIN this id at pair time and verify it on every reconnect preflight
+// (the wrong-Mac guard), so it must survive bridge restarts: bearer tokens
+// already persist across restarts (credentials.js), and a per-process random
+// id would strand every paired client in a terminal "different bridge —
+// re-pair required" state after any routine restart, with the pairing surface
+// locked. Generated once and persisted next to the credential store; the id
+// has zero authorization value (it only names the bridge), so persisting it
+// plaintext is fine.
+export const BRIDGE_ID = loadOrCreateBridgeId();
+
+function loadOrCreateBridgeId() {
+  const file = path.join(CREDENTIALS_DIR, "bridge-id");
+  try {
+    const existing = fs.readFileSync(file, "utf-8").trim();
+    // Shape-check so a corrupt/truncated file mints a fresh id instead of
+    // serving garbage forever.
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(existing)) {
+      return existing;
+    }
+  } catch { /* absent or unreadable: mint a fresh one below */ }
+  const id = crypto.randomUUID();
+  try {
+    // Atomic write (temp + rename), mirroring credentials.js: a crash
+    // mid-write must never leave a truncated id behind.
+    fs.mkdirSync(CREDENTIALS_DIR, { recursive: true, mode: 0o700 });
+    const tmpFile = `${file}.tmp`;
+    fs.rmSync(tmpFile, { force: true });
+    fs.writeFileSync(tmpFile, id + "\n", { mode: 0o600 });
+    fs.renameSync(tmpFile, file);
+  } catch (err) {
+    log("warn", `Could not persist bridge id to ${file} (${err.message}); using a per-process id — paired watches will see a different bridge after the next restart.`);
+  }
+  return id;
+}
 
 export function availableAgentsList() {
   const agents = [];

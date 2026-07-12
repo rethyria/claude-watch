@@ -65,6 +65,8 @@ const val TERMINAL_VIEWPORT_LINES = 30
 /** Everything the pager can ask the ViewModel to do. */
 data class SessionPagerActions(
     val onPair: (host: String, port: String, code: String) -> Unit = { _, _, _ -> },
+    /** User unpair: the engine stops, credentials are wiped, nothing retries. */
+    val onUnpair: () -> Unit = {},
     val onSendCommand: (String) -> Unit = {},
     /** Mirror the command box into the ViewModel-owned draft (ack-gated send lifecycle). */
     val onCommandDraftChange: (String) -> Unit = {},
@@ -271,12 +273,26 @@ private fun ControlPage(ui: BridgeViewModel.UiState, actions: SessionPagerAction
             color = Color.Gray,
             modifier = Modifier.testTag("sessionId"),
         )
+        // Re-onboarding explanation: shown only when the token was
+        // definitively rejected (401), the paired address answered with a
+        // foreign bridgeId, or the bridge's protocol is too old.
+        ui.repairExplanation?.let {
+            Text(
+                it,
+                fontSize = 10.sp,
+                color = WatchTheme.Error,
+                modifier = Modifier.testTag("repairExplanation"),
+            )
+        }
 
         Spacer(Modifier.height(6.dp))
         LabeledField("host", host, "host") { host = it }
         LabeledField("port", port, "port") { port = it }
         LabeledField("code", code, "code") { code = it }
         DebugChip("Pair", "pairButton") { actions.onPair(host, port, code) }
+        if (ui.paired) {
+            DebugChip("Unpair", "unpairButton") { actions.onUnpair() }
+        }
 
         // Command input (issue #20): the text is the ViewModel's draft, not
         // local state — a failed send RESTORES the text here for retry, an

@@ -1,6 +1,13 @@
 package dev.claudewatch.wear
 
 import dev.claudewatch.shared.terminal.TerminalLineType
+import dev.claudewatch.wear.data.AesGcmTokenCipher
+import dev.claudewatch.wear.data.CredentialStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
@@ -10,34 +17,76 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
 import java.util.concurrent.TimeUnit
+import javax.crypto.KeyGenerator
 
 /**
- * Regression coverage for the pair-to-stream-open gap: an SSE event pushed by
- * the bridge after /v1/pair succeeds but before GET /v1/events is actually
- * connected used to be lost forever — the first connect sent no Last-Event-ID
- * (so no ring-buffer replay), and the bridge's connect-time sync event reuses
- * the newest buffered id, masking the miss from later reconnects. The fix is
- * two-sided: the first connect requests a full replay (Last-Event-ID: 0), and
- * "paired" is only reported once the stream is open (onOpen), which is the
- * go-signal the instrumented e2e gates on.
+ * ViewModel-level behavior over the real ConnectionEngine + CredentialStore
+ * (AES cipher on a temp file — the production Keystore key only differs in
+ * where the key material lives):
+ *
+ *  - The pair-to-stream-open gap regression: the first connect after pairing
+ *    requests a full replay (Last-Event-ID: 0) and "paired" is only reported
+ *    once the stream is actually open (the go-signal the instrumented e2e
+ *    gates on).
+ *  - A 404 on a permission answer means the prompt expired on the bridge:
+ *    the user sees "expired" and the dead Allow/Deny card is cleared.
  */
 class BridgeViewModelTest {
 
+    @get:Rule
+    val tmp = TemporaryFolder()
+
     private lateinit var server: MockWebServer
+    private lateinit var storeScope: CoroutineScope
     private lateinit var viewModel: BridgeViewModel
+
+    private val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
 
     @Before
     fun setUp() {
         server = MockWebServer()
         server.start()
-        viewModel = BridgeViewModel()
+        storeScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        val store = CredentialStore(
+            { File(tmp.root, "conn.bin") },
+            AesGcmTokenCipher { key },
+            storeScope,
+        )
+        viewModel = BridgeViewModel(store)
     }
 
     @After
     fun tearDown() {
-        server.shutdown()
+        runBlocking {
+            val job = storeScope.coroutineContext[Job]!!
+            job.cancel()
+            job.join()
+        }
+        try {
+            server.shutdown()
+        } catch (_: Exception) {
+            // A held-open SSE writer can outlive the shutdown grace period;
+            // the sockets are closed either way.
+        }
+    }
+
+    private fun enqueuePing() {
+        server.enqueue(MockResponse().setBody("""{"proto":"2","bridgeId":"b-1","machineName":"m"}"""))
+    }
+
+    private fun awaitUi(timeoutMs: Long = 20_000, predicate: (BridgeViewModel.UiState) -> Boolean): BridgeViewModel.UiState {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val state = viewModel.state.value
+            if (predicate(state)) return state
+            Thread.sleep(10)
+        }
+        throw AssertionError("timed out; last state: ${viewModel.state.value}")
     }
 
     private fun awaitStatus(timeoutMs: Long = 15_000, predicate: (String) -> Boolean): String {
@@ -65,6 +114,7 @@ class BridgeViewModelTest {
 
     @Test
     fun firstConnectRequestsFullReplayAndPairedWaitsForStreamOpen() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -79,6 +129,10 @@ class BridgeViewModelTest {
         )
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+
+        val pingRequest = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no /v1/ping request")
+        assertEquals("/v1/ping", pingRequest.path)
 
         val pairRequest = server.takeRequest(10, TimeUnit.SECONDS)
             ?: throw AssertionError("no /v1/pair request")
@@ -98,8 +152,14 @@ class BridgeViewModelTest {
             viewModel.state.value.status.contains("paired"),
         )
 
-        awaitStatus { it == "paired, stream open" }
+        awaitUi { it.status == "paired, stream open" }
     }
+
+    // The single-slot "expired permission" test from the connection-lifecycle
+    // branch is superseded by a404AnswerRemovesTheZombiePermissionLocally
+    // below: same 404-is-authoritative-gone contract, exercised against the
+    // permission QUEUE (the single-slot pendingPermission API no longer
+    // exists).
 
     /**
      * The reducer wiring: real /v1 event frames arriving over SSE surface as
@@ -109,6 +169,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun sseEventsFlowThroughTheSharedReducerIntoUiState() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -184,6 +245,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun newestPendingPermissionIsRenderedWhileTheOlderStaysQueued() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -226,6 +288,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun concurrentPromptsFromTwoSessionsAreEachAnsweredOnTheirOwnPermissionId() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -259,6 +322,7 @@ class BridgeViewModelTest {
         )
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 
@@ -311,6 +375,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun failedAnswerKeepsThePromptQueuedAndSurfacesTheError() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -357,6 +422,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun allowAlwaysSendsTheBehaviorBasedAnswer() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -384,6 +450,7 @@ class BridgeViewModelTest {
         )
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 
@@ -419,6 +486,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun a404AnswerRemovesTheZombiePermissionLocally() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -468,6 +536,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun a401AnswerDropsTheDeadTokenPromptWithoutFalseResolving() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -517,6 +586,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun transportFailuresUnlockALocalDismissThatSendsNoDecision() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -595,6 +665,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun askUserQuestionAnswersEveryQuestionInOnePost() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -611,6 +682,7 @@ class BridgeViewModelTest {
         )
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 
@@ -661,6 +733,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun failedQuestionAnswersKeepTheCardQueuedUntilARetryAcks() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -714,6 +787,7 @@ class BridgeViewModelTest {
      */
     @Test
     fun spawnAndKillGoOverV1CommandWithTheBridgeBodyShapes() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -726,6 +800,7 @@ class BridgeViewModelTest {
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         awaitStatus { it == "paired, stream open" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 
@@ -771,6 +846,7 @@ class BridgeViewModelTest {
     fun dictatedCommandIsPostedAndEchoedOnlyAfterTheBridgeAcks() {
         val haptics = RecordingHaptics()
         viewModel.haptics = haptics
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -797,6 +873,7 @@ class BridgeViewModelTest {
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 
@@ -863,6 +940,7 @@ class BridgeViewModelTest {
     fun failedSendEchoesNothingSurfacesTheErrorAndRetryResendsTheSameText() {
         val haptics = RecordingHaptics()
         viewModel.haptics = haptics
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -884,6 +962,7 @@ class BridgeViewModelTest {
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 
@@ -934,6 +1013,7 @@ class BridgeViewModelTest {
     fun timedOutSendClearsPendingRestoresTheDraftAndRetryResendsTheSameText() {
         val haptics = RecordingHaptics()
         viewModel.haptics = haptics
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -956,6 +1036,7 @@ class BridgeViewModelTest {
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 
@@ -1018,6 +1099,7 @@ class BridgeViewModelTest {
     fun textEnteredWhileASendIsPendingSurvivesThatSendsFailure() {
         val haptics = RecordingHaptics()
         viewModel.haptics = haptics
+        enqueuePing() // the engine's discovery preflight precedes every pair
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -1037,6 +1119,7 @@ class BridgeViewModelTest {
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 

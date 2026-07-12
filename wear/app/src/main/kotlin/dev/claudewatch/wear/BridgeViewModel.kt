@@ -1,7 +1,10 @@
 package dev.claudewatch.wear
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.claudewatch.shared.protocol.AskUserQuestion
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
@@ -9,25 +12,37 @@ import dev.claudewatch.shared.protocol.SseFrame
 import dev.claudewatch.shared.state.BridgeEventReducer
 import dev.claudewatch.shared.state.BridgeState
 import dev.claudewatch.shared.terminal.ToolOutputFormatter
+import dev.claudewatch.wear.data.CredentialStore
+import dev.claudewatch.wear.net.BackoffPolicy
 import dev.claudewatch.wear.net.BridgeClient
+import dev.claudewatch.wear.net.ConnectionEngine
+import dev.claudewatch.wear.net.ConnectionState
+import dev.claudewatch.wear.net.NetworkEscalator
+import dev.claudewatch.wear.net.WifiNetworkEscalator
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import okhttp3.Response
-import okhttp3.sse.EventSource
-import okhttp3.sse.EventSourceListener
 
 /**
- * State for the single debug screen: pair with the bridge, stream SSE events,
- * send a session-scoped command, answer permission prompts.
+ * State for the watch UI: pair with the bridge, stream SSE events, send
+ * session-scoped commands, answer permission and question prompts.
  *
- * All event handling goes through :shared's pure [BridgeEventReducer]: this
- * class only does I/O and mirrors the reduced [BridgeState] into [UiState].
+ * All connection lifecycle behavior lives in [ConnectionEngine] — this class
+ * only renders its state and feeds it user intents. All event handling goes
+ * through :shared's pure [BridgeEventReducer]: this class only does I/O and
+ * mirrors the reduced [BridgeState] into [UiState].
  */
-class BridgeViewModel : ViewModel() {
+class BridgeViewModel(
+    store: CredentialStore,
+    clientFactory: (String, Int) -> BridgeClient = { hostIp, port -> BridgeClient(hostIp, port) },
+    backoff: BackoffPolicy = BackoffPolicy(),
+    escalator: NetworkEscalator = NetworkEscalator.NOOP,
+) : ViewModel() {
 
     /**
      * One queued approval card, fully resolved for rendering: WHAT is being
@@ -53,6 +68,8 @@ class BridgeViewModel : ViewModel() {
     data class UiState(
         val status: String = "unpaired",
         val paired: Boolean = false,
+        /** Non-null when the user must pair again; rendered as an explanation. */
+        val repairExplanation: String? = null,
         val sessionId: String? = null,
         /**
          * Approval queue, newest-first. The FRONT is the rendered card. Newest
@@ -110,50 +127,62 @@ class BridgeViewModel : ViewModel() {
     @Volatile
     var haptics: Haptics = Haptics.None
 
-    private var client: BridgeClient? = null
-    private var token: String? = null
-    private var eventSource: EventSource? = null
+    // Owns the engine's lifetime; viewModelScope is avoided on purpose (it
+    // requires Dispatchers.Main, which plain JVM unit tests don't have).
+    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val engine = ConnectionEngine(store, engineScope, clientFactory, backoff, escalator = escalator)
 
-    @Volatile
-    private var stopped = false
-
-    fun pair(host: String, portText: String, code: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                _state.update { it.copy(status = "pairing") }
-                val port = portText.trim().toIntOrNull()
-                    ?: throw IllegalArgumentException("invalid port: $portText")
-                val candidate = BridgeClient(host, port)
-                val result = candidate.pair(code.trim(), deviceName = "wear-skeleton")
-                val body = result.body
-                val newToken = body?.optString("token").takeUnless { it.isNullOrEmpty() }
-                if (!result.ok || body == null || newToken == null) {
-                    val error = body?.optString("error") ?: ""
-                    _state.update { it.copy(status = "pair failed: ${result.status} $error") }
-                    return@launch
+    init {
+        engineScope.launch {
+            engine.state.collect { connection ->
+                _state.update {
+                    it.copy(
+                        status = statusText(connection),
+                        paired = connection.isPairedState(),
+                        repairExplanation = repairExplanation(connection),
+                    )
                 }
-                client = candidate
-                token = newToken
-                // Seed the session id from the pair snapshot when one is running.
-                var sessionId: String? = null
-                val sessions = body.optJSONArray("sessions")
-                if (sessions != null) {
-                    for (i in 0 until sessions.length()) {
-                        val session = sessions.optJSONObject(i) ?: continue
-                        if (session.optString("state") == "running") {
-                            sessionId = session.optString("id").takeUnless { it.isEmpty() }
-                        }
-                    }
-                }
-                // Don't report "paired" yet: the stream isn't open, so events
-                // can still be missed. onOpen below is the ready signal (and
-                // what the e2e test gates on before firing hooks).
-                _state.update { it.copy(status = "pair ok, opening stream", paired = true, sessionId = sessionId) }
-                connectEvents()
-            } catch (e: Exception) {
-                _state.update { it.copy(status = "pair error: ${e.message}") }
             }
         }
+        engineScope.launch {
+            engine.events.collect { handleEvent(it.id, it.type, it.data) }
+        }
+        engine.start()
+    }
+
+    fun pair(host: String, portText: String, code: String) {
+        engineScope.launch {
+            val port = portText.trim().toIntOrNull()
+            if (port == null) {
+                _state.update { it.copy(status = "pair failed: invalid port: $portText") }
+                return@launch
+            }
+            val body = engine.pair(host, port, code.trim(), deviceName = "wear-client") ?: return@launch
+            // Seed the session id from the pair snapshot when one is running.
+            var sessionId: String? = null
+            val sessions = body.optJSONArray("sessions")
+            if (sessions != null) {
+                for (i in 0 until sessions.length()) {
+                    val session = sessions.optJSONObject(i) ?: continue
+                    if (session.optString("state") == "running") {
+                        sessionId = session.optString("id").takeUnless { it.isEmpty() }
+                    }
+                }
+            }
+            if (sessionId != null) {
+                _state.update { it.copy(sessionId = sessionId) }
+            }
+        }
+    }
+
+    /**
+     * User unpair: engine stops, credentials are wiped, nothing retries. The
+     * screen model resets to the unpaired default (status/paired follow from
+     * the engine's Stopped state through the collector).
+     */
+    fun unpair() {
+        engine.stop()
+        _state.update { UiState(status = it.status, paired = false) }
     }
 
     /** Mirror the command box into [UiState.commandDraft] (see its doc for why the VM owns it). */
@@ -202,14 +231,12 @@ class BridgeViewModel : ViewModel() {
     fun sendCommand(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
-        val currentClient = client
-        val currentToken = token
         val sessionId = _state.value.sessionId
         fun refuse(result: String, error: String) {
             haptics.commandFailed()
             _state.update { it.copy(commandResult = result, commandError = error, commandDraft = trimmed) }
         }
-        if (currentClient == null || currentToken == null) {
+        if (!_state.value.paired) {
             refuse("command:not-paired", "Not paired — command not sent")
             return
         }
@@ -226,23 +253,29 @@ class BridgeViewModel : ViewModel() {
         // Pending, NOT echoed: the terminal shows nothing until the bridge
         // acks. The draft empties so the pending indicator owns the text.
         _state.update { it.copy(commandInFlightText = trimmed, commandError = null, commandDraft = "") }
-        viewModelScope.launch(Dispatchers.IO) {
+        engineScope.launch {
             try {
-                val result = currentClient.sendCommand(currentToken, sessionId, trimmed)
-                if (result.ok) {
-                    haptics.commandAcked()
-                    _state.update { ui ->
-                        // Echo and pending-clear are one atomic update: there
-                        // is no observable state where the command is echoed
-                        // but still pending, or acked but not echoed.
-                        val echoed = ui.withBridge(ui.bridge.echoCommand(sessionId, trimmed))
-                        echoed.copy(
-                            commandResult = "command:${result.status}",
-                            commandInFlightText = null,
-                        )
+                val result = engine.sendCommand(sessionId, trimmed)
+                when {
+                    // The engine lost its pairing while the send was queued
+                    // (stop/401 teardown): nothing was sent, same restore
+                    // contract as any other failure.
+                    result == null ->
+                        sendFailed(trimmed, "command:not-paired", "not paired")
+                    result.ok -> {
+                        haptics.commandAcked()
+                        _state.update { ui ->
+                            // Echo and pending-clear are one atomic update: there
+                            // is no observable state where the command is echoed
+                            // but still pending, or acked but not echoed.
+                            val echoed = ui.withBridge(ui.bridge.echoCommand(sessionId, trimmed))
+                            echoed.copy(
+                                commandResult = "command:${result.status}",
+                                commandInFlightText = null,
+                            )
+                        }
                     }
-                } else {
-                    sendFailed(trimmed, "command:${result.status}", "HTTP ${result.status}")
+                    else -> sendFailed(trimmed, "command:${result.status}", "HTTP ${result.status}")
                 }
             } catch (e: Exception) {
                 // Transport error or timeout: same contract as a non-2xx.
@@ -280,15 +313,13 @@ class BridgeViewModel : ViewModel() {
 
     /** Spawn a fresh agent session ("claude" or "codex") in a bridge-owned PTY. */
     fun spawnSession(agent: String) {
-        val currentClient = client
-        val currentToken = token
-        if (currentClient == null || currentToken == null) {
-            _state.update { it.copy(sessionActionResult = "spawn:not-paired") }
-            return
-        }
-        viewModelScope.launch(Dispatchers.IO) {
+        engineScope.launch {
             try {
-                val result = currentClient.spawnSession(currentToken, agent)
+                val result = engine.spawnSession(agent)
+                if (result == null) {
+                    _state.update { it.copy(sessionActionResult = "spawn:not-paired") }
+                    return@launch
+                }
                 val spawnedId = result.body?.optString("sessionId").takeUnless { it.isNullOrEmpty() }
                 _state.update {
                     it.copy(
@@ -306,16 +337,12 @@ class BridgeViewModel : ViewModel() {
 
     /** Kill [sessionId]; the page disappears when the bridge's `ended` event prunes it. */
     fun killSession(sessionId: String) {
-        val currentClient = client
-        val currentToken = token
-        if (currentClient == null || currentToken == null) {
-            _state.update { it.copy(sessionActionResult = "kill:not-paired") }
-            return
-        }
-        viewModelScope.launch(Dispatchers.IO) {
+        engineScope.launch {
             try {
-                val result = currentClient.killSession(currentToken, sessionId)
-                _state.update { it.copy(sessionActionResult = "kill:${result.status}") }
+                val result = engine.killSession(sessionId)
+                _state.update {
+                    it.copy(sessionActionResult = if (result == null) "kill:not-paired" else "kill:${result.status}")
+                }
             } catch (e: Exception) {
                 _state.update { it.copy(sessionActionResult = "kill:error ${e.message}") }
             }
@@ -343,9 +370,9 @@ class BridgeViewModel : ViewModel() {
      * unlocks the sheet's [dismissPermissionLocally] escape hatch.
      */
     fun answerPermission(permissionId: String, behavior: String) {
-        sendDecision(permissionId) { currentClient, currentToken ->
+        sendDecision(permissionId) {
             val message = if (behavior == "deny") "Denied from the watch" else null
-            currentClient.answerPermission(currentToken, permissionId, behavior, message)
+            engine.answerPermission(permissionId, behavior, message)
         }
     }
 
@@ -364,24 +391,34 @@ class BridgeViewModel : ViewModel() {
      */
     fun answerQuestions(permissionId: String, answers: List<String>) {
         if (answers.isEmpty()) return
-        sendDecision(permissionId) { currentClient, currentToken ->
-            currentClient.answerQuestions(currentToken, permissionId, answers)
+        sendDecision(permissionId) {
+            engine.answerQuestions(permissionId, answers)
         }
     }
 
     private fun sendDecision(
         permissionId: String,
-        post: (BridgeClient, String) -> BridgeClient.ApiResult,
+        post: suspend () -> BridgeClient.ApiResult?,
     ) {
-        val currentClient = client
-        val currentToken = token
         // Answer only a prompt that is actually still queued.
         if (_state.value.bridge.pendingPermissions.none { it.permissionId == permissionId }) return
-        if (currentClient == null || currentToken == null) return
         _state.update { it.copy(decisionInFlightId = permissionId, decisionError = null) }
-        viewModelScope.launch(Dispatchers.IO) {
+        engineScope.launch {
             try {
-                val result = post(currentClient, currentToken)
+                val result = post()
+                if (result == null) {
+                    // Engine not paired: nothing was sent; the prompt stays
+                    // queued (retryable — same class as a transport failure).
+                    _state.update {
+                        it.copy(
+                            decisionResult = "decision:not-paired",
+                            decisionInFlightId = null,
+                            decisionError = "Not paired — decision not sent",
+                            decisionFailureCount = it.decisionFailureCount + 1,
+                        )
+                    }
+                    return@launch
+                }
                 _state.update { ui ->
                     // The bridge pushes no permission-cleared when a prompt is
                     // resolved via /v1/command from another paired device, or
@@ -448,49 +485,6 @@ class BridgeViewModel : ViewModel() {
         }
     }
 
-    private val sseListener = object : EventSourceListener() {
-        override fun onOpen(eventSource: EventSource, response: Response) {
-            _state.update { it.copy(status = "paired, stream open") }
-        }
-
-        override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-            handleEvent(id, type ?: "message", data)
-        }
-
-        override fun onClosed(eventSource: EventSource) {
-            scheduleReconnect("stream closed")
-        }
-
-        override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-            scheduleReconnect("stream failure: ${t?.message ?: response?.code}")
-        }
-    }
-
-    private fun connectEvents() {
-        val currentClient = client ?: return
-        val currentToken = token ?: return
-        eventSource?.cancel()
-        // Before any event has parsed AND applied, connect with "0" so the
-        // bridge replays its whole ring buffer. Without it, an event pushed
-        // between pair success and the stream actually opening is lost
-        // forever: a connect with no Last-Event-ID gets no replay, and the
-        // connect-time sync event reuses the newest buffered id, so a later
-        // reconnect's "id > lastId" replay can never recover the miss. The
-        // reducer commits lastEventId only after a successful parse+apply, so
-        // a rejected frame is also replayed on reconnect instead of skipped.
-        val lastEventId = _state.value.bridge.lastEventId ?: "0"
-        eventSource = currentClient.openEvents(currentToken, lastEventId, sseListener)
-    }
-
-    private fun scheduleReconnect(reason: String) {
-        if (stopped) return
-        _state.update { it.copy(status = "paired, reconnecting ($reason)") }
-        viewModelScope.launch(Dispatchers.IO) {
-            delay(RECONNECT_DELAY_MS)
-            if (!stopped && _state.value.paired) connectEvents()
-        }
-    }
-
     private fun handleEvent(id: String?, type: String, data: String) {
         val frame = SseFrame(id, type, data)
         _state.update { ui ->
@@ -546,12 +540,57 @@ class BridgeViewModel : ViewModel() {
         )
     }
 
-    override fun onCleared() {
-        stopped = true
-        eventSource?.cancel()
+    private fun statusText(connection: ConnectionState): String = when (connection) {
+        ConnectionState.Stopped -> "unpaired"
+        ConnectionState.Pairing -> "pairing"
+        is ConnectionState.PairFailed -> "pair failed: ${connection.message}"
+        is ConnectionState.ProtoMismatch ->
+            "bridge proto ${connection.bridgeProto ?: "unknown"} unsupported (need >= ${connection.minProto})"
+        // Deliberately does not contain "paired": events could still be
+        // missed until the stream is actually open (see BridgeViewModelTest).
+        is ConnectionState.Connecting -> "connecting stream"
+        ConnectionState.Connected -> "paired, stream open"
+        is ConnectionState.Reconnecting -> "paired, reconnecting (${connection.reason})"
+        is ConnectionState.AuthExpired -> "re-pair required"
+        is ConnectionState.BridgeMismatch -> "re-pair required (different bridge)"
     }
 
-    private companion object {
-        const val RECONNECT_DELAY_MS = 2_000L
+    private fun repairExplanation(connection: ConnectionState): String? = when (connection) {
+        is ConnectionState.AuthExpired -> connection.reason
+        is ConnectionState.ProtoMismatch ->
+            "This bridge speaks protocol ${connection.bridgeProto ?: "unknown"} but the app needs " +
+                "${connection.minProto} or newer. Update the bridge skill on your computer, then pair again."
+        is ConnectionState.BridgeMismatch ->
+            "A different bridge (${connection.actualBridgeId ?: "unknown"}) answered at the paired " +
+                "address — expected ${connection.expectedBridgeId ?: "unknown"}. Nothing was sent to it. " +
+                "If your computer's address changed, pair again from the bridge banner."
+        else -> null
+    }
+
+    private fun ConnectionState.isPairedState(): Boolean = when (this) {
+        is ConnectionState.Connecting, ConnectionState.Connected, is ConnectionState.Reconnecting -> true
+        else -> false
+    }
+
+    override fun onCleared() {
+        // Process/UI teardown is NOT unpair: cancel all network activity but
+        // keep credentials so the next launch resumes.
+        engine.shutdown()
+        engineScope.cancel()
+    }
+
+    companion object {
+        /**
+         * Production wiring: Keystore-encrypted store in app-private files,
+         * held-Wi-Fi escalation through the real ConnectivityManager.
+         */
+        fun factory(context: Context): ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                BridgeViewModel(
+                    CredentialStore.singleton(context),
+                    escalator = WifiNetworkEscalator(context.applicationContext),
+                )
+            }
+        }
     }
 }

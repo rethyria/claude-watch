@@ -51,6 +51,9 @@ dependencies {
     implementation(libs.activity.compose)
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.coroutines.android)
+    // DataStore with a custom (encrypting) Serializer — the Proto-DataStore
+    // mechanism (single typed object, atomic writes) without protobuf codegen.
+    implementation(libs.datastore)
     implementation(libs.okhttp)
     implementation(libs.okhttp.sse)
 

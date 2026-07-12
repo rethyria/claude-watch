@@ -7,6 +7,7 @@ import okhttp3.sse.EventSourceListener
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -39,6 +40,20 @@ class BridgeClientTest {
     @Test(expected = IllegalArgumentException::class)
     fun refusesNonPrivateHosts() {
         BridgeClient("8.8.8.8", 7860)
+    }
+
+    @Test
+    fun pingIsAnUnauthenticatedV1Probe() {
+        server.enqueue(MockResponse().setBody("""{"proto":"2","bridgeId":"b-1","machineName":"m"}"""))
+
+        val result = client.ping()
+
+        assertEquals(200, result.status)
+        assertEquals("2", result.body!!.getString("proto"))
+        val request = server.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/v1/ping", request.path)
+        assertNull(request.getHeader("Authorization"))
     }
 
     @Test
