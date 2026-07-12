@@ -1,6 +1,8 @@
-// Handoff §8 (offline / re-pair). The reconnect countdown and the pairing
-// spinner flow are still placeholder-level (follow-up agent), but the pairing
-// PATH itself must exist here: this screen is the whole unpaired/offline
+// Handoff §8 (offline / re-pair). The spec's per-second "retry in Ns"
+// countdown renders as the engine's own status line instead ("paired,
+// reconnecting (reason)") — UiState does not expose the backoff deadline,
+// and the UI layer does not reach into the engine to get one. The pairing
+// PATH itself lives here: this screen is the whole unpaired/offline
 // experience and MainActivity mounts HaloApp directly, so without the form a
 // fresh install would dead-end on "not paired" with nothing tappable.
 // Pairing goes straight through onPair — the engine re-pairs in place, so
