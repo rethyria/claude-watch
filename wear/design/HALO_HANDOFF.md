@@ -107,6 +107,21 @@ shown as sent until the bridge ACKs.** Success: feed entry "you: … ✓". Failu
 (no ack in ~3s): red-dashed transcript, "not delivered — bridge didn't ack",
 Retry / Discard. (Existing ViewModel already enforces ack-gating.)
 
+> **Implementation deviation (accepted):** the LISTENING phase is the system
+> recognizer activity (`RecognizerIntent.ACTION_RECOGNIZE_SPEECH`), not a
+> custom screen — Wear's recognizer intent offers no partial-result stream
+> for a live transcript, covers the whole display, and auto-submits on
+> end-of-speech, so the concentric circles, the styled live transcript, and
+> the tap-to-send affordance are not implemented. The target-naming intent
+> survives as the recognizer's prompt line ("To {session}"), set at launch
+> from the summoning surface's session. Everything AFTER transcription —
+> sending hold, ack gating, failure with Retry/Discard — follows this spec
+> verbatim (`HaloVoiceScreen.kt`, overlay lifecycle in `HaloApp.kt`). The
+> failed state is modal (Retry/Discard are the only exits) and Cancel during
+> sending keeps the overlay armed so an eventual failure reopens it: no other
+> Halo surface renders the restored draft, and the text must never be lost
+> silently.
+
 ### 8. Offline / re-pair
 Ring hollow grey (same geometry, drained). "Bridge offline" (30, `#E5484D`),
 "reconnecting… retry in Ns" countdown, "Re-pair watch" outline chip (terracotta).

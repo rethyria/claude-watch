@@ -2,9 +2,12 @@
 // option pills, a selection advances to the next question, and the answers
 // are BUFFERED and submitted together after the last one (one positional
 // answer per question — never keyed by question text, which would collapse
-// duplicate questions and deadlock the submit gate). "Dictate an answer…" is
-// always the last option, so a question whose options failed to parse is
-// still answerable. Renders the [card] it is GIVEN — HaloApp resolves nav's
+// duplicate questions and deadlock the submit gate). The buffer itself is
+// HOISTED to HaloApp (keyed by prompt id) so "answer later ↓" / swipe-down —
+// which unmount this overlay-scoped composable — lose nothing (§6).
+// "Dictate an answer…" is always the last option, so a question whose
+// options failed to parse is still answerable. Renders the [card] it is
+// GIVEN — HaloApp resolves nav's
 // targeted prompt (or the queue front) and keeps the exiting chaining frame
 // rendering the entry that just left the queue, so ui.permissionQueue is read
 // here ONLY as the resolution signal, never to choose what to render.
@@ -33,12 +36,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -72,6 +74,15 @@ fun HaloQuestionCard(
     card: BridgeViewModel.PendingPermission,
     model: HaloModel,
     ui: BridgeViewModel.UiState,
+    /**
+     * The answer buffer: one answer per question POSITION (see the header
+     * comment). OWNED BY THE CALLER and keyed to this prompt's id there,
+     * because this composable unmounts on every overlay exit — "answer
+     * later ↓", swipe-down, even a reconnect blip — and §6 promises that
+     * exit "loses nothing": picks made so far must survive a close/reopen
+     * round-trip. Kept after submit so a failed POST retries the exact picks.
+     */
+    answers: SnapshotStateList<String?>,
     onAnswers: (String, List<String>) -> Unit,
     onDismiss: (String) -> Unit,
     /** Launch the recognizer; the transcription lands in the callback. */
@@ -82,13 +93,9 @@ fun HaloQuestionCard(
     val done by rememberUpdatedState(onDone)
     val questions = card.questions
 
-    // The buffer: one answer per question POSITION (see the header comment).
-    // Keyed by prompt id so a recycled composition never leaks another card's
-    // answers, and KEPT after submit so a failed POST retries the exact picks.
-    var index by remember(card.permissionId) { mutableIntStateOf(0) }
-    val answers = remember(card.permissionId) {
-        mutableStateListOf<String?>().apply { repeat(questions.size) { add(null) } }
-    }
+    // The current question is DERIVED (first unanswered position), never a
+    // separately-stored index that could drift from the hoisted buffer.
+    val index = answers.indexOfFirst { it == null }.let { if (it < 0) answers.size else it }
     var submitted by remember(card.permissionId) { mutableStateOf(false) }
     var dismissedLocally by remember(card.permissionId) { mutableStateOf(false) }
     // The error of the last FAILED attempt on this card, scoped locally
@@ -109,8 +116,12 @@ fun HaloQuestionCard(
     var showFlash by remember(card.permissionId) { mutableStateOf(false) }
     if (resolved && !resolutionSeen) {
         resolutionSeen = true
+        // The ✓ flash needs decisionForId to match: decisionResult is global
+        // and sticky, so alone it can be an EARLIER prompt's success — e.g. a
+        // submit that raced a hook-abort and never actually POSTed.
         showFlash = submitted && !dismissedLocally && !inFlight &&
-            ui.decisionError == null && ui.decisionResult.isDecisionSuccess()
+            ui.decisionError == null && ui.decisionForId == card.permissionId &&
+            ui.decisionResult.isDecisionSuccess()
     }
     LaunchedEffect(resolved) {
         if (!resolved) return@LaunchedEffect
@@ -132,10 +143,17 @@ fun HaloQuestionCard(
         if (SystemClock.uptimeMillis() < armAtMs) return
         val trimmed = answer.trim()
         if (trimmed.isEmpty()) return
-        if (index >= answers.size) return
-        answers[index] = trimmed
-        if (index < questions.lastIndex) index++ else submit()
+        val position = answers.indexOfFirst { it == null }
+        if (position < 0) return
+        answers[position] = trimmed
+        if (answers.none { it == null }) submit()
     }
+    // The dictation sink outlives the composition that created it (the
+    // recognizer round-trip takes seconds): route it through the LATEST
+    // record, whose resolved/inFlight guards read the current state — a
+    // tap-time closure would happily "answer" a prompt that resolved while
+    // the recognizer was up.
+    val currentRecord by rememberUpdatedState<(String) -> Unit>(::record)
 
     Crossfade(
         targetState = showFlash,
@@ -157,7 +175,7 @@ fun HaloQuestionCard(
                 attemptError = attemptError,
                 resolved = resolved,
                 onPick = ::record,
-                onDictate = { onDictate { spoken -> record(spoken) } },
+                onDictate = { onDictate { spoken -> currentRecord(spoken) } },
                 onRetry = { if (!inFlight && !resolved) submit() },
                 onDismissLocally = {
                     dismissedLocally = true

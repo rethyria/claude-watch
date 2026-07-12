@@ -129,8 +129,11 @@ fun HaloApprovalCard(
     var showFlash by remember(card.permissionId) { mutableStateOf(false) }
     if (resolved && !resolutionSeen) {
         resolutionSeen = true
+        // decisionForId must ALSO match: decisionResult is sticky, so alone
+        // it can be an earlier prompt's success masquerading as this one's.
         showFlash = sent != null && !dismissedLocally && !inFlight &&
-            ui.decisionError == null && ui.decisionResult.isDecisionSuccess()
+            ui.decisionError == null && ui.decisionForId == card.permissionId &&
+            ui.decisionResult.isDecisionSuccess()
     }
     LaunchedEffect(resolved) {
         if (!resolved) return@LaunchedEffect

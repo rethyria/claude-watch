@@ -36,12 +36,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -78,6 +82,8 @@ data class HaloActions(
     val onAnswerPermission: (permissionId: String, behavior: String) -> Unit = { _, _ -> },
     val onAnswerQuestions: (permissionId: String, answers: List<String>) -> Unit = { _, _ -> },
     val onDismissPermission: (permissionId: String) -> Unit = {},
+    /** Voice-overlay Discard: drop the failed draft AND its error together. */
+    val onDiscardCommand: () -> Unit = {},
     val onSpawn: (agent: String) -> Unit = {},
     val onKill: (sessionId: String) -> Unit = {},
 )
@@ -110,29 +116,68 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
     // (queue chaining) or the overlay close.
     var cardHold by remember { mutableStateOf<BridgeViewModel.PendingPermission?>(null) }
 
+    // §6 "answer later ↓ exits, losing nothing": the question card's answer
+    // buffer lives HERE, keyed by prompt id, because the card composable
+    // unmounts on every overlay exit (answer later, swipe-down, a reconnect
+    // blip) and composition-local state would restart a half-answered prompt
+    // at question 1. Entries are pruned once their prompt is resolved.
+    val answerDrafts = remember { mutableStateMapOf<String, SnapshotStateList<String?>>() }
+
     // §7 voice overlay. The listening phase is the system recognizer activity
     // (it covers the screen; see HaloVoiceScreen's header), so the overlay's
     // lifecycle keys off the SEND: armed when a Halo surface launches
-    // dictation, opened when its send goes in flight, held open on failure
-    // (Retry/Discard), closed on the ack — the echo is then in the feed.
-    // Question-card dictation never arms it: those transcriptions are answer
-    // buffer entries, not sends.
-    var voiceArmed by remember { mutableStateOf(false) }
-    var voiceOpen by remember { mutableStateOf(false) }
+    // dictation, opened when its send goes in flight OR its launch/send is
+    // refused (commandError with no new send — e.g. no recognizer on the
+    // watch, busy refusal), held open on failure (Retry/Discard), closed on
+    // the ack — the echo is then in the feed. Cancel while sending stops
+    // WATCHING but stays ARMED: an eventual failure must reopen the overlay,
+    // because nothing else in Halo renders the restored draft — closing for
+    // good would silently lose the text at the rendering layer. Question-card
+    // dictation never arms it: those transcriptions are answer buffer
+    // entries, not sends. All of it rememberSaveable: the recognizer result
+    // is redelivered across activity recreation, and plain remember would
+    // drop the armed overlay for a send that is still very much in flight.
+    var voiceArmed by rememberSaveable { mutableStateOf(false) }
+    var voiceOpen by rememberSaveable { mutableStateOf(false) }
+    // True once this arm's send/failure has reached the overlay: gates the
+    // "concluded quietly" disarm below so the recognizer round-trip (no send
+    // yet, no error) isn't mistaken for a finished send.
+    var voiceWatched by rememberSaveable { mutableStateOf(false) }
     // Retry must re-target the session of the ORIGINAL dictation, captured at
     // launch: the VM's fallback (most recently working session) can differ.
-    var voiceTarget by remember { mutableStateOf<String?>(null) }
+    var voiceTarget by rememberSaveable { mutableStateOf<String?>(null) }
+    // A send already in flight when dictation starts is NOT this dictation's
+    // send: without this pin, dictating during another send's ack window
+    // would open the overlay showing the OLD text labeled with the NEW target.
+    var voicePriorInFlight by rememberSaveable { mutableStateOf<String?>(null) }
     val dictate: (String?) -> Unit = { sessionId ->
         voiceTarget = sessionId
+        voicePriorInFlight = ui.commandInFlightText
         voiceArmed = true
+        voiceWatched = false
         actions.onDictate(sessionId)
     }
     // Idempotent snapshot writes (same discipline as cardHold below).
-    if (voiceArmed && !voiceOpen && ui.commandInFlightText != null) voiceOpen = true
+    if (voiceArmed && !voiceOpen) {
+        val sendAppeared = !voiceWatched && ui.commandInFlightText != null &&
+            ui.commandInFlightText != voicePriorInFlight
+        if (sendAppeared || ui.commandError != null) {
+            voiceOpen = true
+            voiceWatched = true
+        }
+    }
     if (voiceOpen && ui.commandInFlightText == null && ui.commandError == null) {
         // Acked: the echo is in the feed; nothing left to show.
         voiceOpen = false
         voiceArmed = false
+        voiceWatched = false
+    }
+    if (voiceArmed && !voiceOpen && voiceWatched &&
+        ui.commandInFlightText == null && ui.commandError == null
+    ) {
+        // The send the user cancelled off concluded successfully: disarm.
+        voiceArmed = false
+        voiceWatched = false
     }
 
     // The model can shrink under the navigation (session killed, project's
@@ -248,6 +293,14 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
             }
         }
         val display = if (nav.cardOpen) cardHold else null
+        // Prune resolved prompts' answer drafts (idempotent: only writes when
+        // something is actually stale). The held prompt's draft survives its
+        // result flash, during which it has already left the queue.
+        run {
+            val liveIds = ui.permissionQueue.mapTo(mutableSetOf()) { it.permissionId }
+            cardHold?.let { liveIds += it.permissionId }
+            if (answerDrafts.keys.any { it !in liveIds }) answerDrafts.keys.retainAll(liveIds)
+        }
         // The card composable reports done: after its result flash (resolved
         // prompt) or on "decide later" (prompt still queued). Resolving the
         // last prompt goes home (spec); chaining otherwise happens through
@@ -300,10 +353,21 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                     label = "haloCard",
                 ) { card ->
                     if (card.questions.isNotEmpty()) {
+                        // The prompt's hoisted answer buffer (created on first
+                        // open, reused on reopen). Rebuilt if the question
+                        // count ever changes under a by-id metadata refresh.
+                        val draft = answerDrafts.getOrPut(card.permissionId) {
+                            mutableStateListOf<String?>().apply { repeat(card.questions.size) { add(null) } }
+                        }
+                        if (draft.size != card.questions.size) {
+                            draft.clear()
+                            repeat(card.questions.size) { draft.add(null) }
+                        }
                         HaloQuestionCard(
                             card = card,
                             model = model,
                             ui = ui,
+                            answers = draft,
                             onAnswers = actions.onAnswerQuestions,
                             onDismiss = actions.onDismissPermission,
                             // A dictated ANSWER goes to the card's buffer,
@@ -327,12 +391,17 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
 
         // §7 voice overlay, above the card (a feed's Dictate and the card
         // both summon it) and below the offline takeover. Modal like the
-        // card; swipe-down is Cancel/keep — the text survives in the draft
-        // either way (the VM's never-silently-lost contract).
+        // card. Swipe-down (= Cancel) only applies while SENDING: it stops
+        // watching but stays armed, so an eventual failure reopens the
+        // overlay — nothing else renders the restored draft. In the FAILED
+        // state the overlay is deliberately modal: Retry and Discard are the
+        // only exits, because a swipe-away would strand the restored text in
+        // a draft no Halo surface shows (the silent-loss class issue #20
+        // exists to prevent, at the rendering layer this time).
         if (voiceOpen) {
-            val closeVoice = {
-                voiceOpen = false
-                voiceArmed = false
+            val cancelVoice = {
+                // Reads currentUi: the gesture closure below never restarts.
+                if (currentUi.commandError == null) voiceOpen = false
             }
             Box(
                 modifier = Modifier
@@ -343,7 +412,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         var total = 0f
                         detectVerticalDragGestures(
                             onDragStart = { total = 0f },
-                            onDragEnd = { if (total > threshold) closeVoice() },
+                            onDragEnd = { if (total > threshold) cancelVoice() },
                         ) { change, dragAmount ->
                             total += dragAmount
                             change.consume()
@@ -357,13 +426,17 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                     },
                     onRetry = { actions.onSendCommand(currentUi.commandDraft, voiceTarget) },
                     onDiscard = {
-                        actions.onCommandDraftChange("")
-                        closeVoice()
+                        // The deliberate-loss exit: drops draft AND error (a
+                        // lingering error would instantly reopen the overlay).
+                        actions.onDiscardCommand()
+                        voiceOpen = false
+                        voiceArmed = false
+                        voiceWatched = false
                     },
                     // No VM abort exists for an in-flight send: Cancel stops
-                    // WATCHING it. An eventual failure restores the text to
-                    // the draft; an ack echoes into the feed as usual.
-                    onCancel = closeVoice,
+                    // WATCHING it. An eventual failure reopens the overlay
+                    // (still armed); an ack echoes into the feed and disarms.
+                    onCancel = cancelVoice,
                 )
             }
         }
