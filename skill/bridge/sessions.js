@@ -17,9 +17,9 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
 // Multi-session: each entry is a session slot
 // { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId?, hookCreated?,
-//   title?, transcriptPath?, titleCache? } — title is lazily derived from the
-//   Claude Code transcript (see the session-titles section below).
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}}>} */
+//   title?, titleIsAi?, transcriptPath?, titleCache? } — title is lazily derived
+//   from the Claude Code transcript (see the session-titles section below).
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -84,29 +84,40 @@ function truncateTitle(text) {
 }
 
 // Derive the current title from a transcript: last ai-title record wins,
-// falling back to the first user prompt. Returns null when neither exists.
-// Throws only I/O errors (the caller absorbs them); malformed lines are
-// skipped silently.
+// falling back to the first user prompt. Returns
+//   { title, fromAi, aiIsNewest } — title null when neither exists; fromAi
+// says the title came from an ai-title record; aiIsNewest says that ai-title
+// is provably the transcript's newest one (a full scan sees every record; a
+// partial head+tail scan only proves it for the tail chunk — an ai-title
+// seen only in the head may be outranked by a newer one in the skipped
+// middle). Throws only I/O errors (the caller absorbs them); malformed
+// lines are skipped silently.
 function deriveTranscriptTitle(transcriptPath, size) {
   const chunks = [];
-  if (size <= 2 * TRANSCRIPT_SCAN_BYTES) {
-    chunks.push({ text: fs.readFileSync(transcriptPath, "utf-8"), partialFirstLine: false });
-  } else {
-    const fd = fs.openSync(transcriptPath, "r");
-    try {
+  const fd = fs.openSync(transcriptPath, "r");
+  try {
+    if (size <= 2 * TRANSCRIPT_SCAN_BYTES) {
+      // Bounded read (never readFileSync): `size` came from a stat of a
+      // regular file, so even a file that grows mid-read costs at most this
+      // buffer.
+      const buf = Buffer.alloc(size);
+      const read = fs.readSync(fd, buf, 0, size, 0);
+      chunks.push({ text: buf.toString("utf-8", 0, read), partialFirstLine: false, isTail: true });
+    } else {
       const head = Buffer.alloc(TRANSCRIPT_SCAN_BYTES);
       const headRead = fs.readSync(fd, head, 0, TRANSCRIPT_SCAN_BYTES, 0);
       const tail = Buffer.alloc(TRANSCRIPT_SCAN_BYTES);
       const tailRead = fs.readSync(fd, tail, 0, TRANSCRIPT_SCAN_BYTES, size - TRANSCRIPT_SCAN_BYTES);
-      chunks.push({ text: head.toString("utf-8", 0, headRead), partialFirstLine: false });
+      chunks.push({ text: head.toString("utf-8", 0, headRead), partialFirstLine: false, isTail: false });
       // The tail chunk almost certainly starts mid-line; drop the fragment.
-      chunks.push({ text: tail.toString("utf-8", 0, tailRead), partialFirstLine: true });
-    } finally {
-      fs.closeSync(fd);
+      chunks.push({ text: tail.toString("utf-8", 0, tailRead), partialFirstLine: true, isTail: true });
     }
+  } finally {
+    fs.closeSync(fd);
   }
 
   let aiTitle = null;
+  let aiTitleInTail = false;
   let firstUserPrompt = null;
   for (const chunk of chunks) {
     const lines = chunk.text.split("\n");
@@ -118,6 +129,7 @@ function deriveTranscriptTitle(transcriptPath, size) {
       if (!record || typeof record !== "object") continue;
       if (record.type === "ai-title" && typeof record.aiTitle === "string" && record.aiTitle.trim()) {
         aiTitle = record.aiTitle.trim(); // last one wins
+        aiTitleInTail = chunk.isTail;
       } else if (!firstUserPrompt && record.type === "user") {
         firstUserPrompt = extractUserPromptText(record);
       }
@@ -125,7 +137,11 @@ function deriveTranscriptTitle(transcriptPath, size) {
   }
 
   const title = aiTitle || firstUserPrompt;
-  return title ? truncateTitle(title) : null;
+  return {
+    title: title ? truncateTitle(title) : null,
+    fromAi: Boolean(aiTitle),
+    aiIsNewest: Boolean(aiTitle) && aiTitleInTail,
+  };
 }
 
 // Refresh a slot's title from its transcript, stat-gated by the (path, mtime,
@@ -136,18 +152,34 @@ export function refreshSessionTitle(slot, transcriptPath = slot?.transcriptPath)
   if (!slot || typeof transcriptPath !== "string" || !transcriptPath) return false;
   try {
     const stat = fs.statSync(transcriptPath);
+    // Regular files only: opening/reading a FIFO or device node here would
+    // block forever or read unboundedly (their stat size is 0, so the size
+    // gate cannot help), stalling the whole single-threaded bridge from
+    // inside a hook handler.
+    if (!stat.isFile()) return false;
     const cache = slot.titleCache;
     if (cache && cache.path === transcriptPath && cache.mtimeMs === stat.mtimeMs && cache.size === stat.size) {
       return false;
     }
-    const title = deriveTranscriptTitle(transcriptPath, stat.size);
-    slot.titleCache = { path: transcriptPath, mtimeMs: stat.mtimeMs, size: stat.size, title };
+    const derived = deriveTranscriptTitle(transcriptPath, stat.size);
+    slot.titleCache = { path: transcriptPath, mtimeMs: stat.mtimeMs, size: stat.size, title: derived.title };
     // A transcript that (no longer) yields a title never clears a previously
     // known one — a stale title beats flapping back to no label.
-    if (title && title !== slot.title) {
-      slot.title = title;
+    if (!derived.title) return false;
+    // Once the title came from an ai-title, only a provably-newer ai-title
+    // may replace it: a partial scan whose only ai-title sits in the
+    // immutable head chunk (or a first-prompt fallback) can be OLDER than
+    // what the slot already carries — the newest ai-title may hide in the
+    // skipped middle. Reverting would broadcast a stale title.
+    if (slot.titleIsAi && !derived.aiIsNewest) return false;
+    if (derived.title !== slot.title) {
+      slot.title = derived.title;
+      slot.titleIsAi = derived.fromAi;
       return true;
     }
+    // Same text, but now known to be ai-derived: remember that so a later
+    // prompt fallback or head-only ai-title cannot displace it.
+    if (derived.fromAi) slot.titleIsAi = true;
     return false;
   } catch {
     return false;

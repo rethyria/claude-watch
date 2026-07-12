@@ -11,6 +11,7 @@
 // them once at evaluation), hence the dynamic imports inside the tests.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -200,6 +201,75 @@ test("huge transcripts are scanned head+tail, never fully read: first prompt and
     assert.ok(fs.statSync(middle).size > 2 * 256 * 1024);
     const sidMiddle = resolveHookSession({ session_id: "cc-title-8", cwd: "/tmp/title-proj-8", transcript_path: middle });
     assert.equal(sessions.get(sidMiddle).title, "fallback prompt for the huge transcript");
+  } finally {
+    sessions.clear();
+  }
+});
+
+test("a partial head+tail scan never reverts a known ai-title to an older head one or a prompt fallback", async () => {
+  const { sessions, resolveHookSession, refreshSessionTitle } = await import("../sessions.js");
+
+  try {
+    const filler = JSON.stringify({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "x".repeat(1024) }] },
+    });
+
+    // Small enough for a full scan: title evolves from "Old early title"
+    // (which will end up inside the immutable 256 KiB head chunk) to
+    // "New pivot title".
+    const lines = [JSON.stringify(userPrompt("the first prompt")), JSON.stringify(aiTitle("Old early title"))];
+    for (let i = 0; i < 300; i++) lines.push(filler);
+    lines.push(JSON.stringify(aiTitle("New pivot title")));
+    const transcript = writeTranscript(lines);
+    assert.ok(fs.statSync(transcript).size <= 2 * 256 * 1024, "starts small enough for a full scan");
+
+    const sid = resolveHookSession({ session_id: "cc-title-9", cwd: "/tmp/title-proj-9", transcript_path: transcript });
+    const slot = sessions.get(sid);
+    assert.equal(slot.title, "New pivot title");
+
+    // The session runs long: enough output lands AFTER the pivot to push the
+    // transcript past the full-scan threshold, leaving "New pivot title" in
+    // the skipped middle and only "Old early title" inside the head chunk.
+    fs.appendFileSync(transcript, Array(450).fill(filler).join("\n") + "\n");
+    assert.ok(fs.statSync(transcript).size > 2 * 256 * 1024, "now scanned head+tail");
+
+    assert.equal(refreshSessionTitle(slot, transcript), false, "no change announced");
+    assert.equal(slot.title, "New pivot title", "the known ai-title is not reverted to the older head one");
+
+    // Idempotent: the cache absorbs the unchanged transcript, and even a
+    // forced re-derivation (mtime bump) must not regress.
+    fs.appendFileSync(transcript, filler + "\n");
+    assert.equal(refreshSessionTitle(slot, transcript), false);
+    assert.equal(slot.title, "New pivot title");
+
+    // A genuinely newer ai-title lands in the tail: that one DOES win.
+    fs.appendFileSync(transcript, JSON.stringify(aiTitle("Even newer tail title")) + "\n");
+    assert.equal(refreshSessionTitle(slot, transcript), true);
+    assert.equal(slot.title, "Even newer tail title");
+  } finally {
+    sessions.clear();
+  }
+});
+
+test("non-regular transcript files (FIFO, device nodes, directories) yield no title and never block", async () => {
+  const { sessions, refreshSessionTitle } = await import("../sessions.js");
+
+  try {
+    const slot = { id: "unit-slot", state: "running" };
+
+    // A FIFO with no writer would block openSync/readFileSync forever; a
+    // character device like /dev/zero stats as size 0 but reads unboundedly.
+    // All must be rejected by the isFile() gate before any read happens.
+    const fifo = path.join(transcriptDir, "transcript.fifo");
+    execFileSync("mkfifo", [fifo]);
+    assert.equal(refreshSessionTitle(slot, fifo), false, "FIFO: rejected without blocking");
+
+    for (const special of ["/dev/zero", "/dev/null", transcriptDir]) {
+      if (special.startsWith("/dev/") && !fs.existsSync(special)) continue;
+      assert.equal(refreshSessionTitle(slot, special), false, `${special}: no title, no error`);
+    }
+    assert.equal(slot.title, undefined, "no title was ever derived");
   } finally {
     sessions.clear();
   }
