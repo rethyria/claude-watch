@@ -9,8 +9,8 @@ test("v1 surface: pair → SSE → permission hook → decision round-trip", { t
   const bridge = await startBridge(t);
   const { port, pairingCode } = bridge;
 
-  // Pairing over /v1 behaves exactly like /pair
-  const pair = await request(port, "POST", "/v1/pair", { body: { code: pairingCode } });
+  // Pairing over /v1 requires the client's protocol version (see PROTOCOL.md)
+  const pair = await request(port, "POST", "/v1/pair", { body: { code: pairingCode, proto: 3 } });
   assert.equal(pair.status, 200);
   assert.ok(pair.body.token, "v1 pair response carries a token");
   assert.ok(pair.body.bridgeId, "v1 pair response carries bridgeId");
@@ -87,7 +87,7 @@ test("cross-surface: /v1-paired client answers a legacy hook; tokens interchange
   const bridge = await startBridge(t);
   const { port, pairingCode } = bridge;
 
-  const pair = await request(port, "POST", "/v1/pair", { body: { code: pairingCode } });
+  const pair = await request(port, "POST", "/v1/pair", { body: { code: pairingCode, proto: 3 } });
   assert.equal(pair.status, 200);
   const token = pair.body.token;
 

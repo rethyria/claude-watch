@@ -60,6 +60,11 @@ class BridgeClientTest {
         val body = JSONObject(request.body.readUtf8())
         assertEquals("123456", body.getString("code"))
         assertEquals("wear-skeleton", body.getString("deviceName"))
+        assertEquals(
+            "pair request must declare the client protocol version (bridge 426s without it)",
+            BridgeClient.PROTO_VERSION,
+            body.getInt("proto"),
+        )
     }
 
     @Test

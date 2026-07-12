@@ -245,6 +245,7 @@ export async function handleHookTaskComplete(req, res) {
 // behavior (a plain `stop` event).
 export async function handleHookNotification(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
   let body;
   try {
     body = await readBody(req, res);

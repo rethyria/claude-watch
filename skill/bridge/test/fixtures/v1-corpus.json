@@ -1,0 +1,711 @@
+[
+  {
+    "name": "ping",
+    "request": {
+      "method": "GET",
+      "path": "/v1/ping",
+      "authenticated": false,
+      "body": null
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "proto": 3,
+        "bridgeId": "<bridge-id>",
+        "machineName": "<machine-name>"
+      }
+    }
+  },
+  {
+    "name": "status unauthenticated",
+    "request": {
+      "method": "GET",
+      "path": "/v1/status",
+      "authenticated": false,
+      "body": null
+    },
+    "response": {
+      "status": 401,
+      "body": {
+        "error": "Unauthorized"
+      }
+    }
+  },
+  {
+    "name": "events unauthenticated",
+    "response": {
+      "status": 401
+    }
+  },
+  {
+    "name": "pair refused below min proto",
+    "request": {
+      "method": "POST",
+      "path": "/v1/pair",
+      "authenticated": false,
+      "body": {
+        "code": "<pairing-code>",
+        "proto": 2,
+        "deviceName": "fixture-watch"
+      }
+    },
+    "response": {
+      "status": 426,
+      "body": {
+        "error": "Unsupported protocol version: this bridge requires proto >= 3, but the pair request declared 2. Update the watch app.",
+        "proto": 3,
+        "minProto": 3
+      }
+    }
+  },
+  {
+    "name": "pair refused without proto",
+    "request": {
+      "method": "POST",
+      "path": "/v1/pair",
+      "authenticated": false,
+      "body": {
+        "code": "<pairing-code>",
+        "deviceName": "fixture-watch"
+      }
+    },
+    "response": {
+      "status": 426,
+      "body": {
+        "error": "Unsupported protocol version: this bridge requires proto >= 3, but the pair request declared none. Update the watch app.",
+        "proto": 3,
+        "minProto": 3
+      }
+    }
+  },
+  {
+    "name": "pair",
+    "request": {
+      "method": "POST",
+      "path": "/v1/pair",
+      "authenticated": false,
+      "body": {
+        "code": "<pairing-code>",
+        "proto": 3,
+        "deviceName": "fixture-watch"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "token": "<token>",
+        "bridgeId": "<bridge-id>",
+        "availableAgents": [
+          "claude",
+          "codex"
+        ],
+        "sessions": [],
+        "proto": 3
+      }
+    }
+  },
+  {
+    "name": "pair locked after success",
+    "request": {
+      "method": "POST",
+      "path": "/v1/pair",
+      "authenticated": false,
+      "body": {
+        "code": "<pairing-code>",
+        "proto": 3,
+        "deviceName": "second-watch"
+      }
+    },
+    "response": {
+      "status": 403,
+      "body": {
+        "error": "Already paired. Re-pairing requires explicit authorization on the bridge."
+      }
+    }
+  },
+  {
+    "name": "status",
+    "request": {
+      "method": "GET",
+      "path": "/v1/status",
+      "authenticated": true,
+      "body": null
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "bridgeId": "<bridge-id>",
+        "state": "connected",
+        "availableAgents": [
+          "claude",
+          "codex"
+        ],
+        "sessions": [],
+        "sseClients": 0,
+        "pendingPermissions": 0,
+        "eventBufferSize": 1,
+        "hasPty": false,
+        "activeAgent": null
+      }
+    }
+  },
+  {
+    "name": "events connect",
+    "response": {
+      "status": 200
+    }
+  },
+  {
+    "name": "sse: session running",
+    "event": {
+      "event": "session",
+      "data": {
+        "state": "running",
+        "agent": "claude",
+        "cwd": "/tmp/fixture-project",
+        "folderName": "fixture-project",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "sse: permission-request Bash",
+    "event": {
+      "event": "permission-request",
+      "data": {
+        "permissionId": "<permission-1>",
+        "tool_name": "Bash",
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "tool_input": {
+          "command": "ls -la"
+        },
+        "permission_suggestions": [
+          {
+            "type": "addRules",
+            "rules": [
+              {
+                "toolName": "Bash",
+                "ruleContent": "ls:*"
+              }
+            ],
+            "behavior": "allow",
+            "destination": "session"
+          }
+        ],
+        "options": [
+          {
+            "behavior": "allow",
+            "label": "Yes",
+            "description": "Allow this once"
+          },
+          {
+            "behavior": "allow-always",
+            "label": "Yes, don't ask again",
+            "description": "Allow and apply the suggested permission rules"
+          },
+          {
+            "behavior": "deny",
+            "label": "No",
+            "description": "Deny this request"
+          }
+        ],
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "decision allow-always",
+    "request": {
+      "method": "POST",
+      "path": "/v1/command",
+      "authenticated": true,
+      "body": {
+        "permissionId": "<permission-1>",
+        "decision": {
+          "behavior": "allow-always"
+        }
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "hook response: allow-always applies suggestions",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/permission",
+      "blocking": true
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "hookSpecificOutput": {
+          "hookEventName": "PermissionRequest",
+          "decision": {
+            "behavior": "allow",
+            "updatedPermissions": [
+              {
+                "type": "addRules",
+                "rules": [
+                  {
+                    "toolName": "Bash",
+                    "ruleContent": "ls:*"
+                  }
+                ],
+                "behavior": "allow",
+                "destination": "session"
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "sse: permission-request AskUserQuestion (no top-level options)",
+    "event": {
+      "event": "permission-request",
+      "data": {
+        "permissionId": "<permission-2>",
+        "tool_name": "AskUserQuestion",
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "tool_input": {
+          "questions": [
+            {
+              "header": "Color",
+              "question": "Favorite color?",
+              "options": [
+                {
+                  "label": "Blue"
+                },
+                {
+                  "label": "Red"
+                }
+              ],
+              "multiSelect": false
+            },
+            {
+              "header": "Style",
+              "question": "Tabs or spaces?",
+              "options": [
+                {
+                  "label": "Tabs"
+                },
+                {
+                  "label": "Spaces"
+                }
+              ],
+              "multiSelect": false
+            }
+          ]
+        },
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "decision with answers for every question",
+    "request": {
+      "method": "POST",
+      "path": "/v1/command",
+      "authenticated": true,
+      "body": {
+        "permissionId": "<permission-2>",
+        "decision": {
+          "behavior": "allow"
+        },
+        "answers": [
+          "Blue",
+          "Tabs"
+        ]
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "hook response: AskUserQuestion answers",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/permission",
+      "blocking": true
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "hookSpecificOutput": {
+          "hookEventName": "PermissionRequest",
+          "decision": {
+            "behavior": "allow",
+            "updatedInput": {
+              "questions": [
+                {
+                  "header": "Color",
+                  "question": "Favorite color?",
+                  "options": [
+                    {
+                      "label": "Blue"
+                    },
+                    {
+                      "label": "Red"
+                    }
+                  ],
+                  "multiSelect": false
+                },
+                {
+                  "header": "Style",
+                  "question": "Tabs or spaces?",
+                  "options": [
+                    {
+                      "label": "Tabs"
+                    },
+                    {
+                      "label": "Spaces"
+                    }
+                  ],
+                  "multiSelect": false
+                }
+              ],
+              "answers": {
+                "Favorite color?": "Blue",
+                "Tabs or spaces?": "Tabs"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "sse: permission-request Write (no allow-always without suggestions)",
+    "event": {
+      "event": "permission-request",
+      "data": {
+        "permissionId": "<permission-3>",
+        "tool_name": "Write",
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "tool_input": {
+          "file_path": "notes.txt",
+          "content": "hello"
+        },
+        "options": [
+          {
+            "behavior": "allow",
+            "label": "Yes",
+            "description": "Allow this once"
+          },
+          {
+            "behavior": "deny",
+            "label": "No",
+            "description": "Deny this request"
+          }
+        ],
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "decision deny with message",
+    "request": {
+      "method": "POST",
+      "path": "/v1/command",
+      "authenticated": true,
+      "body": {
+        "permissionId": "<permission-3>",
+        "decision": {
+          "behavior": "deny",
+          "message": "Denied from fixture"
+        }
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "hook response: deny carries message",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/permission",
+      "blocking": true
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "hookSpecificOutput": {
+          "hookEventName": "PermissionRequest",
+          "decision": {
+            "behavior": "deny",
+            "message": "Denied from fixture"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "hook notification",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/notification",
+      "authenticated": false,
+      "body": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "notification_type": "permission_prompt",
+        "message": "Claude needs your permission"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "sse: notification carries notification_type",
+    "event": {
+      "event": "notification",
+      "data": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "notification_type": "permission_prompt",
+        "message": "Claude needs your permission",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "hook tool-output",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/tool-output",
+      "authenticated": false,
+      "body": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "tool_name": "Read",
+        "tool_output": "fixture file contents"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "sse: tool-output",
+    "event": {
+      "event": "tool-output",
+      "data": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "tool_name": "Read",
+        "tool_output": "fixture file contents",
+        "source": "claude",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "hook stop",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/stop",
+      "authenticated": false,
+      "body": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "sse: stop",
+    "event": {
+      "event": "stop",
+      "data": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "hook task-complete",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/task-complete",
+      "authenticated": false,
+      "body": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "summary": "fixture task done"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "sse: task-complete",
+    "event": {
+      "event": "task-complete",
+      "data": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "summary": "fixture task done",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "hook error",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/error",
+      "authenticated": false,
+      "body": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "error": "fixture error"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "sse: error",
+    "event": {
+      "event": "error",
+      "data": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "error": "fixture error",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "hook session-end",
+    "request": {
+      "method": "POST",
+      "path": "/v1/hooks/session-end",
+      "authenticated": false,
+      "body": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "sse: session ended",
+    "event": {
+      "event": "session",
+      "data": {
+        "state": "ended",
+        "agent": "claude",
+        "folderName": "fixture-project",
+        "reason": "session-end",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "events reconnect with Last-Event-ID",
+    "response": {
+      "status": 200
+    }
+  },
+  {
+    "name": "sse replay: error",
+    "event": {
+      "event": "error",
+      "data": {
+        "session_id": "fixture-hook-session-1",
+        "cwd": "/tmp/fixture-project",
+        "error": "fixture error",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "sse replay: session ended",
+    "event": {
+      "event": "session",
+      "data": {
+        "state": "ended",
+        "agent": "claude",
+        "folderName": "fixture-project",
+        "reason": "session-end",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "command unauthenticated",
+    "request": {
+      "method": "POST",
+      "path": "/v1/command",
+      "authenticated": false,
+      "body": {
+        "command": "hello\n"
+      }
+    },
+    "response": {
+      "status": 401,
+      "body": {
+        "error": "Unauthorized"
+      }
+    }
+  },
+  {
+    "name": "command without any action",
+    "request": {
+      "method": "POST",
+      "path": "/v1/command",
+      "authenticated": true,
+      "body": {}
+    },
+    "response": {
+      "status": 400,
+      "body": {
+        "error": "Missing 'command', 'spawn', 'kill', or 'permissionId'+'decision'"
+      }
+    }
+  }
+]

@@ -1,0 +1,452 @@
+[
+  {
+    "name": "ping",
+    "request": {
+      "method": "GET",
+      "path": "/ping",
+      "authenticated": false,
+      "body": null
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "proto": 3,
+        "bridgeId": "<bridge-id>",
+        "machineName": "<machine-name>"
+      }
+    }
+  },
+  {
+    "name": "pair missing code",
+    "request": {
+      "method": "POST",
+      "path": "/pair",
+      "authenticated": false,
+      "body": {}
+    },
+    "response": {
+      "status": 400,
+      "body": {
+        "error": "Missing 'code' field"
+      }
+    }
+  },
+  {
+    "name": "pair invalid code",
+    "request": {
+      "method": "POST",
+      "path": "/pair",
+      "authenticated": false,
+      "body": {
+        "code": "000000"
+      }
+    },
+    "response": {
+      "status": 401,
+      "body": {
+        "error": "Invalid pairing code"
+      }
+    }
+  },
+  {
+    "name": "pair (no version gate on legacy)",
+    "request": {
+      "method": "POST",
+      "path": "/pair",
+      "authenticated": false,
+      "body": {
+        "code": "<pairing-code>",
+        "proto": 1,
+        "deviceName": "legacy-watch"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "token": "<token>",
+        "bridgeId": "<bridge-id>",
+        "availableAgents": [
+          "claude",
+          "codex"
+        ],
+        "sessions": [],
+        "sessionId": "<bridge-id>"
+      }
+    }
+  },
+  {
+    "name": "pair locked after success",
+    "request": {
+      "method": "POST",
+      "path": "/pair",
+      "authenticated": false,
+      "body": {
+        "code": "<pairing-code>"
+      }
+    },
+    "response": {
+      "status": 403,
+      "body": {
+        "error": "Already paired. Re-pairing requires explicit authorization on the bridge."
+      }
+    }
+  },
+  {
+    "name": "status keeps sessionId alias",
+    "request": {
+      "method": "GET",
+      "path": "/status",
+      "authenticated": true,
+      "body": null
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "bridgeId": "<bridge-id>",
+        "sessionId": "<bridge-id>",
+        "state": "connected",
+        "availableAgents": [
+          "claude",
+          "codex"
+        ],
+        "sessions": [],
+        "sseClients": 0,
+        "pendingPermissions": 0,
+        "eventBufferSize": 1,
+        "hasPty": false,
+        "activeAgent": null
+      }
+    }
+  },
+  {
+    "name": "events connect",
+    "response": {
+      "status": 200
+    }
+  },
+  {
+    "name": "sse: session running",
+    "event": {
+      "event": "session",
+      "data": {
+        "state": "running",
+        "agent": "claude",
+        "cwd": "/tmp/legacy-project",
+        "folderName": "legacy-project",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "sse: permission-request (options field is additive)",
+    "event": {
+      "event": "permission-request",
+      "data": {
+        "permissionId": "<permission-1>",
+        "tool_name": "Bash",
+        "session_id": "legacy-hook-session-1",
+        "cwd": "/tmp/legacy-project",
+        "tool_input": {
+          "command": "git status"
+        },
+        "permission_suggestions": [
+          {
+            "type": "addRules",
+            "rules": [
+              {
+                "toolName": "Bash",
+                "ruleContent": "git status"
+              }
+            ],
+            "behavior": "allow",
+            "destination": "session"
+          }
+        ],
+        "options": [
+          {
+            "behavior": "allow",
+            "label": "Yes",
+            "description": "Allow this once"
+          },
+          {
+            "behavior": "allow-always",
+            "label": "Yes, don't ask again",
+            "description": "Allow and apply the suggested permission rules"
+          },
+          {
+            "behavior": "deny",
+            "label": "No",
+            "description": "Deny this request"
+          }
+        ],
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "decision legacy allowAll",
+    "request": {
+      "method": "POST",
+      "path": "/command",
+      "authenticated": true,
+      "body": {
+        "permissionId": "<permission-1>",
+        "decision": {
+          "behavior": "allow"
+        },
+        "allowAll": true
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "hook response: allowAll applies suggestions",
+    "request": {
+      "method": "POST",
+      "path": "/hooks/permission",
+      "blocking": true
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "hookSpecificOutput": {
+          "hookEventName": "PermissionRequest",
+          "decision": {
+            "behavior": "allow",
+            "updatedPermissions": [
+              {
+                "type": "addRules",
+                "rules": [
+                  {
+                    "toolName": "Bash",
+                    "ruleContent": "git status"
+                  }
+                ],
+                "behavior": "allow",
+                "destination": "session"
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "sse: permission-request AskUserQuestion",
+    "event": {
+      "event": "permission-request",
+      "data": {
+        "permissionId": "<permission-2>",
+        "tool_name": "AskUserQuestion",
+        "session_id": "legacy-hook-session-1",
+        "cwd": "/tmp/legacy-project",
+        "tool_input": {
+          "questions": [
+            {
+              "header": "Color",
+              "question": "Favorite color?",
+              "options": [
+                {
+                  "label": "Blue"
+                },
+                {
+                  "label": "Red"
+                }
+              ],
+              "multiSelect": false
+            },
+            {
+              "header": "Style",
+              "question": "Tabs or spaces?",
+              "options": [
+                {
+                  "label": "Tabs"
+                },
+                {
+                  "label": "Spaces"
+                }
+              ],
+              "multiSelect": false
+            }
+          ]
+        },
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "decision legacy selectedOption",
+    "request": {
+      "method": "POST",
+      "path": "/command",
+      "authenticated": true,
+      "body": {
+        "permissionId": "<permission-2>",
+        "decision": {
+          "behavior": "allow"
+        },
+        "selectedOption": "Blue"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "hook response: selectedOption answers first question only",
+    "request": {
+      "method": "POST",
+      "path": "/hooks/permission",
+      "blocking": true
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "hookSpecificOutput": {
+          "hookEventName": "PermissionRequest",
+          "decision": {
+            "behavior": "allow",
+            "updatedInput": {
+              "questions": [
+                {
+                  "header": "Color",
+                  "question": "Favorite color?",
+                  "options": [
+                    {
+                      "label": "Blue"
+                    },
+                    {
+                      "label": "Red"
+                    }
+                  ],
+                  "multiSelect": false
+                },
+                {
+                  "header": "Style",
+                  "question": "Tabs or spaces?",
+                  "options": [
+                    {
+                      "label": "Tabs"
+                    },
+                    {
+                      "label": "Spaces"
+                    }
+                  ],
+                  "multiSelect": false
+                }
+              ],
+              "answers": {
+                "Favorite color?": "Blue"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "hook tool-output",
+    "request": {
+      "method": "POST",
+      "path": "/hooks/tool-output",
+      "authenticated": false,
+      "body": {
+        "session_id": "legacy-hook-session-1",
+        "cwd": "/tmp/legacy-project",
+        "tool_name": "Read",
+        "tool_output": "legacy file contents"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "sse: tool-output",
+    "event": {
+      "event": "tool-output",
+      "data": {
+        "session_id": "legacy-hook-session-1",
+        "cwd": "/tmp/legacy-project",
+        "tool_name": "Read",
+        "tool_output": "legacy file contents",
+        "source": "claude",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "hook stop",
+    "request": {
+      "method": "POST",
+      "path": "/hooks/stop",
+      "authenticated": false,
+      "body": {
+        "session_id": "legacy-hook-session-1",
+        "cwd": "/tmp/legacy-project"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  {
+    "name": "sse: stop",
+    "event": {
+      "event": "stop",
+      "data": {
+        "session_id": "legacy-hook-session-1",
+        "cwd": "/tmp/legacy-project",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "events reconnect with Last-Event-ID",
+    "response": {
+      "status": 200
+    }
+  },
+  {
+    "name": "sse replay: stop",
+    "event": {
+      "event": "stop",
+      "data": {
+        "session_id": "legacy-hook-session-1",
+        "cwd": "/tmp/legacy-project",
+        "sessionId": "<session-1>"
+      }
+    }
+  },
+  {
+    "name": "command unauthenticated",
+    "request": {
+      "method": "POST",
+      "path": "/command",
+      "authenticated": false,
+      "body": {
+        "command": "hello\n"
+      }
+    },
+    "response": {
+      "status": 401,
+      "body": {
+        "error": "Unauthorized"
+      }
+    }
+  }
+]

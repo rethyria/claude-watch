@@ -149,9 +149,16 @@ export function handleEvents(req, res) {
   // (codex.js). Pending permissions in particular must not rely on the ring
   // buffer: ordinary pty-output can evict a permission-request before a
   // disconnected watch reconnects.
+  // Snapshot events consume ids from the same counter as buffered events
+  // (pre-increment, matching pushSseEvent) so every id a client observes is
+  // strictly increasing — PROTOCOL.md guarantees monotonic ids, and a
+  // post-increment here reissued the previous event's id to the first
+  // snapshot event on every connect. Snapshot entries are never buffered, so
+  // replay semantics are unaffected: a client resuming from a snapshot id
+  // still receives every buffered event that came after it.
   for (const provider of sseSyncProviders) {
     for (const { event, data } of provider()) {
-      const syncEntry = formatSseMessage({ id: sseEventId++, event, data });
+      const syncEntry = formatSseMessage({ id: ++sseEventId, event, data });
       try { res.write(syncEntry); } catch { /* ignore */ }
     }
   }

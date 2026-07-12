@@ -3,21 +3,7 @@
 // session and strands every in-flight permission hook.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import net from "node:net";
-import { startBridge, request, connectSse } from "./helpers.js";
-
-// Send raw bytes over a plain TCP socket: fetch/http.request refuse to emit a
-// malformed Host header, which is exactly what this attack needs.
-function rawRequest(port, payload, timeoutMs = 10_000) {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect(port, "127.0.0.1", () => socket.write(payload));
-    let data = "";
-    socket.setTimeout(timeoutMs, () => { socket.destroy(); resolve(data); });
-    socket.on("data", (chunk) => { data += chunk.toString(); });
-    socket.on("close", () => resolve(data));
-    socket.on("error", reject);
-  });
-}
+import { startBridge, request, connectSse, rawRequest } from "./helpers.js";
 
 test("malformed Host header gets 400; bridge, sessions, and pending permissions survive", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);

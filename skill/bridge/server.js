@@ -10,14 +10,13 @@ import { createHostAllowList } from "./host-guard.js";
 import {
   PORT_RANGE_START,
   PORT_RANGE_END,
-  BRIDGE_ID,
   CLAUDE_BIN,
   CODEX_BIN,
   ALLOW_PAIRING_FLAG,
-  PROTOCOL_VERSION,
   EXTRA_ALLOWED_HOSTS,
   CREDENTIALS_DIR,
   PORT_FILE,
+  bonjourTxtRecord,
 } from "./config.js";
 import {
   generatePairingCode,
@@ -118,6 +117,14 @@ async function onRequest(req, res) {
     jsonResponse(res, 400, { error: "Bad request" });
     return;
   }
+
+  // Handlers that behave differently per surface (legacy vs /v1 — see
+  // handlePair/handleStatus) must classify from the SAME pathname the router
+  // routes on. Re-deriving it from the raw req.url string in a handler is a
+  // bug: an absolute-form request target ("POST http://host:port/v1/pair",
+  // legal HTTP/1.1) routes as /v1 here but has no "/v1..." string prefix,
+  // which once let such a request skip the /v1 min-version gate entirely.
+  req.pathname = url.pathname;
 
   // DNS-rebinding guard: a well-formed but unknown Host header (an absent
   // header parses to the literal hostname "undefined" and is likewise
@@ -259,12 +266,9 @@ async function startServer() {
     type: "claude-watch",
     protocol: "tcp",
     port: boundPort,
-    txt: {
-      version: PROTOCOL_VERSION,
-      bridgeId: BRIDGE_ID,
-      sessionId: BRIDGE_ID, // backward compat
-      machineName: os.hostname(),
-    },
+    // txt.v carries the protocol version (PROTOCOL.md "Versioning");
+    // txt.version/txt.sessionId are frozen legacy aliases.
+    txt: bonjourTxtRecord(),
   });
 
   log("info", `Bonjour advertising _claude-watch._tcp on port ${boundPort}`);
