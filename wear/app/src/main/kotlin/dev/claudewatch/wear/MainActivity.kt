@@ -13,16 +13,19 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.wear.compose.material.MaterialTheme
-import dev.claudewatch.wear.ui.SessionPagerActions
-import dev.claudewatch.wear.ui.SessionPagerScreen
+import dev.claudewatch.wear.ui.halo.HaloActions
+import dev.claudewatch.wear.ui.halo.HaloApp
 
 /**
- * Entry point: the session pager (see ui/SessionPagerScreen.kt). Page 0 is
- * the walking skeleton's control/debug page; every live session gets its own
- * terminal page, rendered from the shared reducer's state.
+ * Entry point: the Halo UI (see ui/halo/HaloApp.kt) — ring home, per-project
+ * pages, drill-down lists/feeds, approval cards — rendered from the shared
+ * reducer's state. The previous pager (ui/SessionPagerScreen.kt) is kept
+ * compiling for the instrumented tests until they migrate to Halo.
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -50,6 +53,12 @@ fun WatchApp(
     // SpeechRecognizer on Wear. The transcription follows the exact same
     // ack-gated send path as typed text (BridgeViewModel.dictationResult);
     // a cancelled or empty recognition sends nothing.
+    // The recognizer round-trips through an activity result, so the session
+    // the dictation was started FOR is captured at launch and re-attached to
+    // the transcription here — the ViewModel's own default is the most
+    // recently WORKING session, which is the wrong target when the user
+    // dictates from another session's feed.
+    val dictationTarget = remember { mutableStateOf<String?>(null) }
     val speech = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
@@ -57,17 +66,18 @@ fun WatchApp(
             ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
             ?.firstOrNull()
         if (result.resultCode == Activity.RESULT_OK && !spoken.isNullOrBlank()) {
-            viewModel.dictationResult(spoken)
+            viewModel.dictationResult(spoken, dictationTarget.value)
         }
     }
-    SessionPagerScreen(
+    HaloApp(
         ui = state,
-        actions = SessionPagerActions(
+        actions = HaloActions(
             onPair = viewModel::pair,
             onUnpair = viewModel::unpair,
             onSendCommand = viewModel::sendCommand,
             onCommandDraftChange = viewModel::updateCommandDraft,
-            onDictate = {
+            onDictate = { sessionId ->
+                dictationTarget.value = sessionId
                 try {
                     speech.launch(
                         Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)

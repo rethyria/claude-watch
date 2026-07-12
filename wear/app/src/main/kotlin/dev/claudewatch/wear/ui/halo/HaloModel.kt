@@ -66,21 +66,41 @@ data class HaloModel(
                 )
             }
 
+            // A queued prompt whose session the bridge doesn't report (null
+            // sessionId, or the session already pruned) still BLOCKS the
+            // agent; dropping it would leave no ring segment, no waiting
+            // state, and no path that can ever open its card. Surface each as
+            // a synthetic session under its resolved label instead.
+            val known = ui.bridge.sessions.keys
+            val orphans = ui.permissionQueue
+                .filter { it.sessionId == null || it.sessionId !in known }
+                .map { p ->
+                    HaloSession(
+                        id = p.sessionId ?: "prompt:${p.permissionId}",
+                        title = p.sessionLabel,
+                        projectName = p.sessionLabel,
+                        state = if (p.questions.isNotEmpty()) SessionState.WAITING_Q else SessionState.WAITING_PERM,
+                        pending = p,
+                    )
+                }
+                .distinctBy { it.id }
+            val all = halo + orphans
+
             // Stable project order: first-seen wins, so the ring/pager don't
             // reshuffle as sessions transition state.
             val projects = LinkedHashMap<String, MutableList<HaloSession>>()
-            for (session in halo) {
+            for (session in all) {
                 projects.getOrPut(session.projectName) { mutableListOf() }.add(session)
             }
 
             // Queue order follows the ViewModel's permissionQueue (newest-first,
             // the front is the rendered card), mapped onto the derived sessions.
-            val byId = halo.associateBy { it.id }
-            val queue = ui.permissionQueue.mapNotNull { p -> p.sessionId?.let { byId[it] } }
+            val byId = all.associateBy { it.id }
+            val queue = ui.permissionQueue.mapNotNull { p -> byId[p.sessionId ?: "prompt:${p.permissionId}"] }
 
             return HaloModel(
                 projects = projects.map { (name, sessions) -> HaloProject(name, sessions) },
-                sessions = halo,
+                sessions = all,
                 queue = queue,
             )
         }
