@@ -26,11 +26,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -42,14 +45,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
+import androidx.wear.compose.foundation.rotary.rotaryScrollable
 import androidx.wear.compose.material.Text
 import dev.claudewatch.wear.BridgeViewModel
 import dev.claudewatch.wear.ui.LOCAL_DISMISS_AFTER_FAILURES
@@ -84,6 +96,9 @@ fun HaloApprovalCard(
     // card's decision into this one's flash.
     var sent by remember(card.permissionId) { mutableStateOf<String?>(null) }
     var dismissedLocally by remember(card.permissionId) { mutableStateOf(false) }
+    // The error of the last FAILED attempt on this card, scoped locally
+    // because ui.decisionError is connection-global and sticky.
+    var attemptError by remember(card.permissionId) { mutableStateOf<String?>(null) }
     val armAtMs = remember(card.permissionId) { SystemClock.uptimeMillis() + ARM_DELAY_MS }
 
     // Ack-gated: the prompt leaves the queue only when the ViewModel got an
@@ -92,21 +107,40 @@ fun HaloApprovalCard(
     val resolved = ui.permissionQueue.none { it.permissionId == card.permissionId }
     val inFlight = ui.decisionInFlightId == card.permissionId
 
-    // Resolution drives the exit: a locally answered prompt plays the 1.4s
-    // flash first; one resolved WITHOUT a local decision (answered from
-    // another device, timed out server-side, or locally dismissed) leaves
-    // immediately — flashing "Approved" for a decision this watch didn't
-    // make would be a lie.
-    val showFlash = resolved && sent != null && !dismissedLocally
+    // A failed attempt (prompt still queued, POST no longer in flight, error
+    // surfaced) releases the latched tap: keeping it would let a later
+    // server-side resolution masquerade as this watch's delivered decision.
+    // Idempotent snapshot write, same discipline as HaloApp's card hold.
+    if (sent != null && !resolved && !inFlight && ui.decisionError != null) {
+        attemptError = ui.decisionError
+        sent = null
+    }
+
+    // Resolution drives the exit — but the ✓/✕ flash plays only for an
+    // outcome THIS watch delivered: `sent` latched, no local dismiss, and the
+    // resolving ack was a decision 2xx. A prompt resolved any other way
+    // (answered from another device → 404, dead token → 401/403, timed out,
+    // hook-abort push while our POST was mid-flight) leaves immediately —
+    // flashing "Approved" for a decision that never landed would be a lie.
+    // Latched at the resolving snapshot: decisionResult/decisionError are
+    // global and sticky, so they are only meaningful in that exact frame.
+    var resolutionSeen by remember(card.permissionId) { mutableStateOf(false) }
+    var showFlash by remember(card.permissionId) { mutableStateOf(false) }
+    if (resolved && !resolutionSeen) {
+        resolutionSeen = true
+        showFlash = sent != null && !dismissedLocally && !inFlight &&
+            ui.decisionError == null && ui.decisionResult.isDecisionSuccess()
+    }
     LaunchedEffect(resolved) {
         if (!resolved) return@LaunchedEffect
-        if (sent != null && !dismissedLocally) delay(FLASH_MS)
+        if (showFlash) delay(FLASH_MS)
         done()
     }
 
     fun decide(behavior: String) {
         if (inFlight || resolved) return
         if (SystemClock.uptimeMillis() < armAtMs) return
+        attemptError = null
         sent = behavior
         onAnswer(card.permissionId, behavior)
     }
@@ -124,7 +158,7 @@ fun HaloApprovalCard(
                 model = model,
                 ui = ui,
                 inFlight = inFlight,
-                sent = sent,
+                attemptError = attemptError,
                 resolved = resolved,
                 onDecide = ::decide,
                 onDismissLocally = {
@@ -137,13 +171,17 @@ fun HaloApprovalCard(
     }
 }
 
+/** True only for an acked decision POST with an HTTP 2xx (see decisionResult). */
+private fun String?.isDecisionSuccess(): Boolean =
+    this?.removePrefix("decision:")?.toIntOrNull()?.let { it in 200..299 } == true
+
 @Composable
 private fun DecisionLayer(
     card: BridgeViewModel.PendingPermission,
     model: HaloModel,
     ui: BridgeViewModel.UiState,
     inFlight: Boolean,
-    sent: String?,
+    attemptError: String?,
     resolved: Boolean,
     onDecide: (String) -> Unit,
     onDismissLocally: () -> Unit,
@@ -165,20 +203,45 @@ private fun DecisionLayer(
     val sessionTitle = session?.title ?: card.sessionLabel
 
     val buttonsEnabled = !inFlight && !resolved
-    val statusLine = when {
-        inFlight -> "sending…"
-        // decisionError is connection-global; scope it to a failed attempt on
-        // THIS card (the prompt is still queued, so the answer didn't land).
-        sent != null && !resolved -> ui.decisionError
-        else -> null
-    }
+    val statusLine = if (inFlight) "sending…" else attemptError
 
+    // The failure path stacks extra rows (status line, local-dismiss hatch)
+    // past what a round display fits, so the column scrolls — touch and
+    // rotary — with the full circular safe inset as content padding: the
+    // header and the bottom exits must never sit on the curve.
+    val scrollState = rememberScrollState()
+    val focusRequester = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    // verticalScroll consumes every vertical drag (leftover deltas surface
+    // through nested scroll, never back to the pointer system), which starves
+    // the overlay's swipe-down detector in HaloApp. This restores that exit
+    // from the leftovers: dragging down past the threshold with the column
+    // already at its top is "decide later" — same ~60px-at-450 threshold.
+    val decideLater by rememberUpdatedState(onDecideLater)
+    val exitThresholdPx = with(LocalDensity.current) { 30.dp.toPx() }
+    val overscrollExit = remember(exitThresholdPx) {
+        object : NestedScrollConnection {
+            private var overscroll = 0f
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput && available.y > 0f) overscroll += available.y
+                return Offset.Zero
+            }
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                if (overscroll > exitThresholdPx) decideLater()
+                overscroll = 0f
+                return Velocity.Zero
+            }
+        }
+    }
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = Halo.Geo.SafeInset, vertical = 10.dp),
+            .nestedScroll(overscrollExit)
+            .rotaryScrollable(RotaryScrollableDefaults.behavior(scrollState), focusRequester)
+            .verticalScroll(scrollState)
+            .padding(Halo.Geo.SafeInset),
     ) {
         Text(
             text = "PERMISSION",
@@ -292,14 +355,12 @@ private fun DecisionLayer(
         }
 
         if (alwaysOption != null) {
-            Text(
-                text = "always allow ›",
-                fontSize = Halo.Type.Min,
+            TextAction(
+                label = "always allow ›",
                 color = Halo.Palette.TextFaint,
-                modifier = Modifier
-                    .clickable(enabled = buttonsEnabled) { onDecide(alwaysOption.behavior) }
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
-                    .testTag("haloAlwaysAllow"),
+                tag = "haloAlwaysAllow",
+                enabled = buttonsEnabled,
+                onClick = { onDecide(alwaysOption.behavior) },
             )
         }
 
@@ -318,29 +379,52 @@ private fun DecisionLayer(
         // failures — a bridge that stopped answering must not wedge the app
         // behind an unanswerable card (see dismissPermissionLocally).
         if (ui.decisionFailureCount >= LOCAL_DISMISS_AFTER_FAILURES) {
-            Text(
-                text = "dismiss without answering",
-                fontSize = Halo.Type.Min,
+            TextAction(
+                label = "dismiss without answering",
                 color = Halo.Palette.Error,
-                modifier = Modifier
-                    .clickable(onClick = onDismissLocally)
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
-                    .testTag("haloDismissLocal"),
+                tag = "haloDismissLocal",
+                onClick = onDismissLocally,
             )
         }
-        Text(
-            text = "decide later ↓",
-            fontSize = Halo.Type.Min,
+        TextAction(
+            label = "decide later ↓",
             color = Halo.Palette.TextFaint,
-            modifier = Modifier
-                .clickable(onClick = onDecideLater)
-                .padding(horizontal = 12.dp, vertical = 4.dp)
-                .testTag("haloDecideLater"),
+            tag = "haloDecideLater",
+            onClick = onDecideLater,
         )
     }
 }
 
-/** 76px-ref decision pill; full-width row split keeps both far past 48dp wide. */
+/**
+ * A small faint text link per the handoff, but with a TouchMin-tall hit box:
+ * these stack directly on each other and one of them ("always allow") is a
+ * permanent grant — a fat-finger between them is a decision-grade mis-tap.
+ */
+@Composable
+private fun TextAction(
+    label: String,
+    color: Color,
+    tag: String,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .heightIn(min = Halo.Geo.TouchMin)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 12.dp)
+            .testTag(tag),
+    ) {
+        Text(text = label, fontSize = Halo.Type.Min, color = color)
+    }
+}
+
+/**
+ * Decision pill. The handoff's 76px reference works out to 38dp, but its
+ * ≥48dp touch-target rule is the binding constraint on this surface —
+ * TouchMin tall; the full-width row split keeps both far past 48dp wide.
+ */
 @Composable
 private fun RowScope.DecisionPill(
     label: String,
@@ -355,7 +439,7 @@ private fun RowScope.DecisionPill(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .weight(weight)
-            .height(42.dp)
+            .height(Halo.Geo.TouchMin)
             .alpha(if (enabled) 1f else 0.55f)
             .clip(shape)
             .then(

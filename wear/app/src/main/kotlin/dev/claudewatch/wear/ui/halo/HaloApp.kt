@@ -181,16 +181,25 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
         val front = nav.cardPermissionId
             ?.let { id -> ui.permissionQueue.firstOrNull { it.permissionId == id } }
             ?: ui.permissionQueue.firstOrNull()
-        // Hold update (idempotent snapshot writes): track the live queue until
-        // the shown prompt resolves, then freeze on it for the flash. Closing
-        // the overlay (swipe-down, decide later) drops any hold.
+        // Hold update (idempotent snapshot writes): `front` is taken only when
+        // nothing is held — once a prompt is shown it stays PINNED until the
+        // card reports done. The queue is newest-first, so following the live
+        // front would let every new arrival slide in over the card mid-read
+        // (and a steady prompt stream would starve the shown one forever).
+        // While the held prompt is still queued it is refreshed BY ID so late
+        // metadata (a session label arriving) still lands; once it leaves the
+        // queue it freezes for the result flash. Closing the overlay
+        // (swipe-down, decide later) drops any hold.
         if (!nav.cardOpen) {
             if (cardHold != null) cardHold = null
         } else {
-            val holdGone = cardHold?.let { held ->
-                ui.permissionQueue.none { it.permissionId == held.permissionId }
-            } == true
-            if (!holdGone) cardHold = front
+            val held = cardHold
+            if (held == null) {
+                cardHold = front
+            } else {
+                val live = ui.permissionQueue.firstOrNull { it.permissionId == held.permissionId }
+                if (live != null && live != held) cardHold = live
+            }
         }
         val display = if (nav.cardOpen) cardHold else null
         // The card composable reports done: after its result flash (resolved
