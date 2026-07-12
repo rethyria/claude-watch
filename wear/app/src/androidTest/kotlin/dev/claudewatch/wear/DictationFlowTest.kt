@@ -14,6 +14,9 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeLeft
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import dev.claudewatch.wear.data.AesGcmTokenCipher
+import dev.claudewatch.wear.data.CredentialStore
 import dev.claudewatch.wear.ui.SessionPagerActions
 import dev.claudewatch.wear.ui.SessionPagerScreen
 import okhttp3.mockwebserver.MockResponse
@@ -27,7 +30,9 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
 import java.util.concurrent.TimeUnit
+import javax.crypto.KeyGenerator
 
 /**
  * Dictated commands with ack-gated echo (issue #20), driven through the real
@@ -58,11 +63,20 @@ class DictationFlowTest {
     /** The fixed transcription the stubbed recognizer "hears". */
     private val recognized = "run the tests"
 
+    // Fresh unpaired store per test (AES key in memory, file in the app's
+    // cache) — the production Keystore singleton would leak pairings between
+    // tests.
+    private val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+
     @Before
     fun setUp() {
         server = MockWebServer()
         server.start()
-        viewModel = BridgeViewModel()
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val storeFile = File.createTempFile("dictation-conn", ".bin", context.cacheDir)
+        viewModel = BridgeViewModel(
+            CredentialStore({ storeFile }, AesGcmTokenCipher { key }),
+        )
     }
 
     @After
@@ -87,6 +101,10 @@ class DictationFlowTest {
 
     /** Pair against the fake bridge and stream one running session (s-1). */
     private fun pairWithSession() {
+        // The engine's discovery preflight pings before every pair.
+        server.enqueue(
+            MockResponse().setBody("""{"proto":"2","bridgeId":"b-1","machineName":"m"}"""),
+        )
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
@@ -107,6 +125,7 @@ class DictationFlowTest {
         )
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         compose.waitUntil(30_000) { viewModel.state.value.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
     }
