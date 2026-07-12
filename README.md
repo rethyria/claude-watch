@@ -254,6 +254,13 @@ The `setup-hooks.sh` script installs these HTTP hooks globally in `~/.claude/set
 ./skill/setup-hooks.sh --remove
 ```
 
+Removal (and reinstall dedup) matches individual hook objects by exact URL —
+`http://127.0.0.1:<port>` plus one of the installer's own `/hooks/<path>`
+endpoints — so your own hooks are never touched, even ones on other loopback
+ports/paths or sharing a settings entry with claude-watch's. All settings.json
+rewrites go through a temp file + rename, so an interrupted run can't corrupt
+the file.
+
 ### Unpairing
 
 - **iPhone:** Settings > Forget Mac

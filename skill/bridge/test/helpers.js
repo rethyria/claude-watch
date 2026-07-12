@@ -9,6 +9,44 @@ import { fileURLToPath } from "node:url";
 
 const BRIDGE_DIR = fileURLToPath(new URL("..", import.meta.url));
 
+// Fresh per-test temp directory, removed on cleanup.
+export function tempDir(t, prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+  return dir;
+}
+
+// Run a shell script (the installer or the generated codex-watch wrapper) as
+// a child process with a controlled HOME/PATH, collecting combined output.
+export function runScript(scriptPath, args, envOverride) {
+  return new Promise((resolve) => {
+    const proc = spawn("bash", [scriptPath, ...args], {
+      env: { ...process.env, ...envOverride },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    proc.stdout.on("data", (d) => { output += d.toString(); });
+    proc.stderr.on("data", (d) => { output += d.toString(); });
+    proc.on("exit", (code) => resolve({ code, output }));
+  });
+}
+
+// Collect every hook URL the installer wrote into HOME/.claude/settings.json.
+export function installedHookUrls(home) {
+  const settings = JSON.parse(
+    fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"),
+  );
+  const urls = [];
+  for (const entries of Object.values(settings.hooks ?? {})) {
+    for (const entry of entries) {
+      for (const hook of entry.hooks ?? []) {
+        if (hook.url) urls.push(hook.url);
+      }
+    }
+  }
+  return urls;
+}
+
 // Options:
 //   credentialsDir — directory for the bridge's persisted credentials.
 //     Omitted: a fresh per-test temp dir (removed on cleanup), so every

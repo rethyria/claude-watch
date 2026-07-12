@@ -8,36 +8,15 @@
 // port can't collide with parallel test files binding real 786x ports.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { startBridge, request, connectSse } from "./helpers.js";
+import {
+  startBridge, request, connectSse, tempDir, runScript, installedHookUrls,
+} from "./helpers.js";
 
 const SETUP_HOOKS = fileURLToPath(new URL("../../setup-hooks.sh", import.meta.url));
-
-function tempDir(t, prefix) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
-  return dir;
-}
-
-// Run a shell script (the installer or the generated codex-watch wrapper) as
-// a child process with a controlled HOME/PATH, collecting combined output.
-function runScript(scriptPath, args, envOverride) {
-  return new Promise((resolve) => {
-    const proc = spawn("bash", [scriptPath, ...args], {
-      env: { ...process.env, ...envOverride },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "";
-    proc.stdout.on("data", (d) => { output += d.toString(); });
-    proc.stderr.on("data", (d) => { output += d.toString(); });
-    proc.on("exit", (code) => resolve({ code, output }));
-  });
-}
 
 // Occupy a port with a bare TCP listener (stands in for Gradio on 7860).
 // Accepted sockets get an error swallower — a probing client (curl) that
@@ -59,22 +38,6 @@ async function startDecoy(t, port) {
     decoy.close(resolve);
   }));
   return decoy;
-}
-
-// Collect every hook URL the installer wrote into settings.json.
-function installedHookUrls(home) {
-  const settings = JSON.parse(
-    fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"),
-  );
-  const urls = [];
-  for (const entries of Object.values(settings.hooks ?? {})) {
-    for (const entry of entries) {
-      for (const hook of entry.hooks ?? []) {
-        if (hook.url) urls.push(hook.url);
-      }
-    }
-  }
-  return urls;
 }
 
 test("bridge writes its bound port on startup, refreshes a stale file, removes it on exit", { timeout: 60_000 }, async (t) => {

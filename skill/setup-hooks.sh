@@ -19,6 +19,16 @@ SETTINGS="$HOME/.claude/settings.json"
 # timeout.
 PERMISSION_HOOK_TIMEOUT_S=600
 
+# The EXACT set of /hooks/<path> endpoints this installer writes — the single
+# source of truth for recognizing OUR hook objects during removal and
+# reinstall dedup. A hook object is ours only if its URL is exactly
+# http://127.0.0.1:<port>/hooks/<one of these> (any port: the bridge walks
+# 7860-7869, so a previous install may target a different port). Anything
+# else — other loopback ports, other paths, other /hooks/* endpoints — is the
+# user's and must never be touched. The install-mode Python asserts every URL
+# it writes is covered by this list.
+HOOK_PATHS="tool-output permission stop session-end error notification"
+
 # ── Remove mode ──────────────────────────────────────────────────────────────
 if [ "$1" = "--remove" ]; then
   # Remove codex wrapper
@@ -29,39 +39,104 @@ if [ "$1" = "--remove" ]; then
     exit 0
   fi
 
-  # Remove the hooks we added (identified by claude-watch URLs)
-  python3 -c "
-import json, sys
+  # Remove the hooks we added: match individual hook OBJECTS (never whole
+  # entries) by exact URL, so a user's own hooks sharing an entry with ours
+  # survive. All inputs travel via the environment — nothing is interpolated
+  # into the Python source, so a HOME containing quotes can't break or hijack
+  # the script. The rewrite is atomic (temp file + rename): an interruption
+  # mid-write can never corrupt settings.json.
+  CLAUDE_WATCH_SETTINGS="$SETTINGS" \
+  CLAUDE_WATCH_HOOK_PATHS="$HOOK_PATHS" \
+  python3 - <<'PYEOF'
+import json, os, re, stat
 
-with open('$SETTINGS', 'r') as f:
+settings_path = os.environ['CLAUDE_WATCH_SETTINGS']
+hook_paths = os.environ['CLAUDE_WATCH_HOOK_PATHS'].split()
+claude_watch_url = re.compile(
+    r'^http://127\.0\.0\.1:\d+/hooks/(?:' + '|'.join(map(re.escape, hook_paths)) + r')$')
+
+
+def is_ours(hook):
+    url = hook.get('url')
+    return isinstance(url, str) and bool(claude_watch_url.match(url))
+
+
+def strip_claude_watch_hooks(hooks):
+    """Drop OUR hook objects; entries keeping any user hooks survive intact."""
+    changed = False
+    for event in list(hooks.keys()):
+        entries = []
+        event_changed = False
+        for entry in hooks[event]:
+            hook_objs = entry.get('hooks', [])
+            kept = [h for h in hook_objs if not is_ours(h)]
+            if len(kept) == len(hook_objs):
+                entries.append(entry)
+                continue
+            event_changed = True
+            if kept:
+                trimmed = dict(entry)
+                trimmed['hooks'] = kept
+                entries.append(trimmed)
+        if event_changed:
+            changed = True
+            if entries:
+                hooks[event] = entries
+            else:
+                del hooks[event]
+    return changed
+
+
+def write_settings_atomically(path, data):
+    """Temp file in the same directory + rename: readers only ever see either
+    the old complete file or the new complete file, never a partial write.
+
+    The rename discards the original file's permissions (the temp file's
+    umask-derived mode would win), and settings.json can carry secrets (env
+    vars, apiKeyHelper config) that users protect with e.g. chmod 600 — so
+    replicate the existing mode onto the temp file BEFORE the rename. A brand
+    new settings file keeps the umask default, same as a plain open(path, 'w').
+
+    Resolve symlinks first: dotfiles managers (stow, chezmoi, ...) commonly
+    make ~/.claude/settings.json a symlink into a repo. os.replace on the
+    symlink itself would swap the link for a regular file, silently detaching
+    the user's dotfiles setup — so rewrite the link's TARGET instead, exactly
+    like the plain open(path, 'w') this replaced used to. (os.stat below
+    follows symlinks anyway, so the mode logic is unaffected.)"""
+    path = os.path.realpath(path)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = None
+    tmp = f'{path}.tmp.{os.getpid()}'
+    try:
+        with open(tmp, 'w') as f:
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+with open(settings_path) as f:
     settings = json.load(f)
 
 hooks = settings.get('hooks', {})
-changed = False
-for event in list(hooks.keys()):
-    filtered = [
-        entry for entry in hooks[event]
-        if not any(
-            h.get('url', '').startswith('http://127.0.0.1:') and '/hooks/' in h.get('url', '')
-            for h in entry.get('hooks', [])
-        )
-    ]
-    if len(filtered) != len(hooks[event]):
-        changed = True
-        if filtered:
-            hooks[event] = filtered
-        else:
-            del hooks[event]
-
-if changed:
+if strip_claude_watch_hooks(hooks):
     if not hooks:
         del settings['hooks']
-    with open('$SETTINGS', 'w') as f:
-        json.dump(settings, f, indent=2)
-    print('Agent Watch hooks removed from $SETTINGS')
+    write_settings_atomically(settings_path, settings)
+    print(f'Agent Watch hooks removed from {settings_path}')
 else:
     print('No Agent Watch hooks found.')
-"
+PYEOF
   exit 0
 fi
 
@@ -130,18 +205,24 @@ else
   echo "  Bridge status: NOT RUNNING (hooks will work once you start the bridge on port ${PORT})"
 fi
 
-# Create settings file if it doesn't exist
 mkdir -p "$(dirname "$SETTINGS")"
-if [ ! -f "$SETTINGS" ]; then
-  echo '{}' > "$SETTINGS"
-fi
 
-# Merge hooks into existing settings using Python (preserves existing config)
-python3 -c "
-import json
+# Merge hooks into existing settings using Python (preserves existing config).
+# All inputs travel via the environment — nothing is interpolated into the
+# Python source, so a HOME containing quotes can't break or hijack the script.
+CLAUDE_WATCH_SETTINGS="$SETTINGS" \
+CLAUDE_WATCH_BRIDGE_URL="$BRIDGE_URL" \
+CLAUDE_WATCH_HOOK_PATHS="$HOOK_PATHS" \
+CLAUDE_WATCH_PERMISSION_TIMEOUT_S="$PERMISSION_HOOK_TIMEOUT_S" \
+python3 - <<'PYEOF'
+import json, os, re, stat
 
-BRIDGE = '${BRIDGE_URL}'
-PERMISSION_TIMEOUT_S = ${PERMISSION_HOOK_TIMEOUT_S}
+settings_path = os.environ['CLAUDE_WATCH_SETTINGS']
+BRIDGE = os.environ['CLAUDE_WATCH_BRIDGE_URL']
+PERMISSION_TIMEOUT_S = int(os.environ['CLAUDE_WATCH_PERMISSION_TIMEOUT_S'])
+hook_paths = os.environ['CLAUDE_WATCH_HOOK_PATHS'].split()
+claude_watch_url = re.compile(
+    r'^http://127\.0\.0\.1:\d+/hooks/(?:' + '|'.join(map(re.escape, hook_paths)) + r')$')
 
 # The hooks we want to install
 new_hooks = {
@@ -204,39 +285,110 @@ new_hooks = {
     }]
 }
 
-with open('$SETTINGS', 'r') as f:
-    settings = json.load(f)
+
+def is_ours(hook):
+    url = hook.get('url')
+    return isinstance(url, str) and bool(claude_watch_url.match(url))
+
+
+def strip_claude_watch_hooks(hooks):
+    """Drop OUR hook objects; entries keeping any user hooks survive intact."""
+    changed = False
+    for event in list(hooks.keys()):
+        entries = []
+        event_changed = False
+        for entry in hooks[event]:
+            hook_objs = entry.get('hooks', [])
+            kept = [h for h in hook_objs if not is_ours(h)]
+            if len(kept) == len(hook_objs):
+                entries.append(entry)
+                continue
+            event_changed = True
+            if kept:
+                trimmed = dict(entry)
+                trimmed['hooks'] = kept
+                entries.append(trimmed)
+        if event_changed:
+            changed = True
+            if entries:
+                hooks[event] = entries
+            else:
+                del hooks[event]
+    return changed
+
+
+def write_settings_atomically(path, data):
+    """Temp file in the same directory + rename: readers only ever see either
+    the old complete file or the new complete file, never a partial write.
+
+    The rename discards the original file's permissions (the temp file's
+    umask-derived mode would win), and settings.json can carry secrets (env
+    vars, apiKeyHelper config) that users protect with e.g. chmod 600 — so
+    replicate the existing mode onto the temp file BEFORE the rename. A brand
+    new settings file keeps the umask default, same as a plain open(path, 'w').
+
+    Resolve symlinks first: dotfiles managers (stow, chezmoi, ...) commonly
+    make ~/.claude/settings.json a symlink into a repo. os.replace on the
+    symlink itself would swap the link for a regular file, silently detaching
+    the user's dotfiles setup — so rewrite the link's TARGET instead, exactly
+    like the plain open(path, 'w') this replaced used to. (os.stat below
+    follows symlinks anyway, so the mode logic is unaffected.)"""
+    path = os.path.realpath(path)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = None
+    tmp = f'{path}.tmp.{os.getpid()}'
+    try:
+        with open(tmp, 'w') as f:
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# HOOK_PATHS drives the removal/dedup matcher: every URL we are about to
+# install must be covered by it, or a later removal would leave strays.
+for entries in new_hooks.values():
+    for entry in entries:
+        for hook in entry['hooks']:
+            assert is_ours(hook), f"hook URL not covered by HOOK_PATHS: {hook['url']}"
+
+try:
+    with open(settings_path) as f:
+        settings = json.load(f)
+except FileNotFoundError:
+    settings = {}
 
 existing_hooks = settings.get('hooks', {})
 
+# Dedup any previous claude-watch install (possibly targeting a different
+# port — the bridge walks the range) without touching the user's own hooks:
+# object-level filtering on exact claude-watch URLs only.
+strip_claude_watch_hooks(existing_hooks)
+
 # Merge: add our hooks without removing user's existing hooks
 for event, entries in new_hooks.items():
-    if event not in existing_hooks:
-        existing_hooks[event] = []
-
-    # Remove any old claude-watch hooks for this event
-    existing_hooks[event] = [
-        entry for entry in existing_hooks[event]
-        if not any(
-            h.get('url', '').startswith('http://127.0.0.1:') and '/hooks/' in h.get('url', '')
-            for h in entry.get('hooks', [])
-        )
-    ]
-
-    # Add our new hooks
-    existing_hooks[event].extend(entries)
+    existing_hooks.setdefault(event, []).extend(entries)
 
 settings['hooks'] = existing_hooks
 
-with open('$SETTINGS', 'w') as f:
-    json.dump(settings, f, indent=2)
+write_settings_atomically(settings_path, settings)
 
 print('Hooks installed successfully!')
 print()
 print('Events hooked:')
 for event in new_hooks:
     print(f'  • {event}')
-"
+PYEOF
 
 echo ""
 
