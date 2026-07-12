@@ -57,9 +57,13 @@ data class HaloModel(
                     ?: "workspace"
                 HaloSession(
                     id = s.sessionId,
-                    title = pending?.sessionLabel?.takeIf { it.isNotBlank() }
-                        ?: s.folderName
-                        ?: "${s.agent ?: "session"} · ${s.sessionId.take(6)}",
+                    // The bridge has no session-title concept: folderName IS
+                    // the project (and sessionLabel derives from it), so using
+                    // either here duplicates the divider/page label and makes
+                    // sibling sessions in one project indistinguishable.
+                    // agent · short-id is the honest distinct label until the
+                    // protocol carries a real session title.
+                    title = "${s.agent ?: "session"} · ${s.sessionId.take(6)}",
                     projectName = project,
                     state = state,
                     pending = pending,
