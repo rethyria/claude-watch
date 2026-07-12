@@ -19,6 +19,8 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -92,6 +94,11 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
         val scope = nav.listScope
         nav = when {
             nav.cardOpen && ui.permissionQueue.isEmpty() -> nav.jumpHome() // spec: empty queue returns home
+            // The pinned prompt was resolved (chaining moved to the queue
+            // front): drop the stale id so nav reflects what is rendered.
+            nav.cardPermissionId != null &&
+                ui.permissionQueue.none { it.permissionId == nav.cardPermissionId } ->
+                nav.copy(cardPermissionId = null)
             nav.depth == HaloDepth.SESSION && model.sessions.none { it.id == nav.sessionId } -> nav.back()
             scope is ListScope.Project &&
                 nav.depth != HaloDepth.PAGE &&
@@ -140,7 +147,13 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         model = model,
                         sessionId = layer.sessionId,
                         ui = ui,
-                        onOpenCard = { nav = nav.copy(cardOpen = true) },
+                        // The banner belongs to THIS session: pin its own
+                        // prompt, not whatever sits at the global queue front.
+                        onOpenCard = {
+                            val pending = currentModel.sessions
+                                .firstOrNull { it.id == layer.sessionId }?.pending
+                            nav = nav.openCard(pending?.permissionId)
+                        },
                         onDictate = actions.onDictate,
                         onCycle = { nav = nav.copy(sessionId = it) },
                     )
@@ -148,28 +161,56 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
             }
         }
 
-        // The card overlay: renders the FRONT of the queue over everything.
-        // Chaining is a horizontal slide keyed on the front's id — resolving
-        // one card slides the next in from the right (handoff §5). Withheld
-        // while offline: a disconnected bridge can't receive the answer.
-        val front = ui.permissionQueue.firstOrNull()
+        // The card overlay: renders the prompt the card was opened FOR
+        // (nav.cardPermissionId — a project page or feed banner targets its
+        // own session's prompt, which need not be the global queue front),
+        // falling back to the front once that prompt resolves. Chaining is a
+        // horizontal slide keyed on the prompt's id — resolving one card
+        // slides the next in from the right (handoff §5). Withheld while
+        // offline: a disconnected bridge can't receive the answer.
+        val front = nav.cardPermissionId
+            ?.let { id -> ui.permissionQueue.firstOrNull { it.permissionId == id } }
+            ?: ui.permissionQueue.firstOrNull()
         if (nav.cardOpen && front != null && !ui.isOffline()) {
-            Box(modifier = Modifier.fillMaxSize().background(Halo.Palette.Background)) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Halo.Palette.Background)
+                    // The card is modal (handoff §5: answering or "decide
+                    // later" are the only exits): this pointer node keeps
+                    // taps and swipes off the invisible screens underneath —
+                    // without it the top TimeText strip and the back detector
+                    // still receive input — and owns swipe-down as the
+                    // "decide later" exit.
+                    .pointerInput(Unit) {
+                        val threshold = size.height * SWIPE_THRESHOLD_FRACTION
+                        var total = 0f
+                        detectVerticalDragGestures(
+                            onDragStart = { total = 0f },
+                            onDragEnd = { if (total > threshold) nav = nav.back() },
+                        ) { change, dragAmount ->
+                            total += dragAmount
+                            change.consume()
+                        }
+                    },
+            ) {
                 AnimatedContent(
-                    targetState = front.permissionId,
+                    targetState = front,
                     transitionSpec = {
                         (slideInHorizontally(tween(TRANSITION_MS, easing = HaloEasing)) { (it * SLIDE_FRACTION).roundToInt() } +
                             fadeIn(tween(TRANSITION_MS, easing = HaloEasing)))
                             .togetherWith(fadeOut(tween(TRANSITION_MS / 2)))
                     },
+                    // Key on the id so metadata refreshes (e.g. a session
+                    // label arriving late) update in place; carrying the
+                    // VALUE keeps the exiting layer rendering the resolved
+                    // card, which is already gone from the queue.
+                    contentKey = { it.permissionId },
                     label = "haloCard",
-                ) { frontId ->
-                    // Re-resolve inside the animated block: the exiting frame
-                    // may outlive its queue entry.
-                    val card = ui.permissionQueue.firstOrNull { it.permissionId == frontId }
-                        ?: return@AnimatedContent
+                ) { card ->
                     if (card.questions.isNotEmpty()) {
                         HaloQuestionCard(
+                            card = card,
                             model = model,
                             ui = ui,
                             onAnswers = actions.onAnswerQuestions,
@@ -179,6 +220,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         )
                     } else {
                         HaloApprovalCard(
+                            card = card,
                             model = model,
                             ui = ui,
                             onAnswer = actions.onAnswerPermission,
@@ -193,8 +235,17 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
         // Offline/unpaired takes the whole screen: state colors and pending
         // approvals are stale the moment the stream drops (handoff §8).
         if (ui.isOffline()) {
-            Box(modifier = Modifier.fillMaxSize().background(Halo.Palette.Background)) {
-                HaloOfflineScreen(ui = ui, onRepair = actions.onUnpair)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Halo.Palette.Background)
+                    // A takeover, not a scrim: swallow every gesture so the
+                    // hidden pager/centerpiece/back detectors can't be driven
+                    // invisibly while offline. The screen's own controls are
+                    // children and are hit first.
+                    .consumeAllGestures(),
+            ) {
+                HaloOfflineScreen(ui = ui, onPair = actions.onPair)
             }
         }
     }
@@ -203,6 +254,23 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
 /** True when the bridge cannot currently receive commands or answers. */
 private fun BridgeViewModel.UiState.isOffline(): Boolean =
     !paired || status.contains("reconnecting")
+
+/**
+ * Modal scrim: a pointer node here removes the sibling layers underneath
+ * from the hit path (a bare background does NOT hit-test, so without this
+ * every gesture falls through), and consuming keeps ancestors quiet too.
+ * Children of the overlay still receive their events first.
+ */
+private fun Modifier.consumeAllGestures(): Modifier = pointerInput(Unit) {
+    awaitEachGesture {
+        awaitFirstDown(requireUnconsumed = false).consume()
+        while (true) {
+            val event = awaitPointerEvent()
+            event.changes.forEach { it.consume() }
+            if (event.changes.none { it.pressed }) break
+        }
+    }
+}
 
 // ── Depth layers & motion ───────────────────────────────────────────────────
 
