@@ -567,6 +567,147 @@ class BridgeViewModelTest {
     }
 
     /**
+     * An AskUserQuestion permission-request frame: no top-level options, ALL
+     * questions in tool_input.questions — the exact event shape hooks.js
+     * broadcasts for tool_name AskUserQuestion.
+     */
+    private fun askUserQuestionFrame(id: Int, permissionId: String, sessionId: String = "s-1"): String =
+        "id: $id\nevent: permission-request\n" +
+            """data: {"permissionId":"$permissionId","tool_name":"AskUserQuestion","tool_input":{"questions":[""" +
+            """{"question":"Which color scheme?","header":"Color","multiSelect":false,""" +
+            """"options":[{"label":"Blue"},{"label":"Green"}]},""" +
+            """{"question":"Tabs or spaces?","header":"Indent","multiSelect":false,""" +
+            """"options":[{"label":"Tabs"},{"label":"Spaces"}]}]},"sessionId":"$sessionId"}""" +
+            "\n\n"
+
+    /**
+     * Issue #18 acceptance: a multi-question AskUserQuestion payload surfaces
+     * EVERY question typed on the queued card (no top-level options — the
+     * question card, not the behavior buttons), and answerQuestions POSTs the
+     * bridge's preferred /v1 decision shape — `decision.answers` keyed by
+     * question text with an entry per question, free-text values verbatim —
+     * which the bridge forwards to the blocked hook (`updatedInput.answers`;
+     * see skill/bridge/test/permission-semantics.test.js). Ack-gated exactly
+     * like a behavior answer: only the 2xx dismisses the card.
+     */
+    @Test
+    fun askUserQuestionAnswersEveryQuestionInOnePost() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append(askUserQuestionFrame(1, "perm-ask"))
+            append(":pad\n\n".repeat(80))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        val state = awaitState { it.permissionQueue.isNotEmpty() }
+        val rendered = state.permissionQueue.first()
+        // Every question of the payload is on the card, with its own options.
+        assertEquals(
+            listOf("Which color scheme?", "Tabs or spaces?"),
+            rendered.questions.map { it.question },
+        )
+        assertEquals(listOf("Blue", "Green"), rendered.questions[0].options.map { it.label })
+        assertEquals(listOf("Tabs", "Spaces"), rendered.questions[1].options.map { it.label })
+        // Question prompts render questions, not behavior buttons.
+        assertEquals(emptyList<String>(), rendered.options.map { it.behavior })
+
+        // One answer per question: an option label and a free-text answer.
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.answerQuestions(
+            "perm-ask",
+            mapOf(
+                "Which color scheme?" to "Blue",
+                "Tabs or spaces?" to "two-space soft tabs",
+            ),
+        )
+        val request = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no decision request")
+        assertEquals("/v1/command", request.path)
+        val body = JSONObject(request.body.readUtf8())
+        assertEquals("perm-ask", body.getString("permissionId"))
+        val decision = body.getJSONObject("decision")
+        assertEquals("allow", decision.getString("behavior"))
+        val answers = decision.getJSONObject("answers")
+        assertEquals("every question gets its answer", 2, answers.length())
+        assertEquals("Blue", answers.getString("Which color scheme?"))
+        assertEquals(
+            "free-text answers travel verbatim",
+            "two-space soft tabs",
+            answers.getString("Tabs or spaces?"),
+        )
+
+        // Only the 2xx ack dismissed the card.
+        val acked = awaitState { it.permissionQueue.isEmpty() }
+        assertEquals("decision:200", acked.decisionResult)
+    }
+
+    /**
+     * Issue #18 acceptance: dismissal semantics match the approval card — a
+     * failed answers POST keeps the question card queued with the error
+     * surfaced (never optimistic clearing) and counts toward the local-dismiss
+     * escape hatch; the retry's 2xx is what dismisses it.
+     */
+    @Test
+    fun failedQuestionAnswersKeepTheCardQueuedUntilARetryAcks() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append(askUserQuestionFrame(1, "perm-ask-flaky"))
+            append(":pad\n\n".repeat(80))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.permissionQueue.any { p -> p.permissionId == "perm-ask-flaky" } }
+
+        val answers = mapOf(
+            "Which color scheme?" to "Green",
+            "Tabs or spaces?" to "Tabs",
+        )
+        server.enqueue(MockResponse().setResponseCode(500).setBody("""{"error":"boom"}"""))
+        viewModel.answerQuestions("perm-ask-flaky", answers)
+
+        val failed = awaitState { it.decisionResult == "decision:500" }
+        assertEquals(
+            "a failed answers POST must keep the question card queued",
+            listOf("perm-ask-flaky"),
+            failed.permissionQueue.map { it.permissionId },
+        )
+        assertEquals("Decision failed: HTTP 500", failed.decisionError)
+        assertEquals(
+            "failures count toward the local-dismiss escape hatch",
+            1,
+            failed.decisionFailureCount,
+        )
+
+        // Retry succeeds: only the 2xx ack dismisses the card, error cleared.
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.answerQuestions("perm-ask-flaky", answers)
+        val acked = awaitState { it.decisionResult == "decision:200" && it.permissionQueue.isEmpty() }
+        assertEquals(null, acked.decisionError)
+        assertEquals(0, acked.decisionFailureCount)
+    }
+
+    /**
      * Spawn and kill ride POST /v1/command with the bridge's `spawn` / `kill`
      * body shapes (commands.js handleCommand); the results surface in
      * [BridgeViewModel.UiState.sessionActionResult] and spawn retargets the

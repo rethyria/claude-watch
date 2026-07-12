@@ -14,7 +14,11 @@ import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
 import androidx.compose.ui.test.swipeUp
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import dev.claudewatch.shared.protocol.AskUserQuestion
+import dev.claudewatch.shared.protocol.AskUserQuestionOption
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.wear.ui.LOCAL_DISMISS_AFTER_FAILURES
 import dev.claudewatch.wear.ui.SessionPagerActions
@@ -222,6 +226,228 @@ class ApprovalFlowTest {
         compose.onNodeWithTag("permissionDismiss").assertIsDisplayed().performClick()
         assertEquals(listOf("perm-bash"), dismissals)
         assertEquals("dismiss must never send an answer", emptyList<Pair<String, String>>(), answers)
+
+        // The ViewModel dropped the card: the sheet leaves, the app is usable.
+        state = ui(emptyList())
+        compose.waitForIdle()
+        assertEquals(0, compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().size)
+    }
+
+    // ------------------------------------------------------------------
+    // AskUserQuestion card (issue #18)
+    // ------------------------------------------------------------------
+
+    private val askPrompt = BridgeViewModel.PendingPermission(
+        permissionId = "perm-ask",
+        sessionId = "s-1",
+        toolName = "AskUserQuestion",
+        requestSummary = "[AskUserQuestion]",
+        sessionLabel = "alpha",
+        options = emptyList(),
+        questions = listOf(
+            AskUserQuestion(
+                question = "Which color scheme?",
+                header = "Color",
+                options = listOf(
+                    AskUserQuestionOption("Blue"),
+                    AskUserQuestionOption("Green"),
+                ),
+            ),
+            AskUserQuestion(
+                question = "Tabs or spaces?",
+                header = "Indent",
+                options = listOf(
+                    AskUserQuestionOption("Tabs"),
+                    AskUserQuestionOption("Spaces"),
+                ),
+            ),
+        ),
+    )
+
+    /**
+     * Issue #18 acceptance: a multi-question payload renders EVERY question
+     * (the legacy client silently answered only the first), Send stays
+     * disabled until each has an answer, and the sent map carries one answer
+     * per question keyed by question text — the key the bridge uses to route
+     * answers back to the blocked hook.
+     */
+    @Test
+    fun multiQuestionCardRendersEveryQuestionAndSendsAllAnswers() {
+        val sent = mutableListOf<Pair<String, Map<String, String>>>()
+        compose.setContent {
+            SessionPagerScreen(
+                ui = ui(listOf(askPrompt)),
+                actions = SessionPagerActions(
+                    onAnswerQuestions = { id, answers -> sent += id to answers },
+                ),
+            )
+        }
+
+        // The same single-presenter sheet, in question mode: which session
+        // asks, every question, each question's own options.
+        compose.onNodeWithTag("permissionSheet").assertIsDisplayed()
+        compose.onNodeWithText("alpha").assertIsDisplayed()
+        compose.onNodeWithTag("questionText-0").assertIsDisplayed()
+        compose.onNodeWithText("Which color scheme?").assertIsDisplayed()
+        compose.onNodeWithTag("questionText-1").performScrollTo()
+        compose.onNodeWithText("Tabs or spaces?").assertIsDisplayed()
+
+        // Half-answered: Send must not fire — a partial map would silently
+        // drop the unanswered question's hook answer.
+        compose.onNodeWithTag("questionOption-0-Blue").performScrollTo().performClick()
+        compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+        assertEquals("send must be gated until every question is answered", 0, sent.size)
+
+        // Fully answered: one POST payload with BOTH answers, keyed to the
+        // rendered card's permissionId.
+        compose.onNodeWithTag("questionOption-1-Spaces").performScrollTo().performClick()
+        compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+        assertEquals(
+            listOf(
+                "perm-ask" to mapOf(
+                    "Which color scheme?" to "Blue",
+                    "Tabs or spaces?" to "Spaces",
+                ),
+            ),
+            sent,
+        )
+    }
+
+    /** Issue #18 acceptance: the free-text path answers a question with typed text. */
+    @Test
+    fun freeTextAnswerIsSentForItsQuestion() {
+        val sent = mutableListOf<Pair<String, Map<String, String>>>()
+        compose.setContent {
+            SessionPagerScreen(
+                ui = ui(listOf(askPrompt)),
+                actions = SessionPagerActions(
+                    onAnswerQuestions = { id, answers -> sent += id to answers },
+                ),
+            )
+        }
+
+        // Question 0 by option, question 1 by typed free text.
+        compose.onNodeWithTag("questionOption-0-Green").performScrollTo().performClick()
+        compose.onNodeWithTag("questionFreeText-1").performScrollTo().performTextInput("two-space soft tabs")
+        compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+        assertEquals(
+            listOf(
+                "perm-ask" to mapOf(
+                    "Which color scheme?" to "Green",
+                    "Tabs or spaces?" to "two-space soft tabs",
+                ),
+            ),
+            sent,
+        )
+    }
+
+    /** A multiSelect question toggles options and joins the picks in option order. */
+    @Test
+    fun multiSelectQuestionJoinsToggledOptionsInOptionOrder() {
+        val sent = mutableListOf<Pair<String, Map<String, String>>>()
+        val multi = askPrompt.copy(
+            permissionId = "perm-multi",
+            questions = listOf(
+                AskUserQuestion(
+                    question = "Which linters?",
+                    header = "Lint",
+                    options = listOf(
+                        AskUserQuestionOption("ktlint"),
+                        AskUserQuestionOption("detekt"),
+                        AskUserQuestionOption("android-lint"),
+                    ),
+                    multiSelect = true,
+                ),
+            ),
+        )
+        compose.setContent {
+            SessionPagerScreen(
+                ui = ui(listOf(multi)),
+                actions = SessionPagerActions(
+                    onAnswerQuestions = { id, answers -> sent += id to answers },
+                ),
+            )
+        }
+
+        // Toggle in REVERSE order, and toggle one off again: the answer joins
+        // the still-selected labels in the question's option order.
+        compose.onNodeWithTag("questionOption-0-android-lint").performScrollTo().performClick()
+        compose.onNodeWithTag("questionOption-0-detekt").performScrollTo().performClick()
+        compose.onNodeWithTag("questionOption-0-ktlint").performScrollTo().performClick()
+        compose.onNodeWithTag("questionOption-0-android-lint").performScrollTo().performClick()
+        compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+        assertEquals(
+            listOf("perm-multi" to mapOf("Which linters?" to "ktlint, detekt")),
+            sent,
+        )
+    }
+
+    /**
+     * Issue #18 acceptance: dismissal/restore semantics match the approval
+     * card — gesture-undismissable, a failed send keeps the card with the
+     * error surfaced AND the user's picks intact for retry, and the
+     * no-decision local-dismiss escape hatch unlocks only after repeated
+     * failures.
+     */
+    @Test
+    fun questionCardMatchesTheApprovalCardsDismissalAndRestoreSemantics() {
+        val sent = mutableListOf<Pair<String, Map<String, String>>>()
+        val dismissals = mutableListOf<String>()
+        var state by mutableStateOf(ui(listOf(askPrompt)))
+        compose.setContent {
+            SessionPagerScreen(
+                ui = state,
+                actions = SessionPagerActions(
+                    onAnswerQuestions = { id, answers -> sent += id to answers },
+                    onDismissPermission = { id -> dismissals += id },
+                ),
+            )
+        }
+
+        // Swipe-immune in every direction, exactly like the approval card.
+        compose.onNodeWithTag("permissionSheet").performTouchInput { swipeRight() }
+        compose.onNodeWithTag("permissionSheet").performTouchInput { swipeLeft() }
+        compose.onNodeWithTag("permissionSheet").performTouchInput { swipeDown() }
+        compose.onNodeWithTag("permissionSheet").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("permissionSheet").assertIsDisplayed()
+
+        // Answer both questions and send; the POST fails (the ViewModel keeps
+        // the card queued, surfaces the error, counts the failure).
+        compose.onNodeWithTag("questionOption-0-Blue").performScrollTo().performClick()
+        compose.onNodeWithTag("questionOption-1-Tabs").performScrollTo().performClick()
+        compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+        assertEquals(1, sent.size)
+        state = ui(listOf(askPrompt), error = "Decision failed: HTTP 500", failureCount = 1)
+        compose.waitForIdle()
+
+        // Restored: error surfaced, the card still up, and the user's picks
+        // intact — the retry sends the SAME answers without re-entering them.
+        compose.onNodeWithTag("permissionError").assertIsDisplayed()
+        assertEquals(
+            "dismiss must not be offered below the failure threshold",
+            0,
+            compose.onAllNodes(hasTestTag("permissionDismiss")).fetchSemanticsNodes().size,
+        )
+        compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+        assertEquals(2, sent.size)
+        assertEquals(
+            "the restored card must retry with the picks it was rendered with",
+            sent[0],
+            sent[1],
+        )
+
+        // Threshold reached: the explicit no-decision dismiss appears and
+        // sends NO answers — identical to the approval card's escape hatch.
+        state = ui(
+            listOf(askPrompt),
+            error = "Decision failed: HTTP 500",
+            failureCount = LOCAL_DISMISS_AFTER_FAILURES,
+        )
+        compose.waitForIdle()
+        compose.onNodeWithTag("permissionDismiss").performScrollTo().performClick()
+        assertEquals(listOf("perm-ask"), dismissals)
+        assertEquals("dismiss must never send answers", 2, sent.size)
 
         // The ViewModel dropped the card: the sheet leaves, the app is usable.
         state = ui(emptyList())

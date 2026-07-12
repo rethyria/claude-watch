@@ -49,6 +49,18 @@ sessions, and answer blocking permission hooks.
   the 10-minute auto-deny. Option buttons come from the bridge's canonical
   behavior-keyed option list (`allow` / `allow-always` / `deny`) — decisions
   send the machine-readable `behavior`, never label or position matching.
+- **AskUserQuestion card (issue #18):** question prompts ride the same sheet
+  (same queue, ack-gating, swipe-immunity, escape hatch) with a question body
+  instead of behavior buttons. They carry no canonical options; the typed
+  `PermissionRequestEvent.questions` surfaces EVERY question of
+  `tool_input.questions` (parsed leniently — hook content never fails the
+  frame), each with its own option chips (single-select replaces, `multiSelect`
+  toggles and joins in option order) plus a free-text field per question. One
+  Send goes out only when every question has an answer, POSTing
+  `decision: {behavior: "allow", answers: {<question text>: <answer>}}` —
+  the /v1 object form the bridge maps back to the blocked hook as
+  `updatedInput.answers`. A failed send restores the card with the picks
+  intact for retry.
 - **Stack:** Kotlin, Compose for Wear OS, OkHttp + okhttp-sse (readTimeout 0,
   `Last-Event-ID` reconnect replay).
 - **Standalone:** `com.google.android.wearable.standalone=true` — no phone
@@ -115,7 +127,10 @@ concurrently, both queue on the sheet, and each answer unblocks exactly the
 hook whose card was rendered (deny lands on one, allow on the other), plus an
 allow-always answer for a hook with `permission_suggestions` asserting the
 bridge maps it to `behavior: "allow"` + `updatedPermissions` so the prompt
-does not recur — then spawns a session from the watch, swipes the pager to
+does not recur — and the AskUserQuestion card: a blocking two-question hook
+renders both questions, one answered by option chip and one by typed free
+text, and unblocks with both answers keyed by question text in
+`updatedInput.answers` — then spawns a session from the watch, swipes the pager to
 its live terminal (the stubbed agent's PTY output renders as terminal
 lines), and kills it from the page header, asserting the bridge's
 `session ended` prunes the page.
@@ -127,4 +142,6 @@ thinking-cursor raise/clear, and page pruning on session end.
 `ApprovalFlowTest` (instrumented, no bridge) covers the sheet itself:
 what/which-session/queue-depth rendering, answers keyed to the rendered
 card's `permissionId`, swipe-immunity in all four directions, error surfacing
-without dropping the prompt, and the behavior-keyed allow-always button.
+without dropping the prompt, the behavior-keyed allow-always button, and the
+AskUserQuestion card (all questions rendered, send gated on completeness,
+free-text and multi-select answers, approval-card dismissal/restore parity).

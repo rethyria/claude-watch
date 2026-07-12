@@ -12,10 +12,12 @@ package dev.claudewatch.shared.protocol
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 
 /**
@@ -129,11 +131,33 @@ data class PermissionOption(
 }
 
 /**
+ * One choice offered by an [AskUserQuestion]; [label] is both what the watch
+ * renders and the literal answer string sent back for the question.
+ */
+data class AskUserQuestionOption(
+    val label: String,
+    val description: String? = null,
+)
+
+/**
+ * One question of an AskUserQuestion prompt, extracted from
+ * `tool_input.questions`. [question] is the answer key: the bridge's
+ * `collectAskUserQuestionAnswers()` maps answers back to the blocked hook by
+ * question text.
+ */
+data class AskUserQuestion(
+    val question: String,
+    val header: String? = null,
+    val options: List<AskUserQuestionOption> = emptyList(),
+    val multiSelect: Boolean = false,
+)
+
+/**
  * `permission-request` — a blocking hook is waiting on a decision.
  * [permissionId] is the correlation key for the `POST /v1/command` answer and
  * is mandatory. [options] is the canonical top-level list; AskUserQuestion
  * prompts carry none (their per-question lists live in `tool_input.questions`,
- * forwarded verbatim in [toolInput]).
+ * forwarded verbatim in [toolInput] and surfaced typed via [questions]).
  */
 @Serializable
 data class PermissionRequestEvent(
@@ -148,7 +172,45 @@ data class PermissionRequestEvent(
     init {
         require(permissionId.isNotEmpty()) { "permission-request must carry a permissionId" }
     }
+
+    /**
+     * The AskUserQuestion questionnaire, typed. Unlike the event contract
+     * itself this is HOOK CONTENT (`tool_input` is forwarded verbatim), so
+     * per the tolerant/strict split it parses LENIENTLY: an entry that is not
+     * an object or lacks a non-blank `question` (the answer key — see
+     * `collectAskUserQuestionAnswers()` bridge-side) is skipped, as is any
+     * option without a non-blank `label`; nothing here can fail the frame.
+     * Empty for every other tool.
+     */
+    val questions: List<AskUserQuestion>
+        get() {
+            if (toolName != "AskUserQuestion") return emptyList()
+            val raw = toolInput?.get("questions") as? JsonArray ?: return emptyList()
+            return raw.mapNotNull { entry ->
+                val obj = entry as? JsonObject ?: return@mapNotNull null
+                val text = obj.stringOrNull("question")?.takeUnless { it.isBlank() }
+                    ?: return@mapNotNull null
+                AskUserQuestion(
+                    question = text,
+                    header = obj.stringOrNull("header"),
+                    options = (obj["options"] as? JsonArray).orEmpty().mapNotNull { opt ->
+                        val option = opt as? JsonObject ?: return@mapNotNull null
+                        val label = option.stringOrNull("label")?.takeUnless { it.isBlank() }
+                            ?: return@mapNotNull null
+                        AskUserQuestionOption(label, option.stringOrNull("description"))
+                    },
+                    multiSelect = (obj["multiSelect"] as? JsonPrimitive)?.booleanOrNull ?: false,
+                )
+            }
+        }
 }
+
+// NOT a companion member: kotlinx.serialization generates PermissionRequest-
+// Event's `serializer()` accessor onto its companion object, and declaring a
+// private companion of our own would make that accessor inaccessible
+// (IllegalAccessError at parse time).
+private fun JsonObject.stringOrNull(key: String): String? =
+    (this[key] as? JsonPrimitive)?.contentOrNull
 
 /** `permission-cleared` — dismiss a pending prompt (hook aborted, Codex resolved it, ...). */
 @Serializable

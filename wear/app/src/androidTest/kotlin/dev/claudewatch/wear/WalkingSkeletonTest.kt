@@ -234,6 +234,73 @@ class WalkingSkeletonTest {
             compose.waitUntil(30_000) {
                 compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().isEmpty()
             }
+
+            // --- AskUserQuestion: every question answered, incl. free text --
+            // A multi-question payload renders ALL questions on the question
+            // card (the legacy client answered only the first), one gets an
+            // option pick and the other a typed free-text answer, and the
+            // blocked hook unblocks with BOTH answers keyed by question text
+            // (updatedInput.answers — see collectAskUserQuestionAnswers in
+            // skill/bridge/hooks.js).
+            val questions = org.json.JSONArray()
+                .put(
+                    JSONObject()
+                        .put("question", "Which database should the service use?")
+                        .put("header", "Database")
+                        .put("multiSelect", false)
+                        .put(
+                            "options",
+                            org.json.JSONArray()
+                                .put(JSONObject().put("label", "PostgreSQL"))
+                                .put(JSONObject().put("label", "SQLite")),
+                        ),
+                )
+                .put(
+                    JSONObject()
+                        .put("question", "What should the service be called?")
+                        .put("header", "Name")
+                        .put("multiSelect", false)
+                        .put("options", org.json.JSONArray().put(JSONObject().put("label", "api-server"))),
+                )
+            val hookQ = permissionHook(
+                JSONObject()
+                    .put("tool_name", "AskUserQuestion")
+                    .put("session_id", "wear-e2e-session-a")
+                    .put("cwd", "/tmp/wear-e2e-a")
+                    .put("tool_input", JSONObject().put("questions", questions)),
+            )
+            // Both questions render on the sheet.
+            waitForText("questionText-0", "Which database should the service use?")
+            waitForText("questionText-1", "What should the service be called?")
+
+            // Send is gated until EVERY question has an answer.
+            compose.onNodeWithTag("questionsSend").performScrollTo()
+            Thread.sleep(500)
+            assertFalse("hook must block until every question is answered", hookQ.isDone)
+
+            // Question 0: pick an option. Question 1: type a free-text answer.
+            compose.onNodeWithTag("questionOption-0-SQLite").performScrollTo().performClick()
+            fill("questionFreeText-1", "wear-e2e-custom-name")
+            compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+
+            val (statusQ, bodyQ) = hookQ.get(30, TimeUnit.SECONDS)
+            assertEquals(200, statusQ)
+            val decisionQ = decisionOf(bodyQ)
+            assertEquals("allow", decisionQ.getString("behavior"))
+            val answersQ = decisionQ.getJSONObject("updatedInput").getJSONObject("answers")
+            assertEquals(
+                "the option answer must land on its question",
+                "SQLite",
+                answersQ.getString("Which database should the service use?"),
+            )
+            assertEquals(
+                "the free-text answer must land on its question",
+                "wear-e2e-custom-name",
+                answersQ.getString("What should the service be called?"),
+            )
+            compose.waitUntil(30_000) {
+                compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().isEmpty()
+            }
         } finally {
             executor.shutdownNow()
         }

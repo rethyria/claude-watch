@@ -2,6 +2,7 @@ package dev.claudewatch.wear
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import dev.claudewatch.shared.protocol.AskUserQuestion
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
 import dev.claudewatch.shared.protocol.SseFrame
@@ -34,6 +35,10 @@ class BridgeViewModel : ViewModel() {
      * ([sessionLabel]) — the live-testing feedback on the single-slot card
      * that only said "Bash". [options] is the bridge's canonical
      * behavior-keyed list (never inferred from labels or position).
+     * [questions] is non-empty exactly for AskUserQuestion prompts (which
+     * carry no canonical options): EVERY question of the payload, each with
+     * its own option list, rendered by the question card and answered
+     * per-question via [answerQuestions].
      */
     data class PendingPermission(
         val permissionId: String,
@@ -42,6 +47,7 @@ class BridgeViewModel : ViewModel() {
         val requestSummary: String,
         val sessionLabel: String,
         val options: List<PermissionOption>,
+        val questions: List<AskUserQuestion> = emptyList(),
     )
 
     data class UiState(
@@ -217,6 +223,33 @@ class BridgeViewModel : ViewModel() {
      * unlocks the sheet's [dismissPermissionLocally] escape hatch.
      */
     fun answerPermission(permissionId: String, behavior: String) {
+        sendDecision(permissionId) { currentClient, currentToken ->
+            val message = if (behavior == "deny") "Denied from the watch" else null
+            currentClient.answerPermission(currentToken, permissionId, behavior, message)
+        }
+    }
+
+    /**
+     * Answer the queued AskUserQuestion prompt [permissionId] with an answer
+     * for EVERY question, keyed by question text ([answers]) — a selected
+     * option's label or free typed text; the bridge forwards the map verbatim
+     * to the blocked hook as `updatedInput.answers`. Same ack-gated dismissal
+     * and failure semantics as [answerPermission]: the card leaves the queue
+     * only on 2xx/404 (or dead-token 401/403), a retryable failure keeps it
+     * rendered with the error surfaced and counts toward the local-dismiss
+     * escape hatch.
+     */
+    fun answerQuestions(permissionId: String, answers: Map<String, String>) {
+        if (answers.isEmpty()) return
+        sendDecision(permissionId) { currentClient, currentToken ->
+            currentClient.answerQuestions(currentToken, permissionId, answers)
+        }
+    }
+
+    private fun sendDecision(
+        permissionId: String,
+        post: (BridgeClient, String) -> BridgeClient.ApiResult,
+    ) {
         val currentClient = client
         val currentToken = token
         // Answer only a prompt that is actually still queued.
@@ -225,8 +258,7 @@ class BridgeViewModel : ViewModel() {
         _state.update { it.copy(decisionInFlightId = permissionId, decisionError = null) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val message = if (behavior == "deny") "Denied from the watch" else null
-                val result = currentClient.answerPermission(currentToken, permissionId, behavior, message)
+                val result = post(currentClient, currentToken)
                 _state.update { ui ->
                     // The bridge pushes no permission-cleared when a prompt is
                     // resolved via /v1/command from another paired device, or
@@ -363,6 +395,12 @@ class BridgeViewModel : ViewModel() {
 
     private fun PermissionRequestEvent.toPending(bridge: BridgeState): PendingPermission {
         val session = sessionId?.let { bridge.sessions[it] }
+        // AskUserQuestion prompts are content, not permission decisions: they
+        // carry per-question option lists instead of canonical options, and
+        // the question card answers them via answerQuestions. A question
+        // payload that parses to nothing degrades to the plain allow/deny
+        // card below rather than an unanswerable sheet.
+        val askQuestions = questions
         return PendingPermission(
             permissionId = permissionId,
             sessionId = sessionId,
@@ -374,13 +412,14 @@ class BridgeViewModel : ViewModel() {
                 ?: "unknown session",
             // Behavior-keyed options straight from the bridge; a legacy event
             // without options still gets behavior-based allow/deny (never
-            // label matching).
-            options = options.ifEmpty {
+            // label matching). Question prompts render questions, not options.
+            options = if (askQuestions.isNotEmpty()) emptyList() else options.ifEmpty {
                 listOf(
                     PermissionOption("allow", "Yes"),
                     PermissionOption("deny", "No"),
                 )
             },
+            questions = askQuestions,
         )
     }
 

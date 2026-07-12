@@ -23,6 +23,14 @@
 //  - Option buttons come from the bridge's canonical behavior-keyed option
 //    list; the decision sent is the option's machine-readable `behavior`,
 //    never inferred from label wording or position.
+//
+// AskUserQuestion prompts (issue #18) render on the SAME sheet with the same
+// queue/ack/dismissal semantics, but with a question card body instead of the
+// behavior buttons: EVERY question of the payload (the watchOS card silently
+// answered only the first), each with its per-question option chips and a
+// free-text field, and one Send that goes out only once every question has an
+// answer — the bridge maps the answers map back to the blocked hook keyed by
+// question text.
 package dev.claudewatch.wear.ui
 
 import androidx.compose.foundation.background
@@ -36,18 +44,24 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.Chip
 import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.Text
+import dev.claudewatch.shared.protocol.AskUserQuestion
 import dev.claudewatch.wear.BridgeViewModel
 
 /** Failed answer attempts before the sheet offers the no-decision local dismiss. */
@@ -70,10 +84,12 @@ fun PermissionSheet(
     error: String?,
     failureCount: Int,
     onAnswer: (permissionId: String, behavior: String) -> Unit,
+    onAnswerQuestions: (permissionId: String, answers: Map<String, String>) -> Unit = { _, _ -> },
     onDismiss: (permissionId: String) -> Unit,
 ) {
     val prompt = queue.firstOrNull() ?: return
     val inFlight = inFlightId == prompt.permissionId
+    val isQuestion = prompt.questions.isNotEmpty()
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -93,7 +109,11 @@ fun PermissionSheet(
                 .padding(horizontal = 20.dp, vertical = 28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("Permission", fontSize = 13.sp, color = WatchTheme.ClaudeOrange)
+            Text(
+                if (isQuestion) "Question" else "Permission",
+                fontSize = 13.sp,
+                color = WatchTheme.ClaudeOrange,
+            )
             if (queue.size > 1) {
                 Text(
                     "${queue.size - 1} more waiting",
@@ -113,23 +133,25 @@ fun PermissionSheet(
                 maxLines = 1,
                 modifier = Modifier.testTag("permissionSession"),
             )
-            Text(
-                prompt.toolName,
-                fontSize = 13.sp,
-                color = WatchTheme.Command,
-                modifier = Modifier.testTag("permissionTool"),
-            )
-            // WHAT is being asked: the actual command/file/pattern.
-            Text(
-                prompt.requestSummary,
-                fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
-                color = WatchTheme.ClaudeOrange,
-                maxLines = 4,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("permissionSummary"),
-            )
+            if (!isQuestion) {
+                Text(
+                    prompt.toolName,
+                    fontSize = 13.sp,
+                    color = WatchTheme.Command,
+                    modifier = Modifier.testTag("permissionTool"),
+                )
+                // WHAT is being asked: the actual command/file/pattern.
+                Text(
+                    prompt.requestSummary,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = WatchTheme.ClaudeOrange,
+                    maxLines = 4,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("permissionSummary"),
+                )
+            }
             Spacer(Modifier.height(6.dp))
 
             if (error != null && !inFlight) {
@@ -151,30 +173,42 @@ fun PermissionSheet(
                 Spacer(Modifier.height(4.dp))
             }
 
-            // One button per canonical option, in bridge order, keyed and
-            // answered by machine-readable behavior. The rendered card's
-            // permissionId is captured HERE, so an answer can only ever land
-            // on the request the user was looking at.
-            Column(
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                prompt.options.forEach { option ->
-                    Chip(
-                        onClick = { if (!inFlight) onAnswer(prompt.permissionId, option.behavior) },
-                        enabled = !inFlight,
-                        label = {
-                            Text(
-                                text = option.label.ifEmpty { option.behavior },
-                                fontSize = 12.sp,
-                                color = if (option.behavior == "deny") WatchTheme.Error else WatchTheme.Success,
-                            )
-                        },
-                        colors = ChipDefaults.secondaryChipColors(),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("permissionOption-${option.behavior}"),
-                    )
+            if (isQuestion) {
+                // AskUserQuestion body: every question of the payload with its
+                // own options and free-text answer. The rendered card's
+                // permissionId is captured at render time, exactly like the
+                // behavior buttons below.
+                QuestionCardBody(
+                    prompt = prompt,
+                    inFlight = inFlight,
+                    onSend = { answers -> onAnswerQuestions(prompt.permissionId, answers) },
+                )
+            } else {
+                // One button per canonical option, in bridge order, keyed and
+                // answered by machine-readable behavior. The rendered card's
+                // permissionId is captured HERE, so an answer can only ever land
+                // on the request the user was looking at.
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    prompt.options.forEach { option ->
+                        Chip(
+                            onClick = { if (!inFlight) onAnswer(prompt.permissionId, option.behavior) },
+                            enabled = !inFlight,
+                            label = {
+                                Text(
+                                    text = option.label.ifEmpty { option.behavior },
+                                    fontSize = 12.sp,
+                                    color = if (option.behavior == "deny") WatchTheme.Error else WatchTheme.Success,
+                                )
+                            },
+                            colors = ChipDefaults.secondaryChipColors(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("permissionOption-${option.behavior}"),
+                        )
+                    }
                 }
             }
             // The escape hatch: only after repeated failed answers, and never
@@ -200,5 +234,134 @@ fun PermissionSheet(
             }
             Spacer(Modifier.height(28.dp))
         }
+    }
+}
+
+/**
+ * The AskUserQuestion card body: EVERY question of [prompt]'s payload, each
+ * with its per-question option chips (single-select replaces, `multiSelect`
+ * toggles) and a free-text field, plus one Send that fires only when every
+ * question has an answer.
+ *
+ * Answer state is remembered PER permissionId: a failed POST (the ViewModel
+ * keeps the card queued and surfaces the error) restores the card with the
+ * user's picks intact for retry, while a different prompt fronting the queue
+ * starts clean. Chips and free text are mutually exclusive per question —
+ * tapping a chip clears typed text, typing clears the chip selection — so the
+ * answer that gets sent is always the one visibly active.
+ */
+@Composable
+private fun QuestionCardBody(
+    prompt: BridgeViewModel.PendingPermission,
+    inFlight: Boolean,
+    onSend: (Map<String, String>) -> Unit,
+) {
+    // Selected option labels per question index (label order is restored from
+    // the question's option list on send, so multi-select answers are stable
+    // regardless of tap order).
+    val selections = remember(prompt.permissionId) { mutableStateMapOf<Int, Set<String>>() }
+    val freeText = remember(prompt.permissionId) { mutableStateMapOf<Int, String>() }
+
+    fun answerFor(index: Int, question: AskUserQuestion): String? {
+        val typed = freeText[index]?.trim().orEmpty()
+        if (typed.isNotEmpty()) return typed
+        val selected = selections[index].orEmpty()
+        if (selected.isEmpty()) return null
+        return question.options.map { it.label }.filter { it in selected }.joinToString(", ")
+    }
+
+    Column(
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        prompt.questions.forEachIndexed { index, question ->
+            Text(
+                question.header ?: "Q${index + 1}",
+                fontSize = 10.sp,
+                color = WatchTheme.TextSecondary,
+                modifier = Modifier.testTag("questionHeader-$index"),
+            )
+            Text(
+                question.question,
+                fontSize = 12.sp,
+                color = WatchTheme.Command,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("questionText-$index"),
+            )
+            question.options.forEach { option ->
+                val selected = option.label in selections[index].orEmpty()
+                Chip(
+                    onClick = {
+                        if (inFlight) return@Chip
+                        val current = selections[index].orEmpty()
+                        selections[index] = when {
+                            !question.multiSelect -> setOf(option.label)
+                            selected -> current - option.label
+                            else -> current + option.label
+                        }
+                        // A picked option is the answer: drop typed text.
+                        freeText.remove(index)
+                    },
+                    enabled = !inFlight,
+                    label = {
+                        Text(
+                            text = (if (selected) "✓ " else "") + option.label,
+                            fontSize = 12.sp,
+                            color = if (selected) WatchTheme.ClaudeOrange else WatchTheme.Command,
+                        )
+                    },
+                    colors = ChipDefaults.secondaryChipColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("questionOption-$index-${option.label}"),
+                )
+            }
+            // Free-text answer: always available, even for a question whose
+            // options failed to parse — no question is ever unanswerable.
+            BasicTextField(
+                value = freeText[index].orEmpty(),
+                onValueChange = { typed ->
+                    freeText[index] = typed
+                    // Typing takes over from any picked option.
+                    if (typed.isNotBlank()) selections.remove(index)
+                },
+                enabled = !inFlight,
+                singleLine = true,
+                textStyle = TextStyle(color = WatchTheme.Command, fontSize = 12.sp),
+                cursorBrush = SolidColor(WatchTheme.Command),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(WatchTheme.FieldBackground)
+                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                    .testTag("questionFreeText-$index"),
+            )
+            Spacer(Modifier.height(4.dp))
+        }
+
+        // One answer per question, keyed by question text (the bridge's
+        // answer key). Send stays disabled until the map is complete: a
+        // partial answer set would silently drop the unanswered questions.
+        val answers = prompt.questions
+            .mapIndexedNotNull { index, question ->
+                answerFor(index, question)?.let { question.question to it }
+            }
+            .toMap()
+        val complete = answers.size == prompt.questions.size
+        Chip(
+            onClick = { if (!inFlight && complete) onSend(answers) },
+            enabled = !inFlight && complete,
+            label = {
+                Text(
+                    text = if (complete) "Send answers" else "Answer all questions (${answers.size}/${prompt.questions.size})",
+                    fontSize = 12.sp,
+                    color = if (complete) WatchTheme.Success else WatchTheme.TextSecondary,
+                )
+            },
+            colors = ChipDefaults.secondaryChipColors(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("questionsSend"),
+        )
     }
 }

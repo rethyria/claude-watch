@@ -14,6 +14,9 @@ object WatchTheme {
     val TextSecondary = Color(0xFF9E9E9E)
     val Command = Color.White
 
+    /** Text-input backdrop (matches the control page's field styling). */
+    val FieldBackground = Color(0xFF202020)
+
     /** Terminal line color; diff-style `  + ` output renders success-green. */
     fun colorFor(line: TerminalLine): Color = when (line.type) {
         TerminalLineType.OUTPUT ->

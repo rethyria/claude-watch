@@ -76,6 +76,22 @@ class BridgeClient(hostIp: String, port: Int) {
     }
 
     /**
+     * POST /v1/command — resolve a pending AskUserQuestion prompt with an
+     * answer for EVERY question. [answers] is keyed by question text — the
+     * bridge's preferred /v1 object form (`collectAskUserQuestionAnswers()` in
+     * hooks.js maps it into `updatedInput.answers` for the blocked hook); the
+     * legacy single-`selectedOption` form answers only the first question and
+     * stays off this client. The behavior is always `allow`: answering IS the
+     * approval for a question prompt.
+     */
+    fun answerQuestions(token: String, permissionId: String, answers: Map<String, String>): ApiResult {
+        val decision = JSONObject()
+            .put("behavior", "allow")
+            .put("answers", JSONObject(answers))
+        return postJson("/v1/command", token, JSONObject().put("permissionId", permissionId).put("decision", decision))
+    }
+
+    /**
      * POST /v1/command — spawn a fresh agent session ("claude" or "codex") in
      * a bridge-owned PTY. The bridge answers `{ok, sessionId, agent}` and
      * announces the session over SSE (`session` `running`).

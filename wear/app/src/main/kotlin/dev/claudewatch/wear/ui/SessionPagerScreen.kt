@@ -68,6 +68,8 @@ data class SessionPagerActions(
     val onSendCommand: (String) -> Unit = {},
     /** Answer the RENDERED card: (its permissionId, the chosen option's behavior). */
     val onAnswerPermission: (permissionId: String, behavior: String) -> Unit = { _, _ -> },
+    /** Answer the RENDERED AskUserQuestion card: one answer per question, keyed by question text. */
+    val onAnswerQuestions: (permissionId: String, answers: Map<String, String>) -> Unit = { _, _ -> },
     /** Drop the rendered card locally WITHOUT sending a decision (escape hatch; see PermissionSheet). */
     val onDismissPermission: (permissionId: String) -> Unit = {},
     val onSpawn: (agent: String) -> Unit = {},
@@ -121,6 +123,7 @@ fun SessionPagerScreen(ui: BridgeViewModel.UiState, actions: SessionPagerActions
                 error = ui.decisionError,
                 failureCount = ui.decisionFailureCount,
                 onAnswer = actions.onAnswerPermission,
+                onAnswerQuestions = actions.onAnswerQuestions,
                 onDismiss = actions.onDismissPermission,
             )
         }

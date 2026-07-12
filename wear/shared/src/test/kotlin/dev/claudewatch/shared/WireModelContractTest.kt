@@ -59,10 +59,18 @@ class WireModelContractTest {
         // Machine-readable behaviors, never option position or wording.
         assertEquals(listOf("allow", "allow-always", "deny"), permission.options.map { it.behavior })
 
-        // AskUserQuestion: no top-level options; questions forwarded verbatim.
+        // AskUserQuestion: no top-level options; questions forwarded verbatim
+        // AND surfaced typed — question text (the answer key), header, the
+        // per-question option labels, multiSelect.
         val askUser = BridgeEventParser.parse(byId.getValue("9")) as PermissionRequestEvent
         assertTrue(askUser.options.isEmpty())
         assertEquals(1, askUser.toolInput?.get("questions")?.jsonArray?.size)
+        val question = askUser.questions.single()
+        assertEquals("Which database should the service use?", question.question)
+        assertEquals("Database", question.header)
+        assertEquals(listOf("PostgreSQL", "SQLite"), question.options.map { it.label })
+        assertEquals("Relational, hosted", question.options[0].description)
+        assertEquals(false, question.multiSelect)
 
         // Codex tool-output posts an explicit JSON null tool_output.
         val codexTool = BridgeEventParser.parse(byId.getValue("14")) as ToolOutputEvent
@@ -76,6 +84,70 @@ class WireModelContractTest {
 
         val killed = BridgeEventParser.parse(byId.getValue("21")) as SessionEvent
         assertEquals(true, killed.killed)
+    }
+
+    // ------------------------------------------------------------------
+    // AskUserQuestion questions: typed, and lenient (hook content)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun multiQuestionAskUserQuestionSurfacesEveryQuestion() {
+        val event = BridgeEventParser.parse(
+            "permission-request",
+            """{"permissionId":"p-ask","tool_name":"AskUserQuestion","tool_input":{"questions":[""" +
+                """{"question":"Which color scheme?","header":"Color",""" +
+                """"options":[{"label":"Blue"},{"label":"Green"}],"multiSelect":false},""" +
+                """{"question":"Which linters?","header":"Lint",""" +
+                """"options":[{"label":"ktlint"},{"label":"detekt"}],"multiSelect":true}]}}""",
+        ) as PermissionRequestEvent
+        // ALL questions, in payload order — the legacy single-question
+        // assumption is exactly the defect this card fixes.
+        assertEquals(
+            listOf("Which color scheme?", "Which linters?"),
+            event.questions.map { it.question },
+        )
+        assertEquals(listOf(false, true), event.questions.map { it.multiSelect })
+        assertEquals(listOf("ktlint", "detekt"), event.questions[1].options.map { it.label })
+    }
+
+    @Test
+    fun questionParsingIsLenientBecauseToolInputIsHookContent() {
+        // tool_input is forwarded verbatim by the bridge, so unlike the event
+        // contract it must never fail the frame: non-object entries, missing
+        // question text (the answer key), and label-less options are skipped.
+        val event = BridgeEventParser.parse(
+            "permission-request",
+            """{"permissionId":"p-ask","tool_name":"AskUserQuestion","tool_input":{"questions":[""" +
+                """"not an object",42,{"header":"NoQuestionText"},""" +
+                """{"question":"Keeps parsing?","options":[{"description":"no label"},{"label":"Yes"}],""" +
+                """"multiSelect":"not a bool"}]}}""",
+        ) as PermissionRequestEvent
+        val question = event.questions.single()
+        assertEquals("Keeps parsing?", question.question)
+        assertNull(question.header)
+        assertEquals(listOf("Yes"), question.options.map { it.label })
+        assertEquals(false, question.multiSelect)
+    }
+
+    @Test
+    fun questionsAreEmptyOffTheAskUserQuestionTool() {
+        // A "questions" key in some other tool's input is that tool's
+        // business, not a questionnaire.
+        val bash = BridgeEventParser.parse(
+            "permission-request",
+            """{"permissionId":"p-1","tool_name":"Bash",""" +
+                """"tool_input":{"questions":[{"question":"looks like one"}],"command":"ls"},""" +
+                """"options":[{"behavior":"allow","label":"Yes"},{"behavior":"deny","label":"No"}]}""",
+        ) as PermissionRequestEvent
+        assertTrue(bash.questions.isEmpty())
+
+        // And an AskUserQuestion without a usable questions array is simply
+        // question-less (clients degrade to the plain card), never an error.
+        val empty = BridgeEventParser.parse(
+            "permission-request",
+            """{"permissionId":"p-2","tool_name":"AskUserQuestion","tool_input":{"questions":"nope"}}""",
+        ) as PermissionRequestEvent
+        assertTrue(empty.questions.isEmpty())
     }
 
     // ------------------------------------------------------------------

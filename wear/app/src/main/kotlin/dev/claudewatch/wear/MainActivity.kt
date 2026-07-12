@@ -36,6 +36,7 @@ fun WatchApp(viewModel: BridgeViewModel = viewModel()) {
             onPair = viewModel::pair,
             onSendCommand = viewModel::sendCommand,
             onAnswerPermission = viewModel::answerPermission,
+            onAnswerQuestions = viewModel::answerQuestions,
             onDismissPermission = viewModel::dismissPermissionLocally,
             onSpawn = viewModel::spawnSession,
             onKill = viewModel::killSession,
