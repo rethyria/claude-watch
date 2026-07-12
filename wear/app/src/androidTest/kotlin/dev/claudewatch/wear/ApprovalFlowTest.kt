@@ -16,6 +16,7 @@ import androidx.compose.ui.test.swipeRight
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.claudewatch.shared.protocol.PermissionOption
+import dev.claudewatch.wear.ui.LOCAL_DISMISS_AFTER_FAILURES
 import dev.claudewatch.wear.ui.SessionPagerActions
 import dev.claudewatch.wear.ui.SessionPagerScreen
 import org.junit.Assert.assertEquals
@@ -63,11 +64,13 @@ class ApprovalFlowTest {
         queue: List<BridgeViewModel.PendingPermission>,
         inFlightId: String? = null,
         error: String? = null,
+        failureCount: Int = 0,
     ) = BridgeViewModel.UiState(
         status = "paired, stream open",
         permissionQueue = queue,
         decisionInFlightId = inFlightId,
         decisionError = error,
+        decisionFailureCount = failureCount,
     )
 
     @Test
@@ -174,6 +177,56 @@ class ApprovalFlowTest {
         compose.onNodeWithTag("permissionSending").assertIsDisplayed()
         compose.onNodeWithTag("permissionOption-allow").performClick()
         assertEquals("clicks while in flight must not re-answer", 1, answers.size)
+    }
+
+    /**
+     * The availability escape hatch: an unreachable/restarted bridge must not
+     * wedge the whole app behind the undismissable sheet. After
+     * [LOCAL_DISMISS_AFTER_FAILURES] consecutive failed answers a "Dismiss"
+     * button appears that drops the card locally and sends NO decision —
+     * before that threshold it must NOT exist (a one-blip dismissal would
+     * reintroduce the swipe-into-auto-deny defect class by another door).
+     */
+    @Test
+    fun dismissEscapeHatchAppearsOnlyAfterRepeatedFailuresAndSendsNoAnswer() {
+        val answers = mutableListOf<Pair<String, String>>()
+        val dismissals = mutableListOf<String>()
+        var state by mutableStateOf(
+            ui(listOf(bashPrompt), error = "Decision failed: HTTP 500", failureCount = 1),
+        )
+        compose.setContent {
+            SessionPagerScreen(
+                ui = state,
+                actions = SessionPagerActions(
+                    onAnswerPermission = { id, behavior -> answers += id to behavior },
+                    onDismissPermission = { id -> dismissals += id },
+                ),
+            )
+        }
+
+        // One failure: error surfaced, but no dismiss — retry is the only path.
+        compose.onNodeWithTag("permissionError").assertIsDisplayed()
+        assertEquals(
+            "dismiss must not be offered below the failure threshold",
+            0,
+            compose.onAllNodes(hasTestTag("permissionDismiss")).fetchSemanticsNodes().size,
+        )
+
+        // Threshold reached: the explicit no-decision dismiss appears.
+        state = ui(
+            listOf(bashPrompt),
+            error = "Decision failed: HTTP 500",
+            failureCount = LOCAL_DISMISS_AFTER_FAILURES,
+        )
+        compose.waitForIdle()
+        compose.onNodeWithTag("permissionDismiss").assertIsDisplayed().performClick()
+        assertEquals(listOf("perm-bash"), dismissals)
+        assertEquals("dismiss must never send an answer", emptyList<Pair<String, String>>(), answers)
+
+        // The ViewModel dropped the card: the sheet leaves, the app is usable.
+        state = ui(emptyList())
+        compose.waitForIdle()
+        assertEquals(0, compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().size)
     }
 
     @Test

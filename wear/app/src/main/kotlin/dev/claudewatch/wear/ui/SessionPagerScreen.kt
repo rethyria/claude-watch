@@ -68,6 +68,8 @@ data class SessionPagerActions(
     val onSendCommand: (String) -> Unit = {},
     /** Answer the RENDERED card: (its permissionId, the chosen option's behavior). */
     val onAnswerPermission: (permissionId: String, behavior: String) -> Unit = { _, _ -> },
+    /** Drop the rendered card locally WITHOUT sending a decision (escape hatch; see PermissionSheet). */
+    val onDismissPermission: (permissionId: String) -> Unit = {},
     val onSpawn: (agent: String) -> Unit = {},
     val onKill: (sessionId: String) -> Unit = {},
 )
@@ -109,14 +111,17 @@ fun SessionPagerScreen(ui: BridgeViewModel.UiState, actions: SessionPagerActions
         HorizontalPageIndicator(pageIndicatorState = indicatorState)
         // The approval sheet: the SINGLE presenter for pending permissions,
         // drawn over everything (pager included) and never dismissable by
-        // gesture — it leaves only when the queue empties (see
+        // gesture — it leaves when the queue empties, or via the explicit
+        // no-decision escape hatch after repeated failed answers (see
         // PermissionSheet.kt for the full defect inoculation list).
         if (ui.permissionQueue.isNotEmpty()) {
             PermissionSheet(
                 queue = ui.permissionQueue,
                 inFlightId = ui.decisionInFlightId,
                 error = ui.decisionError,
+                failureCount = ui.decisionFailureCount,
                 onAnswer = actions.onAnswerPermission,
+                onDismiss = actions.onDismissPermission,
             )
         }
     }

@@ -14,7 +14,12 @@
 //  - Non-dismissable, single presenter: a full-screen opaque overlay that
 //    consumes all touch input. Swiping does nothing — the sheet only leaves
 //    when the queue empties. There is no second permission surface anywhere
-//    else in the app.
+//    else in the app. The ONE escape hatch — offered only after repeated
+//    failed answer attempts (bridge unreachable, or restarted with our token
+//    now dead) — is an explicit "Dismiss" button that sends NO decision: the
+//    bridge's own timeout owns the real outcome, so nothing is ever silently
+//    approved or denied. Without it, a dead bridge would wedge the whole app
+//    (pairing page included) behind an unanswerable sheet forever.
 //  - Option buttons come from the bridge's canonical behavior-keyed option
 //    list; the decision sent is the option's machine-readable `behavior`,
 //    never inferred from label wording or position.
@@ -45,18 +50,27 @@ import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.Text
 import dev.claudewatch.wear.BridgeViewModel
 
+/** Failed answer attempts before the sheet offers the no-decision local dismiss. */
+const val LOCAL_DISMISS_AFTER_FAILURES = 2
+
 /**
  * Render the front of [queue] (newest-first; see
  * [BridgeViewModel.UiState.permissionQueue]) as a non-dismissable approval
  * card. [inFlightId] disables the buttons while that card's answer POST is in
- * flight; [error] is the surfaced failure of the last answer attempt.
+ * flight; [error] is the surfaced failure of the last answer attempt. Once
+ * [failureCount] consecutive answers have failed retryably
+ * ([LOCAL_DISMISS_AFTER_FAILURES]), [onDismiss] is offered as an explicit
+ * escape hatch that drops the card locally WITHOUT sending a decision — see
+ * [BridgeViewModel.dismissPermissionLocally].
  */
 @Composable
 fun PermissionSheet(
     queue: List<BridgeViewModel.PendingPermission>,
     inFlightId: String?,
     error: String?,
+    failureCount: Int,
     onAnswer: (permissionId: String, behavior: String) -> Unit,
+    onDismiss: (permissionId: String) -> Unit,
 ) {
     val prompt = queue.firstOrNull() ?: return
     val inFlight = inFlightId == prompt.permissionId
@@ -162,6 +176,27 @@ fun PermissionSheet(
                             .testTag("permissionOption-${option.behavior}"),
                     )
                 }
+            }
+            // The escape hatch: only after repeated failed answers, and never
+            // while one is in flight. Sends NO decision — it merely drops the
+            // card locally so an unreachable/restarted bridge can't wedge the
+            // whole app; the bridge's own timeout owns the real outcome.
+            if (!inFlight && failureCount >= LOCAL_DISMISS_AFTER_FAILURES) {
+                Spacer(Modifier.height(8.dp))
+                Chip(
+                    onClick = { onDismiss(prompt.permissionId) },
+                    label = {
+                        Text(
+                            "Dismiss (sends no answer)",
+                            fontSize = 11.sp,
+                            color = WatchTheme.TextSecondary,
+                        )
+                    },
+                    colors = ChipDefaults.secondaryChipColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("permissionDismiss"),
+                )
             }
             Spacer(Modifier.height(28.dp))
         }

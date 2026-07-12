@@ -216,6 +216,12 @@ class BridgeViewModelTest {
      * both queued (neither orphans the other), each answerable, and every
      * answer POST carries the RENDERED card's permissionId, not whatever
      * happens to be globally newest by the time the click lands.
+     *
+     * The anti-race property is pinned by answering the OLDER, NON-FRONT
+     * card FIRST while both are still queued: this is exactly "a new prompt
+     * fronted the queue between render and answer" (the watchOS defect), so
+     * an implementation that substitutes the queue front for the passed id
+     * fails here on the POST-body assertion instead of surviving the suite.
      */
     @Test
     fun concurrentPromptsFromTwoSessionsAreEachAnsweredOnTheirOwnPermissionId() {
@@ -266,26 +272,33 @@ class BridgeViewModelTest {
         assertEquals("alpha", queued.sessionLabel)
         assertEquals("$ rm -rf ./build", queued.requestSummary)
 
-        // Answer the rendered card (deny): the POST must carry perm-b.
-        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
-        viewModel.answerPermission(rendered.permissionId, "deny")
-        val denyRequest = server.takeRequest(10, TimeUnit.SECONDS)
-            ?: throw AssertionError("no decision request for perm-b")
-        val denyBody = JSONObject(denyRequest.body.readUtf8())
-        assertEquals("perm-b", denyBody.getString("permissionId"))
-        assertEquals("deny", denyBody.getJSONObject("decision").getString("behavior"))
-
-        // Ack-gated: perm-b leaves only now, revealing perm-a — still answerable.
-        val afterDeny = awaitState { it.permissionQueue.size == 1 }
-        assertEquals("perm-a", afterDeny.permissionQueue.first().permissionId)
-
+        // Answer the OLDER, NON-FRONT card first, while perm-b still fronts
+        // the queue: the render-to-answer race, materialized. The POST must
+        // carry perm-a — the id the click was keyed to — NOT the queue front.
         server.enqueue(MockResponse().setBody("""{"ok":true}"""))
         viewModel.answerPermission("perm-a", "allow")
         val allowRequest = server.takeRequest(10, TimeUnit.SECONDS)
             ?: throw AssertionError("no decision request for perm-a")
         val allowBody = JSONObject(allowRequest.body.readUtf8())
-        assertEquals("perm-a", allowBody.getString("permissionId"))
+        assertEquals(
+            "the answer must land on the passed permissionId, never the queue front",
+            "perm-a",
+            allowBody.getString("permissionId"),
+        )
         assertEquals("allow", allowBody.getJSONObject("decision").getString("behavior"))
+
+        // Ack-gated: exactly perm-a left the queue; the front is untouched.
+        val afterAllow = awaitState { it.permissionQueue.size == 1 }
+        assertEquals("perm-b", afterAllow.permissionQueue.first().permissionId)
+
+        // Then the remaining (front) card, answered on its own id.
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.answerPermission("perm-b", "deny")
+        val denyRequest = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no decision request for perm-b")
+        val denyBody = JSONObject(denyRequest.body.readUtf8())
+        assertEquals("perm-b", denyBody.getString("permissionId"))
+        assertEquals("deny", denyBody.getJSONObject("decision").getString("behavior"))
         awaitState { it.permissionQueue.isEmpty() }
     }
 
@@ -441,6 +454,116 @@ class BridgeViewModelTest {
         )
         // No false "Approved": the 404 is surfaced, not swallowed.
         assertEquals("Already resolved elsewhere", state.decisionError)
+    }
+
+    /**
+     * Regression (availability): the bridge restarted, so this device's token
+     * is dead — every answer 401s and the restarted bridge will never push
+     * permission-cleared. Keeping the card queued would wedge the WHOLE app
+     * (the full-screen sheet covers the pairing page) with no recovery. A
+     * 401/403 is authoritative "this token can never resolve it": drop the
+     * card locally — deciding NOTHING on the user's behalf — and surface the
+     * re-pair error so page 0's pairing controls are reachable again.
+     */
+    @Test
+    fun a401AnswerDropsTheDeadTokenPromptWithoutFalseResolving() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append(permissionRequestFrame(1, "perm-wedge", "Bash"))
+            // Keep the stream open so the reconnect path can't steal the
+            // queued 401 response from the answer below.
+            append(":pad\n\n".repeat(60))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.permissionQueue.any { p -> p.permissionId == "perm-wedge" } }
+
+        // The bridge was restarted: the old token is unknown, answers 401.
+        server.enqueue(
+            MockResponse().setResponseCode(401).setBody("""{"error":"Unauthorized"}"""),
+        )
+        viewModel.answerPermission("perm-wedge", "allow")
+
+        val state = awaitState {
+            it.decisionResult == "decision:401" && it.permissionQueue.isEmpty()
+        }
+        assertTrue(
+            "a dead-token prompt must leave bridge state so the app is usable again",
+            state.bridge.pendingPermissions.isEmpty(),
+        )
+        // Not swallowed as success — the user is told to re-pair.
+        assertEquals("Not authorized — re-pair with the bridge", state.decisionError)
+    }
+
+    /**
+     * Regression (availability): the bridge host is unreachable (laptop
+     * closed, network changed) — every answer fails at the transport layer,
+     * so no 2xx/404 can ever arrive and no SSE permission-cleared either.
+     * The prompt must stay queued (it may well still be live server-side; no
+     * optimistic clearing), but repeated failures count up and unlock the
+     * sheet's local-dismiss escape hatch, which drops the card WITHOUT
+     * sending any decision — otherwise the undismissable full-screen sheet
+     * wedges the entire app forever.
+     */
+    @Test
+    fun transportFailuresUnlockALocalDismissThatSendsNoDecision() {
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append(permissionRequestFrame(1, "perm-stuck", "Bash"))
+            append(":pad\n\n".repeat(60))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.permissionQueue.any { p -> p.permissionId == "perm-stuck" } }
+
+        // The bridge host disappears: every subsequent request — answers and
+        // SSE reconnects alike — fails at the transport layer.
+        server.shutdown()
+
+        viewModel.answerPermission("perm-stuck", "allow")
+        val once = awaitState { it.decisionFailureCount == 1 }
+        assertEquals(
+            "a transport-failed answer must keep the prompt queued",
+            listOf("perm-stuck"),
+            once.permissionQueue.map { it.permissionId },
+        )
+        assertTrue(
+            "the failure must be surfaced on the card: ${once.decisionError}",
+            once.decisionError?.startsWith("Decision failed:") == true,
+        )
+
+        viewModel.answerPermission("perm-stuck", "allow")
+        awaitState { it.decisionFailureCount == 2 && it.decisionInFlightId == null }
+
+        // The escape hatch: drops the card locally, decides nothing (the
+        // server is unreachable — no request can even be attempted), and
+        // clears the surfaced error so the app is usable again.
+        viewModel.dismissPermissionLocally("perm-stuck")
+        val dismissed = awaitState { it.permissionQueue.isEmpty() }
+        assertTrue(
+            "the dismissed prompt must leave bridge state entirely",
+            dismissed.bridge.pendingPermissions.isEmpty(),
+        )
+        assertEquals(null, dismissed.decisionError)
+        assertEquals(0, dismissed.decisionFailureCount)
     }
 
     /**
