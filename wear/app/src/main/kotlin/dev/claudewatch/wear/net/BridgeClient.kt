@@ -8,6 +8,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
@@ -93,6 +94,38 @@ class BridgeClient(hostIp: String, port: Int) {
         if (message != null) decision.put("message", message)
         return postJson("/v1/command", token, JSONObject().put("permissionId", permissionId).put("decision", decision))
     }
+
+    /**
+     * POST /v1/command — resolve a pending AskUserQuestion prompt with an
+     * answer for EVERY question. [answers] is POSITIONAL: one entry per
+     * question, aligned with the prompt's `tool_input.questions` order — the
+     * bridge's /v1 array form (`collectAskUserQuestionAnswers()` in hooks.js
+     * zips it with the questions into `updatedInput.answers` for the blocked
+     * hook). The array form is deliberate: the alternative object form is
+     * keyed by question text, which collapses questions that share the same
+     * text into one entry and cannot express distinct answers for them. The
+     * legacy single-`selectedOption` form answers only the first question and
+     * stays off this client. The behavior is always `allow`: answering IS the
+     * approval for a question prompt.
+     */
+    fun answerQuestions(token: String, permissionId: String, answers: List<String>): ApiResult {
+        val decision = JSONObject()
+            .put("behavior", "allow")
+            .put("answers", JSONArray(answers))
+        return postJson("/v1/command", token, JSONObject().put("permissionId", permissionId).put("decision", decision))
+    }
+
+    /**
+     * POST /v1/command — spawn a fresh agent session ("claude" or "codex") in
+     * a bridge-owned PTY. The bridge answers `{ok, sessionId, agent}` and
+     * announces the session over SSE (`session` `running`).
+     */
+    fun spawnSession(token: String, agent: String): ApiResult =
+        postJson("/v1/command", token, JSONObject().put("spawn", agent))
+
+    /** POST /v1/command — kill a session; the bridge pushes `session` `ended` with `killed: true`. */
+    fun killSession(token: String, sessionId: String): ApiResult =
+        postJson("/v1/command", token, JSONObject().put("kill", true).put("sessionId", sessionId))
 
     /** GET /v1/events — opens the SSE stream, replaying from [lastEventId] when set. */
     fun openEvents(token: String, lastEventId: String?, listener: EventSourceListener): EventSource {

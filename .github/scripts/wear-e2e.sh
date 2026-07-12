@@ -11,15 +11,19 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-# The session-id-scoped command path shells out to a `claude` binary
-# (`claude -p <prompt> --continue` against the hook-created, PTY-less
-# session). CI has no real Claude Code install, so provide a stub that just
-# echoes — the assertion is about the bridge accepting the command (2xx),
-# not about agent output.
+# The bridge shells out to a `claude` binary in two ways the e2e exercises:
+# headless prompts (`claude -p <prompt> --continue` against the hook-created,
+# PTY-less session — must exit) and PTY session spawns from the watch's Spawn
+# action (must STAY ALIVE and produce output, or the session ends before the
+# test can page over to it and kill it). CI has no real Claude Code install,
+# so provide a stub that echoes, then keeps its PTY open unless invoked
+# headless.
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 echo "stub-claude invoked: $*"
+case " $* " in *" -p "*) exit 0 ;; esac
+exec cat
 EOF
 chmod +x "$HOME/.local/bin/claude"
 export PATH="$HOME/.local/bin:$PATH"

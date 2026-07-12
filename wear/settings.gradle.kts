@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "claude-watch-wear"
 include(":app")
+include(":shared")
