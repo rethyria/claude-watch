@@ -59,7 +59,13 @@ data class HaloActions(
     val onUnpair: () -> Unit = {},
     val onSendCommand: (String) -> Unit = {},
     val onCommandDraftChange: (String) -> Unit = {},
-    val onDictate: () -> Unit = {},
+    /**
+     * Start dictation targeting [sessionId] — the session whose screen asked,
+     * not the ViewModel's "most recently working" default, which points at a
+     * DIFFERENT session whenever the user dictates from an idle feed. Null
+     * keeps the default (no specific session on screen).
+     */
+    val onDictate: (sessionId: String?) -> Unit = {},
     val onAnswerPermission: (permissionId: String, behavior: String) -> Unit = { _, _ -> },
     val onAnswerQuestions: (permissionId: String, answers: List<String>) -> Unit = { _, _ -> },
     val onDismissPermission: (permissionId: String) -> Unit = {},
@@ -158,7 +164,8 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                                 .firstOrNull { it.id == layer.sessionId }?.pending
                             nav = nav.openCard(pending?.permissionId)
                         },
-                        onDictate = actions.onDictate,
+                        // Dictation from a feed goes to THAT session.
+                        onDictate = { actions.onDictate(layer.sessionId) },
                         onCycle = { nav = nav.copy(sessionId = it) },
                     )
                 }
@@ -219,7 +226,9 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                             ui = ui,
                             onAnswers = actions.onAnswerQuestions,
                             onDismiss = actions.onDismissPermission,
-                            onDictate = actions.onDictate,
+                            // A dictated answer belongs to the card's session
+                            // (null for an orphan prompt: default target).
+                            onDictate = { actions.onDictate(card.sessionId) },
                             onDone = { nav = nav.back() },
                         )
                     } else {

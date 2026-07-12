@@ -194,13 +194,14 @@ class BridgeViewModel(
      * A recognizer result (RecognizerIntent.ACTION_RECOGNIZE_SPEECH) landed:
      * put the transcription in the draft — so a refused/failed send leaves it
      * visible and retryable instead of vanishing — and send it through the
-     * exact same ack-gated path as typed text.
+     * exact same ack-gated path as typed text. [toSession] pins the target to
+     * the session the user dictated FROM (see [sendCommand]).
      */
-    fun dictationResult(text: String) {
+    fun dictationResult(text: String, toSession: String? = null) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
         _state.update { it.copy(commandDraft = trimmed) }
-        sendCommand(trimmed)
+        sendCommand(trimmed, toSession)
     }
 
     /** The watch has no speech recognizer activity: surface it, send nothing. */
@@ -228,10 +229,13 @@ class BridgeViewModel(
      *    front: error surfaced, text kept in the draft, no POST, no echo —
      *    never pretending to send.
      */
-    fun sendCommand(text: String) {
+    fun sendCommand(text: String, toSession: String? = null) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
-        val sessionId = _state.value.sessionId
+        // The fallback (the most recently WORKING session) predates screens
+        // that show one specific session; those pass [toSession] so the
+        // command — and its "> text" echo — land in the feed on screen.
+        val sessionId = toSession ?: _state.value.sessionId
         fun refuse(result: String, error: String) {
             haptics.commandFailed()
             _state.update { it.copy(commandResult = result, commandError = error, commandDraft = trimmed) }

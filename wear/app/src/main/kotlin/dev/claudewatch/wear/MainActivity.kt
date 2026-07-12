@@ -13,6 +13,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.wear.compose.material.MaterialTheme
@@ -51,6 +53,12 @@ fun WatchApp(
     // SpeechRecognizer on Wear. The transcription follows the exact same
     // ack-gated send path as typed text (BridgeViewModel.dictationResult);
     // a cancelled or empty recognition sends nothing.
+    // The recognizer round-trips through an activity result, so the session
+    // the dictation was started FOR is captured at launch and re-attached to
+    // the transcription here — the ViewModel's own default is the most
+    // recently WORKING session, which is the wrong target when the user
+    // dictates from another session's feed.
+    val dictationTarget = remember { mutableStateOf<String?>(null) }
     val speech = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
@@ -58,7 +66,7 @@ fun WatchApp(
             ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
             ?.firstOrNull()
         if (result.resultCode == Activity.RESULT_OK && !spoken.isNullOrBlank()) {
-            viewModel.dictationResult(spoken)
+            viewModel.dictationResult(spoken, dictationTarget.value)
         }
     }
     HaloApp(
@@ -68,7 +76,8 @@ fun WatchApp(
             onUnpair = viewModel::unpair,
             onSendCommand = viewModel::sendCommand,
             onCommandDraftChange = viewModel::updateCommandDraft,
-            onDictate = {
+            onDictate = { sessionId ->
+                dictationTarget.value = sessionId
                 try {
                     speech.launch(
                         Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)

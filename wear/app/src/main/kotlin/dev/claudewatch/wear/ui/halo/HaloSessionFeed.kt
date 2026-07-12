@@ -32,6 +32,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -221,10 +222,11 @@ private fun FeedTail(
     thinking: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    val listState = rememberLazyListState()
-    val focusRequester = remember { FocusRequester() }
-    LaunchedEffect(Unit) { focusRequester.requestFocus() }
-
+    // The empty state composes INSTEAD of the LazyColumn below, so it must be
+    // decided before the FocusRequester's LaunchedEffect: requesting focus
+    // while the rotaryScrollable node (the only thing the requester ever
+    // attaches to) is not composed throws IllegalStateException — and every
+    // fresh session and orphan prompt starts with an empty terminal.
     if (lines.isEmpty() && !thinking) {
         Box(modifier = modifier, contentAlignment = Alignment.Center) {
             Text(
@@ -236,11 +238,35 @@ private fun FeedTail(
         return
     }
 
+    val listState = rememberLazyListState()
+    val focusRequester = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+
+    // Stable per-line keys, so a reading position held in history survives the
+    // stream appending (and the 200-line ring dropping) lines: without keys
+    // the viewport is anchored by INDEX and drifts one row per event. The
+    // RingBuffer keeps no monotonic counter, so the absolute index of the
+    // oldest retained line is reconstructed here by diffing successive lists.
+    val keyState = remember { FeedKeyState() }
+    if (keyState.lines !== lines || keyState.thinking != thinking) {
+        keyState.base += droppedCount(keyState.lines, lines)
+        keyState.lines = lines
+        keyState.thinking = thinking
+        // Key-based anchoring holds the viewport on the line it shows — which
+        // at the tail means NOT following new output. Reading the position
+        // here (pre-measure, so still the pre-append position; unobserved so
+        // scrolling doesn't recompose us) and re-requesting index 0 keeps the
+        // tail pinned; requestScrollToItem overrides key anchoring for
+        // exactly the next remeasure.
+        val atTail = Snapshot.withoutReadObservation {
+            listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0
+        }
+        if (atTail) listState.requestScrollToItem(0)
+    }
+
     // Bottom-anchored via reverseLayout: index 0 is the NEWEST line pinned to
-    // the bottom edge, so a streaming feed stays anchored while the user is
-    // at the tail and holds position once they rotary-scroll into history.
-    // Touch scrolling is off (rotary-only per the handoff), which leaves
-    // vertical drags to the screen's swipe-down-back.
+    // the bottom edge. Touch scrolling is off (rotary-only per the handoff),
+    // which leaves vertical drags to the screen's swipe-down-back.
     LazyColumn(
         state = listState,
         reverseLayout = true,
@@ -249,16 +275,57 @@ private fun FeedTail(
             .rotaryScrollable(
                 behavior = RotaryScrollableDefaults.behavior(listState),
                 focusRequester = focusRequester,
+                // The rotary behavior drives scrollBy toward higher indices,
+                // which reverseLayout renders UPWARD — reversed here so the
+                // crown direction matches the session list's.
+                reverseDirection = true,
             )
             .padding(horizontal = Halo.Geo.SafeInset)
             .padding(vertical = 4.dp),
     ) {
         if (thinking) {
-            item { FeedLine(TerminalLine("…", TerminalLineType.SYSTEM)) }
+            item(key = "thinking") { FeedLine(TerminalLine("…", TerminalLineType.SYSTEM)) }
         }
-        // Newest-first to match reverseLayout's index order.
-        items(lines.size) { i -> FeedLine(lines[lines.size - 1 - i]) }
+        // Newest-first to match reverseLayout's index order; keys count from
+        // the base so a line keeps its key as older lines fall off the ring.
+        items(
+            count = lines.size,
+            key = { i -> keyState.base + (lines.size - 1 - i) },
+        ) { i -> FeedLine(lines[lines.size - 1 - i]) }
     }
+}
+
+/**
+ * Composition-local bookkeeping for [FeedTail]'s stable keys: the last list
+ * rendered and the absolute stream index of its first element. Deliberately
+ * not snapshot state — it is read and written only inside composition, in the
+ * same pass that rebuilds the item keys.
+ */
+private class FeedKeyState {
+    var lines: List<TerminalLine> = emptyList()
+    var thinking = false
+    var base = 0L
+}
+
+/**
+ * How many lines the ring dropped between [old] and [new], recovered from the
+ * append-only contract: `new` is `old` minus some head plus some tail. The
+ * largest suffix/prefix overlap decides; repeated identical lines can make it
+ * overestimate the overlap, which only shifts every key by the same amount —
+ * anchoring then lands on an identical-looking line, which is acceptable.
+ */
+private fun droppedCount(old: List<TerminalLine>, new: List<TerminalLine>): Int {
+    for (overlap in minOf(old.size, new.size) downTo 1) {
+        var match = true
+        for (j in 0 until overlap) {
+            if (old[old.size - overlap + j] != new[j]) {
+                match = false
+                break
+            }
+        }
+        if (match) return old.size - overlap
+    }
+    return old.size
 }
 
 /**
