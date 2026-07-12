@@ -137,6 +137,10 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         scope = layer.scope,
                         onOpenSession = { nav = nav.drillToSession(it) },
                         onKill = actions.onKill,
+                        // The list's scrollable eats every vertical drag, so
+                        // InnerScreen's back detector can't fire under it; the
+                        // list re-triggers back itself via nested scroll.
+                        onBack = { nav = nav.back() },
                     )
                 }
                 is Layer.Feed -> InnerScreen(
@@ -414,8 +418,10 @@ private fun PageDots(
 /**
  * Wraps every screen below the pager with the shared chrome: top TimeText
  * (tap = jump home) and the swipe-down-to-go-back gesture. The back detector
- * sits UNDER the content so a scrolling child (session list/feed) consumes
- * its own drags first.
+ * sits UNDER the content, so it only covers screens without a full-screen
+ * scrollable: a scrollable child consumes every vertical drag (its leftover
+ * goes to nested scroll, never back to pointer input) and must re-provide
+ * back itself, as HaloSessionList does.
  */
 @Composable
 private fun InnerScreen(
