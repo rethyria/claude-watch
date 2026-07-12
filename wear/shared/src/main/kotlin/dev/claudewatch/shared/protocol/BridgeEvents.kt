@@ -53,6 +53,11 @@ enum class SessionRunState {
  * `session` — session lifecycle. `running` and `ended` MUST be attributed to
  * a session; the end-of-life extras (`exitCode`/`signal`/`killed`/`reason`/
  * `error`) vary by how the session ended and are all optional.
+ *
+ * [title] is the additive optional session title the bridge derives from the
+ * Claude Code transcript (last `ai-title` record, falling back to the first
+ * user prompt — see PROTOCOL.md); absent until derivable, so clients keep
+ * their own fallback label.
  */
 @Serializable
 data class SessionEvent(
@@ -61,6 +66,7 @@ data class SessionEvent(
     val agent: String? = null,
     val cwd: String? = null,
     val folderName: String? = null,
+    val title: String? = null,
     val reason: String? = null,
     val exitCode: Int? = null,
     val signal: String? = null,

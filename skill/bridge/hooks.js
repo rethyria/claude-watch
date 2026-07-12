@@ -3,7 +3,7 @@
 import crypto from "node:crypto";
 import { log, jsonResponse, readBody, isLoopbackAddress } from "./util.js";
 import { pushSseEvent, sseClients } from "./transport-sse.js";
-import { resolveHookSession, endHookSession } from "./sessions.js";
+import { resolveHookSession, endHookSession, refreshHookSessionTitle } from "./sessions.js";
 import {
   waitForPermission,
   cancelPermission,
@@ -195,6 +195,10 @@ export async function handleHookStop(req, res) {
   }
 
   const sid = resolveHookSession(body);
+  // The turn just finished, so the transcript (and possibly its ai-title)
+  // just changed: opportunistic title refresh — a change is broadcast as an
+  // idempotent `session` running event before the stop lands.
+  refreshHookSessionTitle(sid, body);
   log("info", `Hook: Stop received${sid ? ` session=${sid}` : ""}`);
   pushSseEvent("stop", body, sid);
   return jsonResponse(res, 200, { ok: true });

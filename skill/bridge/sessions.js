@@ -1,6 +1,7 @@
 // Multi-session PTY management: the sessions map, spawning/attaching/killing
 // PTY-backed agent sessions, lookup helpers, and hook-to-session resolution.
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { spawnPtyProcess } from "./pty.js";
 import { log } from "./util.js";
@@ -15,8 +16,10 @@ import {
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
 // Multi-session: each entry is a session slot
-// { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId?, hookCreated? }
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean}>} */
+// { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId?, hookCreated?,
+//   title?, titleIsAi?, transcriptPath?, titleCache? } — title is lazily derived
+//   from the Claude Code transcript (see the session-titles section below).
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -29,6 +32,189 @@ const hookSessionIndex = new Map();
 function bindHookSession(slot, hookSessionId) {
   slot.hookSessionId = hookSessionId;
   hookSessionIndex.set(hookSessionId, slot.id);
+}
+
+// --- Session titles (derived from the Claude Code transcript) ---------------
+// Claude Code keeps a session title in the transcript JSONL that every hook
+// payload points at via `transcript_path`: dedicated records of the shape
+//   {"type":"ai-title","aiTitle":"<title>","sessionId":"…"}
+// re-emitted whenever the title evolves — the LAST one is current. Before an
+// ai-title exists, the first real user prompt (truncated) is the best label.
+//
+// Hooks are a hot path, so derivation is lazy and cached per slot keyed on
+// (path, mtime, size): the transcript is only re-read when it changed, and
+// only at opportunistic moments (session creation / first hook binding,
+// Stop, SessionEnd) — never on every hook event. Any failure (missing file,
+// unreadable, malformed lines) silently yields no title.
+
+const TRANSCRIPT_TITLE_MAX_CHARS = 60;
+// Big transcripts are scanned as a head chunk (first user prompt lives at the
+// top) plus a tail chunk (the latest ai-title re-emission) instead of a full
+// read.
+const TRANSCRIPT_SCAN_BYTES = 256 * 1024;
+
+function transcriptPathOf(body) {
+  return typeof body?.transcript_path === "string" && body.transcript_path
+    ? body.transcript_path
+    : null;
+}
+
+// First real prompt text of a `user` transcript record, or null. Skips meta
+// records and synthetic bodies (slash-command markup like <command-name>,
+// tool_result content) — those are not what the user asked for.
+function extractUserPromptText(record) {
+  if (record.isMeta) return null;
+  const content = record.message?.content;
+  let text = null;
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    const textPart = content.find((part) => part?.type === "text" && typeof part.text === "string");
+    text = textPart ? textPart.text : null;
+  }
+  if (typeof text !== "string") return null;
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text || text.startsWith("<")) return null;
+  return text;
+}
+
+function truncateTitle(text) {
+  if (text.length <= TRANSCRIPT_TITLE_MAX_CHARS) return text;
+  return `${text.slice(0, TRANSCRIPT_TITLE_MAX_CHARS - 1).trimEnd()}…`;
+}
+
+// Derive the current title from a transcript: last ai-title record wins,
+// falling back to the first user prompt. Returns
+//   { title, fromAi, aiIsNewest } — title null when neither exists; fromAi
+// says the title came from an ai-title record; aiIsNewest says that ai-title
+// is provably the transcript's newest one (a full scan sees every record; a
+// partial head+tail scan only proves it for the tail chunk — an ai-title
+// seen only in the head may be outranked by a newer one in the skipped
+// middle). Throws only I/O errors (the caller absorbs them); malformed
+// lines are skipped silently.
+function deriveTranscriptTitle(transcriptPath, size) {
+  const chunks = [];
+  const fd = fs.openSync(transcriptPath, "r");
+  try {
+    if (size <= 2 * TRANSCRIPT_SCAN_BYTES) {
+      // Bounded read (never readFileSync): `size` came from a stat of a
+      // regular file, so even a file that grows mid-read costs at most this
+      // buffer.
+      const buf = Buffer.alloc(size);
+      const read = fs.readSync(fd, buf, 0, size, 0);
+      chunks.push({ text: buf.toString("utf-8", 0, read), partialFirstLine: false, isTail: true });
+    } else {
+      const head = Buffer.alloc(TRANSCRIPT_SCAN_BYTES);
+      const headRead = fs.readSync(fd, head, 0, TRANSCRIPT_SCAN_BYTES, 0);
+      const tail = Buffer.alloc(TRANSCRIPT_SCAN_BYTES);
+      const tailRead = fs.readSync(fd, tail, 0, TRANSCRIPT_SCAN_BYTES, size - TRANSCRIPT_SCAN_BYTES);
+      chunks.push({ text: head.toString("utf-8", 0, headRead), partialFirstLine: false, isTail: false });
+      // The tail chunk almost certainly starts mid-line; drop the fragment.
+      chunks.push({ text: tail.toString("utf-8", 0, tailRead), partialFirstLine: true, isTail: true });
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  let aiTitle = null;
+  let aiTitleInTail = false;
+  let firstUserPrompt = null;
+  for (const chunk of chunks) {
+    const lines = chunk.text.split("\n");
+    for (let i = chunk.partialFirstLine ? 1 : 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      if (!record || typeof record !== "object") continue;
+      if (record.type === "ai-title" && typeof record.aiTitle === "string" && record.aiTitle.trim()) {
+        aiTitle = record.aiTitle.trim(); // last one wins
+        aiTitleInTail = chunk.isTail;
+      } else if (!firstUserPrompt && record.type === "user") {
+        firstUserPrompt = extractUserPromptText(record);
+      }
+    }
+  }
+
+  const title = aiTitle || firstUserPrompt;
+  return {
+    title: title ? truncateTitle(title) : null,
+    fromAi: Boolean(aiTitle),
+    aiIsNewest: Boolean(aiTitle) && aiTitleInTail,
+  };
+}
+
+// Refresh a slot's title from its transcript, stat-gated by the (path, mtime,
+// size) cache so an unchanged transcript costs one stat and no read. Returns
+// true when the slot's title actually changed. Never throws: an unreadable or
+// malformed transcript leaves the slot as it was (no title, no crash).
+export function refreshSessionTitle(slot, transcriptPath = slot?.transcriptPath) {
+  if (!slot || typeof transcriptPath !== "string" || !transcriptPath) return false;
+  try {
+    const stat = fs.statSync(transcriptPath);
+    // Regular files only: opening/reading a FIFO or device node here would
+    // block forever or read unboundedly (their stat size is 0, so the size
+    // gate cannot help), stalling the whole single-threaded bridge from
+    // inside a hook handler.
+    if (!stat.isFile()) return false;
+    const cache = slot.titleCache;
+    if (cache && cache.path === transcriptPath && cache.mtimeMs === stat.mtimeMs && cache.size === stat.size) {
+      return false;
+    }
+    const derived = deriveTranscriptTitle(transcriptPath, stat.size);
+    slot.titleCache = { path: transcriptPath, mtimeMs: stat.mtimeMs, size: stat.size, title: derived.title };
+    // A transcript that (no longer) yields a title never clears a previously
+    // known one — a stale title beats flapping back to no label.
+    if (!derived.title) return false;
+    // Once the title came from an ai-title, only a provably-newer ai-title
+    // may replace it: a partial scan whose only ai-title sits in the
+    // immutable head chunk (or a first-prompt fallback) can be OLDER than
+    // what the slot already carries — the newest ai-title may hide in the
+    // skipped middle. Reverting would broadcast a stale title.
+    if (slot.titleIsAi && !derived.aiIsNewest) return false;
+    if (derived.title !== slot.title) {
+      slot.title = derived.title;
+      slot.titleIsAi = derived.fromAi;
+      return true;
+    }
+    // Same text, but now known to be ai-derived: remember that so a later
+    // prompt fallback or head-only ai-title cannot displace it.
+    if (derived.fromAi) slot.titleIsAi = true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+// The additive `title` field rides every session payload once known; absent
+// until derivable (clients must tolerate either, per PROTOCOL.md).
+function sessionEventPayload(slot, fields) {
+  return slot.title ? { ...fields, title: slot.title } : fields;
+}
+
+// Refresh + broadcast: when an opportunistic refresh changes a running slot's
+// title, clients learn it through an idempotent `session` running event (the
+// same shape the connect-time sync re-sends).
+function announceTitleRefresh(slot, transcriptPath) {
+  if (!refreshSessionTitle(slot, transcriptPath)) return;
+  if (slot.state !== "running") return;
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, { state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName }),
+    slot.id,
+  );
+}
+
+// Opportunistic refresh from a hook body (Stop is the natural moment: the
+// turn just finished, so the transcript — and possibly its ai-title — just
+// changed). Remembers the transcript path on the slot so later refreshes work
+// even from payloads that omit it.
+export function refreshHookSessionTitle(sessionId, body) {
+  const slot = sessions.get(sessionId);
+  if (!slot) return;
+  const transcriptPath = transcriptPathOf(body);
+  if (transcriptPath) slot.transcriptPath = transcriptPath;
+  announceTitleRefresh(slot, slot.transcriptPath);
 }
 
 // Invoked when a PTY-backed session ends so codex.js can clear its synthetic
@@ -147,7 +333,7 @@ export function bindPtyProcess(slot, proc) {
     slot.ptyProcess = null;
     flushReadyWaiters(slot, false);
     runSessionCleanupHooks(sessionId, "pty-closed");
-    pushSseEvent("session", { state: "ended", exitCode, signal, agent: slot.agent, folderName: slot.folderName }, sessionId);
+    pushSseEvent("session", sessionEventPayload(slot, { state: "ended", exitCode, signal, agent: slot.agent, folderName: slot.folderName }), sessionId);
   });
 
   proc.on("error", (err) => {
@@ -157,7 +343,7 @@ export function bindPtyProcess(slot, proc) {
     slot.ptyProcess = null;
     flushReadyWaiters(slot, false);
     runSessionCleanupHooks(sessionId, "pty-error");
-    pushSseEvent("session", { state: "ended", error: err.message, agent: slot.agent, folderName: slot.folderName }, sessionId);
+    pushSseEvent("session", sessionEventPayload(slot, { state: "ended", error: err.message, agent: slot.agent, folderName: slot.folderName }), sessionId);
   });
 }
 
@@ -219,7 +405,7 @@ export function killSession(sessionId) {
   slot.state = "ended";
   slot.endedAt = Date.now();
   slot.ptyProcess = null;
-  pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, killed: true }, sessionId);
+  pushSseEvent("session", sessionEventPayload(slot, { state: "ended", agent: slot.agent, folderName: slot.folderName, killed: true }), sessionId);
   log("info", `Session ${sessionId} killed`);
   return true;
 }
@@ -264,6 +450,8 @@ export function getSessionsSnapshot() {
     folderName: s.folderName,
     state: s.state,
     createdAt: s.createdAt,
+    // Additive optional field: only present once derived from the transcript.
+    ...(s.title ? { title: s.title } : {}),
   }));
 }
 
@@ -318,14 +506,14 @@ function evictExternalSessionIfAtCap() {
   if (victim.hookSessionId) hookSessionIndex.delete(victim.hookSessionId);
   if (victim.state !== "ended") {
     runSessionCleanupHooks(victim.id, "evicted");
-    pushSseEvent("session", { state: "ended", agent: victim.agent, folderName: victim.folderName, reason: "evicted" }, victim.id);
+    pushSseEvent("session", sessionEventPayload(victim, { state: "ended", agent: victim.agent, folderName: victim.folderName, reason: "evicted" }), victim.id);
   }
   log("warn", `External session cap (${MAX_EXTERNAL_SESSIONS}) reached — evicted ${victim.state} session ${victim.id} (${victim.folderName})`);
 }
 
 // Auto-create a slot for an agent instance the bridge does not own (started
 // outside the bridge, or a bridge-owned PTY whose cwd no longer matches).
-function createExternalSession({ source, cwd, hookSessionId }) {
+function createExternalSession({ source, cwd, hookSessionId, transcriptPath }) {
   evictExternalSessionIfAtCap();
 
   const agent = source === "codex" ? "codex" : "claude";
@@ -344,10 +532,16 @@ function createExternalSession({ source, cwd, hookSessionId }) {
     hookCreated: true,
   };
   if (hookSessionId) bindHookSession(slot, hookSessionId);
+  if (transcriptPath) {
+    slot.transcriptPath = transcriptPath;
+    // Session creation is one of the opportunistic refresh points: derive the
+    // title now so the initial "running" event already carries it.
+    refreshSessionTitle(slot, transcriptPath);
+  }
   sessions.set(sessionId, slot);
 
   log("info", `Auto-created session ${sessionId} for external ${agent} (${folderName})`);
-  pushSseEvent("session", { state: "running", agent, cwd: resolvedCwd, folderName }, sessionId);
+  pushSseEvent("session", sessionEventPayload(slot, { state: "running", agent, cwd: resolvedCwd, folderName }), sessionId);
 
   return sessionId;
 }
@@ -366,13 +560,19 @@ export function resolveHookSession(body) {
   const cwd = body.session_cwd || body.cwd || null;
   const source = body.source || "claude";
   const hookSessionId = hookSessionIdOf(body);
+  const transcriptPath = transcriptPathOf(body);
 
   if (hookSessionId) {
     // A known session_id always routes to the slot it was bound to.
     const boundId = hookSessionIndex.get(hookSessionId);
     if (boundId) {
       const bound = sessions.get(boundId);
-      if (bound) return bound.id;
+      if (bound) {
+        // Remember (never read) the transcript path on the hot path; the
+        // stat+read happens only at the opportunistic refresh points.
+        if (transcriptPath) bound.transcriptPath = transcriptPath;
+        return bound.id;
+      }
       hookSessionIndex.delete(hookSessionId); // slot was pruned
     }
 
@@ -382,13 +582,19 @@ export function resolveHookSession(body) {
       for (const [, slot] of sessions) {
         if (slot.state === "running" && slot.ptyProcess && slot.cwd === cwd && !slot.hookSessionId) {
           bindHookSession(slot, hookSessionId);
+          // A fresh binding is session creation from the slot's point of
+          // view: derive the title now and broadcast it if it changed.
+          if (transcriptPath) {
+            slot.transcriptPath = transcriptPath;
+            announceTitleRefresh(slot, transcriptPath);
+          }
           return slot.id;
         }
       }
     }
 
     // No claimable slot — this is an external instance; give it its own slot.
-    return createExternalSession({ source, cwd, hookSessionId });
+    return createExternalSession({ source, cwd, hookSessionId, transcriptPath });
   }
 
   // Legacy payload without session_id: exact-cwd match only. Resolve the cwd
@@ -397,9 +603,12 @@ export function resolveHookSession(body) {
   // event.
   const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const match = findSessionByCwd(resolvedCwd);
-  if (match) return match.id;
+  if (match) {
+    if (transcriptPath) match.transcriptPath = transcriptPath;
+    return match.id;
+  }
 
-  return createExternalSession({ source, cwd: resolvedCwd, hookSessionId: null });
+  return createExternalSession({ source, cwd: resolvedCwd, hookSessionId: null, transcriptPath });
 }
 
 // SessionEnd hook: the Claude Code instance behind this session_id exited.
@@ -417,6 +626,11 @@ export function endHookSession(body) {
     slot = findSessionByCwd(body.session_cwd || body.cwd || null);
   }
   if (!slot || slot.state === "ended") return slot?.id ?? null;
+  // Last chance to read the final transcript state (SessionEnd is an
+  // opportunistic refresh point) so the "ended" event carries the final title.
+  const transcriptPath = transcriptPathOf(body);
+  if (transcriptPath) slot.transcriptPath = transcriptPath;
+  refreshSessionTitle(slot, slot.transcriptPath);
   if (slot.ptyProcess) {
     // Bridge-owned: the PTY close handler ends the slot, not this hook. But
     // the Claude Code instance behind this session_id is gone — /clear and
@@ -434,7 +648,7 @@ export function endHookSession(body) {
   slot.state = "ended";
   slot.endedAt = Date.now();
   runSessionCleanupHooks(slot.id, "session-end-hook");
-  pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, reason: "session-end" }, slot.id);
+  pushSseEvent("session", sessionEventPayload(slot, { state: "ended", agent: slot.agent, folderName: slot.folderName, reason: "session-end" }), slot.id);
   log("info", `External session ${slot.id} ended (SessionEnd hook)`);
   return slot.id;
 }
@@ -446,13 +660,13 @@ registerSseSyncProvider(function* runningSessionsSync() {
     if (slot.state === "running") {
       yield {
         event: "session",
-        data: JSON.stringify({
+        data: JSON.stringify(sessionEventPayload(slot, {
           state: "running",
           agent: slot.agent,
           cwd: slot.cwd,
           folderName: slot.folderName,
           sessionId: sid,
-        }),
+        })),
       };
     }
   }
