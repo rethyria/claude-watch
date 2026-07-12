@@ -81,6 +81,14 @@ class BridgeViewModel(
         val permissionQueue: List<PendingPermission> = emptyList(),
         /** permissionId of the answer POST currently in flight, if any. */
         val decisionInFlightId: String? = null,
+        /**
+         * permissionId of the prompt [decisionResult] belongs to. decisionResult
+         * is connection-global and STICKY ("decision:200" survives from any
+         * earlier prompt), so a card must never read it alone: a prompt that
+         * resolves without this watch's POST (hook-abort push, answered
+         * elsewhere) would otherwise flash a stale success as its own ack.
+         */
+        val decisionForId: String? = null,
         /** Why the last answer failed; the prompt it belongs to is still queued. */
         val decisionError: String? = null,
         /**
@@ -194,19 +202,47 @@ class BridgeViewModel(
      * A recognizer result (RecognizerIntent.ACTION_RECOGNIZE_SPEECH) landed:
      * put the transcription in the draft — so a refused/failed send leaves it
      * visible and retryable instead of vanishing — and send it through the
-     * exact same ack-gated path as typed text.
+     * exact same ack-gated path as typed text. [toSession] pins the target to
+     * the session the user dictated FROM (see [sendCommand]).
+     *
+     * The draft is filled only when EMPTY: an occupied draft holds text a
+     * previous failed send restored (or the user typed), and overwriting it
+     * would silently destroy that text — the exact loss class issue #20
+     * exists to prevent. If this send then fails, [sendFailed]'s conditional
+     * restore keeps the transcription visible inside the surfaced error.
      */
-    fun dictationResult(text: String) {
+    fun dictationResult(text: String, toSession: String? = null) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
-        _state.update { it.copy(commandDraft = trimmed) }
-        sendCommand(trimmed)
+        _state.update {
+            if (it.commandDraft.isEmpty()) it.copy(commandDraft = trimmed) else it
+        }
+        sendCommand(trimmed, toSession)
+    }
+
+    /**
+     * A new recognizer launch is starting: clear a stale [UiState.commandError]
+     * left by an earlier refusal/failure so the voice overlay (which opens on
+     * an error while armed) can't resurface an old failure as this
+     * dictation's outcome.
+     */
+    fun dictationStarted() {
+        _state.update { it.copy(commandError = null) }
     }
 
     /** The watch has no speech recognizer activity: surface it, send nothing. */
     fun dictationUnavailable() {
         haptics.commandFailed()
         _state.update { it.copy(commandError = "No speech recognizer on this watch — type the command") }
+    }
+
+    /**
+     * The user explicitly discarded a failed send from the voice overlay:
+     * drop the restored draft AND its surfaced error together. This is the
+     * deliberate-loss exit — the only path allowed to destroy the text.
+     */
+    fun discardCommand() {
+        _state.update { it.copy(commandDraft = "", commandError = null) }
     }
 
     /**
@@ -228,13 +264,27 @@ class BridgeViewModel(
      *    front: error surfaced, text kept in the draft, no POST, no echo —
      *    never pretending to send.
      */
-    fun sendCommand(text: String) {
+    fun sendCommand(text: String, toSession: String? = null) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
-        val sessionId = _state.value.sessionId
+        // The fallback (the most recently WORKING session) predates screens
+        // that show one specific session; those pass [toSession] so the
+        // command — and its "> text" echo — land in the feed on screen.
+        val sessionId = toSession ?: _state.value.sessionId
         fun refuse(result: String, error: String) {
             haptics.commandFailed()
-            _state.update { it.copy(commandResult = result, commandError = error, commandDraft = trimmed) }
+            _state.update {
+                // Same non-clobbering rule as sendFailed: the refused text
+                // only fills a draft it already owns (or that is empty).
+                // Other text in the draft — restored by an earlier failure —
+                // stays; the refused text rides the error instead.
+                val draftFree = it.commandDraft.isEmpty() || it.commandDraft == trimmed
+                it.copy(
+                    commandResult = result,
+                    commandError = if (draftFree) error else "$error — not sent: “$trimmed”",
+                    commandDraft = if (draftFree) trimmed else it.commandDraft,
+                )
+            }
         }
         if (!_state.value.paired) {
             refuse("command:not-paired", "Not paired — command not sent")
@@ -251,8 +301,17 @@ class BridgeViewModel(
             return
         }
         // Pending, NOT echoed: the terminal shows nothing until the bridge
-        // acks. The draft empties so the pending indicator owns the text.
-        _state.update { it.copy(commandInFlightText = trimmed, commandError = null, commandDraft = "") }
+        // acks. The draft empties so the pending indicator owns the text —
+        // but only a draft holding THIS text (a dictation with an occupied
+        // draft sends without ever claiming it; wiping it here would destroy
+        // the other text the draft is preserving).
+        _state.update {
+            it.copy(
+                commandInFlightText = trimmed,
+                commandError = null,
+                commandDraft = if (it.commandDraft == trimmed) "" else it.commandDraft,
+            )
+        }
         engineScope.launch {
             try {
                 val result = engine.sendCommand(sessionId, trimmed)
@@ -412,6 +471,7 @@ class BridgeViewModel(
                     _state.update {
                         it.copy(
                             decisionResult = "decision:not-paired",
+                            decisionForId = permissionId,
                             decisionInFlightId = null,
                             decisionError = "Not paired — decision not sent",
                             decisionFailureCount = it.decisionFailureCount + 1,
@@ -436,6 +496,7 @@ class BridgeViewModel(
                     val authDead = result.status == 401 || result.status == 403
                     val next = ui.copy(
                         decisionResult = "decision:${result.status}",
+                        decisionForId = permissionId,
                         decisionInFlightId = null,
                         decisionError = when {
                             result.ok -> null
@@ -454,6 +515,7 @@ class BridgeViewModel(
                 _state.update {
                     it.copy(
                         decisionResult = "decision:error ${e.message}",
+                        decisionForId = permissionId,
                         decisionInFlightId = null,
                         decisionError = "Decision failed: ${e.message}",
                         decisionFailureCount = it.decisionFailureCount + 1,

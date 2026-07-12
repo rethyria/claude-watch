@@ -1,0 +1,85 @@
+// Halo design tokens — the single source of truth for the "Halo" Wear OS
+// direction (design_handoff_claude_watch_halo/README.md, high-fidelity).
+// AMOLED-first: pure black screens, terracotta = "waiting for you".
+// All px measurements in the handoff are at a 450×450 reference; we express
+// them as dp/sp proportionally (450px ≈ the full round display).
+package dev.claudewatch.wear.ui.halo
+
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+object Halo {
+    // ── Colors ──────────────────────────────────────────────────────────────
+    object Palette {
+        val Background = Color(0xFF000000)
+        val DocBase = Color(0xFF0D0D0F)
+        val Surface = Color(0xFF191B20)
+        val Surface2 = Color(0xFF23262D)
+        val InsetWell = Color(0xFF16181D)
+
+        val TextPrimary = Color(0xFFF4F1EA)
+        val TextSecondary = Color(0xFF8D8B84)
+        val TextFaint = Color(0xFF63615B)
+
+        // Semantic session/state colors.
+        val WaitingForYou = Color(0xFFD97757) // terracotta — perm & question
+        val Running = Color(0xFF6CB289)
+        val Idle = Color(0xFF3A3C42)
+        val Error = Color(0xFFE5484D) // error / offline
+
+        // Ambient (always-on) dimmed variants.
+        val AmbientTerracotta = Color(0xFF7A4634)
+        val AmbientNeutral = Color(0xFF222329)
+
+        val ApproveText = Color(0xFF1A0F0A) // on terracotta fill
+        val UserEntry = Color(0xFFE8A889) // dictated/user lines + "sending" state
+
+        // Command well border, page dots.
+        val CommandWellBorder = Color(0xFF35281F)
+        val Divider = Color(0xFF26282E)
+        val DotCurrent = Color(0xFFF4F1EA)
+        val DotOther = Color(0xFF4A4C52)
+        val OutlineButton = Color(0xFF3A3C42)
+    }
+
+    // ── Type (Roboto; Roboto Mono for commands/tool lines) ──────────────────
+    // Minimum on-watch size is 20sp per the handoff.
+    object Type {
+        val TimeCenter = 44.sp; val TimeCenterWeight = FontWeight.Light // 88px ref
+        val BigCount = 50.sp; val BigCountWeight = FontWeight.Bold       // 100px ref
+        val Title = 13.sp                                               // 24–26px
+        val Body = 12.5.sp                                              // 24–25px
+        val Caption = 11.sp                                             // 20–22px
+        val MonoCommand = 13.sp                                         // 26px mono
+        val Min = 10.sp                                                 // 20px floor
+    }
+
+    // ── Geometry ────────────────────────────────────────────────────────────
+    object Geo {
+        val RingRadiusFraction = 205f / 225f // arc radius / display radius
+        const val RingStroke = 9f            // px at 450 ref (scaled at draw time)
+        const val RingStrokeAmbient = 4f
+        val SafeInset = 28.dp                // ~56px circular safe-area inset
+        val CardRadius = 17.dp               // cards/wells 16–18px
+        val RowRadius = 13.dp                // session rows 26px
+        val TouchMin = 48.dp
+    }
+
+    /** Per-session state that colors a ring segment and a row dot. */
+    enum class SessionState { WAITING_PERM, WAITING_Q, RUNNING, IDLE, ERROR }
+
+    /** Ring/dot color for a session state (interactive, not ambient). */
+    fun colorFor(state: SessionState): Color = when (state) {
+        SessionState.WAITING_PERM, SessionState.WAITING_Q -> Palette.WaitingForYou
+        SessionState.RUNNING -> Palette.Running
+        SessionState.IDLE -> Palette.Idle
+        SessionState.ERROR -> Palette.Error
+    }
+
+    fun ambientColorFor(state: SessionState): Color = when (state) {
+        SessionState.WAITING_PERM, SessionState.WAITING_Q -> Palette.AmbientTerracotta
+        else -> Palette.AmbientNeutral
+    }
+}

@@ -1,6 +1,8 @@
 package dev.claudewatch.wear
 
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
+import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasTestTag
@@ -12,7 +14,9 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.swipeLeft
+import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import okhttp3.MediaType.Companion.toMediaType
@@ -32,10 +36,17 @@ import java.util.concurrent.TimeUnit
 
 /**
  * The walking skeleton, CI-scripted: a real bridge runs on the emulator host
- * (reachable via 10.0.2.2) and this test drives the actual app UI through the
- * full loop — pair with the code scraped from bridge stdout, watch an SSE
- * event render as raw text, send a session-id-scoped command, and answer a
- * blocking permission hook so it unblocks with the chosen decision.
+ * (reachable via 10.0.2.2) and this test drives the actual Halo app through
+ * the full loop — pair with the code scraped from bridge stdout, watch an SSE
+ * event render in a session feed, answer blocking permission hooks (single,
+ * queued, allow-always) so each unblocks with the chosen decision, answer an
+ * AskUserQuestion payload, and spawn + kill a real PTY session from the list.
+ *
+ * The old control-page command box has no Halo equivalent (commands are
+ * dictation-only and the recognizer cannot run headlessly); the ack-gated
+ * command POST is covered end-to-end by DictationFlowTest against an
+ * on-device MockWebServer, and the question card's free-text answer rides
+ * the same recognizer, so here it is answered by option.
  *
  * Instrumentation arguments (see .github/scripts/wear-e2e.sh):
  *   bridgeHost   bridge address as seen from the emulator (default 10.0.2.2)
@@ -82,36 +93,79 @@ class WalkingSkeletonTest {
         }
     }
 
-    private fun textOf(tag: String): String =
-        compose.onNodeWithTag(tag).fetchSemanticsNode()
-            .config[SemanticsProperties.Text].joinToString("") { it.text }
-
     private fun tagExists(tag: String): Boolean =
         compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().isNotEmpty()
 
     // Placement-gated existence: HorizontalPager PREFETCHES neighbor pages,
     // composing them unplaced (semantics bounds anchored at origin), so a bare
-    // fetchSemanticsNodes existence check matches a page one swipe before it
-    // is actually in front. assertIsDisplayed rejects those unplaced nodes.
+    // fetchSemanticsNodes existence check can match a node that is not in
+    // front. assertIsDisplayed rejects those unplaced nodes.
     private fun tagDisplayed(tag: String): Boolean =
         runCatching { compose.onNodeWithTag(tag).assertIsDisplayed() }.isSuccess
 
+    private fun hasTestTagPrefix(prefix: String) =
+        SemanticsMatcher("TestTag starts with $prefix") { node ->
+            node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith(prefix) == true
+        }
+
+    /** The session ids of every listed row (list screen only). */
+    private fun rowIds(): Set<String> =
+        compose.onAllNodes(hasTestTagPrefix("haloRow-")).fetchSemanticsNodes()
+            .mapNotNull { it.config.getOrNull(SemanticsProperties.TestTag)?.removePrefix("haloRow-") }
+            .toSet()
+
+    /** Swipe up from home into the all-sessions list. */
+    private fun drillToList() {
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+    }
+
+    /**
+     * Tap the centerpiece until the waiting item's card opens: the prompt
+     * travels bridge → SSE → queue asynchronously, and tapping before it
+     * lands is a spec'd no-op, so poll-click instead of a bare wait.
+     */
+    private fun openFirstWaitingCard(timeoutMs: Long = 30_000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (tagExists("haloCard")) {
+                armCard()
+                return
+            }
+            if (tagDisplayed("haloCenter")) {
+                compose.onNodeWithTag("haloCenter").performClick()
+            }
+            compose.waitForIdle()
+            Thread.sleep(200)
+        }
+        throw AssertionError("no waiting card opened within ${timeoutMs}ms")
+    }
+
+    /** The cards ignore taps for ~400ms after appearing (real uptime). */
+    private fun armCard() {
+        compose.waitForIdle()
+        Thread.sleep(500)
+    }
+
+    private fun waitForCardGone() {
+        // Covers the 1.4s result flash before the card chains out or exits.
+        compose.waitUntil(30_000) { !tagExists("haloCard") }
+    }
+
     @Test
-    fun pairStreamCommandApprove() {
+    fun pairStreamApproveQuestionSpawnKill() {
         // --- Pair via manual IP:port + code entry -------------------------
         fill("host", bridgeHost)
         fill("port", bridgePort.toString())
         fill("code", pairingCode)
         compose.onNodeWithTag("pairButton").performScrollTo().performClick()
         // Gate on the SSE stream being open, not on pair success: a hook fired
-        // in the pair-to-stream-open window would race the connect. (The app
-        // also requests a full replay on first connect, but the stream-open
-        // signal is the honest go-signal for the steps below.)
+        // in the pair-to-stream-open window would race the connect.
         waitForText("status", "paired, stream open")
 
-        // --- An SSE event arrives and renders as raw text -----------------
-        // The tool-output hook also auto-creates a bridge session, whose
-        // "session" event gives the app the session id used below.
+        // --- An SSE event arrives and renders in the session's feed -------
+        // The tool-output hook auto-creates a bridge session; its "session"
+        // event puts a row on the list and a segment on the home ring.
         val marker = "wear-e2e-marker-${System.currentTimeMillis()}"
         postHook(
             "/hooks/tool-output",
@@ -120,16 +174,16 @@ class WalkingSkeletonTest {
                 .put("cwd", "/tmp/wear-e2e-project")
                 .put("tool_output", marker),
         ).use { assertEquals(200, it.code) }
-        waitForText("eventLog", marker)
+        waitForText("haloCensus", "1 session")
+        drillToList()
+        val markerSession = rowIds().single()
+        compose.onNodeWithTag("haloRow-$markerSession").performScrollTo().performClick()
         compose.waitUntil(30_000) {
-            compose.onAllNodes(hasTestTag("sessionId") and hasText("session:none"))
-                .fetchSemanticsNodes().isEmpty()
+            compose.onAllNodes(hasText(marker, substring = true)).fetchSemanticsNodes().isNotEmpty()
         }
-
-        // --- A session-id-scoped text command reaches the bridge (2xx) ----
-        fill("commandInput", "say hello from the watch")
-        compose.onNodeWithTag("sendButton").performScrollTo().performClick()
-        waitForText("commandResult", "command:200")
+        // TimeText tap = jump home, ready for the approval legs.
+        compose.onNodeWithTag("haloHome").performClick()
+        compose.waitForIdle()
 
         // --- Concurrent blocking permission hooks (issue #17) -------------
         // Two curl-simulated sessions ask at once: both must queue (neither
@@ -145,7 +199,7 @@ class WalkingSkeletonTest {
             JSONObject(hookBody).getJSONObject("hookSpecificOutput").getJSONObject("decision")
 
         try {
-            // Session A asks first: its Bash card fronts the approval sheet.
+            // Session A asks first: tapping the centerpiece opens ITS card.
             val hookA = permissionHook(
                 JSONObject()
                     .put("tool_name", "Bash")
@@ -153,13 +207,14 @@ class WalkingSkeletonTest {
                     .put("cwd", "/tmp/wear-e2e-a")
                     .put("tool_input", JSONObject().put("command", "rm -rf ./build")),
             )
-            waitForText("permissionTool", "Bash")
+            openFirstWaitingCard()
             // The card says WHAT is being asked, not just the tool name.
-            waitForText("permissionSummary", "rm -rf ./build")
+            waitForText("haloTool", "Bash")
+            waitForText("haloSummary", "rm -rf ./build")
 
-            // Session B asks while A's prompt is still up: the newest card
-            // fronts (a stale prompt must never shadow a live one) and the
-            // sheet shows the queue depth.
+            // Session B asks while A's card is up: the rendered card stays
+            // PINNED (a new arrival must not slide in over a card mid-read)
+            // and the queue depth shows.
             val hookB = permissionHook(
                 JSONObject()
                     .put("tool_name", "Write")
@@ -167,40 +222,39 @@ class WalkingSkeletonTest {
                     .put("cwd", "/tmp/wear-e2e-b")
                     .put("tool_input", JSONObject().put("file_path", "/tmp/wear-e2e-b/notes.txt")),
             )
-            waitForText("permissionTool", "Write")
-            waitForText("permissionSummary", "notes.txt")
-            waitForText("permissionCount", "1 more waiting")
+            waitForText("haloWaitingCount", "2 waiting")
 
             // Neither hook has been answered yet: both must still block.
             Thread.sleep(500)
             assertFalse("hook A must block until a decision arrives", hookA.isDone)
             assertFalse("hook B must block until a decision arrives", hookB.isDone)
 
-            // Deny the RENDERED card (B's Write). Ack-gated: the card leaves
-            // only on the 2xx ack, revealing A's Bash card underneath.
-            compose.onNodeWithTag("permissionOption-deny").assertIsDisplayed().performClick()
-            val (statusB, bodyB) = hookB.get(30, TimeUnit.SECONDS)
-            assertEquals(200, statusB)
-            assertEquals(
-                "the deny must land on B — the request that was rendered",
-                "deny",
-                decisionOf(bodyB).getString("behavior"),
-            )
-            waitForText("permissionTool", "Bash")
-            assertFalse("hook A must still be blocked after B's answer", hookA.isDone)
-
-            // Allow the revealed card (A's Bash): the allow lands on A.
-            compose.onNodeWithTag("permissionOption-allow").assertIsDisplayed().performClick()
+            // Deny the RENDERED card (A's Bash — it was pinned first).
+            // Ack-gated: the card leaves only on the 2xx ack, then queue
+            // chaining slides B's Write card in.
+            compose.onNodeWithTag("haloDeny").assertIsDisplayed().performClick()
             val (statusA, bodyA) = hookA.get(30, TimeUnit.SECONDS)
             assertEquals(200, statusA)
             assertEquals(
-                "the allow must land on A — the request that was rendered",
-                "allow",
+                "the deny must land on A — the request that was rendered",
+                "deny",
                 decisionOf(bodyA).getString("behavior"),
             )
-            compose.waitUntil(30_000) {
-                compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().isEmpty()
-            }
+            waitForText("haloTool", "Write")
+            waitForText("haloSummary", "notes.txt")
+            assertFalse("hook B must still be blocked after A's answer", hookB.isDone)
+
+            // Allow the chained card (B's Write): the allow lands on B.
+            armCard()
+            compose.onNodeWithTag("haloApprove").assertIsDisplayed().performClick()
+            val (statusB, bodyB) = hookB.get(30, TimeUnit.SECONDS)
+            assertEquals(200, statusB)
+            assertEquals(
+                "the allow must land on B — the request that was rendered",
+                "allow",
+                decisionOf(bodyB).getString("behavior"),
+            )
+            waitForCardGone()
 
             // --- Allow-always rides the machine-readable behavior field ---
             // The bridge offers allow-always only when the hook supplies
@@ -218,8 +272,9 @@ class WalkingSkeletonTest {
                     .put("tool_input", JSONObject().put("command", "npm test"))
                     .put("permission_suggestions", org.json.JSONArray().put(suggestion)),
             )
-            waitForText("permissionSummary", "npm test")
-            compose.onNodeWithTag("permissionOption-allow-always").assertIsDisplayed().performClick()
+            openFirstWaitingCard()
+            waitForText("haloSummary", "npm test")
+            compose.onNodeWithTag("haloAlwaysAllow").performScrollTo().performClick()
             val (statusC, bodyC) = hookC.get(30, TimeUnit.SECONDS)
             assertEquals(200, statusC)
             val decisionC = decisionOf(bodyC)
@@ -231,18 +286,16 @@ class WalkingSkeletonTest {
                 1,
                 decisionC.getJSONArray("updatedPermissions").length(),
             )
-            compose.waitUntil(30_000) {
-                compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().isEmpty()
-            }
+            waitForCardGone()
 
-            // --- AskUserQuestion: every question answered, incl. free text --
-            // A multi-question payload renders ALL questions on the question
-            // card (the legacy client answered only the first), one gets an
-            // option pick and the other a typed free-text answer. The client
-            // POSTs the answers as a positional array in question order; the
-            // bridge zips it with the questions and the blocked hook unblocks
-            // with BOTH answers keyed by question text (updatedInput.answers
-            // — see collectAskUserQuestionAnswers in skill/bridge/hooks.js).
+            // --- AskUserQuestion: every question answered, buffered submit --
+            // A multi-question payload walks ALL questions on the question
+            // card (the legacy client answered only the first); the answers
+            // are buffered and POSTed together as a positional array in
+            // question order; the bridge zips it with the questions and the
+            // blocked hook unblocks with BOTH answers keyed by question text
+            // (updatedInput.answers — collectAskUserQuestionAnswers in
+            // skill/bridge/hooks.js).
             val questions = org.json.JSONArray()
                 .put(
                     JSONObject()
@@ -270,83 +323,70 @@ class WalkingSkeletonTest {
                     .put("cwd", "/tmp/wear-e2e-a")
                     .put("tool_input", JSONObject().put("questions", questions)),
             )
-            // Both questions render on the sheet.
-            waitForText("questionText-0", "Which database should the service use?")
-            waitForText("questionText-1", "What should the service be called?")
+            openFirstWaitingCard()
+            waitForText("haloQuestionText", "Which database should the service use?")
 
-            // Send is gated until EVERY question has an answer.
-            compose.onNodeWithTag("questionsSend").performScrollTo()
+            // Answer question 0; the submit is buffered until EVERY question
+            // has an answer, so the hook must still block.
+            compose.onNodeWithTag("haloQOption-0-SQLite").performScrollTo().performClick()
+            waitForText("haloQuestionText", "What should the service be called?")
             Thread.sleep(500)
             assertFalse("hook must block until every question is answered", hookQ.isDone)
 
-            // Question 0: pick an option. Question 1: type a free-text answer.
-            compose.onNodeWithTag("questionOption-0-SQLite").performScrollTo().performClick()
-            fill("questionFreeText-1", "wear-e2e-custom-name")
-            compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
-
+            // The last answer submits both positionally.
+            compose.onNodeWithTag("haloQOption-1-api-server").performScrollTo().performClick()
             val (statusQ, bodyQ) = hookQ.get(30, TimeUnit.SECONDS)
             assertEquals(200, statusQ)
             val decisionQ = decisionOf(bodyQ)
             assertEquals("allow", decisionQ.getString("behavior"))
             val answersQ = decisionQ.getJSONObject("updatedInput").getJSONObject("answers")
             assertEquals(
-                "the option answer must land on its question",
+                "the first answer must land on its question",
                 "SQLite",
                 answersQ.getString("Which database should the service use?"),
             )
             assertEquals(
-                "the free-text answer must land on its question",
-                "wear-e2e-custom-name",
+                "the second answer must land on its question",
+                "api-server",
                 answersQ.getString("What should the service be called?"),
             )
-            compose.waitUntil(30_000) {
-                compose.onAllNodes(hasTestTag("permissionSheet")).fetchSemanticsNodes().isEmpty()
-            }
+            waitForCardGone()
         } finally {
             executor.shutdownNow()
         }
 
-        // --- Spawn a session, page over to its live terminal, kill it ----
+        // --- Spawn a session from the list, watch its feed, kill it -------
         // The real bridge PTY-spawns the stubbed `claude` binary (see
         // .github/scripts/wear-e2e.sh); its ready line arrives as pty-output.
-        val hookSessionText = textOf("sessionId")
-        compose.onNodeWithTag("spawnClaudeButton").performScrollTo().performClick()
-        waitForText("sessionActionResult", "spawn:200")
-        compose.waitUntil(30_000) { textOf("sessionId") != hookSessionText }
-        val spawnedId = textOf("sessionId").removePrefix("session:")
+        drillToList()
+        val before = rowIds()
+        compose.onNodeWithTag("haloSpawn").performScrollTo().performClick()
+        compose.waitUntil(30_000) { (rowIds() - before).isNotEmpty() }
+        val spawnedId = (rowIds() - before).single()
 
-        // Pager navigation over live sessions: swipe until the spawned
-        // session's terminal page is in FRONT (control page + the pages of
-        // the hook-created sessions — including the two permission-hook
-        // sessions above — come first). Gate on placement, not existence —
-        // the pager prefetches the neighbor page, so a bare existence check
-        // would stop one swipe early and the kill click below would be
-        // injected at the unplaced node's origin bounds.
-        for (unused in 0 until 8) {
-            if (tagDisplayed("terminal-$spawnedId")) break
-            compose.onNodeWithTag("sessionPager").performTouchInput { swipeLeft() }
-            compose.waitForIdle()
-        }
-        assertTrue(
-            "spawned session's terminal page must be fronted by swiping",
-            tagDisplayed("terminal-$spawnedId"),
-        )
-        // The spawned PTY's stub output reached THIS page as terminal lines.
-        // Scope the match to the spawned session's terminal subtree: pager
-        // prefetch composes neighbor pages too, so an unscoped hasText could
-        // match text that never rendered on the fronted page.
+        // The spawned PTY's stub output reaches THIS session's feed. Scope
+        // the match to the feed subtree so text from another (prefetched or
+        // composed) surface can't satisfy it.
+        compose.onNodeWithTag("haloRow-$spawnedId").performScrollTo().performClick()
         compose.waitUntil(60_000) {
             compose.onAllNodes(
                 hasText("stub-claude", substring = true) and
-                    hasAnyAncestor(hasTestTag("terminal-$spawnedId")),
+                    hasAnyAncestor(hasTestTag("haloFeed-$spawnedId")),
             ).fetchSemanticsNodes().isNotEmpty()
         }
 
-        // Kill it from its page header; the bridge answers the /v1/command
-        // kill and pushes `session ended killed:true`, which prunes the page.
-        // assertIsDisplayed first: a click on an unplaced node would silently
-        // land at (0,0) and hit nothing.
-        compose.onNodeWithTag("kill-$spawnedId").assertIsDisplayed().performClick()
-        compose.waitUntil(30_000) { !tagExists("terminal-$spawnedId") }
+        // Back to the list; the row's quick-action strip (horizontal swipe)
+        // carries close, which kills the session via /v1/command. The bridge
+        // pushes `session ended killed:true`, which prunes the row.
+        compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeDown() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloRow-$spawnedId").performScrollTo()
+            .performTouchInput { swipeLeft() }
+        compose.waitForIdle()
+        compose.onNode(
+            hasTestTag("haloRowClose") and hasAnyAncestor(hasTestTag("haloRow-$spawnedId")),
+        ).assertIsDisplayed().performClick()
+        compose.waitUntil(30_000) { !tagExists("haloRow-$spawnedId") }
+        assertTrue("the list must stay usable after the kill", tagExists("haloSpawn"))
     }
 }

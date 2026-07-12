@@ -1172,4 +1172,167 @@ class BridgeViewModelTest {
         assertEquals(listOf("failed"), haptics.events.toList())
         assertEquals("no request may leave the device", 0, server.requestCount)
     }
+
+    /**
+     * Regression (Halo review): a NEW dictation while the draft still holds a
+     * previous failed send's restored text must not clobber that text — the
+     * Halo UI renders the draft only on the voice overlay, so an overwritten
+     * draft is text destroyed with no trace (the issue-#20 loss class). The
+     * new transcription is sent without ever claiming the occupied draft, and
+     * the send's in-flight transition must not wipe the draft either (it only
+     * empties a draft holding the text being sent).
+     */
+    @Test
+    fun dictationDoesNotClobberADraftRestoredByAFailedSend() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append("""data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj","sessionId":"s-1"}""")
+            append("\n\n")
+            append(":pad\n\n".repeat(80))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        // First dictation fails: its text is restored into the draft.
+        server.enqueue(MockResponse().setResponseCode(500).setBody("""{"error":"boom"}"""))
+        viewModel.dictationResult("first command")
+        val failed = awaitState { it.commandResult == "command:500" }
+        assertEquals("first command", failed.commandDraft)
+        server.takeRequest(10, TimeUnit.SECONDS) // the failed /v1/command
+
+        // Second dictation goes out while the restored text still owns the
+        // draft: the new text is POSTed, the old text survives throughout.
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.dictationResult("second command")
+        val request = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no /v1/command request for the second dictation")
+        assertEquals("second command", JSONObject(request.body.readUtf8()).getString("command"))
+        val acked = awaitState { it.commandResult == "command:200" }
+        assertEquals(
+            "the restored failed text must survive a newer dictation",
+            "first command",
+            acked.commandDraft,
+        )
+        assertEquals(null, acked.commandInFlightText)
+    }
+
+    /**
+     * Regression (Halo review): the up-front refusals (not-paired /
+     * no-session / busy) share the non-clobbering rule — a refused
+     * transcription must not overwrite other text already in the draft; it
+     * rides the surfaced error instead, so neither text is silently lost.
+     */
+    @Test
+    fun refusedDictationKeepsTheOccupiedDraftAndRidesTheFailedText() {
+        viewModel.updateCommandDraft("typed text")
+        viewModel.dictationResult("spoken command") // never paired: refused
+
+        val refused = awaitState { it.commandResult == "command:not-paired" }
+        assertEquals(
+            "the pre-existing draft must not be clobbered by a refused dictation",
+            "typed text",
+            refused.commandDraft,
+        )
+        assertTrue(
+            "the refused text must stay visible inside the error: ${refused.commandError}",
+            refused.commandError!!.contains("Not paired") &&
+                refused.commandError!!.contains("spoken command"),
+        )
+        assertEquals("no request may leave the device", 0, server.requestCount)
+    }
+
+    /**
+     * Regression (Halo review): decisionResult is global and STICKY, so the
+     * cards must be able to tell WHOSE outcome it is. Every decision outcome
+     * stamps [BridgeViewModel.UiState.decisionForId] with its prompt id, and
+     * a submit for a prompt that is no longer queued (resolved while a
+     * dictated answer round-tripped through the recognizer) is a no-op that
+     * leaves the previous outcome untouched — the card's ✓ flash keys on the
+     * id matching, so the stale success can never masquerade as a delivered
+     * answer.
+     */
+    @Test
+    fun decisionOutcomesCarryTheirPromptIdAndAVanishedPromptIsANoOp() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append(permissionRequestFrame(1, "perm-mine", "Bash"))
+            append(":pad\n\n".repeat(60))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.permissionQueue.any { p -> p.permissionId == "perm-mine" } }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.answerPermission("perm-mine", "allow")
+        val acked = awaitState { it.decisionResult == "decision:200" && it.permissionQueue.isEmpty() }
+        assertEquals("the outcome names its prompt", "perm-mine", acked.decisionForId)
+        server.takeRequest(10, TimeUnit.SECONDS) // the decision /v1/command
+
+        // A submit for a prompt that already left the queue (the stale-sink
+        // race): nothing is POSTed and the sticky success stays attributed to
+        // the prompt it belongs to.
+        val requestsBefore = server.requestCount
+        viewModel.answerQuestions("perm-vanished", listOf("too late"))
+        Thread.sleep(500)
+        val after = viewModel.state.value
+        assertEquals("no POST for a prompt that is no longer queued", requestsBefore, server.requestCount)
+        assertEquals("the previous outcome keeps its attribution", "perm-mine", after.decisionForId)
+        assertEquals("decision:200", after.decisionResult)
+        assertEquals(null, after.decisionInFlightId)
+    }
+
+    /**
+     * The voice overlay's two hygiene hooks (Halo review): Discard drops the
+     * restored draft AND its error together (a lingering error would reopen
+     * the overlay), and a new recognizer launch clears a stale error while
+     * leaving the draft alone (its text is still owed a surface).
+     */
+    @Test
+    fun discardClearsDraftPlusErrorAndANewDictationClearsOnlyTheStaleError() {
+        // Manufacture a failed state: unpaired refusal restores the text.
+        viewModel.dictationResult("lost words")
+        val refused = awaitState { it.commandError != null }
+        assertEquals("lost words", refused.commandDraft)
+
+        viewModel.dictationStarted()
+        val started = viewModel.state.value
+        assertEquals("a new dictation clears the stale error", null, started.commandError)
+        assertEquals("but never touches the draft", "lost words", started.commandDraft)
+
+        viewModel.dictationResult("more words") // refused again: error is back
+        awaitState { it.commandError != null }
+
+        viewModel.discardCommand()
+        val discarded = viewModel.state.value
+        assertEquals("Discard is the deliberate-loss exit for the draft", "", discarded.commandDraft)
+        assertEquals("and takes the surfaced error with it", null, discarded.commandError)
+    }
 }

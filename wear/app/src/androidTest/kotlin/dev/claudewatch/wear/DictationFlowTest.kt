@@ -2,7 +2,6 @@ package dev.claudewatch.wear
 
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -12,13 +11,13 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeLeft
+import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.claudewatch.wear.data.AesGcmTokenCipher
 import dev.claudewatch.wear.data.CredentialStore
-import dev.claudewatch.wear.ui.SessionPagerActions
-import dev.claudewatch.wear.ui.SessionPagerScreen
+import dev.claudewatch.wear.ui.halo.HaloActions
+import dev.claudewatch.wear.ui.halo.HaloApp
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.json.JSONObject
@@ -35,7 +34,7 @@ import java.util.concurrent.TimeUnit
 import javax.crypto.KeyGenerator
 
 /**
- * Dictated commands with ack-gated echo (issue #20), driven through the real
+ * Dictated commands with ack-gated echo (issue #20), driven through the Halo
  * UI + real ViewModel against an on-device MockWebServer bridge. Real voice
  * recognition cannot run headlessly, so — as the issue allows — the
  * RecognizerIntent activity result is STUBBED: `onDictate` delivers a fixed
@@ -45,11 +44,13 @@ import javax.crypto.KeyGenerator
  *
  * Pinned here, against the confirmed watchOS trap (echo + thinking cursor
  * BEFORE the network call, every failure swallowed):
- *  - stubbed recognizer result → command POSTed → echo appears only after 2xx;
- *  - injected 5xx → no echo, error surfaced, the text restored into the
- *    input, and retry re-sends the same text;
+ *  - the feed's Dictate → command POSTed → the voice overlay holds on
+ *    "sending… waiting for ack" and the echo appears only after the 2xx;
+ *  - injected 5xx → no echo, the overlay flips to "not delivered", the text
+ *    survives in the draft, and Retry re-sends the same text to the SAME
+ *    session;
  *  - unpaired → the input path refuses cleanly (no POST, no pending, error
- *    shown) instead of pretending to send.
+ *    surfaced, text kept) instead of pretending to send.
  */
 @RunWith(AndroidJUnit4::class)
 class DictationFlowTest {
@@ -87,13 +88,14 @@ class DictationFlowTest {
     private fun setAppContent() {
         compose.setContent {
             val ui by viewModel.state.collectAsState()
-            SessionPagerScreen(
+            HaloApp(
                 ui = ui,
-                actions = SessionPagerActions(
+                actions = HaloActions(
                     onSendCommand = viewModel::sendCommand,
                     onCommandDraftChange = viewModel::updateCommandDraft,
-                    // The stub: a fixed-text recognizer activity result.
-                    onDictate = { viewModel.dictationResult(recognized) },
+                    // The stub: a fixed-text recognizer activity result,
+                    // keeping the session the dictation was started FROM.
+                    onDictate = { sessionId -> viewModel.dictationResult(recognized, sessionId) },
                 ),
             )
         }
@@ -125,13 +127,19 @@ class DictationFlowTest {
         )
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         compose.waitUntil(30_000) { viewModel.state.value.sessionId == "s-1" }
+        compose.waitUntil(30_000) { viewModel.state.value.status == "paired, stream open" }
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
         server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
     }
 
-    private fun clickDictate() {
-        compose.onNodeWithTag("dictateButton").performScrollTo().performClick()
+    /** Home → all-sessions list → s-1's feed, where the Dictate pill lives. */
+    private fun openFeedAndDictate() {
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloRow-s-1").performScrollTo().performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloDictate").assertIsDisplayed().performClick()
     }
 
     private fun waitForNode(tag: String, substring: String? = null, timeoutMs: Long = 30_000) {
@@ -142,6 +150,9 @@ class DictationFlowTest {
             compose.onAllNodes(matcher).fetchSemanticsNodes().isNotEmpty()
         }
     }
+
+    private fun nodeCount(tag: String): Int =
+        compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().size
 
     private fun terminalLines(sessionId: String): List<String> =
         viewModel.state.value.bridge.sessions[sessionId]?.terminal?.items?.map { it.text }
@@ -158,10 +169,11 @@ class DictationFlowTest {
                 .setHeadersDelay(3_000, TimeUnit.MILLISECONDS)
                 .setBody("""{"ok":true}"""),
         )
-        clickDictate()
+        openFeedAndDictate()
 
-        // Pending until the bridge acks: the indicator shows the exact text…
-        waitForNode("commandPending", recognized)
+        // The voice overlay holds on "sending…" with the exact transcript…
+        waitForNode("haloVoiceStatus")
+        compose.onNode(hasTestTag("haloVoiceTranscript") and hasText(recognized)).assertIsDisplayed()
         // …and this state snapshot proves no echo happened yet (echo and
         // pending-clear are one atomic ViewModel update, so any state that is
         // still pending provably has no echo — no timing sensitivity).
@@ -176,7 +188,7 @@ class DictationFlowTest {
             terminalLines("s-1").none { it == "> $recognized" },
         )
 
-        // The POST carried the recognized text, session-scoped.
+        // The POST carried the recognized text, scoped to the feed's session.
         val request = server.takeRequest(15, TimeUnit.SECONDS)
             ?: throw AssertionError("no /v1/command request")
         assertEquals("/v1/command", request.path)
@@ -184,17 +196,13 @@ class DictationFlowTest {
         assertEquals(recognized, body.getString("command"))
         assertEquals("s-1", body.getString("sessionId"))
 
-        // The 2xx ack lands: pending resolves and the echo appears.
-        waitForNode("commandResult", "command:200")
-        assertEquals(0, compose.onAllNodes(hasTestTag("commandPending")).fetchSemanticsNodes().size)
-        assertEquals(0, compose.onAllNodes(hasTestTag("commandError")).fetchSemanticsNodes().size)
+        // The 2xx ack lands: the overlay resolves and the echo appears in the
+        // feed — never shown as sent before the bridge acked.
+        compose.waitUntil(30_000) { viewModel.state.value.commandResult == "command:200" }
+        compose.waitUntil(30_000) { nodeCount("haloVoice") == 0 }
         assertEquals("> $recognized", terminalLines("s-1").last())
-
-        // And it is really on the session's terminal page, cursor raised.
-        compose.onNodeWithTag("sessionPager").performTouchInput { swipeLeft() }
-        compose.waitForIdle()
         compose.onNodeWithText("> $recognized").assertIsDisplayed()
-        compose.onNodeWithTag("thinkingCursor").assertIsDisplayed()
+        compose.onNodeWithTag("haloThinking").assertIsDisplayed()
     }
 
     @Test
@@ -204,41 +212,55 @@ class DictationFlowTest {
 
         // Injected failure: the bridge answers the command POST with 500.
         server.enqueue(MockResponse().setResponseCode(500).setBody("""{"error":"boom"}"""))
-        clickDictate()
+        openFeedAndDictate()
 
-        waitForNode("commandError", "Send failed: HTTP 500")
+        waitForNode("haloVoiceError")
         server.takeRequest(10, TimeUnit.SECONDS) // the failed /v1/command
         // No echo, nothing pending — and the transcription is RESTORED into
-        // the input for retry instead of being lost (the watchOS trap).
+        // the draft, rendered on the overlay for retry instead of being lost
+        // (the watchOS trap).
         assertTrue(
             "a failed send must never echo: ${terminalLines("s-1")}",
             terminalLines("s-1").none { it == "> $recognized" },
         )
-        assertEquals(0, compose.onAllNodes(hasTestTag("commandPending")).fetchSemanticsNodes().size)
-        compose.onNodeWithTag("commandInput").assert(hasText(recognized))
+        assertEquals(null, viewModel.state.value.commandInFlightText)
+        assertEquals(recognized, viewModel.state.value.commandDraft)
+        compose.onNode(hasTestTag("haloVoiceTranscript") and hasText(recognized)).assertIsDisplayed()
 
-        // Retry via Send: re-sends the SAME text straight from the input.
+        // Retry: re-sends the SAME text to the SAME session.
         server.enqueue(MockResponse().setBody("""{"ok":true}"""))
-        compose.onNodeWithTag("sendButton").performScrollTo().performClick()
+        compose.onNodeWithTag("haloVoiceRetry").performClick()
         val retry = server.takeRequest(15, TimeUnit.SECONDS)
             ?: throw AssertionError("no retry /v1/command request")
-        assertEquals(recognized, JSONObject(retry.body.readUtf8()).getString("command"))
+        val retryBody = JSONObject(retry.body.readUtf8())
+        assertEquals(recognized, retryBody.getString("command"))
+        assertEquals("s-1", retryBody.getString("sessionId"))
 
-        waitForNode("commandResult", "command:200")
-        assertEquals(0, compose.onAllNodes(hasTestTag("commandError")).fetchSemanticsNodes().size)
+        compose.waitUntil(30_000) { viewModel.state.value.commandResult == "command:200" }
+        compose.waitUntil(30_000) { nodeCount("haloVoice") == 0 }
         assertEquals("> $recognized", terminalLines("s-1").last())
+        compose.onNodeWithText("> $recognized").assertIsDisplayed()
     }
 
     @Test
     fun unpairedDictationRefusesCleanlyInsteadOfPretendingToSend() {
         setAppContent()
-        // Never paired: the stubbed transcription must not produce a request.
-        clickDictate()
+        // Never paired: Halo shows the offline/pairing takeover, so no send
+        // surface exists — but a transcription can still land (the recognizer
+        // round-trips through an activity result; the pairing can drop while
+        // it is up). It must refuse cleanly: no POST, no pending, the text
+        // kept — never a pretend-send.
+        viewModel.dictationResult(recognized)
 
-        waitForNode("commandError", "Not paired")
-        assertEquals(0, compose.onAllNodes(hasTestTag("commandPending")).fetchSemanticsNodes().size)
-        // The transcription is kept in the input, not lost.
-        compose.onNodeWithTag("commandInput").assert(hasText(recognized))
+        compose.waitUntil(30_000) {
+            viewModel.state.value.commandError?.contains("Not paired") == true
+        }
+        assertEquals(null, viewModel.state.value.commandInFlightText)
+        // The transcription is kept in the draft, not lost.
+        assertEquals(recognized, viewModel.state.value.commandDraft)
         assertEquals("no request may leave the device", 0, server.requestCount)
+        // The UI never pretends: the pairing screen is up, no voice overlay.
+        compose.onNodeWithTag("status").assertIsDisplayed()
+        assertEquals(0, nodeCount("haloVoice"))
     }
 }
