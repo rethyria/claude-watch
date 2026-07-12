@@ -17,9 +17,12 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
 // Multi-session: each entry is a session slot
 // { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId?, hookCreated?,
-//   title?, titleIsAi?, transcriptPath?, titleCache? } — title is lazily derived
-//   from the Claude Code transcript (see the session-titles section below).
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}}>} */
+//   title?, titleIsAi?, transcriptPath?, titleCache?,
+//   projectRootVerified?, projectRootAttempt? } — title is lazily derived
+//   from the Claude Code transcript (see the session-titles section below);
+//   projectRootVerified/projectRootAttempt cache the project-root attribution
+//   (see the project-root-attribution section below).
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -57,6 +60,98 @@ function transcriptPathOf(body) {
   return typeof body?.transcript_path === "string" && body.transcript_path
     ? body.transcript_path
     : null;
+}
+
+// --- Project-root attribution (issue #51) ------------------------------------
+// A slot used to bind cwd/folderName from the FIRST hook event it saw; a hook
+// firing while the session's shell sat in a subdirectory mislabeled the whole
+// session (e.g. a gradle run in …/claude-watch/wear/ labeled the session
+// "wear"). Hook payloads carry `transcript_path`, whose parent directory name
+// is Claude Code's sanitized project root — derive the real root from it.
+//
+// Sanitization char class, verified two ways on this machine:
+//   * the bundled Claude Code CLI computes the projects dir name as
+//     `cwd.replace(/[^a-zA-Z0-9]/g, "-")` (paths over 200 chars are further
+//     truncated and hash-suffixed — those never match here and simply fall
+//     back to the observed cwd);
+//   * real dirs under ~/.claude/projects/ agree, e.g.
+//     /home/deck/Development/claude-watch → -home-deck-Development-claude-watch
+//     (both "/" and the "-" already in the name map to "-").
+// The mapping is lossy ("-", "/", ".", "_", … all collapse to "-"), so it
+// cannot be inverted. Instead each ancestor of the observed cwd — the cwd
+// itself first — is sanitized and compared against the transcript's parent
+// dir name; the first (deepest) match is the verified project root.
+const PROJECT_DIR_SANITIZE_RE = /[^a-zA-Z0-9]/g;
+
+function sanitizeProjectPath(p) {
+  return p.replace(PROJECT_DIR_SANITIZE_RE, "-");
+}
+
+function findVerifiedProjectRoot(cwd, transcriptPath) {
+  if (typeof cwd !== "string" || !path.isAbsolute(cwd)) return null;
+  const expected = path.basename(path.dirname(transcriptPath));
+  if (!expected) return null;
+  let dir = path.resolve(cwd);
+  for (;;) {
+    if (sanitizeProjectPath(dir) === expected) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null; // reached the filesystem root: no match
+    dir = parent;
+  }
+}
+
+// Proper-ancestor check on path strings (hook cwds are clean absolute paths).
+function isAncestorPath(ancestor, descendant) {
+  if (!ancestor || !descendant || ancestor === descendant) return false;
+  const prefix = ancestor.endsWith(path.sep) ? ancestor : ancestor + path.sep;
+  return descendant.startsWith(prefix);
+}
+
+// Re-label a slot with its (better) project root and tell connected clients
+// via the same idempotent re-sent running `session` event that title changes
+// use, so they re-group the session under the right project.
+function rebindProjectRoot(slot, root) {
+  if (slot.cwd === root) return;
+  slot.cwd = root;
+  slot.folderName = path.basename(root) || root;
+  if (slot.state !== "running") return;
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, { state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName }),
+    slot.id,
+  );
+}
+
+// Attribution upkeep for an already-bound slot, run on the hook hot path so
+// it must stay cheap: string compares only. The ancestor walk runs at most
+// once per distinct (cwd, transcript path) pair — the attempt is cached on
+// the slot — and never again once a root was verified.
+//
+// Only hook-created slots keyed by session_id are eligible: PTY-backed slots
+// keep their user-chosen spawn cwd (attachPtyToSession respawns there), and
+// legacy no-session_id slots are routed by EXACT cwd match, which a rebind
+// would break (Codex sessions therefore stay untouched).
+function updateProjectAttribution(slot, cwd, transcriptPath) {
+  if (!slot.hookCreated) return;
+  if (transcriptPath) {
+    if (slot.projectRootVerified) return; // deterministic — never re-walk
+    const attemptKey = `${cwd ?? ""}\n${transcriptPath}`;
+    if (slot.projectRootAttempt !== attemptKey) {
+      slot.projectRootAttempt = attemptKey;
+      const root = findVerifiedProjectRoot(cwd || slot.cwd, transcriptPath);
+      if (root) {
+        slot.projectRootVerified = true;
+        rebindProjectRoot(slot, root);
+        return;
+      }
+    }
+    // No ancestor matched: fall through to the ancestor-cwd heuristic.
+  } else if (slot.projectRootVerified) {
+    return;
+  }
+  // A session can start deep but never migrates to an unrelated root: a later
+  // event whose cwd is an ANCESTOR of the bound cwd rebinds upward.
+  if (cwd && isAncestorPath(cwd, slot.cwd)) rebindProjectRoot(slot, cwd);
 }
 
 // First real prompt text of a `user` transcript record, or null. Skips meta
@@ -517,9 +612,23 @@ function createExternalSession({ source, cwd, hookSessionId, transcriptPath }) {
   evictExternalSessionIfAtCap();
 
   const agent = source === "codex" ? "codex" : "claude";
-  const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
-  const folderName = path.basename(resolvedCwd) || resolvedCwd;
+  let resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const sessionId = crypto.randomUUID();
+
+  // Bind to the transcript-verified project root, not the (possibly deep)
+  // observed cwd. Legacy no-session_id slots are exempt: they are routed by
+  // exact cwd match, which rebinding would break.
+  let projectRootVerified = false;
+  let projectRootAttempt;
+  if (hookSessionId && transcriptPath) {
+    projectRootAttempt = `${resolvedCwd}\n${transcriptPath}`;
+    const root = findVerifiedProjectRoot(resolvedCwd, transcriptPath);
+    if (root) {
+      resolvedCwd = root;
+      projectRootVerified = true;
+    }
+  }
+  const folderName = path.basename(resolvedCwd) || resolvedCwd;
 
   const slot = {
     id: sessionId,
@@ -530,6 +639,8 @@ function createExternalSession({ source, cwd, hookSessionId, transcriptPath }) {
     state: "running",
     createdAt: Date.now(),
     hookCreated: true,
+    projectRootVerified,
+    projectRootAttempt,
   };
   if (hookSessionId) bindHookSession(slot, hookSessionId);
   if (transcriptPath) {
@@ -571,6 +682,10 @@ export function resolveHookSession(body) {
         // Remember (never read) the transcript path on the hot path; the
         // stat+read happens only at the opportunistic refresh points.
         if (transcriptPath) bound.transcriptPath = transcriptPath;
+        // Attribution upkeep (issue #51): a later event may verify the
+        // project root against the transcript, or reveal an ancestor cwd —
+        // cheap string compares only, the ancestor walk is cached per slot.
+        updateProjectAttribution(bound, cwd, transcriptPath);
         return bound.id;
       }
       hookSessionIndex.delete(hookSessionId); // slot was pruned
