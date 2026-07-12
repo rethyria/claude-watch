@@ -46,6 +46,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material.TimeText
 import androidx.wear.compose.material.TimeTextDefaults
@@ -57,7 +58,8 @@ import kotlin.math.roundToInt
 data class HaloActions(
     val onPair: (host: String, port: String, code: String) -> Unit = { _, _, _ -> },
     val onUnpair: () -> Unit = {},
-    val onSendCommand: (String) -> Unit = {},
+    /** Send [text] to [toSession] (null = the VM's default session). */
+    val onSendCommand: (text: String, toSession: String?) -> Unit = { _, _ -> },
     val onCommandDraftChange: (String) -> Unit = {},
     /**
      * Start dictation targeting [sessionId] — the session whose screen asked,
@@ -66,6 +68,13 @@ data class HaloActions(
      * keeps the default (no specific session on screen).
      */
     val onDictate: (sessionId: String?) -> Unit = {},
+    /**
+     * Dictate a question ANSWER: the transcription lands in [onResult] (the
+     * question card's answer buffer) instead of being sent as a command —
+     * the agent is blocked on AskUserQuestion, so only answerQuestions can
+     * resume it.
+     */
+    val onDictateAnswer: (onResult: (String) -> Unit) -> Unit = {},
     val onAnswerPermission: (permissionId: String, behavior: String) -> Unit = { _, _ -> },
     val onAnswerQuestions: (permissionId: String, answers: List<String>) -> Unit = { _, _ -> },
     val onDismissPermission: (permissionId: String) -> Unit = {},
@@ -101,6 +110,31 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
     // (queue chaining) or the overlay close.
     var cardHold by remember { mutableStateOf<BridgeViewModel.PendingPermission?>(null) }
 
+    // §7 voice overlay. The listening phase is the system recognizer activity
+    // (it covers the screen; see HaloVoiceScreen's header), so the overlay's
+    // lifecycle keys off the SEND: armed when a Halo surface launches
+    // dictation, opened when its send goes in flight, held open on failure
+    // (Retry/Discard), closed on the ack — the echo is then in the feed.
+    // Question-card dictation never arms it: those transcriptions are answer
+    // buffer entries, not sends.
+    var voiceArmed by remember { mutableStateOf(false) }
+    var voiceOpen by remember { mutableStateOf(false) }
+    // Retry must re-target the session of the ORIGINAL dictation, captured at
+    // launch: the VM's fallback (most recently working session) can differ.
+    var voiceTarget by remember { mutableStateOf<String?>(null) }
+    val dictate: (String?) -> Unit = { sessionId ->
+        voiceTarget = sessionId
+        voiceArmed = true
+        actions.onDictate(sessionId)
+    }
+    // Idempotent snapshot writes (same discipline as cardHold below).
+    if (voiceArmed && !voiceOpen && ui.commandInFlightText != null) voiceOpen = true
+    if (voiceOpen && ui.commandInFlightText == null && ui.commandError == null) {
+        // Acked: the echo is in the feed; nothing left to show.
+        voiceOpen = false
+        voiceArmed = false
+    }
+
     // The model can shrink under the navigation (session killed, project's
     // last session gone, queue resolved elsewhere): back out to something
     // that still exists rather than rendering a ghost.
@@ -123,7 +157,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Halo.Palette.Background)) {
+    Box(modifier = Modifier.fillMaxSize().background(Halo.Palette.Background).testTag("haloRoot")) {
         AnimatedContent(
             targetState = layerOf(nav),
             transitionSpec = { depthTransition() },
@@ -153,6 +187,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         scope = layer.scope,
                         onOpenSession = { nav = nav.drillToSession(it) },
                         onKill = actions.onKill,
+                        onSpawn = actions.onSpawn,
                         // The list's scrollable eats every vertical drag, so
                         // InnerScreen's back detector can't fire under it; the
                         // list re-triggers back itself via nested scroll.
@@ -175,7 +210,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                             nav = nav.openCard(pending?.permissionId)
                         },
                         // Dictation from a feed goes to THAT session.
-                        onDictate = { actions.onDictate(layer.sessionId) },
+                        onDictate = { dictate(layer.sessionId) },
                         onCycle = { nav = nav.copy(sessionId = it) },
                     )
                 }
@@ -247,7 +282,8 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                             total += dragAmount
                             change.consume()
                         }
-                    },
+                    }
+                    .testTag("haloCard"),
             ) {
                 AnimatedContent(
                     targetState = display,
@@ -270,9 +306,9 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                             ui = ui,
                             onAnswers = actions.onAnswerQuestions,
                             onDismiss = actions.onDismissPermission,
-                            // A dictated answer belongs to the card's session
-                            // (null for an orphan prompt: default target).
-                            onDictate = { actions.onDictate(card.sessionId) },
+                            // A dictated ANSWER goes to the card's buffer,
+                            // never out as a command (the agent is blocked).
+                            onDictate = actions.onDictateAnswer,
                             onDone = { finishCard(card) },
                         )
                     } else {
@@ -286,6 +322,49 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         )
                     }
                 }
+            }
+        }
+
+        // §7 voice overlay, above the card (a feed's Dictate and the card
+        // both summon it) and below the offline takeover. Modal like the
+        // card; swipe-down is Cancel/keep — the text survives in the draft
+        // either way (the VM's never-silently-lost contract).
+        if (voiceOpen) {
+            val closeVoice = {
+                voiceOpen = false
+                voiceArmed = false
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Halo.Palette.Background)
+                    .pointerInput(Unit) {
+                        val threshold = size.height * SWIPE_THRESHOLD_FRACTION
+                        var total = 0f
+                        detectVerticalDragGestures(
+                            onDragStart = { total = 0f },
+                            onDragEnd = { if (total > threshold) closeVoice() },
+                        ) { change, dragAmount ->
+                            total += dragAmount
+                            change.consume()
+                        }
+                    },
+            ) {
+                HaloVoiceScreen(
+                    ui = ui,
+                    targetSessionTitle = voiceTarget?.let { id ->
+                        model.sessions.firstOrNull { it.id == id }?.title
+                    },
+                    onRetry = { actions.onSendCommand(currentUi.commandDraft, voiceTarget) },
+                    onDiscard = {
+                        actions.onCommandDraftChange("")
+                        closeVoice()
+                    },
+                    // No VM abort exists for an in-flight send: Cancel stops
+                    // WATCHING it. An eventual failure restores the text to
+                    // the draft; an ack echoes into the feed as usual.
+                    onCancel = closeVoice,
+                )
             }
         }
 
@@ -510,7 +589,8 @@ private fun InnerScreen(
                 .align(Alignment.TopCenter)
                 .width(96.dp)
                 .height(36.dp)
-                .clickable(onClick = onHome),
+                .clickable(onClick = onHome)
+                .testTag("haloHome"),
         )
     }
 }

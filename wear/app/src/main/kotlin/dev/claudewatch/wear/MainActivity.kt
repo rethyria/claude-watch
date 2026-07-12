@@ -59,14 +59,39 @@ fun WatchApp(
     // recently WORKING session, which is the wrong target when the user
     // dictates from another session's feed.
     val dictationTarget = remember { mutableStateOf<String?>(null) }
+    // Non-null while a QUESTION-ANSWER dictation is out: the transcription
+    // belongs to the question card's answer buffer, not the command path —
+    // the agent is blocked on AskUserQuestion and only answerQuestions can
+    // resume it. One recognizer launch is out at a time (it is a full-screen
+    // activity), so a single slot cannot be crossed.
+    val dictationSink = remember { mutableStateOf<((String) -> Unit)?>(null) }
     val speech = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        val sink = dictationSink.value
+        dictationSink.value = null
         val spoken = result.data
             ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
             ?.firstOrNull()
         if (result.resultCode == Activity.RESULT_OK && !spoken.isNullOrBlank()) {
-            viewModel.dictationResult(spoken, dictationTarget.value)
+            if (sink != null) sink(spoken) else viewModel.dictationResult(spoken, dictationTarget.value)
+        }
+    }
+    fun launchRecognizer(prompt: String) {
+        try {
+            speech.launch(
+                Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                    .putExtra(
+                        RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                        RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+                    )
+                    .putExtra(RecognizerIntent.EXTRA_PROMPT, prompt),
+            )
+        } catch (_: ActivityNotFoundException) {
+            // No recognizer on this image (common on emulators):
+            // refuse cleanly instead of crashing or pretending.
+            dictationSink.value = null
+            viewModel.dictationUnavailable()
         }
     }
     HaloApp(
@@ -77,21 +102,13 @@ fun WatchApp(
             onSendCommand = viewModel::sendCommand,
             onCommandDraftChange = viewModel::updateCommandDraft,
             onDictate = { sessionId ->
+                dictationSink.value = null
                 dictationTarget.value = sessionId
-                try {
-                    speech.launch(
-                        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                            .putExtra(
-                                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
-                            )
-                            .putExtra(RecognizerIntent.EXTRA_PROMPT, "Command for the agent"),
-                    )
-                } catch (_: ActivityNotFoundException) {
-                    // No recognizer on this image (common on emulators):
-                    // refuse cleanly instead of crashing or pretending.
-                    viewModel.dictationUnavailable()
-                }
+                launchRecognizer("Command for the agent")
+            },
+            onDictateAnswer = { onResult ->
+                dictationSink.value = onResult
+                launchRecognizer("Answer the agent's question")
             },
             onAnswerPermission = viewModel::answerPermission,
             onAnswerQuestions = viewModel::answerQuestions,

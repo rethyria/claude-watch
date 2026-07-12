@@ -68,14 +68,15 @@ import dev.claudewatch.wear.ui.LOCAL_DISMISS_AFTER_FAILURES
 import kotlinx.coroutines.delay
 
 /**
- * Taps landing right after the card appears are ignored: the card can slide
+ * Taps landing right after a card appears are ignored: the card can slide
  * in under a finger that was mid-gesture (queue chaining, feed banner tap)
- * and a swallowed tap here is an unintended permission DECISION.
+ * and a swallowed tap here is an unintended permission DECISION. Shared with
+ * the question card, whose option taps are answers of the same stakes.
  */
-private const val ARM_DELAY_MS = 400L
+internal const val ARM_DELAY_MS = 400L
 
-/** How long the ✓/✕ result flash stays before chaining/exiting (handoff §5). */
-private const val FLASH_MS = 1_400L
+/** How long the ✓/✕ result flash stays before chaining/exiting (handoff §5/§6). */
+internal const val FLASH_MS = 1_400L
 
 /** Deny label color from the handoff (`#B9B7AF`) — not a shared Halo token. */
 private val DenyText = Color(0xFFB9B7AF)
@@ -321,6 +322,7 @@ private fun DecisionLayer(
                 color = Halo.Palette.TextSecondary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.testTag("haloTool"),
             )
         }
         Spacer(Modifier.height(8.dp))

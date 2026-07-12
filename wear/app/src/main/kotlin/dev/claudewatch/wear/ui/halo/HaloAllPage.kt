@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.wear.compose.material.Text
 
@@ -18,7 +19,7 @@ fun HaloAllPage(
 ) {
     Box(modifier = modifier.fillMaxSize()) {
         HaloRing(states = model.sessions.map { it.state }, drained = drained)
-        HaloCenterpiece(onTap = onTapCenter) {
+        HaloCenterpiece(onTap = onTapCenter, modifier = Modifier.testTag("haloCenter")) {
             Text(
                 text = when {
                     model.sessionCount == 0 -> "no sessions"

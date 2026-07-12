@@ -54,6 +54,7 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Velocity
@@ -87,6 +88,7 @@ fun HaloSessionList(
     scope: ListScope,
     onOpenSession: (String) -> Unit,
     onKill: (String) -> Unit,
+    onSpawn: (agent: String) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -224,6 +226,33 @@ fun HaloSessionList(
                 }
             }
         }
+
+        // The one session-creating surface (spawnSession has no home in the
+        // handoff's screens): scoped to the All list so project pages stay
+        // pure mirrors of what the bridge reports.
+        if (scope == ListScope.All) {
+            item(key = "spawn") { SpawnRow(onSpawn = { onSpawn("claude") }) }
+        }
+    }
+}
+
+/** Trailing "new session" row; deliberately quieter than the session pills. */
+@Composable
+private fun SpawnRow(onSpawn: () -> Unit) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .defaultMinSize(minHeight = Halo.Geo.TouchMin)
+            .clickable(onClick = onSpawn)
+            .testTag("haloSpawn"),
+    ) {
+        Text(
+            text = "+ new claude session",
+            fontSize = Halo.Type.Caption,
+            color = Halo.Palette.TextFaint,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
@@ -287,6 +316,7 @@ private fun SessionRow(
 
     Box(
         modifier = background
+            .testTag("haloRow-${session.id}")
             .clickable(onClick = onTap)
             // keyed on the id: a recycled slot must not keep a stale detector
             // accumulating a previous row's drag total.
@@ -377,7 +407,7 @@ private fun ActionStrip(onKill: () -> Unit) {
             label = "close",
             tint = Halo.Palette.Error,
             onClick = onKill,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(1f).testTag("haloRowClose"),
         )
     }
 }

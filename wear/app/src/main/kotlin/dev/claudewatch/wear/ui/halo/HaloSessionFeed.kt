@@ -39,6 +39,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -117,7 +118,8 @@ fun HaloSessionFeed(
                     total += dragAmount
                     change.consume()
                 }
-            },
+            }
+            .testTag("haloFeed-${session.id}"),
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             FeedHeader(
@@ -284,7 +286,11 @@ private fun FeedTail(
             .padding(vertical = 4.dp),
     ) {
         if (thinking) {
-            item(key = "thinking") { FeedLine(TerminalLine("…", TerminalLineType.SYSTEM)) }
+            item(key = "thinking") {
+                Box(modifier = Modifier.testTag("haloThinking")) {
+                    FeedLine(TerminalLine("…", TerminalLineType.SYSTEM))
+                }
+            }
         }
         // Newest-first to match reverseLayout's index order; keys count from
         // the base so a line keeps its key as older lines fall off the ring.
@@ -413,7 +419,8 @@ private fun WaitingBanner(state: SessionState, onOpenCard: () -> Unit) {
                     1f to Halo.Palette.WaitingForYou.copy(alpha = 0.30f),
                 ),
             )
-            .clickable(onClick = onOpenCard),
+            .clickable(onClick = onOpenCard)
+            .testTag("haloWaitingBanner"),
     ) {
         Text(
             text = label,
@@ -434,7 +441,8 @@ private fun DictatePill(onDictate: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .height(Halo.Geo.TouchMin)
-            .clickable(onClick = onDictate),
+            .clickable(onClick = onDictate)
+            .testTag("haloDictate"),
     ) {
         // The visual pill is smaller than the 48dp-tall full-width tap area.
         Box(
