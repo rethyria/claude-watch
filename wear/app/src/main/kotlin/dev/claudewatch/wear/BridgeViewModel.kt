@@ -74,6 +74,22 @@ class BridgeViewModel : ViewModel() {
          * would wedge the whole app behind an unanswerable sheet forever.
          */
         val decisionFailureCount: Int = 0,
+        /**
+         * The command box's text, owned HERE (not by the composable) because
+         * the ack-gated send owns its lifecycle: cleared when a send goes in
+         * flight, RESTORED when the send fails so the exact text can be
+         * retried — never silently lost (the watchOS trap: dictated text
+         * swallowed by any transport error/401/404/500 while the UI claimed
+         * it was sent).
+         */
+        val commandDraft: String = "",
+        /**
+         * Text of the send currently awaiting the bridge's ack. Rendered as a
+         * pending indicator; the terminal echo happens only on the 2xx ack.
+         */
+        val commandInFlightText: String? = null,
+        /** Why the last send failed/was refused; the text is back in [commandDraft]. */
+        val commandError: String? = null,
         val commandResult: String? = null,
         val decisionResult: String? = null,
         /** Last spawn/kill outcome, e.g. "spawn:200" / "kill:200". */
@@ -84,6 +100,15 @@ class BridgeViewModel : ViewModel() {
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state
+
+    /**
+     * The haptic grammar spoken on command outcomes. Defaults to the no-op so
+     * plain-JVM unit tests can construct the ViewModel; [MainActivity] swaps
+     * in [VibratorHaptics], tests may swap in a recorder. Volatile: outcomes
+     * fire from the IO dispatcher.
+     */
+    @Volatile
+    var haptics: Haptics = Haptics.None
 
     private var client: BridgeClient? = null
     private var token: String? = null
@@ -131,30 +156,125 @@ class BridgeViewModel : ViewModel() {
         }
     }
 
+    /** Mirror the command box into [UiState.commandDraft] (see its doc for why the VM owns it). */
+    fun updateCommandDraft(text: String) {
+        _state.update { it.copy(commandDraft = text) }
+    }
+
+    /**
+     * A recognizer result (RecognizerIntent.ACTION_RECOGNIZE_SPEECH) landed:
+     * put the transcription in the draft — so a refused/failed send leaves it
+     * visible and retryable instead of vanishing — and send it through the
+     * exact same ack-gated path as typed text.
+     */
+    fun dictationResult(text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        _state.update { it.copy(commandDraft = trimmed) }
+        sendCommand(trimmed)
+    }
+
+    /** The watch has no speech recognizer activity: surface it, send nothing. */
+    fun dictationUnavailable() {
+        haptics.commandFailed()
+        _state.update { it.copy(commandError = "No speech recognizer on this watch — type the command") }
+    }
+
+    /**
+     * Ack-gated command send (issue #20). The confirmed watchOS trap was the
+     * inverse: echo "> command" + thinking cursor BEFORE the network call and
+     * swallow every failure — the transcription silently lost while the UI
+     * claimed it was sent. Here:
+     *  - the text leaves the draft and shows as PENDING
+     *    ([UiState.commandInFlightText]) until the bridge answers;
+     *  - the terminal echo + thinking cursor happen only on a 2xx ack (in the
+     *    same atomic state update that clears the pending marker), with the
+     *    ack tick of the haptic grammar;
+     *  - any failure (transport, timeout, non-2xx) echoes NOTHING, surfaces
+     *    the error, buzzes, and RESTORES the text into the draft so retry
+     *    re-sends the same text — unless newer text claimed the draft while
+     *    the send was pending, in which case the newer text wins and the
+     *    failed text rides the error message (see [sendFailed]);
+     *  - unpaired / no session / send-already-in-flight refuse cleanly up
+     *    front: error surfaced, text kept in the draft, no POST, no echo —
+     *    never pretending to send.
+     */
     fun sendCommand(text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
         val currentClient = client
         val currentToken = token
         val sessionId = _state.value.sessionId
+        fun refuse(result: String, error: String) {
+            haptics.commandFailed()
+            _state.update { it.copy(commandResult = result, commandError = error, commandDraft = trimmed) }
+        }
         if (currentClient == null || currentToken == null) {
-            _state.update { it.copy(commandResult = "command:not-paired") }
+            refuse("command:not-paired", "Not paired — command not sent")
             return
         }
         if (sessionId == null) {
-            _state.update { it.copy(commandResult = "command:no-session") }
+            refuse("command:no-session", "No session — command not sent")
             return
         }
-        // Echo the command into the session's terminal and raise its thinking
-        // cursor BEFORE the network round-trip (synchronously, so the send is
-        // visible immediately); the cursor clears when the session's next
-        // output event reduces in.
-        _state.update { it.withBridge(it.bridge.echoCommand(sessionId, text)) }
+        if (_state.value.commandInFlightText != null) {
+            // One send at a time: a second command while the first awaits its
+            // ack is refused into the draft (kept, never silently dropped).
+            refuse("command:busy", "Still sending the previous command")
+            return
+        }
+        // Pending, NOT echoed: the terminal shows nothing until the bridge
+        // acks. The draft empties so the pending indicator owns the text.
+        _state.update { it.copy(commandInFlightText = trimmed, commandError = null, commandDraft = "") }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val result = currentClient.sendCommand(currentToken, sessionId, text)
-                _state.update { it.copy(commandResult = "command:${result.status}") }
+                val result = currentClient.sendCommand(currentToken, sessionId, trimmed)
+                if (result.ok) {
+                    haptics.commandAcked()
+                    _state.update { ui ->
+                        // Echo and pending-clear are one atomic update: there
+                        // is no observable state where the command is echoed
+                        // but still pending, or acked but not echoed.
+                        val echoed = ui.withBridge(ui.bridge.echoCommand(sessionId, trimmed))
+                        echoed.copy(
+                            commandResult = "command:${result.status}",
+                            commandInFlightText = null,
+                        )
+                    }
+                } else {
+                    sendFailed(trimmed, "command:${result.status}", "HTTP ${result.status}")
+                }
             } catch (e: Exception) {
-                _state.update { it.copy(commandResult = "command:error ${e.message}") }
+                // Transport error or timeout: same contract as a non-2xx.
+                sendFailed(trimmed, "command:error ${e.message}", "${e.message}")
             }
+        }
+    }
+
+    /**
+     * A send that went in flight failed (non-2xx, transport error, timeout):
+     * echo nothing, surface the error, buzz, and put the text back where a
+     * retry finds it. The restore is CONDITIONAL: it only refills the draft
+     * this send emptied. Text typed or dictated during the pending window
+     * owns the draft — overwriting it with the old in-flight text would
+     * silently destroy the newer text, the exact loss class issue #20 exists
+     * to prevent. When the draft is occupied, the failed text stays visible
+     * inside the surfaced error instead, so it is still never silently lost.
+     */
+    private fun sendFailed(trimmed: String, result: String, reason: String) {
+        haptics.commandFailed()
+        _state.update {
+            val draftFree = it.commandDraft.isEmpty()
+            it.copy(
+                commandResult = result,
+                commandInFlightText = null,
+                commandError = if (draftFree) {
+                    "Send failed: $reason"
+                } else {
+                    "Send failed: $reason — not sent: “$trimmed”"
+                },
+                commandDraft = if (draftFree) trimmed else it.commandDraft,
+            )
         }
     }
 

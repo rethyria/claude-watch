@@ -3,6 +3,7 @@ package dev.claudewatch.wear
 import dev.claudewatch.shared.terminal.TerminalLineType
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -749,20 +750,33 @@ class BridgeViewModelTest {
         awaitState { it.sessionActionResult == "kill:200" }
     }
 
+    /** Records the haptic grammar so JVM tests can assert ack vs failure verbs. */
+    private class RecordingHaptics : Haptics {
+        val events = java.util.concurrent.CopyOnWriteArrayList<String>()
+        override fun commandAcked() { events += "acked" }
+        override fun commandFailed() { events += "failed" }
+    }
+
     /**
-     * The thinking cursor: sending a command echoes `> text` into the target
-     * session's terminal and raises `thinking` immediately (before the POST
-     * resolves); the session's next SSE output clears it and lands after the
-     * echo.
+     * Issue #20 acceptance: a stubbed recognizer result (fixed transcription
+     * fed to [BridgeViewModel.dictationResult] — real voice cannot run
+     * headlessly) is POSTed to /v1/command and echoed into the terminal ONLY
+     * after the bridge's 2xx ack. While the ack is held back the command is
+     * PENDING: no `> text` echo, no thinking cursor — the inverse of the
+     * watchOS trap that echoed before the network call. The ack also speaks
+     * the haptic grammar's tick, and the session's next SSE output still
+     * clears the raised cursor.
      */
     @Test
-    fun commandSendRaisesTheThinkingCursorAndTheNextOutputClearsIt() {
+    fun dictatedCommandIsPostedAndEchoedOnlyAfterTheBridgeAcks() {
+        val haptics = RecordingHaptics()
+        viewModel.haptics = haptics
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
         )
         // The session announcement arrives promptly; the pty-output sits
         // behind a large throttled pad so it lands seconds AFTER the command
-        // below is sent (generous margin: the host may be under load).
+        // below is acked (generous margin: the host may be under load).
         val sseBody = buildString {
             append(":connected\n\n")
             append("id: 1\nevent: session\n")
@@ -783,17 +797,48 @@ class BridgeViewModelTest {
 
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
 
-        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
-        viewModel.sendCommand("say hello")
+        // Hold the ack back so the pending (pre-ack) state is observable.
+        server.enqueue(
+            MockResponse()
+                .setHeadersDelay(2_500, TimeUnit.MILLISECONDS)
+                .setBody("""{"ok":true}"""),
+        )
+        viewModel.dictationResult("say hello")
 
-        // The echo is synchronous: cursor up and `> command` in the terminal
-        // before any response (let alone output) has arrived.
-        val echoed = viewModel.state.value.bridge.sessions.getValue("s-1")
-        assertTrue("thinking cursor must raise on send", echoed.thinking)
+        // Pending is set synchronously; echo/pending-clear is one atomic
+        // update, so THIS snapshot proves the no-echo-before-ack invariant
+        // without any timing sensitivity.
+        val pending = awaitState { it.commandInFlightText == "say hello" }
+        val preAck = pending.bridge.sessions.getValue("s-1")
+        assertFalse("no thinking cursor before the ack", preAck.thinking)
+        assertTrue(
+            "no echo before the ack: ${preAck.terminal.items.map { it.text }}",
+            preAck.terminal.items.none { it.text == "> say hello" },
+        )
+        assertEquals("the draft moved into the pending marker", "", pending.commandDraft)
+        assertTrue("no haptic verb before the outcome", haptics.events.isEmpty())
+
+        // The POST carried the recognized text, session-scoped.
+        val commandRequest = server.takeRequest(15, TimeUnit.SECONDS)
+            ?: throw AssertionError("no /v1/command request")
+        assertEquals("/v1/command", commandRequest.path)
+        val commandBody = JSONObject(commandRequest.body.readUtf8())
+        assertEquals("say hello", commandBody.getString("command"))
+        assertEquals("s-1", commandBody.getString("sessionId"))
+
+        // Only the 2xx ack echoes: `> text` + thinking cursor + ack tick.
+        val acked = awaitState(timeoutMs = 60_000) { it.commandResult == "command:200" }
+        assertEquals(null, acked.commandInFlightText)
+        assertEquals(null, acked.commandError)
+        val echoed = acked.bridge.sessions.getValue("s-1")
+        assertTrue("thinking cursor raises on ack", echoed.thinking)
         val echoLine = echoed.terminal.items.last()
         assertEquals("> say hello", echoLine.text)
         assertEquals(TerminalLineType.COMMAND, echoLine.type)
+        assertEquals(listOf("acked"), haptics.events.toList())
 
         // The delayed pty-output clears the cursor and lands after the echo.
         val cleared = awaitState(timeoutMs = 60_000) {
@@ -804,5 +849,244 @@ class BridgeViewModelTest {
             listOf("> say hello", "hello from the agent"),
             terminal.takeLast(2).map { it.text },
         )
+    }
+
+    /**
+     * Issue #20 acceptance: an injected 5xx echoes NOTHING (the watchOS trap
+     * claimed "sent" and lost the text), surfaces the error with the failure
+     * buzz, and restores the exact text into the draft — so retrying re-sends
+     * the same text, which then echoes on its 2xx ack. (The transport-error/
+     * timeout half of the criterion is pinned separately by
+     * [timedOutSendClearsPendingRestoresTheDraftAndRetryResendsTheSameText].)
+     */
+    @Test
+    fun failedSendEchoesNothingSurfacesTheErrorAndRetryResendsTheSameText() {
+        val haptics = RecordingHaptics()
+        viewModel.haptics = haptics
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append("""data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj","sessionId":"s-1"}""")
+            append("\n\n")
+            // Keep the stream open so reconnects can't steal the queued
+            // command responses below.
+            append(":pad\n\n".repeat(80))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        // Injected failure: the bridge answers the command POST with 500.
+        server.enqueue(MockResponse().setResponseCode(500).setBody("""{"error":"boom"}"""))
+        viewModel.dictationResult("deploy it")
+
+        val failed = awaitState { it.commandResult == "command:500" }
+        assertEquals("Send failed: HTTP 500", failed.commandError)
+        assertEquals("the failed text is restored for retry", "deploy it", failed.commandDraft)
+        assertEquals(null, failed.commandInFlightText)
+        val afterFail = failed.bridge.sessions.getValue("s-1")
+        assertFalse("no thinking cursor on failure", afterFail.thinking)
+        assertTrue(
+            "a failed send must never echo: ${afterFail.terminal.items.map { it.text }}",
+            afterFail.terminal.items.none { it.text == "> deploy it" },
+        )
+        assertEquals(listOf("failed"), haptics.events.toList())
+        server.takeRequest(10, TimeUnit.SECONDS) // the failed /v1/command
+
+        // Retry re-sends the SAME text (straight from the restored draft).
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.sendCommand(failed.commandDraft)
+        val retryRequest = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no retry /v1/command request")
+        val retryBody = JSONObject(retryRequest.body.readUtf8())
+        assertEquals("deploy it", retryBody.getString("command"))
+        assertEquals("s-1", retryBody.getString("sessionId"))
+
+        val acked = awaitState { it.commandResult == "command:200" }
+        assertEquals("the surfaced error clears once the retry acks", null, acked.commandError)
+        assertEquals("the draft clears once the text is really sent", "", acked.commandDraft)
+        assertEquals("> deploy it", acked.bridge.sessions.getValue("s-1").terminal.items.last().text)
+        assertEquals(listOf("failed", "acked"), haptics.events.toList())
+    }
+
+    /**
+     * Issue #20 acceptance, timeout/transport half (sendCommand's catch
+     * branch): the bridge accepts the command POST but never answers — the
+     * client's 20s read timeout fires, so no HTTP status ever arrives. Same
+     * contract as the injected 5xx: echo NOTHING, clear the pending marker
+     * (a stuck marker would wedge every later send behind command:busy
+     * forever — the exact watchOS trap for the timeout case), surface the
+     * error with the failure buzz, and restore the exact text into the draft
+     * — from which a retry re-sends the same text.
+     */
+    @Test
+    fun timedOutSendClearsPendingRestoresTheDraftAndRetryResendsTheSameText() {
+        val haptics = RecordingHaptics()
+        viewModel.haptics = haptics
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append("""data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj","sessionId":"s-1"}""")
+            append("\n\n")
+            // The stream must outlive the 20s read timeout below, or its
+            // reconnect steals the queued retry ack: ~42KB at 256B/250ms
+            // keeps it open for well over a minute.
+            append(":pad\n\n".repeat(6_000))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        // The bridge goes silent: the POST is read but never answered, so
+        // the failure is a client-side read timeout, not a status code.
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        viewModel.dictationResult("say hello")
+
+        // Pending while waiting on the never-coming answer, and no echo.
+        val pending = awaitState { it.commandInFlightText == "say hello" }
+        assertEquals("the draft moved into the pending marker", "", pending.commandDraft)
+
+        // The 20s read timeout fires (generous margin: host under load).
+        val failed = awaitState(timeoutMs = 90_000) { it.commandError != null }
+        assertTrue(
+            "the timeout must surface as a failure: ${failed.commandError}",
+            failed.commandError!!.startsWith("Send failed:"),
+        )
+        assertEquals(
+            "a stuck pending marker would wedge all later sends behind command:busy",
+            null,
+            failed.commandInFlightText,
+        )
+        assertEquals("the failed text is restored for retry", "say hello", failed.commandDraft)
+        val afterFail = failed.bridge.sessions.getValue("s-1")
+        assertFalse("no thinking cursor on a timeout", afterFail.thinking)
+        assertTrue(
+            "a timed-out send must never echo: ${afterFail.terminal.items.map { it.text }}",
+            afterFail.terminal.items.none { it.text == "> say hello" },
+        )
+        assertEquals(listOf("failed"), haptics.events.toList())
+        server.takeRequest(10, TimeUnit.SECONDS) // the timed-out /v1/command
+
+        // Retry straight from the restored draft: the SAME text goes out,
+        // and only its 2xx ack echoes it.
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.sendCommand(failed.commandDraft)
+        val retryRequest = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no retry /v1/command request")
+        assertEquals("/v1/command", retryRequest.path)
+        val retryBody = JSONObject(retryRequest.body.readUtf8())
+        assertEquals("say hello", retryBody.getString("command"))
+        assertEquals("s-1", retryBody.getString("sessionId"))
+        val acked = awaitState(timeoutMs = 60_000) { it.commandResult == "command:200" }
+        assertEquals("the surfaced error clears once the retry acks", null, acked.commandError)
+        assertEquals("> say hello", acked.bridge.sessions.getValue("s-1").terminal.items.last().text)
+        assertEquals(listOf("failed", "acked"), haptics.events.toList())
+    }
+
+    /**
+     * Regression: text typed (or dictated into the draft via the
+     * command:busy refusal) while a send is pending must survive that send's
+     * failure. The failure branches used to restore the OLD in-flight text
+     * unconditionally, silently destroying whatever entered the draft during
+     * the pending window — the exact loss class issue #20 exists to prevent.
+     * The restore only fills a draft the send itself emptied; the failed
+     * text stays visible inside the surfaced error.
+     */
+    @Test
+    fun textEnteredWhileASendIsPendingSurvivesThatSendsFailure() {
+        val haptics = RecordingHaptics()
+        viewModel.haptics = haptics
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append("""data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj","sessionId":"s-1"}""")
+            append("\n\n")
+            append(":pad\n\n".repeat(80))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.sessionId == "s-1" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        // Hold the failure back so there is a pending window to type into.
+        server.enqueue(
+            MockResponse()
+                .setHeadersDelay(2_500, TimeUnit.MILLISECONDS)
+                .setResponseCode(500)
+                .setBody("""{"error":"boom"}"""),
+        )
+        viewModel.dictationResult("first command")
+        awaitState { it.commandInFlightText == "first command" }
+
+        // The user types new text while the first send is still pending.
+        viewModel.updateCommandDraft("second command")
+
+        val failed = awaitState(timeoutMs = 60_000) { it.commandResult == "command:500" }
+        assertEquals(
+            "text entered during the pending window must not be clobbered",
+            "second command",
+            failed.commandDraft,
+        )
+        assertTrue(
+            "the failed text must stay visible, not silently lost: ${failed.commandError}",
+            failed.commandError!!.startsWith("Send failed: HTTP 500") &&
+                failed.commandError!!.contains("first command"),
+        )
+        assertEquals(null, failed.commandInFlightText)
+        assertEquals(listOf("failed"), haptics.events.toList())
+    }
+
+    /**
+     * Issue #20 acceptance: unpaired, the input path refuses cleanly — no
+     * POST is attempted, nothing echoes, nothing pends, the error + failure
+     * buzz surface, and the transcription lands in the draft instead of being
+     * lost.
+     */
+    @Test
+    fun unpairedDictationRefusesCleanlyInsteadOfPretendingToSend() {
+        val haptics = RecordingHaptics()
+        viewModel.haptics = haptics
+
+        // Never paired: the dictated text must not produce any request.
+        viewModel.dictationResult("rm -rf everything")
+
+        val refused = awaitState { it.commandResult == "command:not-paired" }
+        assertEquals("Not paired — command not sent", refused.commandError)
+        assertEquals(null, refused.commandInFlightText)
+        assertEquals("the transcription is kept, not lost", "rm -rf everything", refused.commandDraft)
+        assertEquals(listOf("failed"), haptics.events.toList())
+        assertEquals("no request may leave the device", 0, server.requestCount)
     }
 }

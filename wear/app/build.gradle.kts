@@ -66,4 +66,7 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.okhttp)
+    // On-device fake bridge for the dictation flow test (stubbed recognizer
+    // result → real POST → ack-gated echo) — no real bridge needed.
+    androidTestImplementation(libs.okhttp.mockwebserver)
 }

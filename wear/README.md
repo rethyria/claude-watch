@@ -61,6 +61,18 @@ sessions, and answer blocking permission hooks.
   the /v1 object form the bridge maps back to the blocked hook as
   `updatedInput.answers`. A failed send restores the card with the picks
   intact for retry.
+- **Dictated/typed commands with ack-gated echo (issue #20):** voice input
+  rides `RecognizerIntent.ACTION_RECOGNIZE_SPEECH` (never a raw
+  `SpeechRecognizer` on Wear) and feeds the exact same send path as typed
+  text. The confirmed watchOS trap — echoing `> command` + a thinking cursor
+  BEFORE the network call and swallowing every failure, silently losing the
+  transcription — is inverted: the command shows as **pending** until the
+  bridge acks, the terminal echo + thinking cursor happen only on a 2xx, and
+  any failure (transport, timeout, non-2xx) echoes nothing, surfaces an error
+  and **restores the text into the input** so retry re-sends the same text.
+  Unpaired/no-session input refuses cleanly instead of pretending to send.
+  Outcomes speak a haptic grammar via `VibrationEffect` (`Haptics.kt`): one
+  crisp tick on ack, a double buzz on failure/refusal.
 - **Stack:** Kotlin, Compose for Wear OS, OkHttp + okhttp-sse (readTimeout 0,
   `Last-Event-ID` reconnect replay).
 - **Standalone:** `com.google.android.wearable.standalone=true` — no phone
@@ -145,3 +157,9 @@ card's `permissionId`, swipe-immunity in all four directions, error surfacing
 without dropping the prompt, the behavior-keyed allow-always button, and the
 AskUserQuestion card (all questions rendered, send gated on completeness,
 free-text and multi-select answers, approval-card dismissal/restore parity).
+`DictationFlowTest` (instrumented, on-device MockWebServer bridge) covers the
+dictation flow with the recognizer activity result stubbed to a fixed
+transcription (real voice cannot run headlessly; the real-voice smoke test is
+in the hardware QA checklist): stubbed result → command POSTed → echo only
+after the 2xx ack, injected 5xx → no echo + error + text restored for a retry
+that re-sends the same text, and unpaired input refusing cleanly.
