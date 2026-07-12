@@ -91,7 +91,15 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
     // Gesture lambdas live inside pointerInput(Unit) blocks that never
     // restart; these keep them reading the current state, not a stale capture.
     val currentModel by rememberUpdatedState(model)
+    val currentUi by rememberUpdatedState(ui)
     var lastSwipeAtMs by remember { mutableLongStateOf(0L) }
+
+    // §5/§6 result flash: an answered prompt leaves ui.permissionQueue at ACK
+    // time, but its card must stay composed while the 1.4s ✓/✕ flash plays.
+    // Once the shown prompt vanishes from the queue it is held here until the
+    // card composable reports done — only then does the next front slide in
+    // (queue chaining) or the overlay close.
+    var cardHold by remember { mutableStateOf<BridgeViewModel.PendingPermission?>(null) }
 
     // The model can shrink under the navigation (session killed, project's
     // last session gone, queue resolved elsewhere): back out to something
@@ -99,7 +107,9 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
     LaunchedEffect(model, nav) {
         val scope = nav.listScope
         nav = when {
-            nav.cardOpen && ui.permissionQueue.isEmpty() -> nav.jumpHome() // spec: empty queue returns home
+            // Empty queue returns home (spec) — but not while a resolved
+            // card's result flash is still playing; its onDone navigates.
+            nav.cardOpen && ui.permissionQueue.isEmpty() && cardHold == null -> nav.jumpHome()
             // The pinned prompt was resolved (chaining moved to the queue
             // front): drop the stale id so nav reflects what is rendered.
             nav.cardPermissionId != null &&
@@ -182,7 +192,41 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
         val front = nav.cardPermissionId
             ?.let { id -> ui.permissionQueue.firstOrNull { it.permissionId == id } }
             ?: ui.permissionQueue.firstOrNull()
-        if (nav.cardOpen && front != null && !ui.isOffline()) {
+        // Hold update (idempotent snapshot writes): `front` is taken only when
+        // nothing is held — once a prompt is shown it stays PINNED until the
+        // card reports done. The queue is newest-first, so following the live
+        // front would let every new arrival slide in over the card mid-read
+        // (and a steady prompt stream would starve the shown one forever).
+        // While the held prompt is still queued it is refreshed BY ID so late
+        // metadata (a session label arriving) still lands; once it leaves the
+        // queue it freezes for the result flash. Closing the overlay
+        // (swipe-down, decide later) drops any hold.
+        if (!nav.cardOpen) {
+            if (cardHold != null) cardHold = null
+        } else {
+            val held = cardHold
+            if (held == null) {
+                cardHold = front
+            } else {
+                val live = ui.permissionQueue.firstOrNull { it.permissionId == held.permissionId }
+                if (live != null && live != held) cardHold = live
+            }
+        }
+        val display = if (nav.cardOpen) cardHold else null
+        // The card composable reports done: after its result flash (resolved
+        // prompt) or on "decide later" (prompt still queued). Resolving the
+        // last prompt goes home (spec); chaining otherwise happens through
+        // recomposition — releasing the hold lets the next front slide in.
+        val finishCard: (BridgeViewModel.PendingPermission) -> Unit = { finished ->
+            cardHold = null
+            val queue = currentUi.permissionQueue
+            nav = when {
+                queue.any { it.permissionId == finished.permissionId } -> nav.back()
+                queue.isEmpty() -> nav.jumpHome()
+                else -> nav.copy(cardPermissionId = null)
+            }
+        }
+        if (nav.cardOpen && display != null && !ui.isOffline()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -206,7 +250,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                     },
             ) {
                 AnimatedContent(
-                    targetState = front,
+                    targetState = display,
                     transitionSpec = {
                         (slideInHorizontally(tween(TRANSITION_MS, easing = HaloEasing)) { (it * SLIDE_FRACTION).roundToInt() } +
                             fadeIn(tween(TRANSITION_MS, easing = HaloEasing)))
@@ -229,7 +273,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                             // A dictated answer belongs to the card's session
                             // (null for an orphan prompt: default target).
                             onDictate = { actions.onDictate(card.sessionId) },
-                            onDone = { nav = nav.back() },
+                            onDone = { finishCard(card) },
                         )
                     } else {
                         HaloApprovalCard(
@@ -238,7 +282,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                             ui = ui,
                             onAnswer = actions.onAnswerPermission,
                             onDismiss = actions.onDismissPermission,
-                            onDone = { nav = nav.back() },
+                            onDone = { finishCard(card) },
                         )
                     }
                 }
