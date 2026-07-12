@@ -5,12 +5,15 @@ import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToIndex
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
@@ -88,13 +91,45 @@ class WalkingSkeletonTest {
 
     private fun waitForText(tag: String, substring: String, timeoutMs: Long = 30_000) {
         compose.waitUntil(timeoutMs) {
-            compose.onAllNodes(hasTestTag(tag) and hasText(substring, substring = true))
-                .fetchSemanticsNodes().isNotEmpty()
+            // Unmerged tree: some tagged Texts (e.g. haloCensus) sit inside a
+            // clickable that mergeDescendants, which absorbs their testTag out
+            // of the merged tree — they are only findable unmerged.
+            compose.onAllNodes(
+                hasTestTag(tag) and hasText(substring, substring = true),
+                useUnmergedTree = true,
+            ).fetchSemanticsNodes().isNotEmpty()
         }
+    }
+
+    /**
+     * Gate on the app leaving the offline screen for the online home — Halo's
+     * observable "stream open" signal. The status line only exists on the
+     * offline/pairing screen (the home pager underneath it has none) and that
+     * screen is torn down the instant the stream connects, so `status` can
+     * never read "paired, stream open"; its DISAPPEARANCE is the signal that
+     * the app paired and reached the connecting/connected home. The pager is
+     * the always-composed base layer, so it can't be used directly (it reads
+     * as displayed under the offline overlay). The bridge replays its buffered
+     * backlog and a running-session snapshot on connect (transport-sse.js), so
+     * a hook fired in the pair→connect window is still delivered.
+     */
+    private fun waitForOnlineHome(timeoutMs: Long = 30_000) {
+        compose.waitUntil(timeoutMs) { !tagExists("status") }
     }
 
     private fun tagExists(tag: String): Boolean =
         compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().isNotEmpty()
+
+    /**
+     * Bring a lazy session-list item (a row, or the trailing spawn row) into
+     * view. The list is a ScalingLazyColumn, which only composes items near
+     * the viewport, so an offscreen item is not a node yet — performScrollTo
+     * (needs an existing node) can't reach it; performScrollToNode on the
+     * scrollable scrolls until it composes.
+     */
+    private fun scrollListTo(tag: String) {
+        compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag(tag))
+    }
 
     // Placement-gated existence: HorizontalPager PREFETCHES neighbor pages,
     // composing them unplaced (semantics bounds anchored at origin), so a bare
@@ -108,11 +143,34 @@ class WalkingSkeletonTest {
             node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith(prefix) == true
         }
 
-    /** The session ids of every listed row (list screen only). */
+    /** The session ids of the rows CURRENTLY composed (the lazy viewport). */
     private fun rowIds(): Set<String> =
         compose.onAllNodes(hasTestTagPrefix("haloRow-")).fetchSemanticsNodes()
             .mapNotNull { it.config.getOrNull(SemanticsProperties.TestTag)?.removePrefix("haloRow-") }
             .toSet()
+
+    /**
+     * Every session id in the list, not just the composed viewport. The list
+     * is a ScalingLazyColumn — [rowIds] only sees the rows near the viewport,
+     * so diffing two viewport reads at different scroll offsets is meaningless
+     * (a scroll alone changes the set). Page top→bottom by item index, ending
+     * once the trailing spawn row composes, unioning the rows revealed.
+     */
+    private fun allRowIds(): Set<String> {
+        val list = compose.onNode(hasScrollAction())
+        val ids = rowIds().toMutableSet()
+        var i = 1
+        while (i <= 60 && !tagExists("haloSpawn")) {
+            val scrolled = runCatching {
+                list.performScrollToIndex(i)
+                compose.waitForIdle()
+            }.isSuccess
+            if (!scrolled) break
+            ids += rowIds()
+            i++
+        }
+        return ids
+    }
 
     /** Swipe up from home into the all-sessions list. */
     private fun drillToList() {
@@ -155,24 +213,39 @@ class WalkingSkeletonTest {
     @Test
     fun pairStreamApproveQuestionSpawnKill() {
         // --- Pair via manual IP:port + code entry -------------------------
+        // The credential store outlives reinstalls, so a previous run can
+        // leave the app PAIRED (to a long-gone bridge): the offline screen
+        // then folds the form behind the "re-pair watch" chip. Open it —
+        // re-pairing goes through the exact same manual-entry path.
+        compose.waitForIdle()
+        if (tagExists("repairButton")) {
+            compose.onNodeWithTag("repairButton").performScrollTo().performClick()
+            compose.waitForIdle()
+        }
         fill("host", bridgeHost)
         fill("port", bridgePort.toString())
         fill("code", pairingCode)
         compose.onNodeWithTag("pairButton").performScrollTo().performClick()
-        // Gate on the SSE stream being open, not on pair success: a hook fired
-        // in the pair-to-stream-open window would race the connect.
-        waitForText("status", "paired, stream open")
+        // Gate on the app reaching the online home (the stream is open, or
+        // connecting with backlog replay to follow), not on a status string:
+        // Halo tears the status line down the moment it leaves the offline
+        // screen, so it never reads "paired, stream open".
+        waitForOnlineHome()
 
         // --- An SSE event arrives and renders in the session's feed -------
         // The tool-output hook auto-creates a bridge session; its "session"
-        // event puts a row on the list and a segment on the home ring.
+        // event puts a row on the list and a segment on the home ring. The
+        // marker rides the Bash COMMAND: the feed renders a Bash tool-output
+        // as its `$ <command>` line, whereas Read/Edit/Write render only the
+        // filename and drop the tool_output (ToolOutputFormatter, watchOS
+        // parity), so a marker in tool_output would never surface.
         val marker = "wear-e2e-marker-${System.currentTimeMillis()}"
         postHook(
             "/hooks/tool-output",
             JSONObject()
-                .put("tool_name", "Read")
+                .put("tool_name", "Bash")
                 .put("cwd", "/tmp/wear-e2e-project")
-                .put("tool_output", marker),
+                .put("tool_input", JSONObject().put("command", marker)),
         ).use { assertEquals(200, it.code) }
         waitForText("haloCensus", "1 session")
         drillToList()
@@ -359,15 +432,32 @@ class WalkingSkeletonTest {
         // The real bridge PTY-spawns the stubbed `claude` binary (see
         // .github/scripts/wear-e2e.sh); its ready line arrives as pty-output.
         drillToList()
-        val before = rowIds()
-        compose.onNodeWithTag("haloSpawn").performScrollTo().performClick()
-        compose.waitUntil(30_000) { (rowIds() - before).isNotEmpty() }
-        val spawnedId = (rowIds() - before).single()
+        // Enumerate the WHOLE list, not the viewport: the spawn adds one
+        // session and we must tell its row from every pre-existing one, even
+        // those the lazy list hasn't composed yet.
+        val before = allRowIds()
+        scrollListTo("haloSpawn")
+        compose.onNodeWithTag("haloSpawn").performClick()
+        val deadline = System.currentTimeMillis() + 30_000
+        var found: String? = null
+        while (System.currentTimeMillis() < deadline && found == null) {
+            val fresh = allRowIds() - before
+            when {
+                fresh.size == 1 -> found = fresh.single()
+                fresh.size > 1 -> throw AssertionError("spawn added more than one row: $fresh")
+                else -> {
+                    compose.waitForIdle()
+                    Thread.sleep(200)
+                }
+            }
+        }
+        val spawnedId = found ?: throw AssertionError("spawned session row never appeared")
 
         // The spawned PTY's stub output reaches THIS session's feed. Scope
         // the match to the feed subtree so text from another (prefetched or
         // composed) surface can't satisfy it.
-        compose.onNodeWithTag("haloRow-$spawnedId").performScrollTo().performClick()
+        scrollListTo("haloRow-$spawnedId")
+        compose.onNodeWithTag("haloRow-$spawnedId").performClick()
         compose.waitUntil(60_000) {
             compose.onAllNodes(
                 hasText("stub-claude", substring = true) and
@@ -380,8 +470,8 @@ class WalkingSkeletonTest {
         // pushes `session ended killed:true`, which prunes the row.
         compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeDown() }
         compose.waitForIdle()
-        compose.onNodeWithTag("haloRow-$spawnedId").performScrollTo()
-            .performTouchInput { swipeLeft() }
+        scrollListTo("haloRow-$spawnedId")
+        compose.onNodeWithTag("haloRow-$spawnedId").performTouchInput { swipeLeft() }
         compose.waitForIdle()
         compose.onNode(
             hasTestTag("haloRowClose") and hasAnyAncestor(hasTestTag("haloRow-$spawnedId")),

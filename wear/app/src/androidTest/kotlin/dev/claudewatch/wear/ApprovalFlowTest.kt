@@ -20,6 +20,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.claudewatch.shared.protocol.AskUserQuestion
 import dev.claudewatch.shared.protocol.AskUserQuestionOption
 import dev.claudewatch.shared.protocol.PermissionOption
+import dev.claudewatch.shared.state.BridgeState
+import dev.claudewatch.shared.state.SessionState
 import dev.claudewatch.wear.ui.LOCAL_DISMISS_AFTER_FAILURES
 import dev.claudewatch.wear.ui.halo.HaloActions
 import dev.claudewatch.wear.ui.halo.HaloApp
@@ -70,6 +72,32 @@ class ApprovalFlowTest {
         options = defaultOptions,
     )
 
+    /**
+     * The prompts' sessions as the bridge reports them: resolveHookSession
+     * gives every relayed permission hook a session, which OUTLIVES the
+     * prompt's resolution. Without these, each prompt's session would be a
+     * queue-derived synthetic that vanishes the moment its prompt is
+     * answered — and HaloApp's model-shrink back-out would close the card
+     * over the vanished session instead of chaining, which is not the
+     * production shape these tests pin.
+     */
+    private val fixtureSessions = BridgeState(
+        sessions = mapOf(
+            "s-1" to SessionState(
+                sessionId = "s-1",
+                agent = "claude",
+                cwd = "/home/dev/alpha",
+                folderName = "alpha",
+            ),
+            "s-2" to SessionState(
+                sessionId = "s-2",
+                agent = "claude",
+                cwd = "/home/dev/beta",
+                folderName = "beta",
+            ),
+        ),
+    )
+
     private fun ui(
         queue: List<BridgeViewModel.PendingPermission>,
         inFlightId: String? = null,
@@ -78,6 +106,7 @@ class ApprovalFlowTest {
     ) = BridgeViewModel.UiState(
         status = "paired, stream open",
         paired = true,
+        bridge = fixtureSessions,
         permissionQueue = queue,
         decisionInFlightId = inFlightId,
         decisionError = error,
