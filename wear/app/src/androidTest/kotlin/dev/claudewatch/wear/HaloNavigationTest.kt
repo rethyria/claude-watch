@@ -4,13 +4,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.swipeUp
@@ -93,8 +94,19 @@ class HaloNavigationTest {
         compose.waitForIdle()
     }
 
+    /**
+     * Bring a session's list row into view. The list is a ScalingLazyColumn,
+     * which only composes rows near the viewport, so an offscreen row does not
+     * exist as a node yet — performScrollTo (needs an existing node) can't
+     * reach it; performScrollToNode on the scrollable scrolls until it composes.
+     */
+    private fun scrollToRow(sessionId: String) {
+        compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag("haloRow-$sessionId"))
+    }
+
     private fun openFeed(sessionId: String) {
-        compose.onNodeWithTag("haloRow-$sessionId").performScrollTo().performClick()
+        scrollToRow(sessionId)
+        compose.onNodeWithTag("haloRow-$sessionId").performClick()
         compose.waitForIdle()
     }
 
@@ -105,13 +117,17 @@ class HaloNavigationTest {
         compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
 
         // Home: the glance census counts both sessions across both projects.
-        compose.onNodeWithTag("haloCensus").assertIsDisplayed()
+        // The census lives inside the clickable centerpiece (its whole area is
+        // the tap-to-open target, so it mergeDescendants); its testTag is only
+        // visible in the unmerged tree.
+        compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithText("2 projects · 2 sessions").assertIsDisplayed()
 
-        // Swipe up: the all-sessions list, one row per session.
+        // Swipe up: the all-sessions list. Alpha sits below the title on entry,
+        // so open its feed first — from there its row is comfortably in view,
+        // clear of the top "jump home" strip that overlays the list's top edge.
         drillToList()
         compose.onNodeWithTag("haloRow-$alpha").assertIsDisplayed()
-        compose.onNodeWithTag("haloRow-$beta").performScrollTo().assertIsDisplayed()
 
         // Alpha's feed — human-readable, ANSI-stripped lines, no
         // cross-contamination from beta.
@@ -124,9 +140,12 @@ class HaloNavigationTest {
             compose.onAllNodes(hasText("npm test", substring = true)).fetchSemanticsNodes().size,
         )
 
-        // Swipe down steps back to the list; beta's feed renders ITS lines.
+        // Swipe down steps back to the list; beta is reachable by scrolling the
+        // list down (its own row, below alpha's), and its feed renders ITS lines.
         compose.onNodeWithTag("haloFeed-$alpha").performTouchInput { swipeDown() }
         compose.waitForIdle()
+        scrollToRow(beta)
+        compose.onNodeWithTag("haloRow-$beta").assertIsDisplayed()
         openFeed(beta)
         compose.onNodeWithTag("haloFeed-$beta").assertIsDisplayed()
         compose.onNode(hasText("npm test", substring = true)).assertIsDisplayed()
@@ -184,6 +203,7 @@ class HaloNavigationTest {
         // survives — no ghost screens over a pruned session.
         assertEquals(0, compose.onAllNodes(hasTestTag("haloFeed-$alpha")).fetchSemanticsNodes().size)
         assertEquals(0, compose.onAllNodes(hasTestTag("haloRow-$alpha")).fetchSemanticsNodes().size)
-        compose.onNodeWithTag("haloRow-$beta").performScrollTo().assertIsDisplayed()
+        scrollToRow(beta)
+        compose.onNodeWithTag("haloRow-$beta").assertIsDisplayed()
     }
 }

@@ -17,6 +17,8 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -33,6 +35,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -338,52 +341,62 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                     }
                     .testTag("haloCard"),
             ) {
-                AnimatedContent(
-                    targetState = display,
-                    transitionSpec = {
-                        (slideInHorizontally(tween(TRANSITION_MS, easing = HaloEasing)) { (it * SLIDE_FRACTION).roundToInt() } +
-                            fadeIn(tween(TRANSITION_MS, easing = HaloEasing)))
-                            .togetherWith(fadeOut(tween(TRANSITION_MS / 2)))
-                    },
-                    // Key on the id so metadata refreshes (e.g. a session
-                    // label arriving late) update in place; carrying the
-                    // VALUE keeps the exiting layer rendering the resolved
-                    // card, which is already gone from the queue.
-                    contentKey = { it.permissionId },
-                    label = "haloCard",
-                ) { card ->
-                    if (card.questions.isNotEmpty()) {
-                        // The prompt's hoisted answer buffer (created on first
-                        // open, reused on reopen). Rebuilt if the question
-                        // count ever changes under a by-id metadata refresh.
-                        val draft = answerDrafts.getOrPut(card.permissionId) {
-                            mutableStateListOf<String?>().apply { repeat(card.questions.size) { add(null) } }
+                // No stretch-overscroll under the card: on API 31+ the
+                // platform stretch effect consumes every drag delta past the
+                // scroll bound AND the fling velocity, so the leftovers never
+                // reach the cards' overscroll-exit NestedScrollConnections and
+                // swipe-down ("decide later" / "answer later") is unreachable
+                // by touch. The card is a modal surface, not a stretchy list —
+                // disabling the effect restores the §5/§6 pull-down exit.
+                @OptIn(ExperimentalFoundationApi::class)
+                CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
+                    AnimatedContent(
+                        targetState = display,
+                        transitionSpec = {
+                            (slideInHorizontally(tween(TRANSITION_MS, easing = HaloEasing)) { (it * SLIDE_FRACTION).roundToInt() } +
+                                fadeIn(tween(TRANSITION_MS, easing = HaloEasing)))
+                                .togetherWith(fadeOut(tween(TRANSITION_MS / 2)))
+                        },
+                        // Key on the id so metadata refreshes (e.g. a session
+                        // label arriving late) update in place; carrying the
+                        // VALUE keeps the exiting layer rendering the resolved
+                        // card, which is already gone from the queue.
+                        contentKey = { it.permissionId },
+                        label = "haloCard",
+                    ) { card ->
+                        if (card.questions.isNotEmpty()) {
+                            // The prompt's hoisted answer buffer (created on first
+                            // open, reused on reopen). Rebuilt if the question
+                            // count ever changes under a by-id metadata refresh.
+                            val draft = answerDrafts.getOrPut(card.permissionId) {
+                                mutableStateListOf<String?>().apply { repeat(card.questions.size) { add(null) } }
+                            }
+                            if (draft.size != card.questions.size) {
+                                draft.clear()
+                                repeat(card.questions.size) { draft.add(null) }
+                            }
+                            HaloQuestionCard(
+                                card = card,
+                                model = model,
+                                ui = ui,
+                                answers = draft,
+                                onAnswers = actions.onAnswerQuestions,
+                                onDismiss = actions.onDismissPermission,
+                                // A dictated ANSWER goes to the card's buffer,
+                                // never out as a command (the agent is blocked).
+                                onDictate = actions.onDictateAnswer,
+                                onDone = { finishCard(card) },
+                            )
+                        } else {
+                            HaloApprovalCard(
+                                card = card,
+                                model = model,
+                                ui = ui,
+                                onAnswer = actions.onAnswerPermission,
+                                onDismiss = actions.onDismissPermission,
+                                onDone = { finishCard(card) },
+                            )
                         }
-                        if (draft.size != card.questions.size) {
-                            draft.clear()
-                            repeat(card.questions.size) { draft.add(null) }
-                        }
-                        HaloQuestionCard(
-                            card = card,
-                            model = model,
-                            ui = ui,
-                            answers = draft,
-                            onAnswers = actions.onAnswerQuestions,
-                            onDismiss = actions.onDismissPermission,
-                            // A dictated ANSWER goes to the card's buffer,
-                            // never out as a command (the agent is blocked).
-                            onDictate = actions.onDictateAnswer,
-                            onDone = { finishCard(card) },
-                        )
-                    } else {
-                        HaloApprovalCard(
-                            card = card,
-                            model = model,
-                            ui = ui,
-                            onAnswer = actions.onAnswerPermission,
-                            onDismiss = actions.onDismissPermission,
-                            onDone = { finishCard(card) },
-                        )
                     }
                 }
             }
