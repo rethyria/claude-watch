@@ -238,10 +238,11 @@ class WalkingSkeletonTest {
             // --- AskUserQuestion: every question answered, incl. free text --
             // A multi-question payload renders ALL questions on the question
             // card (the legacy client answered only the first), one gets an
-            // option pick and the other a typed free-text answer, and the
-            // blocked hook unblocks with BOTH answers keyed by question text
-            // (updatedInput.answers — see collectAskUserQuestionAnswers in
-            // skill/bridge/hooks.js).
+            // option pick and the other a typed free-text answer. The client
+            // POSTs the answers as a positional array in question order; the
+            // bridge zips it with the questions and the blocked hook unblocks
+            // with BOTH answers keyed by question text (updatedInput.answers
+            // — see collectAskUserQuestionAnswers in skill/bridge/hooks.js).
             val questions = org.json.JSONArray()
                 .put(
                     JSONObject()

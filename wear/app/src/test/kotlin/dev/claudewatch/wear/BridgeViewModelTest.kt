@@ -584,11 +584,13 @@ class BridgeViewModelTest {
      * Issue #18 acceptance: a multi-question AskUserQuestion payload surfaces
      * EVERY question typed on the queued card (no top-level options — the
      * question card, not the behavior buttons), and answerQuestions POSTs the
-     * bridge's preferred /v1 decision shape — `decision.answers` keyed by
-     * question text with an entry per question, free-text values verbatim —
-     * which the bridge forwards to the blocked hook (`updatedInput.answers`;
-     * see skill/bridge/test/permission-semantics.test.js). Ack-gated exactly
-     * like a behavior answer: only the 2xx dismisses the card.
+     * bridge's /v1 array decision shape — `decision.answers` as a positional
+     * array aligned with the payload's question order, free-text values
+     * verbatim — which the bridge zips with the questions into the blocked
+     * hook's `updatedInput.answers` (collectAskUserQuestionAnswers in
+     * hooks.js). Positional rather than text-keyed so questions sharing the
+     * same text still each carry their own answer on the wire. Ack-gated
+     * exactly like a behavior answer: only the 2xx dismisses the card.
      */
     @Test
     fun askUserQuestionAnswersEveryQuestionInOnePost() {
@@ -627,10 +629,7 @@ class BridgeViewModelTest {
         server.enqueue(MockResponse().setBody("""{"ok":true}"""))
         viewModel.answerQuestions(
             "perm-ask",
-            mapOf(
-                "Which color scheme?" to "Blue",
-                "Tabs or spaces?" to "two-space soft tabs",
-            ),
+            listOf("Blue", "two-space soft tabs"),
         )
         val request = server.takeRequest(10, TimeUnit.SECONDS)
             ?: throw AssertionError("no decision request")
@@ -639,13 +638,13 @@ class BridgeViewModelTest {
         assertEquals("perm-ask", body.getString("permissionId"))
         val decision = body.getJSONObject("decision")
         assertEquals("allow", decision.getString("behavior"))
-        val answers = decision.getJSONObject("answers")
+        val answers = decision.getJSONArray("answers")
         assertEquals("every question gets its answer", 2, answers.length())
-        assertEquals("Blue", answers.getString("Which color scheme?"))
+        assertEquals("answers align with the question order", "Blue", answers.getString(0))
         assertEquals(
             "free-text answers travel verbatim",
             "two-space soft tabs",
-            answers.getString("Tabs or spaces?"),
+            answers.getString(1),
         )
 
         // Only the 2xx ack dismissed the card.
@@ -679,10 +678,7 @@ class BridgeViewModelTest {
         viewModel.pair("127.0.0.1", server.port.toString(), "123456")
         awaitState { it.permissionQueue.any { p -> p.permissionId == "perm-ask-flaky" } }
 
-        val answers = mapOf(
-            "Which color scheme?" to "Green",
-            "Tabs or spaces?" to "Tabs",
-        )
+        val answers = listOf("Green", "Tabs")
         server.enqueue(MockResponse().setResponseCode(500).setBody("""{"error":"boom"}"""))
         viewModel.answerQuestions("perm-ask-flaky", answers)
 

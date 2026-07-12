@@ -267,13 +267,13 @@ class ApprovalFlowTest {
     /**
      * Issue #18 acceptance: a multi-question payload renders EVERY question
      * (the legacy client silently answered only the first), Send stays
-     * disabled until each has an answer, and the sent map carries one answer
-     * per question keyed by question text — the key the bridge uses to route
-     * answers back to the blocked hook.
+     * disabled until each has an answer, and the sent answers are positional
+     * — one per question in the payload's question order, the array form the
+     * bridge zips back onto the blocked hook's questions.
      */
     @Test
     fun multiQuestionCardRendersEveryQuestionAndSendsAllAnswers() {
-        val sent = mutableListOf<Pair<String, Map<String, String>>>()
+        val sent = mutableListOf<Pair<String, List<String>>>()
         compose.setContent {
             SessionPagerScreen(
                 ui = ui(listOf(askPrompt)),
@@ -292,23 +292,18 @@ class ApprovalFlowTest {
         compose.onNodeWithTag("questionText-1").performScrollTo()
         compose.onNodeWithText("Tabs or spaces?").assertIsDisplayed()
 
-        // Half-answered: Send must not fire — a partial map would silently
-        // drop the unanswered question's hook answer.
+        // Half-answered: Send must not fire — a partial answer set would
+        // silently drop the unanswered question's hook answer.
         compose.onNodeWithTag("questionOption-0-Blue").performScrollTo().performClick()
         compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
         assertEquals("send must be gated until every question is answered", 0, sent.size)
 
-        // Fully answered: one POST payload with BOTH answers, keyed to the
-        // rendered card's permissionId.
+        // Fully answered: one POST payload with BOTH answers in question
+        // order, keyed to the rendered card's permissionId.
         compose.onNodeWithTag("questionOption-1-Spaces").performScrollTo().performClick()
         compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
         assertEquals(
-            listOf(
-                "perm-ask" to mapOf(
-                    "Which color scheme?" to "Blue",
-                    "Tabs or spaces?" to "Spaces",
-                ),
-            ),
+            listOf("perm-ask" to listOf("Blue", "Spaces")),
             sent,
         )
     }
@@ -316,7 +311,7 @@ class ApprovalFlowTest {
     /** Issue #18 acceptance: the free-text path answers a question with typed text. */
     @Test
     fun freeTextAnswerIsSentForItsQuestion() {
-        val sent = mutableListOf<Pair<String, Map<String, String>>>()
+        val sent = mutableListOf<Pair<String, List<String>>>()
         compose.setContent {
             SessionPagerScreen(
                 ui = ui(listOf(askPrompt)),
@@ -331,12 +326,7 @@ class ApprovalFlowTest {
         compose.onNodeWithTag("questionFreeText-1").performScrollTo().performTextInput("two-space soft tabs")
         compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
         assertEquals(
-            listOf(
-                "perm-ask" to mapOf(
-                    "Which color scheme?" to "Green",
-                    "Tabs or spaces?" to "two-space soft tabs",
-                ),
-            ),
+            listOf("perm-ask" to listOf("Green", "two-space soft tabs")),
             sent,
         )
     }
@@ -344,7 +334,7 @@ class ApprovalFlowTest {
     /** A multiSelect question toggles options and joins the picks in option order. */
     @Test
     fun multiSelectQuestionJoinsToggledOptionsInOptionOrder() {
-        val sent = mutableListOf<Pair<String, Map<String, String>>>()
+        val sent = mutableListOf<Pair<String, List<String>>>()
         val multi = askPrompt.copy(
             permissionId = "perm-multi",
             questions = listOf(
@@ -377,7 +367,58 @@ class ApprovalFlowTest {
         compose.onNodeWithTag("questionOption-0-android-lint").performScrollTo().performClick()
         compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
         assertEquals(
-            listOf("perm-multi" to mapOf("Which linters?" to "ktlint, detekt")),
+            listOf("perm-multi" to listOf("ktlint, detekt")),
+            sent,
+        )
+    }
+
+    /**
+     * Regression (review finding): a payload whose questions share the SAME
+     * question text must still be fully answerable. Completeness is gated by
+     * question index — a text-keyed answer map collapses duplicate texts to
+     * one entry, so Send could never enable and the swipe-immune sheet would
+     * deadlock with no escape hatch (the local dismiss only unlocks after
+     * failed POSTs, which can't happen if Send never fires). The positional
+     * answer array carries each duplicate's own answer, aligned by index.
+     */
+    @Test
+    fun duplicateQuestionTextsStillCountSeparatelyAndSendPositionalAnswers() {
+        val sent = mutableListOf<Pair<String, List<String>>>()
+        val duplicated = askPrompt.copy(
+            permissionId = "perm-dup",
+            questions = listOf(
+                AskUserQuestion(
+                    question = "Proceed?",
+                    header = "Step 1",
+                    options = listOf(AskUserQuestionOption("Yes"), AskUserQuestionOption("No")),
+                ),
+                AskUserQuestion(
+                    question = "Proceed?",
+                    header = "Step 2",
+                    options = listOf(AskUserQuestionOption("Yes"), AskUserQuestionOption("No")),
+                ),
+            ),
+        )
+        compose.setContent {
+            SessionPagerScreen(
+                ui = ui(listOf(duplicated)),
+                actions = SessionPagerActions(
+                    onAnswerQuestions = { id, answers -> sent += id to answers },
+                ),
+            )
+        }
+
+        // Answering only the first duplicate must not satisfy the gate.
+        compose.onNodeWithTag("questionOption-0-Yes").performScrollTo().performClick()
+        compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+        assertEquals("one of two duplicate-text questions is not complete", 0, sent.size)
+
+        // Answering the second — with a DIFFERENT pick — enables Send, and
+        // both answers travel positionally instead of collapsing into one.
+        compose.onNodeWithTag("questionOption-1-No").performScrollTo().performClick()
+        compose.onNodeWithTag("questionsSend").performScrollTo().performClick()
+        assertEquals(
+            listOf("perm-dup" to listOf("Yes", "No")),
             sent,
         )
     }
@@ -391,7 +432,7 @@ class ApprovalFlowTest {
      */
     @Test
     fun questionCardMatchesTheApprovalCardsDismissalAndRestoreSemantics() {
-        val sent = mutableListOf<Pair<String, Map<String, String>>>()
+        val sent = mutableListOf<Pair<String, List<String>>>()
         val dismissals = mutableListOf<String>()
         var state by mutableStateOf(ui(listOf(askPrompt)))
         compose.setContent {
@@ -423,7 +464,12 @@ class ApprovalFlowTest {
 
         // Restored: error surfaced, the card still up, and the user's picks
         // intact — the retry sends the SAME answers without re-entering them.
-        compose.onNodeWithTag("permissionError").assertIsDisplayed()
+        // The error renders next to the Send chip (where the user is looking
+        // after tapping Send), but scroll to it anyway: on a 454x454 round
+        // viewport the tall two-question card leaves little slack, and this
+        // assertion is about the error being surfaced and reachable, not
+        // about a specific scroll offset.
+        compose.onNodeWithTag("permissionError").performScrollTo().assertIsDisplayed()
         assertEquals(
             "dismiss must not be offered below the failure threshold",
             0,

@@ -231,15 +231,18 @@ class BridgeViewModel : ViewModel() {
 
     /**
      * Answer the queued AskUserQuestion prompt [permissionId] with an answer
-     * for EVERY question, keyed by question text ([answers]) — a selected
-     * option's label or free typed text; the bridge forwards the map verbatim
-     * to the blocked hook as `updatedInput.answers`. Same ack-gated dismissal
-     * and failure semantics as [answerPermission]: the card leaves the queue
-     * only on 2xx/404 (or dead-token 401/403), a retryable failure keeps it
-     * rendered with the error surfaced and counts toward the local-dismiss
-     * escape hatch.
+     * for EVERY question — [answers] is positional, one entry per question in
+     * the prompt's question order (a selected option's label or free typed
+     * text); the bridge zips the array with the questions into
+     * `updatedInput.answers` for the blocked hook. Positional, not text-keyed:
+     * questions with duplicate text must still each count as answered (a
+     * text-keyed map collapses them and would deadlock the send gate). Same
+     * ack-gated dismissal and failure semantics as [answerPermission]: the
+     * card leaves the queue only on 2xx/404 (or dead-token 401/403), a
+     * retryable failure keeps it rendered with the error surfaced and counts
+     * toward the local-dismiss escape hatch.
      */
-    fun answerQuestions(permissionId: String, answers: Map<String, String>) {
+    fun answerQuestions(permissionId: String, answers: List<String>) {
         if (answers.isEmpty()) return
         sendDecision(permissionId) { currentClient, currentToken ->
             currentClient.answerQuestions(currentToken, permissionId, answers)

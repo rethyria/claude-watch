@@ -29,8 +29,12 @@
 // behavior buttons: EVERY question of the payload (the watchOS card silently
 // answered only the first), each with its per-question option chips and a
 // free-text field, and one Send that goes out only once every question has an
-// answer — the bridge maps the answers map back to the blocked hook keyed by
-// question text.
+// answer — sent as a POSITIONAL array aligned with the payload's question
+// order (the bridge's /v1 array form), because keying by question text would
+// collapse duplicate-text questions into one answer and permanently disable
+// Send. On the question card, the failed-send error surfaces NEXT TO the Send
+// chip the user just tapped, not only at the top of the (scrolled-away)
+// sheet.
 package dev.claudewatch.wear.ui
 
 import androidx.compose.foundation.background
@@ -84,7 +88,7 @@ fun PermissionSheet(
     error: String?,
     failureCount: Int,
     onAnswer: (permissionId: String, behavior: String) -> Unit,
-    onAnswerQuestions: (permissionId: String, answers: Map<String, String>) -> Unit = { _, _ -> },
+    onAnswerQuestions: (permissionId: String, answers: List<String>) -> Unit = { _, _ -> },
     onDismiss: (permissionId: String) -> Unit,
 ) {
     val prompt = queue.firstOrNull() ?: return
@@ -154,23 +158,13 @@ fun PermissionSheet(
             }
             Spacer(Modifier.height(6.dp))
 
-            if (error != null && !inFlight) {
-                Text(
-                    error,
-                    fontSize = 10.sp,
-                    color = WatchTheme.Error,
-                    modifier = Modifier.testTag("permissionError"),
-                )
-                Spacer(Modifier.height(4.dp))
-            }
-            if (inFlight) {
-                Text(
-                    "sending…",
-                    fontSize = 10.sp,
-                    color = WatchTheme.TextSecondary,
-                    modifier = Modifier.testTag("permissionSending"),
-                )
-                Spacer(Modifier.height(4.dp))
+            // On the question card the error/in-flight status renders inside
+            // QuestionCardBody, right above the Send chip — the card is tall
+            // enough to scroll, and a failed send must be visible where the
+            // user is actually looking (the bottom, where they tapped Send),
+            // not at the scrolled-away top of the sheet.
+            if (!isQuestion) {
+                SendStatus(error = error, inFlight = inFlight)
             }
 
             if (isQuestion) {
@@ -181,6 +175,7 @@ fun PermissionSheet(
                 QuestionCardBody(
                     prompt = prompt,
                     inFlight = inFlight,
+                    error = error,
                     onSend = { answers -> onAnswerQuestions(prompt.permissionId, answers) },
                 )
             } else {
@@ -238,23 +233,54 @@ fun PermissionSheet(
 }
 
 /**
+ * The last answer attempt's failure ([error]) and the in-flight marker,
+ * rendered wherever the card's action buttons are so a failed send is visible
+ * next to what the user just tapped.
+ */
+@Composable
+private fun SendStatus(error: String?, inFlight: Boolean) {
+    if (error != null && !inFlight) {
+        Text(
+            error,
+            fontSize = 10.sp,
+            color = WatchTheme.Error,
+            modifier = Modifier.testTag("permissionError"),
+        )
+        Spacer(Modifier.height(4.dp))
+    }
+    if (inFlight) {
+        Text(
+            "sending…",
+            fontSize = 10.sp,
+            color = WatchTheme.TextSecondary,
+            modifier = Modifier.testTag("permissionSending"),
+        )
+        Spacer(Modifier.height(4.dp))
+    }
+}
+
+/**
  * The AskUserQuestion card body: EVERY question of [prompt]'s payload, each
  * with its per-question option chips (single-select replaces, `multiSelect`
  * toggles) and a free-text field, plus one Send that fires only when every
- * question has an answer.
+ * question has an answer. Completeness is gated BY INDEX (each question
+ * position must have an answer), never by distinct question text: a payload
+ * with duplicate question texts must still be fully answerable, or the
+ * swipe-immune sheet would deadlock with Send permanently disabled.
  *
  * Answer state is remembered PER permissionId: a failed POST (the ViewModel
- * keeps the card queued and surfaces the error) restores the card with the
- * user's picks intact for retry, while a different prompt fronting the queue
- * starts clean. Chips and free text are mutually exclusive per question —
- * tapping a chip clears typed text, typing clears the chip selection — so the
- * answer that gets sent is always the one visibly active.
+ * keeps the card queued and surfaces the [error] right above Send) restores
+ * the card with the user's picks intact for retry, while a different prompt
+ * fronting the queue starts clean. Chips and free text are mutually exclusive
+ * per question — tapping a chip clears typed text, typing clears the chip
+ * selection — so the answer that gets sent is always the one visibly active.
  */
 @Composable
 private fun QuestionCardBody(
     prompt: BridgeViewModel.PendingPermission,
     inFlight: Boolean,
-    onSend: (Map<String, String>) -> Unit,
+    error: String?,
+    onSend: (List<String>) -> Unit,
 ) {
     // Selected option labels per question index (label order is restored from
     // the question's option list on send, so multi-select answers are stable
@@ -339,21 +365,26 @@ private fun QuestionCardBody(
             Spacer(Modifier.height(4.dp))
         }
 
-        // One answer per question, keyed by question text (the bridge's
-        // answer key). Send stays disabled until the map is complete: a
-        // partial answer set would silently drop the unanswered questions.
-        val answers = prompt.questions
-            .mapIndexedNotNull { index, question ->
-                answerFor(index, question)?.let { question.question to it }
-            }
-            .toMap()
-        val complete = answers.size == prompt.questions.size
+        // One answer per question POSITION, aligned with the payload's
+        // question order (the bridge's /v1 array form). Gated by index, not
+        // by question text: duplicate question texts are model-generated
+        // content the client cannot rule out, and a text-keyed map would
+        // collapse them so `complete` could never be reached. Send stays
+        // disabled until every position is answered: a partial answer set
+        // would silently drop the unanswered questions.
+        val answersByIndex = prompt.questions.mapIndexed { index, question -> answerFor(index, question) }
+        val answeredCount = answersByIndex.count { it != null }
+        val complete = answeredCount == prompt.questions.size
+        // Failed-send error and in-flight marker live HERE, next to the Send
+        // chip the user just tapped — the top of the sheet may be scrolled
+        // far out of the viewport on a tall multi-question card.
+        SendStatus(error = error, inFlight = inFlight)
         Chip(
-            onClick = { if (!inFlight && complete) onSend(answers) },
+            onClick = { if (!inFlight && complete) onSend(answersByIndex.map { checkNotNull(it) }) },
             enabled = !inFlight && complete,
             label = {
                 Text(
-                    text = if (complete) "Send answers" else "Answer all questions (${answers.size}/${prompt.questions.size})",
+                    text = if (complete) "Send answers" else "Answer all questions ($answeredCount/${prompt.questions.size})",
                     fontSize = 12.sp,
                     color = if (complete) WatchTheme.Success else WatchTheme.TextSecondary,
                 )
