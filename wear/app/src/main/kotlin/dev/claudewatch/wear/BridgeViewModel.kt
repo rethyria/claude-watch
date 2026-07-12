@@ -186,7 +186,9 @@ class BridgeViewModel : ViewModel() {
      *    ack tick of the haptic grammar;
      *  - any failure (transport, timeout, non-2xx) echoes NOTHING, surfaces
      *    the error, buzzes, and RESTORES the text into the draft so retry
-     *    re-sends the same text;
+     *    re-sends the same text — unless newer text claimed the draft while
+     *    the send was pending, in which case the newer text wins and the
+     *    failed text rides the error message (see [sendFailed]);
      *  - unpaired / no session / send-already-in-flight refuse cleanly up
      *    front: error surfaced, text kept in the draft, no POST, no echo —
      *    never pretending to send.
@@ -234,29 +236,39 @@ class BridgeViewModel : ViewModel() {
                         )
                     }
                 } else {
-                    haptics.commandFailed()
-                    _state.update {
-                        it.copy(
-                            commandResult = "command:${result.status}",
-                            commandInFlightText = null,
-                            commandError = "Send failed: HTTP ${result.status}",
-                            // Restore for retry — the text is never lost.
-                            commandDraft = trimmed,
-                        )
-                    }
+                    sendFailed(trimmed, "command:${result.status}", "HTTP ${result.status}")
                 }
             } catch (e: Exception) {
                 // Transport error or timeout: same contract as a non-2xx.
-                haptics.commandFailed()
-                _state.update {
-                    it.copy(
-                        commandResult = "command:error ${e.message}",
-                        commandInFlightText = null,
-                        commandError = "Send failed: ${e.message}",
-                        commandDraft = trimmed,
-                    )
-                }
+                sendFailed(trimmed, "command:error ${e.message}", "${e.message}")
             }
+        }
+    }
+
+    /**
+     * A send that went in flight failed (non-2xx, transport error, timeout):
+     * echo nothing, surface the error, buzz, and put the text back where a
+     * retry finds it. The restore is CONDITIONAL: it only refills the draft
+     * this send emptied. Text typed or dictated during the pending window
+     * owns the draft — overwriting it with the old in-flight text would
+     * silently destroy the newer text, the exact loss class issue #20 exists
+     * to prevent. When the draft is occupied, the failed text stays visible
+     * inside the surfaced error instead, so it is still never silently lost.
+     */
+    private fun sendFailed(trimmed: String, result: String, reason: String) {
+        haptics.commandFailed()
+        _state.update {
+            val draftFree = it.commandDraft.isEmpty()
+            it.copy(
+                commandResult = result,
+                commandInFlightText = null,
+                commandError = if (draftFree) {
+                    "Send failed: $reason"
+                } else {
+                    "Send failed: $reason — not sent: “$trimmed”"
+                },
+                commandDraft = if (draftFree) trimmed else it.commandDraft,
+            )
         }
     }
 
