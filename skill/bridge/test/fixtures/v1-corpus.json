@@ -164,6 +164,7 @@
         "agent": "claude",
         "cwd": "/tmp/fixture-project",
         "folderName": "fixture-project",
+        "external": true,
         "sessionId": "<session-1>"
       }
     }
@@ -641,6 +642,7 @@
         "agent": "claude",
         "folderName": "fixture-project",
         "reason": "session-end",
+        "external": true,
         "sessionId": "<session-1>"
       }
     }
@@ -672,6 +674,7 @@
         "agent": "claude",
         "folderName": "fixture-project",
         "reason": "session-end",
+        "external": true,
         "sessionId": "<session-1>"
       }
     }
