@@ -3,6 +3,7 @@ package dev.claudewatch.wear
 import dev.claudewatch.shared.terminal.TerminalLineType
 import dev.claudewatch.wear.data.AesGcmTokenCipher
 import dev.claudewatch.wear.data.CredentialStore
+import dev.claudewatch.wear.ui.halo.HaloModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -76,7 +77,7 @@ class BridgeViewModelTest {
     }
 
     private fun enqueuePing() {
-        server.enqueue(MockResponse().setBody("""{"proto":"2","bridgeId":"b-1","machineName":"m"}"""))
+        server.enqueue(MockResponse().setBody("""{"proto":"3","bridgeId":"b-1","machineName":"m"}"""))
     }
 
     private fun awaitUi(timeoutMs: Long = 20_000, predicate: (BridgeViewModel.UiState) -> Boolean): BridgeViewModel.UiState {
@@ -1334,5 +1335,193 @@ class BridgeViewModelTest {
         val discarded = viewModel.state.value
         assertEquals("Discard is the deliberate-loss exit for the draft", "", discarded.commandDraft)
         assertEquals("and takes the surfaced error with it", null, discarded.commandError)
+    }
+
+    /**
+     * Issue #48 (restoring #16 across reconnects): a reducer-REJECTED frame is
+     * REPLAYED on reconnect, not skipped. The ViewModel acks only APPLIED
+     * frames back to the engine, so the engine's reconnect cursor never runs
+     * past a rejected frame. A valid frame (id 4) is applied+acked; a malformed
+     * frame (id 5, unknown session state → the reducer rejects it) is NOT — so
+     * the reconnect's Last-Event-ID header carries 4 (replaying 5), never 5.
+     */
+    @Test
+    fun aReducerRejectedFrameIsReplayedOnReconnectWhileTheAppliedOneAdvances() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        // Stream 1: a VALID session frame (id 4, applied+acked) then a MALFORMED
+        // one (id 5, unknown state → reducer Rejected, never acked); then it
+        // ends (finite body, no hold) so the engine reconnects.
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    ":connected\n\n" +
+                        sessionRunningFrame(4, "s-4", "proj") +
+                        "id: 5\nevent: session\ndata: {\"state\":\"bogus\",\"sessionId\":\"s-5\"}\n\n",
+                ),
+        )
+        enqueuePing() // the reconnect's discovery preflight
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(16, 250, TimeUnit.MILLISECONDS)
+                .setBody(":connected\n\n" + ":pad\n\n".repeat(400)),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        // The valid frame applied (and was acked); the malformed one rejected.
+        awaitState { it.bridge.sessions.containsKey("s-4") }
+
+        assertEquals("/v1/ping", server.takeRequest(10, TimeUnit.SECONDS)?.path)
+        assertEquals("/v1/pair", server.takeRequest(10, TimeUnit.SECONDS)?.path)
+        val firstEvents = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no /v1/events request")
+        assertEquals("/v1/events", firstEvents.path)
+        assertEquals("0", firstEvents.getHeader("Last-Event-ID"))
+
+        // Reconnect after stream 1 ended: the applied frame advanced the cursor
+        // to 4, but the rejected frame 5 did NOT — so the header replays from 4.
+        assertEquals("/v1/ping", server.takeRequest(10, TimeUnit.SECONDS)?.path)
+        val reconnect = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no reconnect /v1/events request")
+        assertEquals("/v1/events", reconnect.path)
+        assertEquals(
+            "the rejected frame must be replayed (cursor at the applied id, never the rejected one)",
+            "4",
+            reconnect.getHeader("Last-Event-ID"),
+        )
+        assertFalse(
+            "the malformed frame never entered state",
+            viewModel.state.value.bridge.sessions.containsKey("s-5"),
+        )
+    }
+
+    /**
+     * Issue #53: hiding an EXTERNAL (hook-created) session is LOCAL — it sends
+     * nothing to the bridge and drops out of the derived Halo model while
+     * staying in bridge state — and it reappears the moment the bridge reports
+     * any activity for it again ("until it speaks again").
+     */
+    @Test
+    fun hidingAnExternalSessionIsLocalAndItReappearsWhenItSpeaksAgain() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            // An external (hook-created) session: the bridge tags external:true.
+            append("id: 1\nevent: session\n")
+            append(
+                """data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj",""" +
+                    """"external":true,"sessionId":"s-ext"}""",
+            )
+            append("\n\n")
+            // A later event for the same session, delayed behind padding so it
+            // lands AFTER the hide below: any applied event un-hides it.
+            append(":pad\n\n".repeat(400))
+            append("id: 2\nevent: pty-output\n")
+            append("""data: {"text":"back again\r\n","sessionId":"s-ext"}""")
+            append("\n\n")
+            append(":tail\n\n".repeat(40))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 100, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        val running = awaitState { it.bridge.sessions["s-ext"]?.external == true }
+        assertTrue(
+            "an external session is visible in the derived model before hiding",
+            HaloModel.from(running).sessions.any { it.id == "s-ext" },
+        )
+
+        // Hide it: local only (no request), filtered from the model, but still
+        // present in bridge state (only the derived view filters it out).
+        val requestsBefore = server.requestCount
+        viewModel.hideSession("s-ext")
+        val hidden = awaitState { it.hiddenSessions.contains("s-ext") }
+        Thread.sleep(300)
+        assertEquals("hide sends nothing to the bridge", requestsBefore, server.requestCount)
+        assertTrue("bridge state still knows the session", hidden.bridge.sessions.containsKey("s-ext"))
+        assertFalse(
+            "a hidden external session is filtered out of the derived model",
+            HaloModel.from(hidden).sessions.any { it.id == "s-ext" },
+        )
+
+        // The delayed event 2 lands: any applied event un-hides the session.
+        val reappeared = awaitState(timeoutMs = 60_000) { !it.hiddenSessions.contains("s-ext") }
+        assertTrue(
+            "an applied event un-hides the session (until it speaks again)",
+            HaloModel.from(reappeared).sessions.any { it.id == "s-ext" },
+        )
+    }
+
+    /**
+     * Issue #53 (follow-up to the review): a hidden external session must
+     * SURVIVE a bare `session` metadata resync. The bridge re-announces every
+     * live slot with `session running` on every reconnect (and on revive /
+     * title / project-root rebind); that is not the session "speaking", so it
+     * must not un-hide. Otherwise any routine reconnect would defeat an honest
+     * hide. The resync here changes folderName so it is observably APPLIED —
+     * proving the frame was processed yet did not reveal the session.
+     */
+    @Test
+    fun aHiddenExternalSessionSurvivesABareSessionResync() {
+        enqueuePing()
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append(
+                """data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj",""" +
+                    """"external":true,"sessionId":"s-ext"}""",
+            )
+            append("\n\n")
+            // After the hide, the bridge re-announces the SAME live slot (as it
+            // does on every reconnect). folderName changes so the frame is
+            // observably applied — but it must NOT un-hide the session.
+            append(":pad\n\n".repeat(400))
+            append("id: 2\nevent: session\n")
+            append(
+                """data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj-renamed",""" +
+                    """"external":true,"sessionId":"s-ext"}""",
+            )
+            append("\n\n")
+            append(":tail\n\n".repeat(40))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 100, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.bridge.sessions["s-ext"]?.external == true }
+        viewModel.hideSession("s-ext")
+        awaitState { it.hiddenSessions.contains("s-ext") }
+
+        // Wait for the resync to be APPLIED (folderName updates), then assert it
+        // did NOT un-hide: a bare metadata frame is not the session speaking.
+        val afterResync = awaitState(timeoutMs = 60_000) {
+            it.bridge.sessions["s-ext"]?.folderName == "proj-renamed"
+        }
+        assertTrue(
+            "a bare session resync does not un-hide an honest-hidden session",
+            afterResync.hiddenSessions.contains("s-ext"),
+        )
+        assertFalse(
+            "the hidden session stays filtered out of the derived model after a resync",
+            HaloModel.from(afterResync).sessions.any { it.id == "s-ext" },
+        )
     }
 }

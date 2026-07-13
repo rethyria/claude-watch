@@ -133,6 +133,7 @@
         "agent": "claude",
         "cwd": "/tmp/legacy-project",
         "folderName": "legacy-project",
+        "external": true,
         "sessionId": "<session-1>"
       }
     }

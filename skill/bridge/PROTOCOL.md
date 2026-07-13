@@ -232,6 +232,10 @@ Authenticated snapshot:
   human-readable title, present only once the bridge has derived it from the
   session's Claude Code transcript (see the [`session`](#session) event for
   the derivation order). Clients must tolerate its absence.
+- `sessions[].external` (boolean, **optional, additive**): `true` only for a
+  hook-created (external, PTY-less) session whose process the bridge does not
+  own; **omitted** for bridge-owned PTY slots. Clients must treat its absence
+  as `external: false` (killable). See the [`session`](#session) event.
 - `hasPty` / `activeAgent`: legacy conveniences describing the most recent
   active session; prefer `sessions[]`.
 
@@ -388,6 +392,23 @@ none). The title is refreshed opportunistically (session creation, `Stop`,
 idempotent `running` event. Per the additive-field rules this does not bump
 the protocol version; clients fall back to their own label when it is
 absent.
+
+**`external`** (boolean, **optional, additive**): `true` for a HOOK-CREATED
+(external, PTY-less) session the bridge does not own the process of — it was
+observed via hooks, not spawned into a bridge PTY. Carried uniformly on
+EVERY session event of such a slot (`running`/`ended` and the connect-time
+sync), and OMITTED entirely for bridge-owned PTY slots. Clients must treat
+its absence as `external: false`: a PTY session is killable (`kill` command),
+whereas an external session has no bridge-owned process to stop, so a client
+should offer an honest "hide from view" instead of a kill. Additive: this
+does not bump the protocol version and older clients ignore it.
+
+A `kill` on an external session is therefore best-effort and non-authoritative:
+the bridge marks the slot `ended`, but if the still-alive process emits another
+hook the bridge **revives** it — re-broadcasting the idempotent `running` event
+(and clearing the zombie `ended` state) rather than swallowing the event.
+Only an authoritative end (the `SessionEnd` hook, or a bridge-owned PTY exit)
+is final and never revives.
 
 ### `pty-output`
 Raw terminal output from a bridge-owned PTY (ANSI escapes included) or from a

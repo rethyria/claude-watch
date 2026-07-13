@@ -18,11 +18,16 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 // Multi-session: each entry is a session slot
 // { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId?, hookCreated?,
 //   title?, titleIsAi?, transcriptPath?, titleCache?,
-//   projectRootVerified?, projectRootAttempt? } — title is lazily derived
+//   projectRootVerified?, projectRootAttempt?,
+//   shallowestObservedCwd?, pendingRebindCwd?, pendingRebindCount?,
+//   endedAuthoritatively? } — title is lazily derived
 //   from the Claude Code transcript (see the session-titles section below);
 //   projectRootVerified/projectRootAttempt cache the project-root attribution
-//   (see the project-root-attribution section below).
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string}>} */
+//   (see the project-root-attribution section below);
+//   shallowestObservedCwd/pendingRebind* bound the ancestor-cwd rebind ratchet
+//   (issue #52); endedAuthoritatively marks an ending as final (SessionEnd or a
+//   PTY exit) so a stray hook can never revive it (issue #53).
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -91,9 +96,18 @@ function findVerifiedProjectRoot(cwd, transcriptPath) {
   if (typeof cwd !== "string" || !path.isAbsolute(cwd)) return null;
   const expected = path.basename(path.dirname(transcriptPath));
   if (!expected) return null;
-  let dir = path.resolve(cwd);
+  const observed = path.resolve(cwd);
+  let dir = observed;
   for (;;) {
-    if (sanitizeProjectPath(dir) === expected) return dir;
+    // Accept a candidate only when its sanitized name matches AND the observed
+    // cwd actually lives at or under it (issue #52 vector 1). The walk climbs
+    // ancestors of `observed`, so the descendant relation holds by
+    // construction; enforcing it here means a future refactor of the walk can
+    // never "verify" a directory the cwd is not inside. It matters because the
+    // sanitization is lossy — "/" and "-" both map to "-", so /a/b-c and /a/b/c
+    // collide — and this raw-prefix guard keeps a match from ever binding a
+    // sanitize-colliding sibling the cwd never touched.
+    if (sanitizeProjectPath(dir) === expected && isAtOrUnderPath(observed, dir)) return dir;
     const parent = path.dirname(dir);
     if (parent === dir) return null; // reached the filesystem root: no match
     dir = parent;
@@ -105,6 +119,12 @@ function isAncestorPath(ancestor, descendant) {
   if (!ancestor || !descendant || ancestor === descendant) return false;
   const prefix = ancestor.endsWith(path.sep) ? ancestor : ancestor + path.sep;
   return descendant.startsWith(prefix);
+}
+
+// True when `descendant` is `ancestor` itself or nested beneath it. Path-aware
+// (not a raw string prefix): /a/b is neither /a/bc nor under it.
+function isAtOrUnderPath(descendant, ancestor) {
+  return descendant === ancestor || isAncestorPath(ancestor, descendant);
 }
 
 // Re-label a slot with its (better) project root and tell connected clients
@@ -120,6 +140,48 @@ function rebindProjectRoot(slot, root) {
     sessionEventPayload(slot, { state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName }),
     slot.id,
   );
+}
+
+// Ancestor-cwd rebind ratchet for UNVERIFIED hook-created slots — issue #51's
+// fallback (a later event whose cwd is an ancestor of the bound cwd pulls the
+// root upward toward the real project root), hardened by issue #52 so a single
+// stray shallow hook (a subshell that cd'd to /home, a one-off global command)
+// can never drag the whole session's root all the way up. Two guards:
+//   * shallowest-cwd floor: the root only ever moves to a directory a hook was
+//     actually observed firing from, never an extrapolated shallower one.
+//     slot.shallowestObservedCwd tracks the shallowest cwd ever seen; since the
+//     rebind target is always at or below it, the floor rejects only a
+//     candidate shallower than everything observed — an invariant that keeps
+//     the root anchored to observed ground even if this logic is refactored.
+//   * 2-observation confirmation: the SAME ancestor cwd must be seen twice
+//     before an unverified rebind commits, so one errant event never moves it.
+function maybeRatchetProjectRoot(slot, cwd) {
+  if (!cwd) return;
+  // Track the shallowest cwd ever observed for the session (the floor, seeded
+  // here from the first cwd this slot considers).
+  if (slot.shallowestObservedCwd === undefined || isAncestorPath(cwd, slot.shallowestObservedCwd)) {
+    slot.shallowestObservedCwd = cwd;
+  }
+  if (!isAncestorPath(cwd, slot.cwd)) {
+    // Not an upward candidate — clear any half-formed confirmation so a lone
+    // shallow cwd interleaved with unrelated events can't slowly accumulate.
+    slot.pendingRebindCwd = undefined;
+    slot.pendingRebindCount = 0;
+    return;
+  }
+  // Floor: never rebind above the shallowest cwd ever observed.
+  if (isAncestorPath(cwd, slot.shallowestObservedCwd)) return;
+  // Confirmation: require the same ancestor cwd twice before committing.
+  if (slot.pendingRebindCwd === cwd) {
+    slot.pendingRebindCount = (slot.pendingRebindCount || 0) + 1;
+  } else {
+    slot.pendingRebindCwd = cwd;
+    slot.pendingRebindCount = 1;
+  }
+  if (slot.pendingRebindCount < 2) return;
+  slot.pendingRebindCwd = undefined;
+  slot.pendingRebindCount = 0;
+  rebindProjectRoot(slot, cwd);
 }
 
 // Attribution upkeep for an already-bound slot, run on the hook hot path so
@@ -150,8 +212,9 @@ function updateProjectAttribution(slot, cwd, transcriptPath) {
     return;
   }
   // A session can start deep but never migrates to an unrelated root: a later
-  // event whose cwd is an ANCESTOR of the bound cwd rebinds upward.
-  if (cwd && isAncestorPath(cwd, slot.cwd)) rebindProjectRoot(slot, cwd);
+  // event whose cwd is an ANCESTOR of the bound cwd ratchets the root upward,
+  // bounded by the shallowest-cwd floor and 2-observation guard (issue #52).
+  maybeRatchetProjectRoot(slot, cwd);
 }
 
 // First real prompt text of a `user` transcript record, or null. Skips meta
@@ -282,9 +345,15 @@ export function refreshSessionTitle(slot, transcriptPath = slot?.transcriptPath)
 }
 
 // The additive `title` field rides every session payload once known; absent
-// until derivable (clients must tolerate either, per PROTOCOL.md).
+// until derivable (clients must tolerate either, per PROTOCOL.md). A
+// hook-created (external, PTY-less) slot is ALSO tagged `external: true` here,
+// uniformly on EVERY session event (running/ended + the connect-time sync), so
+// clients can offer an honest "hide" instead of a kill for a process the
+// bridge does not own. The flag is OMITTED for bridge-owned PTY slots — older
+// clients tolerate that, and clients treat absent as external=false (killable).
 function sessionEventPayload(slot, fields) {
-  return slot.title ? { ...fields, title: slot.title } : fields;
+  const withTitle = slot.title ? { ...fields, title: slot.title } : fields;
+  return slot.hookCreated ? { ...withTitle, external: true } : withTitle;
 }
 
 // Refresh + broadcast: when an opportunistic refresh changes a running slot's
@@ -425,6 +494,7 @@ export function bindPtyProcess(slot, proc) {
     log("info", `Session ${sessionId} (${slot.agent}) PTY exited: code=${exitCode} signal=${signal}`);
     slot.state = "ended";
     slot.endedAt = Date.now();
+    slot.endedAuthoritatively = true; // process really exited — never revive
     slot.ptyProcess = null;
     flushReadyWaiters(slot, false);
     runSessionCleanupHooks(sessionId, "pty-closed");
@@ -435,6 +505,7 @@ export function bindPtyProcess(slot, proc) {
     log("error", `Session ${sessionId} PTY spawn error: ${err.message}`);
     slot.state = "ended";
     slot.endedAt = Date.now();
+    slot.endedAuthoritatively = true; // spawn/exec failure is terminal — never revive
     slot.ptyProcess = null;
     flushReadyWaiters(slot, false);
     runSessionCleanupHooks(sessionId, "pty-error");
@@ -500,9 +571,31 @@ export function killSession(sessionId) {
   slot.state = "ended";
   slot.endedAt = Date.now();
   slot.ptyProcess = null;
+  // Deliberately NOT endedAuthoritatively: killing an EXTERNAL (hook-created)
+  // slot only marks it ended — the watch cannot actually stop a process the
+  // bridge does not own, so the still-alive session's next hook must be able to
+  // revive it (issue #53). A PTY slot's real end IS authoritative, but that is
+  // set by the PTY close handler, not here.
   pushSseEvent("session", sessionEventPayload(slot, { state: "ended", agent: slot.agent, folderName: slot.folderName, killed: true }), sessionId);
   log("info", `Session ${sessionId} killed`);
   return true;
+}
+
+// Bring an ended-but-revivable EXTERNAL slot back to running and re-broadcast
+// the idempotent running `session` event (same shape as the createExternalSession
+// running push), so every client drops the zombie "ended" state. Called when a
+// hook proves a watch-"closed" external session is still alive (issue #53): the
+// watch's close/kill could not stop the process, and its incoming hooks would
+// otherwise attach silently to the ended slot until the prune deletes it.
+function reviveSlotToRunning(slot) {
+  slot.state = "running";
+  slot.endedAt = undefined;
+  log("info", `Revived external session ${slot.id} on hook activity (was watch-closed)`);
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, { state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName }),
+    slot.id,
+  );
 }
 
 export function findSessionByCwd(cwd) {
@@ -547,6 +640,10 @@ export function getSessionsSnapshot() {
     createdAt: s.createdAt,
     // Additive optional field: only present once derived from the transcript.
     ...(s.title ? { title: s.title } : {}),
+    // Additive: present (=true) only for hook-created (external) slots the
+    // bridge does not own; omitted for PTY slots (clients treat absent as
+    // external=false). Kept in lockstep with sessionEventPayload's SSE tag.
+    ...(s.hookCreated ? { external: true } : {}),
   }));
 }
 
@@ -641,6 +738,8 @@ function createExternalSession({ source, cwd, hookSessionId, transcriptPath }) {
     hookCreated: true,
     projectRootVerified,
     projectRootAttempt,
+    // Seed the ancestor-rebind floor (issue #52) from the first bound cwd.
+    shallowestObservedCwd: resolvedCwd,
   };
   if (hookSessionId) bindHookSession(slot, hookSessionId);
   if (transcriptPath) {
@@ -679,6 +778,16 @@ export function resolveHookSession(body) {
     if (boundId) {
       const bound = sessions.get(boundId);
       if (bound) {
+        // Issue #53: a watch "close" of an EXTERNAL session marked this slot
+        // ended but could not stop the still-alive Claude Code process. This
+        // event proves it is alive — revive the slot to running instead of
+        // silently swallowing events into a zombie window until the prune.
+        // Only revivable (watch kill/hide) endings qualify: a SessionEnd end is
+        // authoritative (the real process exited) and stays ended, and PTY
+        // slots are never hookCreated so they keep true kill semantics.
+        if (bound.state === "ended" && bound.hookCreated && !bound.endedAuthoritatively) {
+          reviveSlotToRunning(bound);
+        }
         // Remember (never read) the transcript path on the hot path; the
         // stat+read happens only at the opportunistic refresh points.
         if (transcriptPath) bound.transcriptPath = transcriptPath;
@@ -762,6 +871,9 @@ export function endHookSession(body) {
 
   slot.state = "ended";
   slot.endedAt = Date.now();
+  // SessionEnd is authoritative: the real process exited, so subsequent stray
+  // hooks must NOT revive it (issue #53) — revival is only for watch kills.
+  slot.endedAuthoritatively = true;
   runSessionCleanupHooks(slot.id, "session-end-hook");
   pushSseEvent("session", sessionEventPayload(slot, { state: "ended", agent: slot.agent, folderName: slot.folderName, reason: "session-end" }), slot.id);
   log("info", `External session ${slot.id} ended (SessionEnd hook)`);

@@ -239,6 +239,32 @@ class BridgeEventReducerTest {
     }
 
     @Test
+    fun externalFlagIsParsedAndSurvivesExternallessResends() {
+        // A hook-created (external) slot carries external:true on its `running`.
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","external":true,"sessionId":"A"}"""),
+            ),
+        )
+        assertTrue("external:true must parse onto the session", state.sessions.getValue("A").external)
+
+        // A connect-time sync resend WITHOUT the flag (PTY slot shape / older
+        // bridge) must not erase a known external flag — same preserve-on-
+        // resend rule as folderName/title.
+        val externalless = SseFrame(null, "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}""")
+        val afterSync = (BridgeEventReducer.reduce(state, externalless, 1_002_000L) as BridgeEventReducer.Applied).state
+        assertTrue("an externalless resend must not clear the external flag", afterSync.sessions.getValue("A").external)
+
+        // A brand-new PTY session with no external field defaults to false.
+        val pty = fold(
+            listOf(
+                SseFrame("3", "session", """{"state":"running","agent":"claude","cwd":"/b","folderName":"b","sessionId":"B"}"""),
+            ),
+        )
+        assertFalse("a PTY slot defaults to external=false (killable)", pty.sessions.getValue("B").external)
+    }
+
+    @Test
     fun resentRunningStillRefreshesSessionMetadata() {
         val state = fold(
             listOf(

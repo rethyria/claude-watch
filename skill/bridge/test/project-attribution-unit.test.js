@@ -130,7 +130,15 @@ test("no ancestor matches the transcript dir → observed cwd is kept (current b
     assert.equal(slot.cwd, "/tmp/attr51-elsewhere/sub", "verification failure falls back to the observed cwd");
     assert.notEqual(slot.projectRootVerified, true);
 
-    // The ancestor-cwd fallback heuristic still corrects it upward later.
+    // The ancestor-cwd fallback heuristic still corrects it upward later —
+    // issue #52 now requires TWO consistent observations before it commits, so
+    // a single stray shallow hook can't drag the root up.
+    resolveHookSession({
+      session_id: "attr51-nomatch",
+      cwd: "/tmp/attr51-elsewhere",
+      transcript_path: transcriptIn("-home-somebody-unrelated-project"),
+    });
+    assert.equal(slot.cwd, "/tmp/attr51-elsewhere/sub", "one observation does not rebind (issue #52)");
     resolveHookSession({
       session_id: "attr51-nomatch",
       cwd: "/tmp/attr51-elsewhere",
@@ -152,8 +160,13 @@ test("no transcript_path → current behavior; a later ancestor-cwd event rebind
     const slot = sessions.get(sid);
     assert.equal(slot.cwd, "/tmp/attr51/proj/deep/sub", "without a transcript the observed cwd binds as before");
 
-    // Ancestor cwd: rebind upward, update folderName, and broadcast the
-    // idempotent running event so clients re-group.
+    // Ancestor cwd: issue #52 hardened the unverified ratchet to require TWO
+    // consistent observations before it rebinds. The first sighting must NOT
+    // move the root…
+    resolveHookSession({ session_id: "attr51-ancestor", cwd: "/tmp/attr51/proj" });
+    assert.equal(slot.cwd, "/tmp/attr51/proj/deep/sub", "one observation does not rebind (issue #52)");
+    // …the second confirms it: rebind upward, update folderName, and broadcast
+    // the idempotent running event so clients re-group.
     resolveHookSession({ session_id: "attr51-ancestor", cwd: "/tmp/attr51/proj" });
     assert.equal(slot.cwd, "/tmp/attr51/proj");
     assert.equal(slot.folderName, "proj");

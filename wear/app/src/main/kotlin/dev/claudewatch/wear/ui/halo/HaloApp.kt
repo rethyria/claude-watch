@@ -89,6 +89,12 @@ data class HaloActions(
     val onDiscardCommand: () -> Unit = {},
     val onSpawn: (agent: String) -> Unit = {},
     val onKill: (sessionId: String) -> Unit = {},
+    /**
+     * Honest-hide an EXTERNAL (hook-created, PTY-less) session from view
+     * (issue #53): local only, no bridge kill — the row picks this over
+     * [onKill] by the session's `external` flag.
+     */
+    val onHide: (sessionId: String) -> Unit = {},
 )
 
 /** Handoff motion: 300ms cubic-bezier(0.2,0.7,0.3,1), 70px slide at 450 ref. */
@@ -235,6 +241,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         scope = layer.scope,
                         onOpenSession = { nav = nav.drillToSession(it) },
                         onKill = actions.onKill,
+                        onHide = actions.onHide,
                         onSpawn = actions.onSpawn,
                         // The list's scrollable eats every vertical drag, so
                         // InnerScreen's back detector can't fire under it; the

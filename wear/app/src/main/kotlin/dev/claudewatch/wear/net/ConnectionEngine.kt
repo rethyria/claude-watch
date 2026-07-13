@@ -421,6 +421,21 @@ class ConnectionEngine(
     suspend fun killSession(sessionId: String): BridgeClient.ApiResult? =
         authedCall { c, t -> c.killSession(t, sessionId) }
 
+    /**
+     * ACK an APPLIED frame back from the event collector (issue #48). This
+     * engine no longer advances its replay cursor on mere receipt; only a
+     * frame the reducer actually APPLIED moves the persisted + reconnect
+     * cursor forward, so a reducer-REJECTED frame is replayed on the next
+     * reconnect (a Rejected frame never acks — see BridgeViewModel.handleEvent).
+     * Empty/keepalive ids carry nothing to resume from and are ignored.
+     * Ordering is preserved by the single [persistCursor] collector.
+     */
+    fun ackApplied(id: String) {
+        if (id.isEmpty()) return
+        lastEventId = id
+        persistCursor.tryEmit(id)
+    }
+
     private suspend fun authedCall(
         block: (BridgeClient, String) -> BridgeClient.ApiResult,
     ): BridgeClient.ApiResult? = withContext(io) {
@@ -652,10 +667,13 @@ class ConnectionEngine(
 
         override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
             if (!isCurrent(myEpoch)) return
-            if (!id.isNullOrEmpty()) {
-                lastEventId = id
-                persistCursor.tryEmit(id)
-            }
+            // Issue #48: do NOT advance/persist the replay cursor on mere
+            // receipt. The collector ACKs a frame back via [ackApplied] only
+            // after the reducer has APPLIED it, so a reducer-REJECTED frame is
+            // replayed after a reconnect instead of being silently skipped —
+            // restoring #16's replay-on-rejection guarantee across reconnects
+            // (it had degraded to in-process only, because this engine cursor
+            // won on reconnect regardless of what the reducer accepted).
             _events.tryEmit(SseEvent(id, type ?: "message", data))
         }
 
@@ -755,8 +773,13 @@ class ConnectionEngine(
     }
 
     companion object {
-        /** Oldest bridge protocol this client can talk to. */
-        const val MIN_PROTO_VERSION = 2
+        /**
+         * Oldest bridge protocol this client can talk to. The bridge is
+         * PROTOCOL_VERSION=3 with MIN_SUPPORTED_CLIENT_PROTO=3, so a proto-2
+         * bridge can no longer serve this client — reject it at pair time with
+         * an explanation instead of tolerating undefined behavior later.
+         */
+        const val MIN_PROTO_VERSION = 3
 
         /**
          * The bridge walks 7860..7869 at startup (7860 is Gradio's default,
