@@ -67,6 +67,14 @@ data class SessionEvent(
     val cwd: String? = null,
     val folderName: String? = null,
     val title: String? = null,
+    /**
+     * Additive optional flag: `true` for a HOOK-CREATED (external, PTY-less)
+     * session whose process the bridge does not own; OMITTED (null) for
+     * bridge-owned PTY slots, which older clients already tolerate and which
+     * clients MUST treat as external=false (killable). Carried uniformly on
+     * every session event of a hook-created slot (see PROTOCOL.md).
+     */
+    val external: Boolean? = null,
     val reason: String? = null,
     val exitCode: Int? = null,
     val signal: String? = null,

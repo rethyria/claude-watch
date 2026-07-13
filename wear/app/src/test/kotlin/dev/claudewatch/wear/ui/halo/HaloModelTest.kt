@@ -5,6 +5,8 @@ import dev.claudewatch.shared.state.SessionActivity
 import dev.claudewatch.shared.state.SessionState
 import dev.claudewatch.wear.BridgeViewModel.UiState
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -20,18 +22,21 @@ class HaloModelTest {
         title: String? = null,
         folderName: String? = "proj",
         cwd: String? = "/home/dev/proj",
+        external: Boolean = false,
     ) = SessionState(
         sessionId = id,
         agent = agent,
         cwd = cwd,
         folderName = folderName,
         title = title,
+        external = external,
         activity = SessionActivity.WORKING,
         activeSinceMs = 1_000L,
     )
 
-    private fun uiState(vararg sessions: SessionState) = UiState(
+    private fun uiState(vararg sessions: SessionState, hidden: Set<String> = emptySet()) = UiState(
         bridge = BridgeState(sessions = sessions.associateBy { it.sessionId }),
+        hiddenSessions = hidden,
     )
 
     @Test
@@ -53,6 +58,34 @@ class HaloModelTest {
         )
         val titles = model.sessions.map { it.title }
         assertEquals(listOf("claude · 5f0d2c", "codex · b7e3f1", "session · c9a8b7"), titles)
+    }
+
+    /** Issue #53: the wire `external` flag is threaded onto the HaloSession so
+     *  the row can pick honest-hide vs real-kill by it. */
+    @Test
+    fun externalFlagIsThreadedOntoTheHaloSession() {
+        val model = HaloModel.from(
+            uiState(
+                session("s-pty", external = false),
+                session("s-ext", external = true),
+            ),
+        )
+        assertFalse("a PTY session is killable", model.sessions.single { it.id == "s-pty" }.external)
+        assertTrue("a hook-created session is external (hide, not kill)", model.sessions.single { it.id == "s-ext" }.external)
+    }
+
+    /** Issue #53: an honest-hidden external session is filtered OUT of the
+     *  derived model — the local view filter behind the row's "hide" action. */
+    @Test
+    fun aHiddenExternalSessionIsFilteredOutOfTheDerivedModel() {
+        val visible = HaloModel.from(uiState(session("s-ext", external = true)))
+        assertEquals(1, visible.sessionCount)
+
+        val hiddenModel = HaloModel.from(
+            uiState(session("s-ext", external = true), hidden = setOf("s-ext")),
+        )
+        assertTrue("a hidden session leaves the derived model entirely", hiddenModel.sessions.isEmpty())
+        assertEquals(0, hiddenModel.projectCount)
     }
 
     @Test

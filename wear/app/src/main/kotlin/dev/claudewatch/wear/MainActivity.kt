@@ -147,6 +147,7 @@ fun WatchApp(
             onDiscardCommand = viewModel::discardCommand,
             onSpawn = viewModel::spawnSession,
             onKill = viewModel::killSession,
+            onHide = viewModel::hideSession,
         ),
     )
 }

@@ -116,7 +116,7 @@ class ConnectionEngineTest {
             probePorts = emptyList(),
         ).also { engine = it }
 
-    private fun pingResponse(proto: String = "2") =
+    private fun pingResponse(proto: String = "3") =
         MockResponse().setBody("""{"proto":"$proto","bridgeId":"b-1","machineName":"m"}""")
 
     private fun pairResponse() =
@@ -179,7 +179,15 @@ class ConnectionEngineTest {
 
         val engine = newEngine()
         val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
-        scope.launch { engine.events.collect { events.add(it) } }
+        // ACK every applied frame like the ViewModel does (issue #48): the
+        // engine advances its replay cursor only on an ack, never on receipt,
+        // so the reconnect below must resume from the last SEEN + acked event.
+        scope.launch {
+            engine.events.collect {
+                it.id?.let { id -> engine.ackApplied(id) }
+                events.add(it)
+            }
+        }
 
         assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
 
@@ -215,6 +223,70 @@ class ConnectionEngineTest {
         }
         // Transient failures never wiped the pairing.
         assertNotNull(credentialsInStore())
+    }
+
+    // -- Replay cursor advances only on ACK (issue #48) ---------------------
+
+    /**
+     * Issue #48: the engine no longer advances its persisted/reconnect cursor
+     * on mere receipt — only an [ConnectionEngine.ackApplied] does. So a frame
+     * the collector does NOT ack (standing in for a reducer-REJECTED frame) is
+     * REPLAYED on the next reconnect (the cursor stays at the pre-frame id),
+     * while an acked frame advances it — the reconnect header proves both.
+     */
+    @Test
+    fun onlyAckedFramesAdvanceTheReconnectReplayCursor() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        // Stream 1 delivers event 5 then ends. The collector below does NOT ack
+        // event 5 (as if the reducer rejected it): the reconnect must replay
+        // from the pre-5 cursor ("0"), never skip past it.
+        server.enqueue(sseEnding("id: 5\nevent: tool-output\ndata: {}\n\n"))
+        server.enqueue(pingResponse()) // reconnect preflight
+        // Stream 2 delivers event 6, which IS acked, then ends.
+        server.enqueue(sseEnding("id: 6\nevent: tool-output\ndata: {}\n\n"))
+        server.enqueue(pingResponse()) // reconnect preflight
+        server.enqueue(sseHeld(":connected\n\n"))
+
+        val engine = newEngine()
+        val seen = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
+        // ACK only events with id >= 6: event 5 is left unacked (the
+        // reducer-Rejected stand-in that must be replayed). ACK before record
+        // so observing an id in `seen` guarantees its ack already ran.
+        scope.launch {
+            engine.events.collect {
+                val n = it.id?.toIntOrNull()
+                if (n != null && n >= 6) engine.ackApplied(it.id!!)
+                seen.add(it)
+            }
+        }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { seen.any { it.id == "5" } }
+
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        // First connect: full replay from 0.
+        takeRequest().let {
+            assertEquals("/v1/events", it.path)
+            assertEquals("0", it.getHeader("Last-Event-ID"))
+        }
+        // Reconnect after the UNACKED event 5: the cursor did not advance, so
+        // the header still carries the pre-5 id — event 5 is replayed (#48/#16).
+        assertEquals("/v1/ping", takeRequest().path)
+        takeRequest().let {
+            assertEquals("/v1/events", it.path)
+            assertEquals("0", it.getHeader("Last-Event-ID"))
+        }
+
+        // Now event 6 arrives and IS acked; its stream ends and the next
+        // reconnect resumes from 6 — an acked frame DOES advance the cursor.
+        awaitCondition { seen.any { it.id == "6" } }
+        assertEquals("/v1/ping", takeRequest().path)
+        takeRequest().let {
+            assertEquals("/v1/events", it.path)
+            assertEquals("6", it.getHeader("Last-Event-ID"))
+        }
     }
 
     // -- Connect-tail race --------------------------------------------------
@@ -261,6 +333,9 @@ class ConnectionEngineTest {
         server.enqueue(sseHeld("id: 4\nevent: tool-output\ndata: {}\n\n", pads = 600))
 
         val engine = newEngine(heartbeatMs = 1_500)
+        // ACK applied frames like the ViewModel does (issue #48): the reconnect
+        // cursor advances to the last SEEN event only because it was acked.
+        scope.launch { engine.events.collect { it.id?.let { id -> engine.ackApplied(id) } } }
         assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
 
         assertEquals("/v1/ping", takeRequest().path)

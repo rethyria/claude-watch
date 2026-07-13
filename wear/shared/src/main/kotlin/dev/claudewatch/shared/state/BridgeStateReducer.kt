@@ -52,6 +52,13 @@ data class SessionState(
     val folderName: String? = null,
     /** Bridge-derived session title (additive wire field); null until the bridge reports one. */
     val title: String? = null,
+    /**
+     * True for a HOOK-CREATED (external, PTY-less) session the bridge does not
+     * own — the row's close action HIDES it honestly instead of pretending to
+     * kill a process the bridge cannot. Bridge-owned PTY slots omit the wire
+     * flag and default to false (killable). Additive wire field (issue #53).
+     */
+    val external: Boolean = false,
     val activity: SessionActivity = SessionActivity.WORKING,
     val activeSinceMs: Long? = null,
     val frozenElapsedMs: Long? = null,
@@ -253,12 +260,18 @@ object BridgeEventReducer {
                     // The bridge re-sends `running` with a fresh title when it
                     // changes; a payload without one must not erase the known title.
                     title = event.title ?: existing.title,
+                    // A hook-created slot carries external:true on EVERY session
+                    // event (uniform emission); a payload without it (PTY slot,
+                    // older bridge) must not erase a known external flag — same
+                    // preserve-on-resend rule as folderName/title.
+                    external = event.external ?: existing.external,
                 ) ?: SessionState(
                     sessionId = id,
                     agent = event.agent,
                     cwd = event.cwd,
                     folderName = event.folderName,
                     title = event.title,
+                    external = event.external ?: false,
                     activity = SessionActivity.WORKING,
                     activeSinceMs = nowMs,
                     frozenElapsedMs = null,

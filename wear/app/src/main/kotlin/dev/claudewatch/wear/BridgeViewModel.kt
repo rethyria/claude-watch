@@ -8,6 +8,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.claudewatch.shared.protocol.AskUserQuestion
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
+import dev.claudewatch.shared.protocol.SessionEvent
 import dev.claudewatch.shared.protocol.SseFrame
 import dev.claudewatch.shared.state.BridgeEventReducer
 import dev.claudewatch.shared.state.BridgeState
@@ -121,6 +122,13 @@ class BridgeViewModel(
         val sessionActionResult: String? = null,
         val eventLog: List<String> = emptyList(),
         val bridge: BridgeState = BridgeState(),
+        /**
+         * Session ids the user honest-hid (issue #53): EXTERNAL, hook-created
+         * sessions the bridge cannot kill, dropped from the derived Halo model
+         * LOCALLY (no network). Cleared per id when any applied event for that
+         * session arrives ("until it speaks again" — see [handleEvent]).
+         */
+        val hiddenSessions: Set<String> = emptySet(),
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -394,7 +402,12 @@ class BridgeViewModel(
         }
     }
 
-    /** Kill [sessionId]; the page disappears when the bridge's `ended` event prunes it. */
+    /**
+     * Kill [sessionId]; the page disappears when the bridge's `ended` event
+     * prunes it. For a PTY-backed (external=false) session the bridge owns the
+     * process, so this is a real stop; an EXTERNAL session uses [hideSession]
+     * instead (the Halo row picks which by the session's `external` flag).
+     */
     fun killSession(sessionId: String) {
         engineScope.launch {
             try {
@@ -406,6 +419,18 @@ class BridgeViewModel(
                 _state.update { it.copy(sessionActionResult = "kill:error ${e.message}") }
             }
         }
+    }
+
+    /**
+     * Honest hide (issue #53): drop an EXTERNAL (hook-created, PTY-less)
+     * session from view LOCALLY — no network, nothing killed. The bridge does
+     * not own its process, so there is no real kill to perform; a ✕-that-stops
+     * would pretend to end a session it cannot. The session reappears the
+     * moment the bridge reports any activity for it again (the un-hide in
+     * [handleEvent]). PTY-backed sessions keep the real [killSession].
+     */
+    fun hideSession(sessionId: String) {
+        _state.update { it.copy(hiddenSessions = it.hiddenSessions + sessionId) }
     }
 
     /**
@@ -549,14 +574,41 @@ class BridgeViewModel(
 
     private fun handleEvent(id: String?, type: String, data: String) {
         val frame = SseFrame(id, type, data)
+        // Whether the reducer APPLIED this frame — decided purely by parse, so
+        // it is stable across any update()-retry (the flag reflects the
+        // committed run). Only an applied frame is acked back to the engine.
+        var applied = false
         _state.update { ui ->
             when (val result = BridgeEventReducer.reduce(ui.bridge, frame, System.currentTimeMillis())) {
-                is BridgeEventReducer.Applied -> ui.withBridge(result.state)
+                is BridgeEventReducer.Applied -> {
+                    applied = true
+                    val next = ui.withBridge(result.state)
+                    // Issue #53: a GENUINE-ACTIVITY event for a hidden session
+                    // un-hides it ("until it speaks again"). A bare `session`
+                    // metadata frame does NOT count as speaking: the bridge
+                    // re-sends `session running` for every live slot on every
+                    // reconnect (and on revive / title / project-root rebind),
+                    // so un-hiding on it would let any routine reconnect defeat
+                    // an honest hide. Output, tool-output, turn-end and a raised
+                    // prompt are what reveal a hidden external session again —
+                    // and a revive always rides in with one of those.
+                    val sid = result.event.sessionId
+                    if (result.event !is SessionEvent && sid != null && sid in next.hiddenSessions) {
+                        next.copy(hiddenSessions = next.hiddenSessions - sid)
+                    } else {
+                        next
+                    }
+                }
                 // Contract violation: drop the frame, leave state (incl.
                 // lastEventId) untouched so a reconnect replays it.
                 is BridgeEventReducer.Rejected -> ui
             }
         }
+        // Issue #48: ACK only APPLIED frames back to the engine, so its
+        // persisted + reconnect cursor never runs ahead of what the reducer
+        // applied — a frame rejected during a reconnect window is then replayed.
+        // A Rejected frame is deliberately NOT acked.
+        if (applied && !id.isNullOrEmpty()) engine.ackApplied(id)
     }
 
     /** Mirror the reduced bridge state into the flat fields the screen renders. */

@@ -111,7 +111,7 @@ class DiscoveryTest {
     ).also { engine = it }
 
     private fun pingResponse(bridgeId: String = "b-1") =
-        MockResponse().setBody("""{"proto":"2","bridgeId":"$bridgeId","machineName":"m"}""")
+        MockResponse().setBody("""{"proto":"3","bridgeId":"$bridgeId","machineName":"m"}""")
 
     private fun pairResponse() =
         MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}""")
@@ -188,7 +188,15 @@ class DiscoveryTest {
 
         val engine = newEngine(probePorts = listOf(decoy.port, relocated.port))
         val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
-        scope.launch { engine.events.collect { events.add(it) } }
+        // ACK every applied frame like the ViewModel does (issue #48): the
+        // engine advances its replay cursor only on an ack, never on receipt,
+        // so the relocated stream below resumes from the last SEEN + acked id.
+        scope.launch {
+            engine.events.collect {
+                it.id?.let { id -> engine.ackApplied(id) }
+                events.add(it)
+            }
+        }
 
         assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
         awaitCondition { events.any { it.id == "5" } }

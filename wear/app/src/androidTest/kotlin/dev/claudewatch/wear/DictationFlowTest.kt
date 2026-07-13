@@ -105,7 +105,7 @@ class DictationFlowTest {
     private fun pairWithSession() {
         // The engine's discovery preflight pings before every pair.
         server.enqueue(
-            MockResponse().setBody("""{"proto":"2","bridgeId":"b-1","machineName":"m"}"""),
+            MockResponse().setBody("""{"proto":"3","bridgeId":"b-1","machineName":"m"}"""),
         )
         server.enqueue(
             MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),

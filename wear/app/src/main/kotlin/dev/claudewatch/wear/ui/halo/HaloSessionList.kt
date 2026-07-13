@@ -88,6 +88,7 @@ fun HaloSessionList(
     scope: ListScope,
     onOpenSession: (String) -> Unit,
     onKill: (String) -> Unit,
+    onHide: (String) -> Unit,
     onSpawn: (agent: String) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -222,6 +223,10 @@ fun HaloSessionList(
                             revealedId = null
                             onKill(session.id)
                         },
+                        onHide = {
+                            revealedId = null
+                            onHide(session.id)
+                        },
                     )
                 }
             }
@@ -302,6 +307,7 @@ private fun SessionRow(
     onSwipe: () -> Unit,
     onTap: () -> Unit,
     onKill: () -> Unit,
+    onHide: () -> Unit,
 ) {
     val waiting = session.state.isWaiting()
     val shape = RoundedCornerShape(Halo.Geo.RowRadius)
@@ -346,7 +352,7 @@ private fun SessionRow(
             label = "rowReveal",
         ) { showActions ->
             if (showActions) {
-                ActionStrip(onKill = onKill)
+                ActionStrip(external = session.external, onKill = onKill, onHide = onHide)
             } else {
                 RowContent(session = session, waiting = waiting)
             }
@@ -386,15 +392,21 @@ private fun RowContent(session: HaloSession, waiting: Boolean) {
 }
 
 /**
- * Swipe-revealed quick actions. Only close is wired (ends the session);
- * mode/compact/handover ship as visible, disabled stubs per the handoff.
- * The 50px circles are the design's own size — smaller than the 48dp touch
- * minimum, so each button's hit target is its full quarter-width cell
- * (weighted, so the row's whole width is clickable): 48dp tall and as wide
- * as four-across on this screen allows.
+ * Swipe-revealed quick actions. The trailing cell is wired; mode/compact/
+ * handover ship as visible, disabled stubs per the handoff. The 50px circles
+ * are the design's own size — smaller than the 48dp touch minimum, so each
+ * button's hit target is its full quarter-width cell (weighted, so the row's
+ * whole width is clickable): 48dp tall and as wide as four-across allows.
+ *
+ * The trailing cell is HONEST about what it can do (issue #53): a bridge-owned
+ * PTY session is really killed (red ✕ → onKill → /v1/command kill), but an
+ * EXTERNAL (hook-created, PTY-less) session the bridge does not own is only
+ * HIDDEN from view until it speaks again — never a fake kill that pretends to
+ * stop a process the bridge cannot — so it is labelled "hide" and routed to
+ * onHide (local, no network).
  */
 @Composable
-private fun ActionStrip(onKill: () -> Unit) {
+private fun ActionStrip(external: Boolean, onKill: () -> Unit, onHide: () -> Unit) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.fillMaxWidth(),
@@ -402,13 +414,22 @@ private fun ActionStrip(onKill: () -> Unit) {
         ActionButton(glyph = "◐", label = "mode", onClick = null, modifier = Modifier.weight(1f))
         ActionButton(glyph = "▤", label = "compact", onClick = null, modifier = Modifier.weight(1f))
         ActionButton(glyph = "⇄", label = "handover", onClick = null, modifier = Modifier.weight(1f))
-        ActionButton(
-            glyph = "✕",
-            label = "close",
-            tint = Halo.Palette.Error,
-            onClick = onKill,
-            modifier = Modifier.weight(1f).testTag("haloRowClose"),
-        )
+        if (external) {
+            ActionButton(
+                glyph = "⊘",
+                label = "hide",
+                onClick = onHide,
+                modifier = Modifier.weight(1f).testTag("haloRowClose"),
+            )
+        } else {
+            ActionButton(
+                glyph = "✕",
+                label = "close",
+                tint = Halo.Palette.Error,
+                onClick = onKill,
+                modifier = Modifier.weight(1f).testTag("haloRowClose"),
+            )
+        }
     }
 }
 

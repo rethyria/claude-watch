@@ -173,6 +173,24 @@ class WireModelContractTest {
     }
 
     @Test
+    fun externalFlagParsesWhenPresentAndIsNullWhenOmitted() {
+        // Hook-created (external) session: the additive flag parses to true.
+        val external = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-1","external":true}""",
+        ) as SessionEvent
+        assertEquals(true, external.external)
+
+        // Bridge-owned PTY slot omits it: null (clients treat absent as false),
+        // and its absence never fails the frame.
+        val pty = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-2"}""",
+        ) as SessionEvent
+        assertNull(pty.external)
+    }
+
+    @Test
     fun unknownEventTypesAreToleratedNotFatal() {
         val event = BridgeEventParser.parse("shiny-new-event", """{"anything":true}""")
         assertTrue(event is UnknownEvent)

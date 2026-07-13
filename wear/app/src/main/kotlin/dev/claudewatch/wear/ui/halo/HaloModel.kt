@@ -18,6 +18,12 @@ data class HaloSession(
     val state: SessionState,
     /** The queued prompt for this session, if it is waiting. */
     val pending: PendingPermission? = null,
+    /**
+     * True for a HOOK-CREATED (external, PTY-less) session the bridge does not
+     * own: its row close action HIDES it honestly instead of a fake kill
+     * (issue #53). False for bridge-owned PTY sessions (real kill).
+     */
+    val external: Boolean = false,
 )
 
 /** A project groups the sessions sharing a working directory. */
@@ -68,6 +74,7 @@ data class HaloModel(
                     projectName = project,
                     state = state,
                     pending = pending,
+                    external = s.external,
                 )
             }
 
@@ -89,7 +96,10 @@ data class HaloModel(
                     )
                 }
                 .distinctBy { it.id }
-            val all = halo + orphans
+            // Issue #53: honest-hidden external sessions drop OUT of the
+            // derived model (a local view filter, not a bridge mutation); the
+            // ViewModel un-hides an id the moment an applied event for it lands.
+            val all = (halo + orphans).filterNot { it.id in ui.hiddenSessions }
 
             // Stable project order: first-seen wins, so the ring/pager don't
             // reshuffle as sessions transition state.
