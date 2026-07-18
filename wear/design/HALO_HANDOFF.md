@@ -156,14 +156,29 @@ lists/feeds. Live feed streams; keep visible tail (~6 lines), bottom-anchored.
 
 _Re-skinned per the Halo usage design; implemented in `HaloUsageScreen.kt`
 (pure presentation math as file-level internal funs, pinned by
-`HaloUsageFormatTest`). The wire is unchanged: `percent` is USED-percent._
+`HaloUsageFormatTest`). The wire carries USED-percent plus an optional
+upstream-verbatim `severity` string per window (PROTOCOL.md "Usage")._
+
+**Chrome:** a decorative top **TimeText** clock on every state — exactly the
+InnerScreen idiom (`#7E7C76`, 20px floor size), NOT a tap target (the clock
+is just a clock).
+
+**Layout anchors** (2026-07-18 refinement): for the expected **n ≤ 3** rows
+(and always for the 3-row skeleton) the **row stack is centered by itself**
+(dead center — `usageChordWidthsPx` assumes rows straddle it, so the chords
+are only honest there) and the header block (eyebrow + stale caveat) pins
+**TopCenter at 118px** (the mock's eyebrow height, clear of the clock); the
+same anchors in Loading and Data, so the eyebrow never jumps when the fetch
+lands. **n ≥ 4** keeps the single centered column — a fixed header would
+collide with the taller stack.
 
 **States** (fetch-on-open drives them; Idle renders as Loading):
-- **Loading:** the eyebrow at 70% opacity, then 3 skeleton rows — header
-  placeholder rects 96×15 and 58×22 (r8, `#22242A`) + an 8px track
-  (`#22242A`), chord-fitted widths; alpha pulses 0.5↔1 over 1.2s ease-in-out,
-  staggered 0.18s per row. Tag `haloUsageLoading` on the skeleton container.
-- **Data:** vertically centered column, 17px gaps. Eyebrow `REMAINING` /
+- **Loading:** the eyebrow at 70% opacity (pinned as above), 3 skeleton rows
+  dead-centered — header placeholder rects 96×15 and 58×22 (r8, `#22242A`) +
+  an 8px track (`#22242A`), chord-fitted widths; alpha pulses 0.5↔1 over 1.2s
+  ease-in-out, staggered 0.18s per row. Tag `haloUsageLoading` on the
+  skeleton container.
+- **Data:** header + rows per the layout anchors above. Eyebrow `REMAINING` /
   `USED` (19/500, letter-spacing 0.14em, `#63615B`) is **tappable** and
   toggles the mode (tag `haloUsageMode`) — screen-local UI state
   (rememberSaveable), default REMAINING. Cache fallback adds "as of Xm ago"
@@ -171,11 +186,18 @@ _Re-skinned per the Halo usage design; implemented in `HaloUsageScreen.kt`
   One row per wire window, wire order: header line (name 22 `#8D8B84` · reset
   19 `#63615B`, the existing formatter · percent 30/500 pushed to the right
   edge) over an 8px r4 bar (track `#3A3C42`, fill width = shown percent).
-  Compact when n ≥ 4: percent 25, in-row gap 5px (else 8px).
+  Compact when n ≥ 4: percent 25, in-row gap 5px (else 8px), 17px stack gaps.
 - **Error:** "usage unavailable" 27/500 `#E5484D`; the dynamic failure detail
   21 `#8D8B84` (single line, ellipsized); Retry pill (tag `haloUsageRetry`) —
   64px tall, 40px side padding, fully rounded, `#D97757` fill, "Retry" 24/500
   `#1A0F0A`. Retry re-fires the same fetch the page entry does.
+
+**Fetch rate limit** (client-side, in `BridgeViewModel.fetchUsage`): the
+upstream endpoint aggressively 429s pollers, so when fresh **live** bars are
+on screen (`Data` with `source == "api"`, within 5 minutes of the last api
+success) a page re-entry is a complete no-op — no request, no Loading
+flicker, instant re-entry. Only a successful api parse arms the window;
+Error-Retry and cache-fallback entries always refetch (no force parameter).
 
 **Display names** (presentation-only): kind `session` → "Session",
 `weekly_all` → "Weekly", any other kind keeps its wire label (e.g. "Fable").
@@ -185,10 +207,18 @@ _Re-skinned per the Halo usage design; implemented in `HaloUsageScreen.kt`
 R = 169, dy = (i−(n−1)/2)·pitch, pitch = 63 (n≤3) / 54 (n=4) / 46 (n≥5); each
 row is individually centered so the stack hugs the circle (n=3 ⇒ 304/328/304).
 
-**Semantic tiers** — always from REMAINING = 100 − wire percent, never from
-the shown number: remaining ≤ 0 "out" ⇒ bar + percent `#E5484D`; < 20 "low" ⇒
-`#D97757`; otherwise bar `#6CB289`, percent `#F4F1EA`.
+**Semantic tiers** — SEVERITY-FIRST, never from the shown number: the wire's
+`severity` is the server's own (undocumented-threshold) color coding, so when
+present and non-`"normal"` it is authoritative — lowercase it;
+`crit`/`exceed`/`error`/`block` substrings ⇒ "out", any other non-normal
+value ⇒ "low". The LOCAL fallback from REMAINING = 100 − wire percent
+(matching the official screen's recalled coding: orange at 75% used, red at
+95%): remaining ≤ 5 "out" ⇒ bar + percent `#E5484D`; ≤ 25 "low" ⇒ `#D97757`;
+otherwise bar `#6CB289`, percent `#F4F1EA`. Final tier = the more severe of
+server and local — the server escalates, never downgrades the local floor.
 
 **Mode:** REMAINING shows remaining% (number and bar); USED shows used% — and
-a drained window in USED mode pins the bar to a full 100%. Flipping the mode
-never changes tier colors.
+a **truly drained** window (remaining ≤ 0 — deliberately NOT tier "out",
+which now starts at 5% remaining: a 95%-used bar must still read as 95%) in
+USED mode pins the bar to a full 100%. Flipping the mode never changes tier
+colors.

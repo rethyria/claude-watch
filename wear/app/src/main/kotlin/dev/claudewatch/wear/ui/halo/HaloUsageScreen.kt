@@ -2,16 +2,22 @@
 // reports (render-what-you-get: 5-hour session, weekly all-models, weekly
 // model-scoped today — but any entry the wire carries gets a bar, so new
 // upstream windows appear without an app update). Re-skinned per the Halo
-// usage design: a tappable REMAINING/USED eyebrow (screen-local mode, the
-// wire percent stays USED), chord-fitted row widths that hug the round
-// display, semantic tiers computed from REMAINING (green / terracotta-low /
-// red-out), pulsing skeleton rows while loading, and a filled Retry pill on
-// error. Glanceable by design: label + bar + reset time, no charts, no
+// usage design: a decorative top clock (the InnerScreen TimeText idiom), a
+// tappable REMAINING/USED eyebrow (screen-local mode, the wire percent stays
+// USED), chord-fitted row widths that hug the round display, semantic tiers
+// that are SEVERITY-FIRST (the server's own `severity` coding wins when
+// present and non-"normal"; local REMAINING thresholds — orange at 75% used,
+// red at 95% — are only the fallback and can only be escalated, never
+// downgraded), pulsing skeleton rows while loading, and a filled Retry pill
+// on error. Glanceable by design: label + bar + reset time, no charts, no
 // scrolling for the expected three bars, no centerpiece and no drill-down
 // (HaloNav no-ops both). Fetch-on-open drives the states: skeletons while
 // loading, bars on data (with an "as of Xm ago" caveat when the bridge served
 // its cache fallback), message + retry on error. Round-safe: every row is cut
-// to the chord of the circle at its own vertical position.
+// to the chord of the circle at its own vertical position — which is why the
+// expected ≤3-row stack is centered by ITSELF (the header pins to the top):
+// usageChordWidthsPx assumes the rows straddle dead center, so the chords are
+// honest only when they actually do.
 package dev.claudewatch.wear.ui.halo
 
 import androidx.compose.animation.core.CubicBezierEasing
@@ -47,6 +53,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -55,6 +62,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.Text
+import androidx.wear.compose.material.TimeText
+import androidx.wear.compose.material.TimeTextDefaults
 import dev.claudewatch.wear.BridgeViewModel.UsageLimit
 import dev.claudewatch.wear.BridgeViewModel.UsageUi
 import java.time.OffsetDateTime
@@ -69,22 +78,40 @@ import kotlin.math.sqrt
 // ─── design's numbers without composing anything) ────────────────────────────
 
 /**
- * Semantic tier of a window, ALWAYS computed from what is left — the wire
- * percent is USED, so remaining = 100 − wire. The REMAINING/USED display mode
- * never feeds into this: a drained window is red no matter which number is
- * on screen.
+ * Semantic tier of a window — SEVERITY-FIRST. The upstream carries its own
+ * `severity` color coding per window (observed value: "normal"), whose exact
+ * thresholds are not documented anywhere — so the SERVER's word wins when it
+ * says anything non-"normal", and the LOCAL thresholds are only a fallback,
+ * set to the user's recollection of the official usage screen: orange at 75%
+ * used, red at 95% used. Computed from what is left — the wire percent is
+ * USED, so remaining = 100 − wire. The server can only ESCALATE (final tier
+ * = the more severe of server and local): a "normal" severity never turns a
+ * 96%-used window green. The REMAINING/USED display mode never feeds into
+ * this: a drained window is red no matter which number is on screen.
  */
 internal enum class UsageTier { OUT, LOW, NORMAL }
 
-internal fun usageTier(wirePercent: Double): UsageTier {
+internal fun usageTier(wirePercent: Double, severity: String? = null): UsageTier {
     val remaining = 100.0 - wirePercent
-    return when {
-        remaining <= 0.0 -> UsageTier.OUT
-        // Below 20% left = the "waiting for you" terracotta, per the Halo
-        // usage design (same threshold the pre-redesign screen used).
-        remaining < 20.0 -> UsageTier.LOW
+    // Local fallback: ≤5 left (≥95% used) is OUT, ≤25 left (≥75% used) is
+    // the "waiting for you" terracotta LOW.
+    val local = when {
+        remaining <= 5.0 -> UsageTier.OUT
+        remaining <= 25.0 -> UsageTier.LOW
         else -> UsageTier.NORMAL
     }
+    // Server escalation, mapping the undocumented vocabulary conservatively:
+    // anything terminal-sounding ("critical", "exceeded", "error",
+    // "blocked", …) is OUT; any OTHER non-"normal" value at least earns the
+    // terracotta — an unknown severity is the server flagging SOMETHING.
+    val server = severity?.lowercase()?.takeUnless { it == "normal" }?.let { s ->
+        val terminal = listOf("crit", "exceed", "error", "block").any { it in s }
+        if (terminal) UsageTier.OUT else UsageTier.LOW
+    } ?: UsageTier.NORMAL
+    // Enum order IS severity order (OUT < LOW < NORMAL), so "the more severe
+    // of the two" is minOf — the server escalates, never downgrades below
+    // the local floor.
+    return minOf(local, server)
 }
 
 /**
@@ -111,10 +138,13 @@ internal fun usageShownPercent(wirePercent: Double, usedMode: Boolean): Int {
 /**
  * The bar's fill fraction (0..1) — the shown percent, except a drained window
  * in USED mode pins to a FULL bar per the Halo usage design: "you used it
- * all" must never read as a nearly-full-but-not-quite bar.
+ * all" must never read as a nearly-full-but-not-quite bar. The pin keys on
+ * TRULY drained (remaining ≤ 0), deliberately DECOUPLED from tier == OUT:
+ * OUT now begins at 5% remaining, and a 95%-used bar must still read as 95%,
+ * not 100% — only "you used it all" earns the full bar.
  */
 internal fun usageBarFraction(wirePercent: Double, usedMode: Boolean): Float {
-    if (usedMode && usageTier(wirePercent) == UsageTier.OUT) return 1f
+    if (usedMode && wirePercent >= 100.0) return 1f
     val shown = if (usedMode) wirePercent else 100.0 - wirePercent
     return (shown.coerceIn(0.0, 100.0) / 100.0).toFloat()
 }
@@ -163,6 +193,21 @@ internal fun usageResetLabel(kind: String, resetsAt: String?): String? {
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
 
+/**
+ * The header block's fixed anchor: 118px at the 450 ref — the design mock's
+ * eyebrow height, clear of the decorative TimeText clock above it. The SAME
+ * anchor in Loading (skeleton) and ≤3-row Data, so the eyebrow never jumps
+ * when the fetch lands.
+ */
+// Header anchor for the pinned (n ≤ 3) layout. The collision math is exact
+// (review finding): Weekly's center sits at 112.5dp, so Session's row top
+// lands at ~62dp — the eyebrow's 24dp tap box must END by ~58dp for real
+// clearance. Anchoring the box at 34dp with BOTTOM-aligned glyphs puts the
+// text at ~46–58dp (near the mock's 118px eyebrow) while the enlarged hit
+// area grows UPWARD into the empty band under the TimeText, never over the
+// first row.
+private val UsageHeaderTop = 34.dp
+
 @Composable
 fun HaloUsageScreen(
     usage: UsageUi,
@@ -194,6 +239,16 @@ fun HaloUsageScreen(
                 nowMs = nowMs,
             )
         }
+        // The decorative top clock from the design mock — EXACTLY the
+        // InnerScreen idiom (HaloApp.kt): same style, and deliberately NOT a
+        // tap target (the clock is just a clock — an invisible hotspot over
+        // the time read as an accidental-jump trap in live testing).
+        TimeText(
+            timeTextStyle = TimeTextDefaults.timeTextStyle(
+                color = Color(0xFF7E7C76),
+                fontSize = Halo.Type.Min,
+            ),
+        )
     }
 }
 
@@ -211,7 +266,10 @@ private fun UsageEyebrow(usedMode: Boolean, onToggle: () -> Unit, dimmed: Boolea
     // visual position stays put (the same composable renders in every state,
     // so the enlarged footprint never makes the layout jump between states).
     Box(
-        contentAlignment = Alignment.Center,
+        // BottomCenter, not Center: in the pinned layout the box's bottom
+        // edge is what must clear the first row (see UsageHeaderTop), so the
+        // glyphs hug it and the tap slack all extends upward.
+        contentAlignment = Alignment.BottomCenter,
         modifier = Modifier
             .defaultMinSize(minWidth = 48.dp, minHeight = 24.dp)
             .clickable(onClick = onToggle)
@@ -240,51 +298,119 @@ private fun UsageData(
     val widthsPx = usageChordWidthsPx(data.limits.size)
     // 4+ rows tighten the typography so the stack still fits the circle.
     val compact = data.limits.size >= 4
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        // 17px stack gap at the 450 ref, vertically centered in the circle.
-        verticalArrangement = Arrangement.spacedBy(8.5.dp, Alignment.CenterVertically),
-        modifier = Modifier.fillMaxSize(),
-    ) {
+    if (compact) {
+        // ≥4 rows: the single centered stack (header + rows centered as one).
+        // A fixed-top header would collide with the taller row pile, so
+        // everything centers together — accepting that the chord widths
+        // (computed around dead center) are approximate for these rare tall
+        // stacks.
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(2.dp), // 4px under the eyebrow
+            // 17px stack gap at the 450 ref, vertically centered in the circle.
+            verticalArrangement = Arrangement.spacedBy(8.5.dp, Alignment.CenterVertically),
+            modifier = Modifier.fillMaxSize(),
         ) {
-            UsageEyebrow(usedMode = usedMode, onToggle = onToggleMode)
-            // The bridge served its CACHE fallback (its upstream call
-            // failed): the bars are real but old — say how old, right under
-            // the eyebrow, instead of pretending live.
-            if (data.source == "cache" && data.fetchedAtMs != null) {
-                val ageMin = ((nowMs() - data.fetchedAtMs) / 60_000L).coerceAtLeast(0L)
-                Text(
-                    text = "as of ${ageMin}m ago",
-                    fontSize = 9.5.sp, // 19px caveat
-                    color = Halo.Palette.TextSecondary,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.testTag("haloUsageStale"),
-                )
+            UsageHeaderBlock(data = data, usedMode = usedMode, onToggleMode = onToggleMode, nowMs = nowMs)
+            data.limits.forEachIndexed { i, limit ->
+                UsageRow(limit = limit, widthPx = widthsPx[i], compact = true, usedMode = usedMode)
             }
         }
-        if (data.limits.isEmpty()) {
-            // A 200 with zero windows (plan without limits?): honest empty
-            // state rather than a blank page.
-            Text(
-                text = "no usage windows reported",
-                fontSize = 11.sp, // 22px
-                color = Halo.Palette.TextFaint,
-                textAlign = TextAlign.Center,
+    } else {
+        // ≤3 rows (the real-world case): the ROW STACK is centered by ITSELF
+        // and the header pins to the top. Centering the whole column as one
+        // stack pushed the rows BELOW center — but usageChordWidthsPx assumes
+        // row i sits dy = (i−(n−1)/2)·pitch around DEAD center, so the chords
+        // are honest only when the rows actually straddle it.
+        Box(modifier = Modifier.fillMaxSize()) {
+            // Eyebrow ONLY at the top anchor — the cache caveat moves below
+            // the stack here (see UsageStaleCaveat); keeping it in the header
+            // would draw it straight across the first row.
+            Box(modifier = Modifier.align(Alignment.TopCenter).padding(top = UsageHeaderTop)) {
+                UsageEyebrow(usedMode = usedMode, onToggle = onToggleMode)
+            }
+            UsageStaleCaveat(
+                data = data,
+                nowMs = nowMs,
+                // Between the stack's bottom (~162dp) and the page dots: the
+                // one honest empty band in the pinned layout.
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp),
             )
-        }
-        data.limits.forEachIndexed { i, limit ->
-            UsageRow(limit = limit, widthPx = widthsPx[i], compact = compact, usedMode = usedMode)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.5.dp), // 17px between rows
+                modifier = Modifier.align(Alignment.Center),
+            ) {
+                if (data.limits.isEmpty()) {
+                    // A 200 with zero windows (plan without limits?): honest
+                    // empty state rather than a blank page.
+                    Text(
+                        text = "no usage windows reported",
+                        fontSize = 11.sp, // 22px
+                        color = Halo.Palette.TextFaint,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                data.limits.forEachIndexed { i, limit ->
+                    UsageRow(limit = limit, widthPx = widthsPx[i], compact = false, usedMode = usedMode)
+                }
+            }
         }
     }
+}
+
+/**
+ * The eyebrow + (cache fallback only) the staleness caveat — one block with
+ * IDENTICAL internals in both arrangements, so switching between the pinned
+ * (n ≤ 3) and compact (n ≥ 4) layouts never changes what the header says.
+ */
+@Composable
+private fun UsageHeaderBlock(
+    data: UsageUi.Data,
+    usedMode: Boolean,
+    onToggleMode: () -> Unit,
+    nowMs: () -> Long,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp), // 4px under the eyebrow
+        modifier = modifier,
+    ) {
+        UsageEyebrow(usedMode = usedMode, onToggle = onToggleMode)
+        // The bridge served its CACHE fallback (its upstream call
+        // failed): the bars are real but old — say how old, right under
+        // the eyebrow, instead of pretending live.
+        UsageStaleCaveat(data = data, nowMs = nowMs)
+    }
+}
+
+/**
+ * "as of Xm ago" — rendered only for the bridge's cache fallback. Composable
+ * on its own because the two layouts place it differently: the compact stack
+ * keeps it under the eyebrow, while the pinned (n ≤ 3) layout moves it BELOW
+ * the row stack — under the eyebrow it would render straight across the first
+ * row (the pinned header has exactly the clearance the eyebrow needs, none
+ * spare; review finding).
+ */
+@Composable
+private fun UsageStaleCaveat(data: UsageUi.Data, nowMs: () -> Long, modifier: Modifier = Modifier) {
+    if (data.source != "cache" || data.fetchedAtMs == null) return
+    val ageMin = ((nowMs() - data.fetchedAtMs) / 60_000L).coerceAtLeast(0L)
+    Text(
+        text = "as of ${ageMin}m ago",
+        fontSize = 9.5.sp, // 19px caveat
+        color = Halo.Palette.TextSecondary,
+        textAlign = TextAlign.Center,
+        modifier = modifier.testTag("haloUsageStale"),
+    )
 }
 
 /** Header line (name · reset · percent) + tiered bar — one window. */
 @Composable
 private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode: Boolean) {
-    val tier = usageTier(limit.percent)
+    // Severity-first (see usageTier): the wire's own coding escalates the
+    // local remaining-based fallback, never downgrades it.
+    val tier = usageTier(limit.percent, limit.severity)
     // Tier colors ALWAYS derive from remaining, never from the shown number:
     // flipping to USED must not turn a drained red row green.
     val fillColor = when (tier) {
@@ -371,16 +497,18 @@ private const val SKELETON_ROWS = 3
 @Composable
 private fun UsageSkeleton(usedMode: Boolean, onToggleMode: () -> Unit) {
     val widthsPx = usageChordWidthsPx(SKELETON_ROWS)
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.5.dp, Alignment.CenterVertically), // 17px
-        modifier = Modifier.fillMaxSize(),
-    ) {
-        UsageEyebrow(usedMode = usedMode, onToggle = onToggleMode, dimmed = true)
+    // The SAME two anchors as the ≤3-row Data layout — header pinned to
+    // UsageHeaderTop, rows centered by themselves — so the eyebrow does not
+    // jump when the fetch lands and the skeleton rows sit exactly where the
+    // real bars will.
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(modifier = Modifier.align(Alignment.TopCenter).padding(top = UsageHeaderTop)) {
+            UsageEyebrow(usedMode = usedMode, onToggle = onToggleMode, dimmed = true)
+        }
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.5.dp), // 17px between rows
-            modifier = Modifier.testTag("haloUsageLoading"),
+            modifier = Modifier.align(Alignment.Center).testTag("haloUsageLoading"),
         ) {
             repeat(SKELETON_ROWS) { i -> UsageSkeletonRow(widthPx = widthsPx[i], index = i) }
         }

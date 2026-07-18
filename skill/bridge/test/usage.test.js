@@ -21,18 +21,23 @@ const FIXTURE_TOKEN = "fixture-oauth-access-token-DO-NOT-LEAK-9f3a";
 // The verified upstream shape (see issue #57): kinds session / weekly_all /
 // weekly_scoped, USED percent, snake_case resets_at, scoped entries naming
 // their model. Percents are deliberately fractional to pin the rounding.
+// `severity` (the upstream's own color coding, observed value "normal") is
+// deliberately mixed: present on the session entry (→ passed through
+// verbatim), absent on weekly_all (→ NO key), empty on the scoped entry
+// (→ also NO key — an empty string is not a severity).
 const API_LIMITS_UPSTREAM = [
-  { kind: "session", percent: 41.6, resets_at: "2026-07-18T19:10:00Z" },
+  { kind: "session", percent: 41.6, resets_at: "2026-07-18T19:10:00Z", severity: "normal" },
   { kind: "weekly_all", percent: 12, resets_at: "2026-07-24T00:00:00Z" },
   {
     kind: "weekly_scoped",
     percent: 3.4,
     resets_at: "2026-07-24T00:00:00Z",
+    severity: "",
     scope: { model: { display_name: "Fable", id: "claude-fable-5" } },
   },
 ];
 const API_LIMITS_NORMALIZED = [
-  { kind: "session", label: "5-hour", percent: 42, resetsAt: "2026-07-18T19:10:00Z" },
+  { kind: "session", label: "5-hour", percent: 42, resetsAt: "2026-07-18T19:10:00Z", severity: "normal" },
   { kind: "weekly_all", label: "weekly", percent: 12, resetsAt: "2026-07-24T00:00:00Z" },
   { kind: "weekly_scoped", label: "Fable", percent: 3, resetsAt: "2026-07-24T00:00:00Z" },
 ];
@@ -139,6 +144,13 @@ test("api 200 → normalized limits with source 'api'; scoped label comes from d
   // Exact-shape assertion: normalized limits in upstream order, source "api",
   // and NO fetchedAtMs (that key is cache-only).
   assert.deepEqual(resp.body, { limits: API_LIMITS_NORMALIZED, source: "api" });
+  // Severity passthrough, spelled out beyond the deepEqual: the upstream's
+  // string survives verbatim, and an entry the upstream sent WITHOUT one (or
+  // with an empty one) carries NO severity key at all — the client's "server
+  // tier wins" logic keys on presence, so an absent key must stay absent.
+  assert.equal(resp.body.limits[0].severity, "normal");
+  assert.ok(!("severity" in resp.body.limits[1]), "absent upstream severity must not grow a key");
+  assert.ok(!("severity" in resp.body.limits[2]), "empty upstream severity must not grow a key");
 
   // The upstream call carries the token + beta header the OAuth endpoint needs.
   assert.equal(mock.seen.length, 1, "one page-open, one upstream fetch — no polling");

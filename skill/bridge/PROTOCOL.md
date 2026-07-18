@@ -265,7 +265,7 @@ Success (`200`):
 ```json
 {
   "limits": [
-    { "kind": "session",       "label": "5-hour", "percent": 42, "resetsAt": "2026-07-18T19:10:00Z" },
+    { "kind": "session",       "label": "5-hour", "percent": 42, "resetsAt": "2026-07-18T19:10:00Z", "severity": "normal" },
     { "kind": "weekly_all",    "label": "weekly", "percent": 12, "resetsAt": "2026-07-24T00:00:00Z" },
     { "kind": "weekly_scoped", "label": "Fable",  "percent": 3,  "resetsAt": "2026-07-24T00:00:00Z" }
   ],
@@ -283,6 +283,13 @@ Success (`200`):
   `"weekly"` for `weekly_all`, the scoped model's display name (e.g.
   `"Fable"`) for `weekly_scoped` (falling back to the kind), and the kind
   verbatim for any future window.
+- `severity` (string, **optional**): the upstream's own color coding for the
+  window, passed through **verbatim** when the upstream sends a non-empty
+  string (observed value: `"normal"`) — the key is **omitted** otherwise. Its
+  exact thresholds are undocumented upstream, so the bridge never interprets
+  it; clients treat it as the **authoritative** tier when present and
+  non-`"normal"` (the server's word wins; local thresholds are only a
+  fallback and may escalate but never downgrade the server's call).
 - `source`: `"api"` — live from the OAuth usage endpoint — or `"cache"` —
   the API was unavailable (expired token, offline) and the bars come from
   Claude Code's own cached snapshot in `~/.claude.json`. `fetchedAtMs`

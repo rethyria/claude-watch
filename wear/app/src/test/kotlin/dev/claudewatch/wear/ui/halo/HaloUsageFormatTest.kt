@@ -15,9 +15,12 @@ import org.junit.Test
  *   time is in the device's zone.
  * - chord-fitted widths: exact px values of the design's formula
  *   min(336, round(2·√(max(R²−dy², 115²))·0.97)), R=169.
- * - semantic tiers from REMAINING (= 100 − wire USED percent).
+ * - semantic tiers, SEVERITY-FIRST: the server's own `severity` coding wins
+ *   when present and non-"normal" (escalate-only), the local REMAINING
+ *   thresholds (= 100 − wire USED percent; orange ≥75% used, red ≥95%) are
+ *   the fallback floor.
  * - REMAINING/USED mode inversion of the shown number and bar, including the
- *   out-and-USED full-bar pin.
+ *   drained-and-USED full-bar pin (remaining ≤ 0, NOT tier == OUT).
  * - presentation-only display names (session → Session, weekly_all → Weekly).
  */
 class HaloUsageFormatTest {
@@ -75,16 +78,44 @@ class HaloUsageFormatTest {
         assertEquals(listOf(223, 275, 315, 328, 315, 275, 223), usageChordWidthsPx(7))
     }
 
-    // ── Semantic tiers (always from REMAINING; wire percent is USED) ────────
+    // ── Semantic tiers (severity-first; local fallback from REMAINING) ──────
 
     @Test
-    fun tiersDeriveFromRemaining() {
+    fun tiersDeriveFromRemainingWhenTheServerSaysNothing() {
+        // The local fallback thresholds match the user's recollection of the
+        // official usage screen: orange at 75% used, red at 95% used.
         assertEquals(UsageTier.NORMAL, usageTier(0.0)) // untouched window
-        assertEquals(UsageTier.NORMAL, usageTier(80.0)) // exactly 20 left: not low
-        assertEquals(UsageTier.LOW, usageTier(81.0)) // 19 left
-        assertEquals(UsageTier.LOW, usageTier(99.9)) // sliver left is still low
+        assertEquals(UsageTier.NORMAL, usageTier(74.0)) // 26 left: not low
+        assertEquals(UsageTier.LOW, usageTier(75.0)) // exactly 75% used: low
+        assertEquals(UsageTier.LOW, usageTier(76.0)) // 24 left
+        assertEquals(UsageTier.LOW, usageTier(94.0)) // 6 left: still low
+        assertEquals(UsageTier.OUT, usageTier(95.0)) // exactly 95% used: out
+        assertEquals(UsageTier.OUT, usageTier(96.0)) // 4 left
         assertEquals(UsageTier.OUT, usageTier(100.0)) // nothing left
         assertEquals(UsageTier.OUT, usageTier(104.0)) // wire overshoot is out
+    }
+
+    @Test
+    fun serverSeverityEscalatesTheTierButNeverDowngradesIt() {
+        // The SERVER's word wins upward: its thresholds are undocumented, so
+        // any non-"normal" severity outranks a locally-green window —
+        // terminal-sounding values ("crit"/"exceed"/"error"/"block"
+        // substrings, case-insensitive) mean OUT, anything else means LOW.
+        assertEquals(UsageTier.LOW, usageTier(10.0, "warning"))
+        assertEquals(UsageTier.LOW, usageTier(10.0, "elevated"))
+        assertEquals(UsageTier.OUT, usageTier(10.0, "critical"))
+        assertEquals(UsageTier.OUT, usageTier(10.0, "CRITICAL")) // wire casing is not ours to trust
+        assertEquals(UsageTier.OUT, usageTier(10.0, "limit_exceeded"))
+        assertEquals(UsageTier.OUT, usageTier(10.0, "error"))
+        assertEquals(UsageTier.OUT, usageTier(10.0, "blocked"))
+        // …but never downward: "normal" at 96% used is still OUT via the
+        // LOCAL floor, and a merely-"warning" severity cannot un-drain it.
+        assertEquals(UsageTier.OUT, usageTier(96.0, "normal"))
+        assertEquals(UsageTier.OUT, usageTier(96.0, "warning"))
+        assertEquals(UsageTier.LOW, usageTier(80.0, "normal")) // local LOW floor holds too
+        // Absent severity → purely local (the default and the explicit null).
+        assertEquals(UsageTier.NORMAL, usageTier(10.0, null))
+        assertEquals(UsageTier.NORMAL, usageTier(10.0))
     }
 
     // ── REMAINING/USED mode inversion ───────────────────────────────────────
@@ -105,12 +136,23 @@ class HaloUsageFormatTest {
     }
 
     @Test
-    fun outAndUsedPinsTheBarFull() {
+    fun drainedAndUsedPinsTheBarFull() {
         // A drained window in USED mode is a FULL bar (and an empty one in
         // REMAINING mode) — "you used it all" must never read as almost-full.
         assertEquals(1f, usageBarFraction(100.0, usedMode = true), 0f)
         assertEquals(1f, usageBarFraction(104.0, usedMode = true), 0f)
         assertEquals(0f, usageBarFraction(104.0, usedMode = false), 0f)
+    }
+
+    @Test
+    fun thePinKeysOnTrulyDrainedNotOnTheOutTier() {
+        // DECOUPLED from the tier: OUT now begins at 5% remaining, and a
+        // 95%-used window IS OUT — but its bar must still read as 95%, not
+        // 100%. Only remaining ≤ 0 earns the full-bar pin.
+        assertEquals(UsageTier.OUT, usageTier(95.0))
+        assertEquals(0.95f, usageBarFraction(95.0, usedMode = true), 1e-6f)
+        assertEquals(0.05f, usageBarFraction(95.0, usedMode = false), 1e-6f)
+        assertEquals(0.99f, usageBarFraction(99.0, usedMode = true), 1e-6f)
     }
 
     // ── Display names ───────────────────────────────────────────────────────
