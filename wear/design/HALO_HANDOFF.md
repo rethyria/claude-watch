@@ -151,3 +151,44 @@ lists/feeds. Live feed streams; keep visible tail (~6 lines), bottom-anchored.
 - The feed is `SessionState.terminal` (RingBuffer<TerminalLine>).
 - Edge states (error-outranks-waiting ring, 8-session ring scaling, approval
   queue "1/3" peek, revocable always-allow manager) are in Concepts.dc.html §2b.
+
+## Usage screen (page 0, one swipe right of home — issue #57)
+
+_Re-skinned per the Halo usage design; implemented in `HaloUsageScreen.kt`
+(pure presentation math as file-level internal funs, pinned by
+`HaloUsageFormatTest`). The wire is unchanged: `percent` is USED-percent._
+
+**States** (fetch-on-open drives them; Idle renders as Loading):
+- **Loading:** the eyebrow at 70% opacity, then 3 skeleton rows — header
+  placeholder rects 96×15 and 58×22 (r8, `#22242A`) + an 8px track
+  (`#22242A`), chord-fitted widths; alpha pulses 0.5↔1 over 1.2s ease-in-out,
+  staggered 0.18s per row. Tag `haloUsageLoading` on the skeleton container.
+- **Data:** vertically centered column, 17px gaps. Eyebrow `REMAINING` /
+  `USED` (19/500, letter-spacing 0.14em, `#63615B`) is **tappable** and
+  toggles the mode (tag `haloUsageMode`) — screen-local UI state
+  (rememberSaveable), default REMAINING. Cache fallback adds "as of Xm ago"
+  (19, `#8D8B84`) directly under the eyebrow, 4px gap (tag `haloUsageStale`).
+  One row per wire window, wire order: header line (name 22 `#8D8B84` · reset
+  19 `#63615B`, the existing formatter · percent 30/500 pushed to the right
+  edge) over an 8px r4 bar (track `#3A3C42`, fill width = shown percent).
+  Compact when n ≥ 4: percent 25, in-row gap 5px (else 8px).
+- **Error:** "usage unavailable" 27/500 `#E5484D`; the dynamic failure detail
+  21 `#8D8B84` (single line, ellipsized); Retry pill (tag `haloUsageRetry`) —
+  64px tall, 40px side padding, fully rounded, `#D97757` fill, "Retry" 24/500
+  `#1A0F0A`. Retry re-fires the same fetch the page entry does.
+
+**Display names** (presentation-only): kind `session` → "Session",
+`weekly_all` → "Weekly", any other kind keeps its wire label (e.g. "Fable").
+
+**Chord-fitted widths:** row i of n gets
+`min(336, round(2·√(max(R²−dy², 115²))·0.97))` px at the 450 ref, with
+R = 169, dy = (i−(n−1)/2)·pitch, pitch = 63 (n≤3) / 54 (n=4) / 46 (n≥5); each
+row is individually centered so the stack hugs the circle (n=3 ⇒ 304/328/304).
+
+**Semantic tiers** — always from REMAINING = 100 − wire percent, never from
+the shown number: remaining ≤ 0 "out" ⇒ bar + percent `#E5484D`; < 20 "low" ⇒
+`#D97757`; otherwise bar `#6CB289`, percent `#F4F1EA`.
+
+**Mode:** REMAINING shows remaining% (number and bar); USED shows used% — and
+a drained window in USED mode pins the bar to a full 100%. Flipping the mode
+never changes tier colors.
