@@ -387,8 +387,37 @@ class ConnectionEngine(
     }
 
     /**
+     * User-initiated stop WITHOUT the credential wipe (issue #24: the
+     * foreground-service notification's Disconnect action). The three
+     * teardowns, side by side:
+     *
+     *  - [stop] — unpair. Cancels everything AND clears the store; only a
+     *    fresh pairing code brings the engine back.
+     *  - [shutdown] — process teardown. Cancels everything, wipes nothing,
+     *    and deliberately does NOT land in [ConnectionState.Stopped]: the
+     *    process is dying, there is no resume to enable.
+     *  - disconnect — THIS. Cancels everything, wipes nothing, and lands in
+     *    [ConnectionState.Stopped] so a later [start] (the app reopening, a
+     *    sticky service restart) resumes from the PERSISTED credentials.
+     *
+     * Note that [teardownLocked] resets only the IN-MEMORY replay cursor; the
+     * persisted one survives untouched — which is exactly what catch-up
+     * needs: the next [start] reads it back and the reconnect's
+     * Last-Event-ID replays everything after the last APPLIED frame, never a
+     * full replay and never a skip.
+     */
+    fun disconnect() {
+        synchronized(lock) {
+            pairGeneration += 1 // aborts any pair() still in flight
+            teardownLocked()
+            _state.value = ConnectionState.Stopped
+        }
+    }
+
+    /**
      * Cancels all network activity WITHOUT clearing credentials — for process
-     * teardown (ViewModel.onCleared), where the pairing must survive.
+     * teardown, where the pairing must survive. For a user-visible stop that
+     * a later [start] can resume from, use [disconnect] instead.
      */
     fun shutdown() {
         synchronized(lock) { teardownLocked() }

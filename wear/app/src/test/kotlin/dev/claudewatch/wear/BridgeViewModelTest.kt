@@ -865,6 +865,58 @@ class BridgeViewModelTest {
     }
 
     /**
+     * Issue #24: disconnect() — the foreground service's notification stop
+     * affordance — lands the UI in the Stopped rendering (paired false,
+     * status = statusText(Stopped)) WITHOUT wiping credentials, and resume()
+     * — what every activity ON_START and every sticky service restart fires —
+     * reconnects: the engine opens /v1/events again (preflight first) and the
+     * UI reports the stream open. The engine-level halves (store untouched,
+     * reconnects cancelled, persisted-cursor replay) are pinned in
+     * ConnectionEngineTest; this pins the VM seam the service and activity
+     * actually call.
+     */
+    @Test
+    fun disconnectStopsTheStreamAndResumeReconnects() {
+        pairAndDrain()
+
+        viewModel.disconnect()
+        val stopped = awaitUi { !it.paired }
+        // Stopped renders through the same statusText as a never-paired
+        // engine — the offline screen's headline (paired=false) is what
+        // distinguishes the cases for the user, and resume() on the next
+        // app open makes the state transient anyway.
+        assertEquals("unpaired", stopped.status)
+
+        // Nothing further reaches the bridge while disconnected.
+        val requestsBefore = server.requestCount
+        Thread.sleep(500)
+        assertEquals(
+            "a disconnected engine must not keep talking to the bridge",
+            requestsBefore,
+            server.requestCount,
+        )
+
+        // resume(): the engine reconnects from PERSISTED credentials —
+        // openEvents is called again (the /v1/events request below) and the
+        // UI only reports paired once the stream is actually open again.
+        enqueuePing() // the resumed connect's discovery preflight
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(16, 250, TimeUnit.MILLISECONDS)
+                .setBody(":connected\n\n" + ":pad\n\n".repeat(400)),
+        )
+        viewModel.resume()
+        val preflight = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("resume must reconnect: no preflight ping")
+        assertEquals("/v1/ping", preflight.path)
+        val events = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("resume must reopen the stream: no /v1/events request")
+        assertEquals("/v1/events", events.path)
+        awaitStatus { it == "paired, stream open" }
+    }
+
+    /**
      * Issue #57: fetchUsage GETs /v1/usage with the paired bearer token,
      * passes through Loading, and parses render-what-you-get — EVERY limits[]
      * entry becomes a bar, an UNKNOWN kind included (a new upstream window

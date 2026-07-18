@@ -687,19 +687,27 @@ private fun UsageSkeleton(usedMode: Boolean, onToggleMode: () -> Unit) {
  */
 @Composable
 private fun UsageSkeletonRow(widthPx: Int, index: Int) {
-    val transition = rememberInfiniteTransition(label = "usageSkeleton")
-    val alpha by transition.animateFloat(
-        initialValue = 0.5f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            // Half the 1.2s pulse per direction; CSS ease-in-out curve.
-            animation = tween(durationMillis = 600, easing = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)),
-            repeatMode = RepeatMode.Reverse,
-            // 0.18s stagger per row, per the Halo usage design.
-            initialStartOffset = StartOffset(index * 180),
-        ),
-        label = "skeletonAlpha",
-    )
+    // Ambient (issue #24): wrist-down, the infinite pulse would keep the
+    // composition animating (and the display redrawing) forever with nobody
+    // looking — freeze at the pulse's dim floor instead. Keyed off the
+    // CompositionLocal so exiting ambient restarts the transition in place.
+    val alpha = if (LocalHaloAmbient.current) {
+        0.5f
+    } else {
+        val transition = rememberInfiniteTransition(label = "usageSkeleton")
+        transition.animateFloat(
+            initialValue = 0.5f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                // Half the 1.2s pulse per direction; CSS ease-in-out curve.
+                animation = tween(durationMillis = 600, easing = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)),
+                repeatMode = RepeatMode.Reverse,
+                // 0.18s stagger per row, per the Halo usage design.
+                initialStartOffset = StartOffset(index * 180),
+            ),
+            label = "skeletonAlpha",
+        ).value
+    }
     Column(
         verticalArrangement = Arrangement.spacedBy(4.dp), // 8px header-to-track
         modifier = Modifier.width((widthPx / 2f).dp).alpha(alpha),

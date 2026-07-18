@@ -1,10 +1,6 @@
 package dev.claudewatch.wear
 
 import android.content.Context
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewmodel.initializer
-import androidx.lifecycle.viewmodel.viewModelFactory
 import dev.claudewatch.shared.protocol.AskUserQuestion
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
@@ -38,13 +34,22 @@ import org.json.JSONObject
  * only renders its state and feeds it user intents. All event handling goes
  * through :shared's pure [BridgeEventReducer]: this class only does I/O and
  * mirrors the reduced [BridgeState] into [UiState].
+ *
+ * PROCESS-lifetime, not activity-lifetime (issue #24): production obtains
+ * this class only through [singleton], never a ViewModelProvider — the old
+ * androidx ViewModel base died with its activity's ViewModelStore
+ * (onCleared → engine.shutdown()), which killed the SSE stream on every
+ * activity destroy. The engine's owner is now the process; the foreground
+ * [BridgeSessionService] is what keeps that process (and the socket) alive
+ * with the screen off, and [shutdown] survives only for tests that construct
+ * their own instances.
  */
 class BridgeViewModel(
     store: CredentialStore,
     clientFactory: (String, Int) -> BridgeClient = { hostIp, port -> BridgeClient(hostIp, port) },
     backoff: BackoffPolicy = BackoffPolicy(),
     escalator: NetworkEscalator = NetworkEscalator.NOOP,
-) : ViewModel() {
+) {
 
     /**
      * One queued approval card, fully resolved for rendering: WHAT is being
@@ -195,10 +200,21 @@ class BridgeViewModel(
     @Volatile
     var haptics: Haptics = Haptics.None
 
-    // Owns the engine's lifetime; viewModelScope is avoided on purpose (it
-    // requires Dispatchers.Main, which plain JVM unit tests don't have).
+    // Owns the engine's lifetime; viewModelScope was avoided even before the
+    // ViewModel base class went (it requires Dispatchers.Main, which plain
+    // JVM unit tests don't have) — which is also why process scoping was a
+    // natural move: nothing here ever depended on an activity's lifecycle.
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val engine = ConnectionEngine(store, engineScope, clientFactory, backoff, escalator = escalator)
+
+    /**
+     * The engine's raw connection state, exposed for [BridgeSessionService]:
+     * the service derives its notification/chip text from it and stops itself
+     * on the terminal states (Stopped / AuthExpired / BridgeMismatch — nothing
+     * left to keep alive). The UI keeps rendering the flattened [UiState]
+     * instead; this VM stays the single owner of the engine either way.
+     */
+    val connection: StateFlow<ConnectionState> = engine.state
 
     init {
         engineScope.launch {
@@ -251,6 +267,34 @@ class BridgeViewModel(
     fun unpair() {
         engine.stop()
         _state.update { UiState(status = it.status, paired = false) }
+    }
+
+    /**
+     * Issue #24: the foreground-service notification's Disconnect action —
+     * stop the stream WITHOUT the credential wipe, unlike [unpair]. The next
+     * [resume] (any activity ON_START, or a sticky service restart)
+     * reconnects from the persisted credentials and replays from the
+     * persisted ack cursor. The screen model is deliberately NOT reset: the
+     * cursor only ever skips frames the reducer already APPLIED into this
+     * state, so retained state + the reconnect replay is exactly the
+     * sessions' truth — wiping it would just re-earn it from a full replay.
+     */
+    fun disconnect() {
+        engine.disconnect()
+    }
+
+    /**
+     * Reconnect a disconnected engine (issue #24's catch-up-on-open).
+     * [ConnectionEngine.start] is already guarded: it no-ops unless the
+     * engine is actually stopped AND surfaced as Stopped, and it stays
+     * Stopped without persisted credentials — so this is safe to fire on
+     * EVERY activity ON_START and every service (re)start command. Reopening
+     * the app after a notification Disconnect or a process death therefore
+     * resumes the stream from the persisted Last-Event-ID instead of
+     * silently staying dead.
+     */
+    fun resume() {
+        engine.start()
     }
 
     /** Mirror the command box into [UiState.commandDraft] (see its doc for why the VM owns it). */
@@ -871,25 +915,38 @@ class BridgeViewModel(
         else -> false
     }
 
-    override fun onCleared() {
-        // Process/UI teardown is NOT unpair: cancel all network activity but
-        // keep credentials so the next launch resumes.
+    /**
+     * Cancel all network activity WITHOUT clearing credentials. Production
+     * never calls this — the [singleton] lives exactly as long as the
+     * process, and process death IS the teardown (that engine death on
+     * activity destroy was the whole bug #24 exists to fix). Kept public for
+     * tests that construct their own instances and must not leak sockets
+     * between cases.
+     */
+    fun shutdown() {
         engine.shutdown()
         engineScope.cancel()
     }
 
     companion object {
+        @Volatile
+        private var instance: BridgeViewModel? = null
+
         /**
-         * Production wiring: Keystore-encrypted store in app-private files,
-         * held-Wi-Fi escalation through the real ConnectivityManager.
+         * Process-wide singleton with the production wiring: the
+         * Keystore-encrypted [CredentialStore.singleton] and held-Wi-Fi
+         * escalation through the real ConnectivityManager. Same
+         * double-checked pattern as the store's, for the same reason turned
+         * up to eleven (issue #24): the engine and its SSE stream must have
+         * PROCESS lifetime — MainActivity and [BridgeSessionService] both
+         * attach to this one instance, and no activity teardown may kill it.
          */
-        fun factory(context: Context): ViewModelProvider.Factory = viewModelFactory {
-            initializer {
-                BridgeViewModel(
+        fun singleton(context: Context): BridgeViewModel =
+            instance ?: synchronized(this) {
+                instance ?: BridgeViewModel(
                     CredentialStore.singleton(context),
                     escalator = WifiNetworkEscalator(context.applicationContext),
-                )
+                ).also { instance = it }
             }
-        }
     }
 }

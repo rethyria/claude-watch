@@ -39,6 +39,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -124,6 +125,16 @@ data class HaloActions(
     val onUsageRefresh: () -> Unit = {},
 )
 
+/**
+ * Ambient mode (issue #24, handoff §9's minimal rendition), for whatever
+ * composable needs to know it without threading a parameter through every
+ * screen: currently the usage skeleton, whose infinite pulse must FREEZE
+ * wrist-down (an infinite transition burns watts redrawing a display nobody
+ * is looking at). Provided by [HaloApp] from the activity's
+ * AmbientLifecycleObserver flag.
+ */
+internal val LocalHaloAmbient = compositionLocalOf { false }
+
 /** Handoff motion: 300ms cubic-bezier(0.2,0.7,0.3,1), 70px slide at 450 ref. */
 private val HaloEasing = CubicBezierEasing(0.2f, 0.7f, 0.3f, 1f)
 private const val TRANSITION_MS = 300
@@ -145,7 +156,27 @@ private const val TAP_GUARD_MS = 300L
 private const val USAGE_AUTO_POLL_MS = 310_000L
 
 @Composable
-fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
+fun HaloApp(
+    ui: BridgeViewModel.UiState,
+    actions: HaloActions,
+    // Wrist-down (issue #24). Defaulted false so every existing call site and
+    // fixture-driven test stays source-compatible.
+    ambient: Boolean = false,
+) {
+    // The flag also rides a CompositionLocal so DEEP consumers (the usage
+    // skeleton's pulse) can read it without a parameter chain through every
+    // screen composable; the body itself takes it as a plain parameter.
+    CompositionLocalProvider(LocalHaloAmbient provides ambient) {
+        HaloAppBody(ui = ui, actions = actions, ambient = ambient)
+    }
+}
+
+@Composable
+private fun HaloAppBody(
+    ui: BridgeViewModel.UiState,
+    actions: HaloActions,
+    ambient: Boolean,
+) {
     val model = HaloModel.from(ui)
     var nav by remember { mutableStateOf(HaloNavState()) }
     // Gesture lambdas live inside pointerInput(Unit) blocks that never
@@ -580,6 +611,24 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
             ) {
                 HaloOfflineScreen(ui = ui, onPair = actions.onPair)
             }
+        }
+
+        // Ambient (issue #24, handoff §9's minimal rendition — the wrist-down
+        // terminal): one dimming scrim over the WHOLE root, offline takeover
+        // included, so every lit pixel drops together; TimeText underneath
+        // stays visible — it is the ambient clock. Unlike the takeover above
+        // this is a TRUE scrim: a bare background does not hit-test, so the
+        // wake-tap the system delivers on exit still lands where it aimed.
+        // The infinite animations are frozen separately via LocalHaloAmbient
+        // (see the usage skeleton). The tag exists ONLY while ambient, which
+        // is what the instrumented tests assert the mode by.
+        if (ambient) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .testTag("haloAmbient"),
+            )
         }
     }
 }

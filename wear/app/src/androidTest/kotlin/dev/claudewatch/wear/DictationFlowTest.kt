@@ -82,6 +82,13 @@ class DictationFlowTest {
 
     @After
     fun tearDown() {
+        // Engine first, server second: killing the server under a live engine
+        // kicks off an endless reconnect + port-probe loop that outlives the
+        // test in the shared instrumentation process (and can steal a later
+        // test's MockWebServer responses if Linux reuses the ephemeral port).
+        // shutdown() is the kdoc-designated teardown for test-constructed
+        // instances — same ordering as CatchUpFlowTest.
+        viewModel.shutdown()
         server.shutdown()
     }
 

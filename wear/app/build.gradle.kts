@@ -48,6 +48,14 @@ dependencies {
     implementation(libs.compose.foundation)
     implementation(libs.wear.compose.material)
     implementation(libs.wear.compose.foundation)
+    // Ambient support (issue #24): AmbientLifecycleObserver flags wrist-down
+    // so Halo can freeze animations and dim instead of burning the display.
+    implementation(libs.wear)
+    // The OngoingActivity chip riding the foreground service's notification
+    // (issue #24), plus androidx.core explicitly for NotificationCompat /
+    // ServiceCompat rather than leaning on a transitive version.
+    implementation(libs.wear.ongoing)
+    implementation(libs.core.ktx)
     implementation(libs.activity.compose)
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.coroutines.android)
@@ -68,6 +76,10 @@ dependencies {
     debugImplementation(libs.compose.ui.test.manifest)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
+    // GrantPermissionRule for POST_NOTIFICATIONS (issue #24): pairing starts
+    // the FGS, whose permission ask would otherwise cover the compose tree
+    // with a system dialog mid-flow.
+    androidTestImplementation(libs.androidx.test.rules)
     androidTestImplementation(libs.okhttp)
     // On-device fake bridge for the dictation flow test (stubbed recognizer
     // result → real POST → ack-gated echo) — no real bridge needed.

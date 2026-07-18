@@ -10,6 +10,18 @@
          ConnectivityManager.requestNetwork(TRANSPORT_WIFI) in WifiNetworkEscalator. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- The bridge connection's process lifetime (issue #24): a connectedDevice
+         foreground service holds the SSE stream open past activity destroy and
+         Doze. CHANGE_NETWORK_STATE above already satisfies the connectedDevice
+         prerequisite on API 34+; CHANGE_WIFI_STATE is held alongside it for the
+         same escalation surface. POST_NOTIFICATIONS because targetSdk 34: the
+         FGS notification (and its OngoingActivity chip) is invisible without
+         the runtime grant on API 33+ — denial is tolerated, the service still
+         runs. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:label="@string/app_name"
@@ -34,5 +46,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Started (never bound) foreground service holding the bridge
+             connection open with process lifetime (issue #24). -->
+        <service
+            android:name=".BridgeSessionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>

@@ -282,3 +282,35 @@ a **truly drained** window (remaining ≤ 0 — deliberately NOT tier "out",
 which now starts at 5% remaining: a 95%-used bar must still read as 95%) in
 USED mode pins the bar to a full 100%. Flipping the mode never changes tier
 colors.
+
+## Background lifetime (#24)
+
+The engine is PROCESS-scoped (`BridgeViewModel.singleton`; MainActivity is
+just an attachment point) and held open by **`BridgeSessionService`**, a
+started `connectedDevice` foreground service: it starts when the UI state
+turns paired (from the RESUMED activity), surfaces as a low-importance
+notification carrying an **OngoingActivity chip** on the watch face
+(`serviceStatusText`: "connected" / "reconnecting" / the state's name —
+chip-short by design), and stops itself on the terminal connection states
+(Stopped / AuthExpired / BridgeMismatch — a chip for a dead connection would
+lie). `START_STICKY`: a system restart revives the connection with no
+activity involved.
+
+**Stop affordance:** the notification's **Disconnect** action —
+`disconnect()`, the middle teardown: stream down, reconnects cancelled,
+credentials and the persisted replay cursor KEPT (unpair remains the only
+wipe).
+
+**Catch-up:** the persisted cursor advances only on reducer-APPLIED frames
+(#48's ack-to-advance), so every reconnect — `resume()` fires on every
+activity ON_START and every service (re)start — sends `Last-Event-ID` =
+last applied id and the bridge replays exactly what the watch never
+rendered. Reopening the app after a Disconnect or process death IS the
+catch-up path; nothing else is needed.
+
+**Ambient** (`AmbientLifecycleObserver` → `HaloApp(ambient = …)`), the
+wrist-down terminal, deliberately minimal: a 0.55 black scrim over the whole
+root (TimeText stays visible underneath — it is the ambient clock), the
+infinite animations frozen (`LocalHaloAmbient`; currently the usage
+skeleton's pulse), and testTag `haloAmbient` present ONLY while ambient.
+Wake restores the full screen in place.
