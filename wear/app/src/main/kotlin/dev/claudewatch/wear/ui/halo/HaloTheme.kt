@@ -23,6 +23,10 @@ object Halo {
         val TextSecondary = Color(0xFF8D8B84)
         val TextFaint = Color(0xFF63615B)
 
+        // Loading-skeleton placeholder grey (usage page, per the Halo usage
+        // design) — darker than Idle so a pulsing rect never reads as a bar.
+        val SkeletonFill = Color(0xFF22242A)
+
         // Semantic session/state colors.
         val WaitingForYou = Color(0xFFD97757) // terracotta — perm & question
         val Running = Color(0xFF6CB289)

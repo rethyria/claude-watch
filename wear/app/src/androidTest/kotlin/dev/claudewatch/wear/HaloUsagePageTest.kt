@@ -27,8 +27,9 @@ import org.junit.runner.RunWith
  * RECORDED onUsageOpen action seam — no bridge, no network. Swipe right from
  * home lands on usage and fires the fetch seam (on EVERY entry — fetch-on-open
  * is the whole caching policy); swipe left returns home; the bars render from
- * injected Data (including the cache-staleness line); Error renders the
- * message with a tappable retry that re-fires the seam; and the page has no
+ * injected Data (including the cache-staleness line); the eyebrow toggles the
+ * REMAINING/USED reading of a known wire percent; Error renders the message
+ * with a tappable retry that re-fires the seam; and the page has no
  * drill-down — swipe up stays put.
  */
 @RunWith(AndroidJUnit4::class)
@@ -107,12 +108,13 @@ class HaloUsagePageTest {
         compose.onNodeWithTag("haloUsageLoading").assertIsDisplayed()
         assertEquals("landing on usage fires the fetch seam", 1, opens)
 
-        // The fetch lands: one REMAINING bar per wire entry, reset lines from
-        // the payload's ISO times.
+        // The fetch lands: one bar per wire entry, with the presentation-only
+        // display names (session → "Session", weekly_all → "Weekly", any
+        // other kind keeps its wire label) per the Halo usage design.
         state = state.copy(usage = fixtureData())
         compose.waitForIdle()
-        compose.onNodeWithText("5-hour").assertIsDisplayed()
-        compose.onNodeWithText("weekly").assertIsDisplayed()
+        compose.onNodeWithText("Session").assertIsDisplayed()
+        compose.onNodeWithText("Weekly").assertIsDisplayed()
         compose.onNodeWithText("Fable").assertIsDisplayed()
 
         swipeBackHome()
@@ -122,6 +124,43 @@ class HaloUsagePageTest {
         swipeToUsage()
         compose.onNodeWithTag("haloUsage").assertIsDisplayed()
         assertEquals("every entry re-fetches", 2, opens)
+    }
+
+    @Test
+    fun tappingTheEyebrowFlipsRemainingToUsed() {
+        // One window with a KNOWN wire (USED) percent: 28 used → the default
+        // REMAINING mode shows 72%; tapping the eyebrow flips the reading to
+        // USED and the same wire renders 28%. Screen-local state — no wire
+        // round-trip involved.
+        compose.setContent {
+            HaloApp(
+                ui = ui(
+                    BridgeViewModel.UsageUi.Data(
+                        limits = listOf(
+                            BridgeViewModel.UsageLimit(
+                                "session", "5-hour", 28.0, "2026-07-18T19:10:00Z",
+                            ),
+                        ),
+                        source = "api",
+                        fetchedAtMs = null,
+                    ),
+                ),
+                actions = HaloActions(),
+            )
+        }
+        swipeToUsage()
+        compose.onNodeWithText("REMAINING").assertIsDisplayed()
+        compose.onNodeWithText("72%").assertIsDisplayed()
+
+        compose.onNodeWithTag("haloUsageMode").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("USED").assertIsDisplayed()
+        compose.onNodeWithText("28%").assertIsDisplayed()
+        assertEquals(
+            "the remaining reading is gone after the flip",
+            0,
+            compose.onAllNodes(hasText("72%")).fetchSemanticsNodes().size,
+        )
     }
 
     @Test
