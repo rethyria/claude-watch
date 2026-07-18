@@ -34,6 +34,14 @@ data class HaloSession(
      * stop a workflow; #53's honesty lesson).
      */
     val agentsRunning: Int = 0,
+    /**
+     * Where a NEW session for this session's project should spawn (issue
+     * #56): the MAIN repo root when known — a worktree session offers the
+     * main checkout, never its throwaway worktree directory — else the
+     * session's own cwd. Null when neither is known (queue-orphan synthetic
+     * sessions), in which case this session contributes no spawn target.
+     */
+    val spawnRoot: String? = null,
 ) {
     /**
      * The ⎇ badge text — "⎇ main", "⎇ issue-53-fix · wt" for a worktree — or
@@ -49,6 +57,9 @@ data class HaloProject(
     val sessions: List<HaloSession>,
 )
 
+/** One spawn-picker entry (issue #56): a known project and its spawn root. */
+data class SpawnTarget(val projectName: String, val root: String)
+
 /** The whole derived tree plus the cross-cutting waiting queue. */
 data class HaloModel(
     val projects: List<HaloProject>,
@@ -59,6 +70,21 @@ data class HaloModel(
     val sessionCount: Int get() = sessions.size
     val projectCount: Int get() = projects.size
     val waitingCount: Int get() = queue.size
+
+    /**
+     * The spawn picker's per-project targets (issue #56): each known
+     * project's spawn root is its sessions' FIRST known [HaloSession.spawnRoot]
+     * (repoRoot beats cwd per session — a worktree session offers the MAIN
+     * checkout). A project whose sessions know neither repoRoot nor cwd
+     * (queue-orphan synthetics) offers no target: spawning "somewhere under
+     * that name" would land the session in the bridge's own cwd, the exact
+     * invisible-surprise #56 removes.
+     */
+    val spawnTargets: List<SpawnTarget>
+        get() = projects.mapNotNull { project ->
+            project.sessions.firstNotNullOfOrNull { it.spawnRoot }
+                ?.let { SpawnTarget(project.name, it) }
+        }
 
     companion object {
         fun from(ui: UiState): HaloModel {
@@ -101,6 +127,9 @@ data class HaloModel(
                     branch = s.branch,
                     worktree = s.worktree,
                     agentsRunning = s.agents?.running ?: 0,
+                    // repoRoot beats cwd: for a worktree session repoRoot IS
+                    // the main checkout, and a new session belongs there.
+                    spawnRoot = s.repoRoot ?: s.cwd,
                 )
             }
 

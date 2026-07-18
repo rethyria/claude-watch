@@ -18,15 +18,22 @@ cd "$REPO_ROOT"
 # test can page over to it and kill it). CI has no real Claude Code install,
 # so provide a stub that echoes, then keeps its PTY open unless invoked
 # headless.
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/claude" <<'EOF'
+# The stub lives in a PRIVATE temp dir — never in $HOME/.local/bin, where it
+# would clobber a developer's real `claude` launcher on every local run (it
+# did, silently, for weeks). And it is handed to the bridge via the
+# CLAUDE_WATCH_CLAUDE_BIN test override, NOT via PATH: the bridge's findBinary
+# checks well-known locations like ~/.local/bin/claude ahead of PATH, so on a
+# dev machine with a real launcher there a PATH-prepended stub silently loses
+# and the e2e spawns the REAL Claude Code (no stub output, hung feed wait).
+STUB_BIN="$(mktemp -d "${TMPDIR:-/tmp}/wear-e2e-stub.XXXXXX")"
+cat > "$STUB_BIN/claude" <<'EOF'
 #!/usr/bin/env bash
 echo "stub-claude invoked: $*"
 case " $* " in *" -p "*) exit 0 ;; esac
 exec cat
 EOF
-chmod +x "$HOME/.local/bin/claude"
-export PATH="$HOME/.local/bin:$PATH"
+chmod +x "$STUB_BIN/claude"
+export CLAUDE_WATCH_CLAUDE_BIN="$STUB_BIN/claude"
 
 # Fresh credentials dir: the bridge must start unpaired and print a code.
 export CLAUDE_WATCH_CREDENTIALS_DIR="$(mktemp -d)"

@@ -1,7 +1,8 @@
-// The Halo root: horizontal pager (All + one page per project) with tappable
-// dots, vertical swipes for depth, 300ms directional slide+fade between
-// depths, a decorative (non-tappable) TimeText on inner screens, and the
-// approval/question card as a top overlay chained off the waiting queue.
+// The Halo root: horizontal pager (usage left of home, All, one page per
+// project) with tappable dots, vertical swipes for depth, 300ms directional
+// slide+fade between depths, a decorative (non-tappable) TimeText on inner
+// screens, and the approval/question card as a top overlay chained off the
+// waiting queue.
 // Navigation state itself is the pure HaloNavState machine (HaloNav.kt); this
 // file only binds gestures, animation, and the screen composables to it.
 package dev.claudewatch.wear.ui.halo
@@ -20,6 +21,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -87,7 +89,12 @@ data class HaloActions(
     val onDismissPermission: (permissionId: String) -> Unit = {},
     /** Voice-overlay Discard: drop the failed draft AND its error together. */
     val onDiscardCommand: () -> Unit = {},
-    val onSpawn: (agent: String) -> Unit = {},
+    /**
+     * Spawn a fresh [agent] session at [cwd] — a project root chosen in the
+     * spawn picker (issue #56), `"~"` for a no-project home session, or null
+     * for the bridge's default cwd chain.
+     */
+    val onSpawn: (agent: String, cwd: String?) -> Unit = { _, _ -> },
     val onKill: (sessionId: String) -> Unit = {},
     /**
      * Honest-hide an EXTERNAL (hook-created, PTY-less) session from view
@@ -95,6 +102,13 @@ data class HaloActions(
      * [onKill] by the session's `external` flag.
      */
     val onHide: (sessionId: String) -> Unit = {},
+    /**
+     * The usage page became current (issue #57): fetch GET /v1/usage. Fired
+     * on EVERY entry (fetch-on-open is the whole caching policy) and by the
+     * usage screen's error-retry tap. An action seam — not a VM call — so
+     * instrumented tests can record entries and inject states.
+     */
+    val onUsageOpen: () -> Unit = {},
 )
 
 /** Handoff motion: 300ms cubic-bezier(0.2,0.7,0.3,1), 70px slide at 450 ref. */
@@ -117,6 +131,13 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
     val currentModel by rememberUpdatedState(model)
     val currentUi by rememberUpdatedState(ui)
     var lastSwipeAtMs by remember { mutableLongStateOf(0L) }
+
+    // Issue #56: the spawn picker overlay. The list's "+ new claude session"
+    // row OPENS it instead of firing blind; a pick spawns-and-closes, the
+    // swipe-down cancel closes without spawning. A plain flag (like the
+    // overlays below, not a nav depth): it floats over the list it was
+    // summoned from and closing must land exactly there.
+    var spawnPickerOpen by remember { mutableStateOf(false) }
 
     // §5/§6 result flash: an answered prompt leaves ui.permissionQueue at ACK
     // time, but its card must stay composed while the 1.4s ✓/✕ flash plays.
@@ -221,6 +242,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                 Layer.Pager -> PagerLayer(
                     model = model,
                     page = nav.page,
+                    usage = ui.usage,
                     onPageChange = { nav = nav.copy(page = it) },
                     onDrill = {
                         lastSwipeAtMs = SystemClock.uptimeMillis()
@@ -231,6 +253,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                             nav = nav.openFirstWaiting(currentModel)
                         }
                     },
+                    onUsageOpen = actions.onUsageOpen,
                 )
                 is Layer.SessionList -> InnerScreen(
                     onBack = { nav = nav.back() },
@@ -253,11 +276,16 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                             onOpenSession = { nav = nav.drillToSession(it) },
                             onKill = actions.onKill,
                             onHide = actions.onHide,
-                            onSpawn = actions.onSpawn,
+                            // Issue #56: the row summons the target picker
+                            // overlay; the actual onSpawn fires from a pick.
+                            onSpawn = { spawnPickerOpen = true },
                             // The list's scrollable eats every vertical drag, so
                             // InnerScreen's back detector can't fire under it; the
                             // list re-triggers back itself via nested scroll.
                             onBack = { nav = nav.back() },
+                            // Reclaim the bezel when the picker closes (its
+                            // rotary node stole focus and is now disposed).
+                            rotaryActive = !spawnPickerOpen,
                         )
                     }
                 }
@@ -278,6 +306,48 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         // Dictation from a feed goes to THAT session.
                         onDictate = { dictate(layer.sessionId) },
                         onCycle = { nav = nav.copy(sessionId = it) },
+                    )
+                }
+            }
+        }
+
+        // Issue #56: the spawn target picker, over the list that summoned it
+        // and UNDER the approval card / offline takeover (a prompt or a
+        // dropped stream outranks choosing a spawn directory). Modal like the
+        // card: consumeAllGestures keeps stray horizontal drags off the
+        // invisible session rows underneath (the picker's own list consumes
+        // vertical drags itself, and its children are hit first).
+        if (spawnPickerOpen) {
+            // Deliberately NO consumeAllGestures() here, unlike the card
+            // overlay below: consuming the down in the Main pass reads to the
+            // picker list's scrollable as "another detector claimed this
+            // gesture", cancelling its drag recognition — which silently
+            // killed the nested-scroll swipe-down cancel for real fingers
+            // (device-bisected). No shield is needed either: the picker's
+            // ScalingLazyColumn is fillMaxSize, so ITS handlers own every hit
+            // on screen and nothing falls through to the session list below;
+            // and this overlay is a root-Box sibling, so no ancestor back
+            // detector can double-handle the pull. The card differs on both
+            // counts (smaller content, gesture detector on the box itself).
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Halo.Palette.Background)
+                    .testTag("haloSpawnPicker"),
+            ) {
+                // Same API 31+ trap as the session list: the stretch-
+                // overscroll would consume every post-overpull drag delta
+                // before nested scroll sees it, making the picker's rebuilt
+                // swipe-down cancel unreachable by a real finger.
+                @OptIn(ExperimentalFoundationApi::class)
+                CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
+                    HaloSpawnPicker(
+                        model = model,
+                        onPick = { cwd ->
+                            spawnPickerOpen = false
+                            actions.onSpawn("claude", cwd)
+                        },
+                        onCancel = { spawnPickerOpen = false },
                     )
                 }
             }
@@ -564,21 +634,34 @@ private fun androidx.compose.animation.AnimatedContentTransitionScope<Layer>.dep
 private fun PagerLayer(
     model: HaloModel,
     page: Int,
+    usage: BridgeViewModel.UsageUi,
     onPageChange: (Int) -> Unit,
     onDrill: () -> Unit,
     onTapCenter: () -> Unit,
+    onUsageOpen: () -> Unit,
 ) {
-    val pageCount = 1 + model.projects.size
+    // Pager slot 0 is the USAGE page (issue #57), so pagerIndex = nav.page + 1:
+    // All keeps nav.page 0 (slot 1, the initial page) and every existing
+    // depth/nav path — jumpHome included — still lands on All untouched.
+    val pageCount = 2 + model.projects.size
     // The remembered PagerState outlives this composition's model; the lambda
     // must read the CURRENT one or the page count freezes at first render.
     val currentModel by rememberUpdatedState(model)
     val pagerState = rememberPagerState(
-        initialPage = page.coerceIn(0, pageCount - 1),
-        pageCount = { 1 + currentModel.projects.size },
+        initialPage = (page + 1).coerceIn(0, pageCount - 1),
+        pageCount = { 2 + currentModel.projects.size },
     )
     val scope = rememberCoroutineScope()
+    val usageOpen by rememberUpdatedState(onUsageOpen)
     LaunchedEffect(pagerState) {
-        snapshotFlow { pagerState.currentPage }.collect(onPageChange)
+        snapshotFlow { pagerState.currentPage }.collect { pagerIndex ->
+            onPageChange(pagerIndex - 1)
+            // Fetch-on-open (issue #57): EVERY landing on the usage page —
+            // swipe, dot tap, re-entry after a depth round trip — re-fetches.
+            // No polling and no client cache by design; this snapshotFlow IS
+            // the "page became current" seam.
+            if (pagerIndex == 0) usageOpen()
+        }
     }
 
     val drill by rememberUpdatedState(onDrill)
@@ -587,6 +670,7 @@ private fun PagerLayer(
             .fillMaxSize()
             // Swipe up drills into the list under the current page. Vertical
             // only — the pager owns horizontal. Threshold per the handoff.
+            // On the usage page the drill lands in HaloNav's no-op (#57).
             .pointerInput(Unit) {
                 val threshold = size.height * SWIPE_THRESHOLD_FRACTION
                 var total = 0f
@@ -597,12 +681,16 @@ private fun PagerLayer(
             },
     ) {
         HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { index ->
-            if (index == 0) {
-                HaloAllPage(model = model, onTapCenter = onTapCenter)
-            } else {
-                // The pager can briefly ask for a page past a shrunken model.
-                val project = model.projects.getOrNull(index - 1) ?: return@HorizontalPager
-                HaloProjectPage(project = project, onTapCenter = onTapCenter)
+            when {
+                // No centerpiece and no drill-down on the usage page: bars
+                // only, retry re-fires the same fetch the entry did.
+                index == 0 -> HaloUsageScreen(usage = usage, onRetry = usageOpen)
+                index == 1 -> HaloAllPage(model = model, onTapCenter = onTapCenter)
+                else -> {
+                    // The pager can briefly ask for a page past a shrunken model.
+                    val project = model.projects.getOrNull(index - 2) ?: return@HorizontalPager
+                    HaloProjectPage(project = project, onTapCenter = onTapCenter)
+                }
             }
         }
         PageDots(
@@ -617,7 +705,10 @@ private fun PagerLayer(
 /**
  * Bottom-center page dots (handoff: current 11px cream, others 8px grey,
  * tappable). Tap targets are deliberately larger than the dots; a full 48dp
- * per dot would overflow the curve with 4+ pages.
+ * per dot would overflow the curve with 4+ pages. The LEADING dot is the
+ * usage page's (issue #57): an outlined ring instead of a fill — visually
+ * distinct and faint, so the session pages' dots keep reading as the row's
+ * "real" content.
  */
 @Composable
 private fun PageDots(
@@ -636,14 +727,21 @@ private fun PageDots(
                     .clickable { onSelect(index) },
             ) {
                 val isCurrent = index == current
-                Box(
-                    modifier = Modifier
-                        .size(if (isCurrent) 5.5.dp else 4.dp)
-                        .background(
-                            if (isCurrent) Halo.Palette.DotCurrent else Halo.Palette.DotOther,
-                            CircleShape,
-                        ),
-                )
+                val color = if (isCurrent) Halo.Palette.DotCurrent else Halo.Palette.DotOther
+                if (index == 0) {
+                    // The usage dot: same footprint, ring not fill.
+                    Box(
+                        modifier = Modifier
+                            .size(if (isCurrent) 5.5.dp else 4.dp)
+                            .border(1.dp, color, CircleShape),
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(if (isCurrent) 5.5.dp else 4.dp)
+                            .background(color, CircleShape),
+                    )
+                }
             }
         }
     }

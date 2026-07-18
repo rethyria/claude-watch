@@ -1,0 +1,181 @@
+package dev.claudewatch.wear
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeUp
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import dev.claudewatch.shared.state.BridgeState
+import dev.claudewatch.shared.state.SessionState
+import dev.claudewatch.wear.ui.halo.HaloActions
+import dev.claudewatch.wear.ui.halo.HaloApp
+import org.junit.Assert.assertEquals
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+
+/**
+ * The usage page LEFT of home (issue #57), driven with fixture UiStates and a
+ * RECORDED onUsageOpen action seam — no bridge, no network. Swipe right from
+ * home lands on usage and fires the fetch seam (on EVERY entry — fetch-on-open
+ * is the whole caching policy); swipe left returns home; the bars render from
+ * injected Data (including the cache-staleness line); Error renders the
+ * message with a tappable retry that re-fires the seam; and the page has no
+ * drill-down — swipe up stays put.
+ */
+@RunWith(AndroidJUnit4::class)
+class HaloUsagePageTest {
+
+    @get:Rule
+    val compose = createComposeRule()
+
+    private fun fixtureBridge() = BridgeState(
+        sessions = mapOf(
+            "s-1" to SessionState(
+                sessionId = "s-1",
+                agent = "claude",
+                cwd = "/home/dev/alpha",
+                folderName = "alpha",
+            ),
+        ),
+    )
+
+    private fun ui(usage: BridgeViewModel.UsageUi) = BridgeViewModel.UiState(
+        status = "paired, stream open",
+        paired = true,
+        bridge = fixtureBridge(),
+        usage = usage,
+    )
+
+    private fun fixtureData(source: String = "api", fetchedAtMs: Long? = null) =
+        BridgeViewModel.UsageUi.Data(
+            limits = listOf(
+                BridgeViewModel.UsageLimit("session", "5-hour", 37.5, "2026-07-18T19:10:00Z"),
+                BridgeViewModel.UsageLimit("weekly_all", "weekly", 80.0, "2026-07-24T00:00:00Z"),
+                BridgeViewModel.UsageLimit("weekly_scoped", "Fable", 12.0, "2026-07-24T00:00:00Z"),
+            ),
+            source = source,
+            fetchedAtMs = fetchedAtMs,
+        )
+
+    /**
+     * Pager swipes as a real finger drags them: frame-by-frame moves (the
+     * same injection discipline as the swipe-threshold gestures — a batched
+     * swipe collapses into one frame-sized delta and can behave nothing like
+     * a finger on API 31+ surfaces). ~0.8 of the width at fling speed settles
+     * the HorizontalPager one page over.
+     */
+    private fun swipeToUsage() {
+        compose.onNodeWithTag("haloRoot").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(width / 12f, 0f), delayMillis = 16L) }
+            up()
+        }
+        compose.waitForIdle()
+    }
+
+    private fun swipeBackHome() {
+        compose.onNodeWithTag("haloRoot").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(-width / 12f, 0f), delayMillis = 16L) }
+            up()
+        }
+        compose.waitForIdle()
+    }
+
+    @Test
+    fun swipeRightLandsOnUsageFetchesOnEveryEntryAndSwipesBackHome() {
+        var opens = 0
+        var state by mutableStateOf(ui(BridgeViewModel.UsageUi.Loading))
+        compose.setContent {
+            HaloApp(ui = state, actions = HaloActions(onUsageOpen = { opens++ }))
+        }
+        // Home is the initial page (the census inside the merged centerpiece).
+        compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
+        assertEquals("home entry never fetches", 0, opens)
+
+        swipeToUsage()
+        compose.onNodeWithTag("haloUsage").assertIsDisplayed()
+        compose.onNodeWithTag("haloUsageLoading").assertIsDisplayed()
+        assertEquals("landing on usage fires the fetch seam", 1, opens)
+
+        // The fetch lands: one REMAINING bar per wire entry, reset lines from
+        // the payload's ISO times.
+        state = state.copy(usage = fixtureData())
+        compose.waitForIdle()
+        compose.onNodeWithText("5-hour").assertIsDisplayed()
+        compose.onNodeWithText("weekly").assertIsDisplayed()
+        compose.onNodeWithText("Fable").assertIsDisplayed()
+
+        swipeBackHome()
+        compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
+
+        // Re-entry re-fetches: fetch-on-open, no client cache.
+        swipeToUsage()
+        compose.onNodeWithTag("haloUsage").assertIsDisplayed()
+        assertEquals("every entry re-fetches", 2, opens)
+    }
+
+    @Test
+    fun cacheSourceRendersTheStalenessLine() {
+        val fiveMinutesAgo = System.currentTimeMillis() - 5 * 60_000L
+        compose.setContent {
+            HaloApp(
+                ui = ui(fixtureData(source = "cache", fetchedAtMs = fiveMinutesAgo)),
+                actions = HaloActions(),
+            )
+        }
+        swipeToUsage()
+        compose.onNodeWithTag("haloUsage").assertIsDisplayed()
+        // The bridge served stale cache: the page says so instead of
+        // pretending the bars are live.
+        compose.onNodeWithTag("haloUsageStale").assertIsDisplayed()
+        compose.onNode(hasText("as of", substring = true)).assertIsDisplayed()
+    }
+
+    @Test
+    fun errorRendersTheMessageWithATappableRetryThatRefetches() {
+        var opens = 0
+        compose.setContent {
+            HaloApp(
+                ui = ui(BridgeViewModel.UsageUi.Error("usage unavailable: no credentials")),
+                actions = HaloActions(onUsageOpen = { opens++ }),
+            )
+        }
+        swipeToUsage()
+        assertEquals(1, opens)
+        compose.onNodeWithText("usage unavailable: no credentials").assertIsDisplayed()
+
+        // Retry re-fires the SAME seam the page entry does.
+        compose.onNodeWithTag("haloUsageRetry").performClick()
+        compose.waitForIdle()
+        assertEquals("retry re-calls onUsageOpen", 2, opens)
+    }
+
+    @Test
+    fun theUsagePageHasNoDrillDown() {
+        compose.setContent {
+            HaloApp(ui = ui(fixtureData()), actions = HaloActions())
+        }
+        swipeToUsage()
+        compose.onNodeWithTag("haloUsage").assertIsDisplayed()
+
+        // Swipe up — the drill gesture — must be a no-op here (HaloNav's
+        // usage-page guard): still the usage page, no session list.
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloUsage").assertIsDisplayed()
+        assertEquals(
+            0,
+            compose.onAllNodes(hasText("all sessions")).fetchSemanticsNodes().size,
+        )
+    }
+}

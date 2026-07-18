@@ -20,6 +20,7 @@ MockWebServer tests) should feed themselves from the same corpus.
 - [Authentication](#authentication)
 - [Identity naming: `bridgeId` vs `sessionId`](#identity-naming-bridgeid-vs-sessionid)
 - [Status — `GET /v1/status`](#status--get-v1status)
+- [Usage — `GET /v1/usage`](#usage--get-v1usage)
 - [Commands — `POST /v1/command`](#commands--post-v1command)
 - [Event stream — `GET /v1/events`](#event-stream--get-v1events)
 - [SSE event catalog](#sse-event-catalog)
@@ -249,14 +250,71 @@ Authenticated snapshot:
 - `hasPty` / `activeAgent`: legacy conveniences describing the most recent
   active session; prefer `sessions[]`.
 
+## Usage — `GET /v1/usage`
+
+Authenticated, **additive** (no proto bump — issue #57): the plan-limit
+windows of the bridge user's Claude account, fetched **on demand** — the
+client calls it on usage-page open only (no polling, and the bridge keeps no
+cache of its own). The bridge reads Claude Code's OAuth access token from
+`~/.claude/.credentials.json` and proxies the OAuth usage API; the token
+itself **never** appears in any response body or log line — the watch sees
+only the normalized bars.
+
+Success (`200`):
+
+```json
+{
+  "limits": [
+    { "kind": "session",       "label": "5-hour", "percent": 42, "resetsAt": "2026-07-18T19:10:00Z" },
+    { "kind": "weekly_all",    "label": "weekly", "percent": 12, "resetsAt": "2026-07-24T00:00:00Z" },
+    { "kind": "weekly_scoped", "label": "Fable",  "percent": 3,  "resetsAt": "2026-07-24T00:00:00Z" }
+  ],
+  "source": "api",
+  "fetchedAtMs": 1752850000000
+}
+```
+
+- `limits[]` is **render-what-you-get**: one entry per window the upstream
+  reports, in upstream order — clients render one bar per entry and must not
+  assume which kinds are present. `percent` is **USED** percent exactly as
+  upstream reports it (rounded to an integer); remaining = `100 - percent`.
+  `resetsAt` is the upstream ISO 8601 reset time, verbatim. `label` is the
+  bridge-normalized display label: `"5-hour"` for `kind: "session"`,
+  `"weekly"` for `weekly_all`, the scoped model's display name (e.g.
+  `"Fable"`) for `weekly_scoped` (falling back to the kind), and the kind
+  verbatim for any future window.
+- `source`: `"api"` — live from the OAuth usage endpoint — or `"cache"` —
+  the API was unavailable (expired token, offline) and the bars come from
+  Claude Code's own cached snapshot in `~/.claude.json`. `fetchedAtMs`
+  (epoch ms) is present **only** when `source` is `"cache"`, so clients can
+  render an "as of Xm ago" staleness line.
+- Neither the API nor the cache yields data →
+  `503 {"error": "usage unavailable: ..."}`.
+
 ## Commands — `POST /v1/command`
 
 One authenticated endpoint, four mutually exclusive actions, dispatched in
 this order:
 
-**1. Spawn a session** — `{ "spawn": "claude" | "codex", "cwd"?: "/path" }` →
-`200 { "ok": true, "sessionId": "<uuid>", "agent": "claude" }`. Invalid agent
-→ `400`; spawn failure → `500`.
+**1. Spawn a session** — `{ "spawn": "claude" | "codex", "cwd"?: "/path" | "~" }`
+→ `200 { "ok": true, "sessionId": "<uuid>", "agent": "claude" }`. Invalid
+agent → `400`; spawn failure → `500`.
+
+`cwd` selects the new session's working directory (issue #56):
+
+- an **absolute path to an existing directory** — the session spawns there
+  (any valid directory from an authed device is allowed; validation is about
+  error quality, not policy);
+- the literal **`"~"`** — the "no project" sentinel, resolved by the bridge
+  to its own user's home directory (the client cannot know that path);
+- **omitted** — the bridge's historical default chain, unchanged: its CLI
+  positional argument, then `$HOME`, then the bridge process cwd.
+
+Anything else — a relative path, a file, a non-existent directory — is
+refused with `400 {"error": "spawn cwd is not a directory: <cwd>"}` and **no
+session slot is created** (an unvalidated target used to spawn a PTY that
+died into an instantly-ended zombie session). The same `cwd` semantics apply
+to the auto-spawn of action 4.
 
 **2. Kill a session** — `{ "kill": true, "sessionId": "<uuid>" }` →
 `200 { "ok": true }`; unknown id → `404 {"error": "No session with that ID"}`.

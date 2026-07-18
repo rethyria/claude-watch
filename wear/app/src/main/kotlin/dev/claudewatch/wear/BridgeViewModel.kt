@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 /**
  * State for the watch UI: pair with the bridge, stream SSE events, send
@@ -65,6 +66,42 @@ class BridgeViewModel(
         val options: List<PermissionOption>,
         val questions: List<AskUserQuestion> = emptyList(),
     )
+
+    /**
+     * One plan-usage window as GET /v1/usage reports it (issue #57).
+     * Render-what-you-get: the bridge preserves whatever windows the upstream
+     * returns, and the client renders one bar per entry — [kind] is matched
+     * only for display niceties (reset-time formatting), never as a filter,
+     * so an unknown kind still gets its bar. [percent] is USED percent
+     * exactly as upstream reports; the screen renders REMAINING (100 − it).
+     * [resetsAt] is the wire's ISO8601 string, parsed at render time (a
+     * malformed one degrades to no reset line, not a dropped bar).
+     */
+    data class UsageLimit(
+        val kind: String,
+        val label: String,
+        val percent: Double,
+        val resetsAt: String?,
+    )
+
+    /**
+     * The usage page's state (issue #57). Fetch-on-open only: [fetchUsage]
+     * flips to [Loading] on every page entry, no polling, no client caching —
+     * [Data.source] == "cache" is the BRIDGE's fallback (its own OAuth call
+     * failed), rendered with an "as of Xm ago" staleness line from
+     * [Data.fetchedAtMs] (present only for cache per the wire contract).
+     */
+    sealed interface UsageUi {
+        /** Never fetched (the page has not been opened this session). */
+        data object Idle : UsageUi
+        data object Loading : UsageUi
+        data class Data(
+            val limits: List<UsageLimit>,
+            val source: String,
+            val fetchedAtMs: Long?,
+        ) : UsageUi
+        data class Error(val message: String) : UsageUi
+    }
 
     data class UiState(
         val status: String = "unpaired",
@@ -129,6 +166,8 @@ class BridgeViewModel(
          * session arrives ("until it speaks again" — see [handleEvent]).
          */
         val hiddenSessions: Set<String> = emptySet(),
+        /** The usage page's fetch-on-open state (issue #57); see [UsageUi]. */
+        val usage: UsageUi = UsageUi.Idle,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -378,11 +417,19 @@ class BridgeViewModel(
         }
     }
 
-    /** Spawn a fresh agent session ("claude" or "codex") in a bridge-owned PTY. */
-    fun spawnSession(agent: String) {
+    /**
+     * Spawn a fresh agent session ("claude" or "codex") in a bridge-owned
+     * PTY. [cwd] is the spawn TARGET (issue #56): a known project's root from
+     * the picker, the literal `"~"` for a no-project session in the bridge
+     * user's home, or null for the bridge's own default cwd chain (the
+     * pre-picker behavior, kept for any caller without a target). An invalid
+     * directory is the bridge's 400 — surfaced via sessionActionResult, no
+     * session slot created.
+     */
+    fun spawnSession(agent: String, cwd: String? = null) {
         engineScope.launch {
             try {
-                val result = engine.spawnSession(agent)
+                val result = engine.spawnSession(agent, cwd)
                 if (result == null) {
                     _state.update { it.copy(sessionActionResult = "spawn:not-paired") }
                     return@launch
@@ -431,6 +478,66 @@ class BridgeViewModel(
      */
     fun hideSession(sessionId: String) {
         _state.update { it.copy(hiddenSessions = it.hiddenSessions + sessionId) }
+    }
+
+    /**
+     * Fetch GET /v1/usage for the usage page (issue #57). Called on EVERY
+     * entry to the page (and by its error-retry tap) — fetch-on-open is the
+     * whole caching policy, so each call flips to [UsageUi.Loading] first and
+     * lands in [UsageUi.Data] or [UsageUi.Error]. Render-what-you-get
+     * parsing: every `limits[]` entry becomes a bar, unknown kinds included;
+     * a 503 (neither the bridge's API call nor its cache fallback yielded
+     * data) surfaces the bridge's error string.
+     */
+    fun fetchUsage() {
+        _state.update { it.copy(usage = UsageUi.Loading) }
+        engineScope.launch {
+            val next = try {
+                val result = engine.fetchUsage()
+                when {
+                    result == null -> UsageUi.Error("Not paired")
+                    result.ok -> result.body?.let(::parseUsage)
+                        ?: UsageUi.Error("Malformed usage payload")
+                    else -> UsageUi.Error(
+                        result.body?.optString("error").takeUnless { it.isNullOrEmpty() }
+                            ?: "HTTP ${result.status}",
+                    )
+                }
+            } catch (e: Exception) {
+                // Transport error or timeout: surfaced with the retry
+                // affordance, same honesty contract as every other fetch.
+                UsageUi.Error("${e.message}")
+            }
+            _state.update { it.copy(usage = next) }
+        }
+    }
+
+    /** GET /v1/usage 200 body → [UsageUi.Data]; null when `limits` is missing. */
+    private fun parseUsage(body: JSONObject): UsageUi.Data? {
+        val limitsJson = body.optJSONArray("limits") ?: return null
+        val limits = buildList {
+            for (i in 0 until limitsJson.length()) {
+                val entry = limitsJson.optJSONObject(i) ?: continue
+                val kind = entry.optString("kind")
+                add(
+                    UsageLimit(
+                        kind = kind,
+                        // A label-less entry still renders — its kind is the
+                        // most honest label available.
+                        label = entry.optString("label").takeUnless { it.isEmpty() } ?: kind,
+                        percent = entry.optDouble("percent", 0.0),
+                        resetsAt = entry.optString("resetsAt").takeUnless { it.isEmpty() },
+                    ),
+                )
+            }
+        }
+        return UsageUi.Data(
+            limits = limits,
+            source = body.optString("source").takeUnless { it.isEmpty() } ?: "api",
+            // Present ONLY when source=="cache" per the wire contract; has()
+            // rather than a 0-default so a live "api" payload stays null.
+            fetchedAtMs = if (body.has("fetchedAtMs")) body.optLong("fetchedAtMs") else null,
+        )
     }
 
     /**

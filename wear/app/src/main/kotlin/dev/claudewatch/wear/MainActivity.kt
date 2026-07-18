@@ -148,6 +148,7 @@ fun WatchApp(
             onSpawn = viewModel::spawnSession,
             onKill = viewModel::killSession,
             onHide = viewModel::hideSession,
+            onUsageOpen = viewModel::fetchUsage,
         ),
     )
 }

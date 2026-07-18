@@ -90,9 +90,22 @@ fun HaloSessionList(
     onOpenSession: (String) -> Unit,
     onKill: (String) -> Unit,
     onHide: (String) -> Unit,
-    onSpawn: (agent: String) -> Unit,
+    /**
+     * The spawn row was tapped (issue #56): summon the spawn TARGET picker.
+     * The actual spawn — agent + chosen cwd — fires from the picker, never
+     * from this list.
+     */
+    onSpawn: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * False while an overlay (the spawn picker) owns rotary focus above this
+     * list. The list stays composed underneath, so its one-shot focus claim
+     * has already run — keying the claim on this flag re-requests the bezel
+     * when the overlay closes, instead of leaving rotary input stranded on
+     * the disposed overlay node.
+     */
+    rotaryActive: Boolean = true,
 ) {
     val title = when (scope) {
         ListScope.All -> "all sessions"
@@ -119,7 +132,9 @@ fun HaloSessionList(
 
     val listState = rememberScalingLazyListState(initialCenterItemIndex = 0)
     val focusRequester = remember { FocusRequester() }
-    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    // Keyed on rotaryActive (not Unit): reclaims the bezel when an overlay
+    // that stole it closes — see the rotaryActive param doc.
+    LaunchedEffect(rotaryActive) { if (rotaryActive) focusRequester.requestFocus() }
 
     // Swipe-down-back, rebuilt from the drags the list rejects: the list's
     // scrollable consumes every vertical drag (even at its edge the leftover
@@ -235,9 +250,11 @@ fun HaloSessionList(
 
         // The one session-creating surface (spawnSession has no home in the
         // handoff's screens): scoped to the All list so project pages stay
-        // pure mirrors of what the bridge reports.
+        // pure mirrors of what the bridge reports. Since issue #56 the tap
+        // opens the spawn TARGET picker rather than spawning blind into the
+        // bridge's own cwd.
         if (scope == ListScope.All) {
-            item(key = "spawn") { SpawnRow(onSpawn = { onSpawn("claude") }) }
+            item(key = "spawn") { SpawnRow(onSpawn = onSpawn) }
         }
     }
 }

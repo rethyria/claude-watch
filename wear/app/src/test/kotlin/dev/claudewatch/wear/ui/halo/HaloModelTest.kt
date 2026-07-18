@@ -4,6 +4,7 @@ import dev.claudewatch.shared.protocol.AgentsActivity
 import dev.claudewatch.shared.state.BridgeState
 import dev.claudewatch.shared.state.SessionActivity
 import dev.claudewatch.shared.state.SessionState
+import dev.claudewatch.wear.BridgeViewModel.PendingPermission
 import dev.claudewatch.wear.BridgeViewModel.UiState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -169,6 +170,86 @@ class HaloModelTest {
         // both hide the indicator: running > 0 is the ONLY show condition.
         assertEquals(0, model.sessions.single { it.id == "s-done" }.agentsRunning)
         assertEquals(0, model.sessions.single { it.id == "s-quiet" }.agentsRunning)
+    }
+
+    /** Issue #56: per-session spawn root — the MAIN repoRoot beats cwd, so a
+     *  worktree session offers the main checkout, never its worktree dir. */
+    @Test
+    fun spawnRootPrefersTheMainRepoRootOverCwd() {
+        val model = HaloModel.from(
+            uiState(
+                session(
+                    "s-wt",
+                    folderName = "alpha-issue-53",
+                    cwd = "/home/dev/worktrees/alpha-issue-53",
+                    branch = "issue-53-fix",
+                    worktree = true,
+                    repoRoot = "/home/dev/alpha",
+                ),
+                session("s-plain", folderName = "beta", cwd = "/home/dev/beta"),
+            ),
+        )
+        assertEquals("/home/dev/alpha", model.sessions.single { it.id == "s-wt" }.spawnRoot)
+        assertEquals("/home/dev/beta", model.sessions.single { it.id == "s-plain" }.spawnRoot)
+    }
+
+    /** Issue #56: spawnTargets — one entry per known project, root from the
+     *  first session that knows one; a project whose ONLY session is a
+     *  worktree still offers the MAIN root. */
+    @Test
+    fun spawnTargetsOfferOneEntryPerProjectWithTheWorktreesMainRoot() {
+        val model = HaloModel.from(
+            uiState(
+                // alpha is represented ONLY by its worktree session: the
+                // picker must offer /home/dev/alpha, not the worktree dir.
+                session(
+                    "s-wt",
+                    folderName = "alpha-issue-53",
+                    cwd = "/home/dev/worktrees/alpha-issue-53",
+                    branch = "issue-53-fix",
+                    worktree = true,
+                    repoRoot = "/home/dev/alpha",
+                ),
+                session("s-b1", folderName = "beta", cwd = "/home/dev/beta"),
+                session("s-b2", folderName = "beta", cwd = "/home/dev/beta"),
+            ),
+        )
+        assertEquals(
+            listOf(
+                SpawnTarget("alpha", "/home/dev/alpha"),
+                SpawnTarget("beta", "/home/dev/beta"),
+            ),
+            model.spawnTargets,
+        )
+    }
+
+    /** Issue #56: a project whose sessions know neither repoRoot nor cwd (a
+     *  queue-orphan synthetic) is SKIPPED — no target beats a lying one that
+     *  would spawn in the bridge's own cwd. */
+    @Test
+    fun projectsWithoutAnyKnownRootOfferNoSpawnTarget() {
+        val orphanPrompt = PendingPermission(
+            permissionId = "perm-orphan",
+            sessionId = null,
+            toolName = "Bash",
+            requestSummary = "$ make",
+            sessionLabel = "ghost",
+            options = emptyList(),
+        )
+        val model = HaloModel.from(
+            UiState(
+                bridge = BridgeState(
+                    sessions = mapOf(
+                        "s-known" to session("s-known", folderName = "proj", cwd = "/home/dev/proj"),
+                    ),
+                ),
+                permissionQueue = listOf(orphanPrompt),
+            ),
+        )
+        // The orphan still renders (its own project group)…
+        assertEquals(2, model.projectCount)
+        // …but only the real project is spawnable.
+        assertEquals(listOf(SpawnTarget("proj", "/home/dev/proj")), model.spawnTargets)
     }
 
     @Test
