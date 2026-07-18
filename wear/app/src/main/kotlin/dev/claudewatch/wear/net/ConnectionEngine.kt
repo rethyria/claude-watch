@@ -413,9 +413,21 @@ class ConnectionEngine(
     suspend fun answerQuestions(permissionId: String, answers: List<String>): BridgeClient.ApiResult? =
         authedCall { c, t -> c.answerQuestions(t, permissionId, answers) }
 
-    /** Spawn a fresh agent session ("claude" or "codex"). Null when not paired. */
-    suspend fun spawnSession(agent: String): BridgeClient.ApiResult? =
-        authedCall { c, t -> c.spawnSession(t, agent) }
+    /**
+     * Spawn a fresh agent session ("claude" or "codex"). Null when not
+     * paired. [cwd] is the spawn target directory (issue #56: a project root,
+     * `"~"` for the bridge user's home, null = the bridge's default chain).
+     */
+    suspend fun spawnSession(agent: String, cwd: String? = null): BridgeClient.ApiResult? =
+        authedCall { c, t -> c.spawnSession(t, agent, cwd) }
+
+    /**
+     * GET /v1/usage — the bridge-normalized plan-usage windows (issue #57).
+     * Null when not paired. Authed like every /v1 call, so a definitive 401
+     * here tears the dead token down the same way.
+     */
+    suspend fun fetchUsage(): BridgeClient.ApiResult? =
+        authedCall { c, t -> c.getUsage(t) }
 
     /** Kill [sessionId]. Null when not paired. */
     suspend fun killSession(sessionId: String): BridgeClient.ApiResult? =

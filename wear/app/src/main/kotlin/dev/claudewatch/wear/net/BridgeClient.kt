@@ -146,14 +146,39 @@ open class BridgeClient(
     /**
      * POST /v1/command — spawn a fresh agent session ("claude" or "codex") in
      * a bridge-owned PTY. The bridge answers `{ok, sessionId, agent}` and
-     * announces the session over SSE (`session` `running`).
+     * announces the session over SSE (`session` `running`). [cwd] is the
+     * spawn target (issue #56): an absolute project root, or the literal
+     * `"~"` the bridge resolves to ITS user's home ("no project"). The key is
+     * OMITTED when null — the bridge's default cwd chain, exactly the
+     * pre-#56 wire shape — and an invalid directory is the bridge's 400 with
+     * no session slot created.
      */
-    fun spawnSession(token: String, agent: String): ApiResult =
-        postJson("/v1/command", token, JSONObject().put("spawn", agent))
+    fun spawnSession(token: String, agent: String, cwd: String? = null): ApiResult =
+        postJson(
+            "/v1/command",
+            token,
+            JSONObject().put("spawn", agent).apply { if (cwd != null) put("cwd", cwd) },
+        )
 
     /** POST /v1/command — kill a session; the bridge pushes `session` `ended` with `killed: true`. */
     fun killSession(token: String, sessionId: String): ApiResult =
         postJson("/v1/command", token, JSONObject().put("kill", true).put("sessionId", sessionId))
+
+    /**
+     * GET /v1/usage — the bridge-normalized plan-usage windows (issue #57):
+     * `{limits: [{kind, label, percent, resetsAt}...], source, fetchedAtMs?}`,
+     * where percent is USED percent and `source: "cache"` (bridge-side
+     * fallback when its upstream OAuth call fails) carries `fetchedAtMs` for
+     * the staleness line. 503 when the bridge has neither API nor cache data.
+     * Fetched on usage-page entry only — no polling. Open for test doubles.
+     */
+    open fun getUsage(token: String): ApiResult {
+        val request = Request.Builder()
+            .url("$baseUrl/v1/usage")
+            .header("Authorization", "Bearer $token")
+            .build()
+        return execute(request)
+    }
 
     /**
      * GET /v1/events — opens the SSE stream, replaying from [lastEventId]

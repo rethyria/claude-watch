@@ -812,6 +812,9 @@ class BridgeViewModelTest {
         assertEquals("/v1/command", spawnRequest.path)
         val spawnBody = JSONObject(spawnRequest.body.readUtf8())
         assertEquals("claude", spawnBody.getString("spawn"))
+        // No picker target = the pre-#56 wire shape: the cwd key is OMITTED
+        // (the bridge's default cwd chain), never null-valued.
+        assertFalse(spawnBody.has("cwd"))
         val afterSpawn = awaitState { it.sessionActionResult == "spawn:200" }
         assertEquals("s-new", afterSpawn.sessionId)
 
@@ -824,6 +827,139 @@ class BridgeViewModelTest {
         assertTrue(killBody.getBoolean("kill"))
         assertEquals("s-new", killBody.getString("sessionId"))
         awaitState { it.sessionActionResult == "kill:200" }
+
+        // Issue #56: a picker target rides the same body as `cwd` — here the
+        // "no project" home sentinel the bridge resolves to ITS user's home.
+        server.enqueue(MockResponse().setBody("""{"ok":true,"sessionId":"s-home","agent":"claude"}"""))
+        viewModel.spawnSession("claude", "~")
+        val homeSpawnRequest = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no targeted spawn request")
+        val homeSpawnBody = JSONObject(homeSpawnRequest.body.readUtf8())
+        assertEquals("claude", homeSpawnBody.getString("spawn"))
+        assertEquals("~", homeSpawnBody.getString("cwd"))
+        awaitState { it.sessionId == "s-home" }
+    }
+
+    /** Pair against the mock bridge and drain the ping/pair/events requests,
+     *  leaving the request queue clean for the test body's own calls. */
+    private fun pairAndDrain() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(16, 250, TimeUnit.MILLISECONDS)
+                .setBody(":connected\n\n" + ":pad\n\n".repeat(400)),
+        )
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitStatus { it == "paired, stream open" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+    }
+
+    /**
+     * Issue #57: fetchUsage GETs /v1/usage with the paired bearer token,
+     * passes through Loading, and parses render-what-you-get — EVERY limits[]
+     * entry becomes a bar, an UNKNOWN kind included (a new upstream window
+     * must appear without an app update), labels from the payload (kind as
+     * the fallback), percent as USED percent untouched. A live "api" payload
+     * carries no fetchedAtMs.
+     */
+    @Test
+    fun usageFetchParsesRenderWhatYouGetIncludingUnknownKinds() {
+        pairAndDrain()
+
+        server.enqueue(
+            MockResponse()
+                // Held back briefly so the Loading state is observable.
+                .setHeadersDelay(300, TimeUnit.MILLISECONDS)
+                .setBody(
+                    """{"limits":[
+                        {"kind":"session","label":"5-hour","percent":37.5,"resetsAt":"2026-07-18T19:10:00Z"},
+                        {"kind":"weekly_all","label":"weekly","percent":80,"resetsAt":"2026-07-24T00:00:00Z"},
+                        {"kind":"weekly_scoped","label":"Fable","percent":12,"resetsAt":"2026-07-24T00:00:00Z"},
+                        {"kind":"lunar_window","percent":5,"resetsAt":"2026-08-01T00:00:00Z"}
+                    ],"source":"api"}""",
+                ),
+        )
+        viewModel.fetchUsage()
+        awaitState { it.usage is BridgeViewModel.UsageUi.Loading }
+
+        val request = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no usage request")
+        assertEquals("GET", request.method)
+        assertEquals("/v1/usage", request.path)
+        assertEquals("Bearer tok-1", request.getHeader("Authorization"))
+
+        val state = awaitState { it.usage is BridgeViewModel.UsageUi.Data }
+        val data = state.usage as BridgeViewModel.UsageUi.Data
+        assertEquals("api", data.source)
+        assertEquals("a live api payload has no fetchedAtMs", null, data.fetchedAtMs)
+        assertEquals(
+            "every entry renders, unknown kinds included",
+            listOf("session", "weekly_all", "weekly_scoped", "lunar_window"),
+            data.limits.map { it.kind },
+        )
+        assertEquals(
+            "labels come from the payload; kind is the label-less fallback",
+            listOf("5-hour", "weekly", "Fable", "lunar_window"),
+            data.limits.map { it.label },
+        )
+        assertEquals(37.5, data.limits[0].percent, 0.0001)
+        assertEquals("2026-07-18T19:10:00Z", data.limits[0].resetsAt)
+    }
+
+    /** Issue #57: the bridge's cache fallback (`source: "cache"`) carries its
+     *  fetchedAtMs through, so the screen can render "as of Xm ago". */
+    @Test
+    fun usageCacheFallbackCarriesItsStalenessMetadata() {
+        pairAndDrain()
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":50,"resetsAt":"2026-07-18T19:10:00Z"}],""" +
+                    """"source":"cache","fetchedAtMs":1752850000000}""",
+            ),
+        )
+        viewModel.fetchUsage()
+        val state = awaitState { it.usage is BridgeViewModel.UsageUi.Data }
+        val data = state.usage as BridgeViewModel.UsageUi.Data
+        assertEquals("cache", data.source)
+        assertEquals(1752850000000L, data.fetchedAtMs)
+    }
+
+    /**
+     * Issue #57: a 503 (neither the bridge's API call nor its cache yielded
+     * data) surfaces the bridge's error string with the retry affordance, and
+     * a retry — the same fetchUsage the page entry fires — REPARSES a later
+     * success over the error (fetch-on-open, no sticky failure).
+     */
+    @Test
+    fun usageErrorSurfacesTheBridgeMessageAndRetryReparses() {
+        pairAndDrain()
+
+        server.enqueue(
+            MockResponse().setResponseCode(503)
+                .setBody("""{"error":"usage unavailable: no credentials"}"""),
+        )
+        viewModel.fetchUsage()
+        val failed = awaitState { it.usage is BridgeViewModel.UsageUi.Error }
+        assertEquals(
+            "usage unavailable: no credentials",
+            (failed.usage as BridgeViewModel.UsageUi.Error).message,
+        )
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":10,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+            ),
+        )
+        viewModel.fetchUsage()
+        val recovered = awaitState { it.usage is BridgeViewModel.UsageUi.Data }
+        assertEquals(1, (recovered.usage as BridgeViewModel.UsageUi.Data).limits.size)
     }
 
     /** Records the haptic grammar so JVM tests can assert ack vs failure verbs. */

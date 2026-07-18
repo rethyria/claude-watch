@@ -442,6 +442,20 @@ class WalkingSkeletonTest {
         val before = allRowIds()
         scrollListTo("haloSpawn")
         compose.onNodeWithTag("haloSpawn").performClick()
+        // Issue #56: the spawn row opens the TARGET picker instead of firing
+        // blind. The skeleton takes the "no project" home entry — the "~"
+        // sentinel the bridge resolves to its own user's home, always a valid
+        // spawn directory on the real bridge under test. The picker overlays
+        // the still-composed session list, so its scrollable must be
+        // addressed BY ANCESTOR (a bare hasScrollAction() now matches both);
+        // the home entry trails the per-project entries and may need the
+        // scroll to compose (lazy list).
+        compose.waitForIdle()
+        compose.onNode(
+            hasScrollAction() and hasAnyAncestor(hasTestTag("haloSpawnPicker")),
+        ).performScrollToNode(hasTestTag("haloSpawnPickHome"))
+        compose.onNodeWithTag("haloSpawnPickHome").performClick()
+        compose.waitForIdle()
         val deadline = System.currentTimeMillis() + 30_000
         var found: String? = null
         while (System.currentTimeMillis() < deadline && found == null) {
