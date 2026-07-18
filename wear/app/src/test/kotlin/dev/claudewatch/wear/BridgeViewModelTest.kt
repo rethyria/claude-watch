@@ -16,6 +16,8 @@ import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -878,7 +880,7 @@ class BridgeViewModelTest {
                 .setHeadersDelay(300, TimeUnit.MILLISECONDS)
                 .setBody(
                     """{"limits":[
-                        {"kind":"session","label":"5-hour","percent":37.5,"resetsAt":"2026-07-18T19:10:00Z"},
+                        {"kind":"session","label":"5-hour","percent":37.5,"resetsAt":"2026-07-18T19:10:00Z","severity":"normal"},
                         {"kind":"weekly_all","label":"weekly","percent":80,"resetsAt":"2026-07-24T00:00:00Z"},
                         {"kind":"weekly_scoped","label":"Fable","percent":12,"resetsAt":"2026-07-24T00:00:00Z"},
                         {"kind":"lunar_window","percent":5,"resetsAt":"2026-08-01T00:00:00Z"}
@@ -910,6 +912,11 @@ class BridgeViewModelTest {
         )
         assertEquals(37.5, data.limits[0].percent, 0.0001)
         assertEquals("2026-07-18T19:10:00Z", data.limits[0].resetsAt)
+        // The server's own color coding rides along upstream-verbatim; an
+        // entry the bridge sent WITHOUT the key parses to null (the tier
+        // logic keys on presence).
+        assertEquals("normal", data.limits[0].severity)
+        assertNull("absent severity must parse to null", data.limits[1].severity)
     }
 
     /** Issue #57: the bridge's cache fallback (`source: "cache"`) carries its
@@ -960,6 +967,78 @@ class BridgeViewModelTest {
         viewModel.fetchUsage()
         val recovered = awaitState { it.usage is BridgeViewModel.UsageUi.Data }
         assertEquals(1, (recovered.usage as BridgeViewModel.UsageUi.Data).limits.size)
+    }
+
+    /**
+     * Client-side rate limit (2026-07-18): the upstream usage endpoint
+     * aggressively 429s pollers, and the page-entry seam fires on EVERY
+     * landing — so a re-entry within [BridgeViewModel.usageRateLimitMs] of a
+     * LIVE api success must be a complete no-op: no request leaves the watch
+     * and the state never leaves Data (no Loading flicker; the fresh bars
+     * stay on screen and re-entry is instant).
+     */
+    @Test
+    fun usageRefetchWithinTheRateLimitWindowIsANoOp() {
+        pairAndDrain()
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":50,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+            ),
+        )
+        viewModel.fetchUsage()
+        val first = awaitState { it.usage is BridgeViewModel.UsageUi.Data }
+        assertEquals("api", (first.usage as BridgeViewModel.UsageUi.Data).source)
+        server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("the first page entry must fetch")
+
+        // Re-entry inside the (default 5-minute) window. The limiter returns
+        // BEFORE the synchronous Loading flip, so the usage state still being
+        // the SAME Data instance right after the call proves the state never
+        // left Data — a Loading flicker would have replaced it.
+        viewModel.fetchUsage()
+        assertSame(first.usage, viewModel.state.value.usage)
+        assertNull(
+            "a rate-limited re-entry must not reach the bridge (exactly ONE /v1/usage served)",
+            server.takeRequest(500, TimeUnit.MILLISECONDS),
+        )
+    }
+
+    /**
+     * The limiter is armed ONLY by a successful `source == "api"` parse: a
+     * cache-fallback result (the bridge's upstream call failed; the bars are
+     * stale) never arms it, so the next page entry refetches immediately —
+     * re-entry is exactly the chance that the API came back.
+     */
+    @Test
+    fun usageCacheResultNeverArmsTheRateLimiter() {
+        pairAndDrain()
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":50,"resetsAt":"2026-07-18T19:10:00Z"}],""" +
+                    """"source":"cache","fetchedAtMs":1752850000000}""",
+            ),
+        )
+        viewModel.fetchUsage()
+        val stale = awaitState { it.usage is BridgeViewModel.UsageUi.Data }
+        assertEquals("cache", (stale.usage as BridgeViewModel.UsageUi.Data).source)
+        server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("the first page entry must fetch")
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":51,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+            ),
+        )
+        viewModel.fetchUsage()
+        val live = awaitState {
+            (it.usage as? BridgeViewModel.UsageUi.Data)?.source == "api"
+        }
+        assertEquals(51.0, (live.usage as BridgeViewModel.UsageUi.Data).limits[0].percent, 0.0001)
+        // BOTH page entries reached the bridge: cache results never gate.
+        server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("a cache-fallback page entry must refetch")
     }
 
     /** Records the haptic grammar so JVM tests can assert ack vs failure verbs. */

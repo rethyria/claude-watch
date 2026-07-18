@@ -76,12 +76,18 @@ class BridgeViewModel(
      * exactly as upstream reports; the screen renders REMAINING (100 − it).
      * [resetsAt] is the wire's ISO8601 string, parsed at render time (a
      * malformed one degrades to no reset line, not a dropped bar).
+     * [severity] is the SERVER's own color coding, upstream-verbatim (the
+     * bridge omits the key when the upstream sent none, so absent ⇒ null):
+     * its thresholds are undocumented, so when present and non-"normal" it is
+     * the authoritative tier — the screen's local thresholds are only a
+     * fallback (see `usageTier`).
      */
     data class UsageLimit(
         val kind: String,
         val label: String,
         val percent: Double,
         val resetsAt: String?,
+        val severity: String? = null,
     )
 
     /**
@@ -481,6 +487,23 @@ class BridgeViewModel(
     }
 
     /**
+     * Client-side floor between LIVE usage refetches. The upstream endpoint
+     * aggressively 429s pollers (GitHub issues #31637/#30930/#31021), and the
+     * page-entry seam fires on EVERY landing — swipe past, dot tap, depth
+     * round trip — so unthrottled fetch-on-open is a polling loop wearing a
+     * different hat. 5 minutes; `internal` so tests can tune it to 0.
+     */
+    internal var usageRateLimitMs = 300_000L
+
+    /**
+     * Epoch ms of the last SUCCESSFUL `source == "api"` usage parse — the
+     * ONLY thing that arms the limiter. Errors and cache fallbacks never
+     * touch it, so the Error screen's Retry and a cache-served page entry
+     * always refetch (no force parameter needed anywhere). 0 = never.
+     */
+    private var lastUsageApiSuccessMs = 0L
+
+    /**
      * Fetch GET /v1/usage for the usage page (issue #57). Called on EVERY
      * entry to the page (and by its error-retry tap) — fetch-on-open is the
      * whole caching policy, so each call flips to [UsageUi.Loading] first and
@@ -488,8 +511,21 @@ class BridgeViewModel(
      * parsing: every `limits[]` entry becomes a bar, unknown kinds included;
      * a 503 (neither the bridge's API call nor its cache fallback yielded
      * data) surfaces the bridge's error string.
+     *
+     * Rate-limited (see [usageRateLimitMs]): when fresh LIVE bars are already
+     * on screen, a re-entry inside the window returns WITHOUT any state
+     * change — the bars stay put (no Loading flicker) and no request leaves
+     * the watch. The gate deliberately keys on the CURRENT state being a
+     * live [UsageUi.Data]: an Error or cache-fallback state means the user is
+     * looking at something worth replacing, so those always refetch.
      */
     fun fetchUsage() {
+        val current = _state.value.usage
+        if (current is UsageUi.Data && current.source == "api" &&
+            System.currentTimeMillis() - lastUsageApiSuccessMs < usageRateLimitMs
+        ) {
+            return
+        }
         _state.update { it.copy(usage = UsageUi.Loading) }
         engineScope.launch {
             val next = try {
@@ -507,6 +543,11 @@ class BridgeViewModel(
                 // Transport error or timeout: surfaced with the retry
                 // affordance, same honesty contract as every other fetch.
                 UsageUi.Error("${e.message}")
+            }
+            // Only a live-API success arms the limiter (see
+            // [lastUsageApiSuccessMs] for why cache/error never do).
+            if (next is UsageUi.Data && next.source == "api") {
+                lastUsageApiSuccessMs = System.currentTimeMillis()
             }
             _state.update { it.copy(usage = next) }
         }
@@ -527,6 +568,7 @@ class BridgeViewModel(
                         label = entry.optString("label").takeUnless { it.isEmpty() } ?: kind,
                         percent = entry.optDouble("percent", 0.0),
                         resetsAt = entry.optString("resetsAt").takeUnless { it.isEmpty() },
+                        severity = entry.optString("severity").takeUnless { it.isEmpty() },
                     ),
                 )
             }

@@ -40,6 +40,11 @@ import {
 //   anything else → its kind verbatim
 // `percent` is USED percent exactly as upstream reports (rounded to an
 // integer); `resetsAt` is the upstream `resets_at` ISO timestamp verbatim.
+// `severity` is the upstream's OWN color coding (observed value: "normal"),
+// passed through verbatim when it is a non-empty string and OMITTED
+// otherwise — its exact thresholds are undocumented, so the bridge never
+// interprets it; clients treat it as the authoritative tier when present and
+// non-"normal" (PROTOCOL.md "Usage").
 // Returns null when the array yields no usable entries, so callers treat the
 // source as unavailable rather than serving an empty bar list.
 function normalizeLimits(rawLimits) {
@@ -58,6 +63,11 @@ function normalizeLimits(rawLimits) {
       label,
       percent: Math.round(Number(entry.percent) || 0),
       resetsAt: typeof entry.resets_at === "string" ? entry.resets_at : null,
+      // Upstream-verbatim, key omitted entirely when absent/empty: the
+      // client's "server tier wins" logic keys on the field's PRESENCE.
+      ...(typeof entry.severity === "string" && entry.severity.length > 0
+        ? { severity: entry.severity }
+        : {}),
     });
   }
   return limits.length > 0 ? limits : null;
