@@ -12,6 +12,8 @@ import {
   SESSION_PRUNE_GRACE_MS,
   SESSION_PRUNE_INTERVAL_MS,
   MAX_EXTERNAL_SESSIONS,
+  WORKFLOW_POLL_MS,
+  WORKFLOW_STALE_MS,
 } from "./config.js";
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
@@ -26,8 +28,12 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 //   (see the project-root-attribution section below);
 //   shallowestObservedCwd/pendingRebind* bound the ancestor-cwd rebind ratchet
 //   (issue #52); endedAuthoritatively marks an ending as final (SessionEnd or a
-//   PTY exit) so a stray hook can never revive it (issue #53).
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean}>} */
+//   PTY exit) so a stray hook can never revive it (issue #53);
+//   branch/worktree/repoRoot + gitMetaCache carry the git metadata derived at
+//   the slot's root (issue #54, see the git-metadata section below);
+//   agents/workflowActive/workflowActivatedAt/workflowJournalCache track
+//   subagent workflow activity (issue #55, see the workflow-activity section).
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -134,6 +140,11 @@ function rebindProjectRoot(slot, root) {
   if (slot.cwd === root) return;
   slot.cwd = root;
   slot.folderName = path.basename(root) || root;
+  // The root moved, so git metadata derived at the old root no longer
+  // describes this slot: re-derive at the new root BEFORE broadcasting so the
+  // rebind event already carries it. The gitMetaCache is keyed on the resolved
+  // HEAD path, so a different root misses it naturally (no explicit clear).
+  refreshGitMetadata(slot);
   if (slot.state !== "running") return;
   pushSseEvent(
     "session",
@@ -344,23 +355,155 @@ export function refreshSessionTitle(slot, transcriptPath = slot?.transcriptPath)
   }
 }
 
+// --- Git metadata (issue #54) -----------------------------------------------
+// Additive branch/worktree/repoRoot fields on session payloads, derived at the
+// slot's bound root via FILE READS ONLY (never a spawned git process — hooks
+// are a hot path and the bridge must stay subprocess-free here):
+//   * <root>/.git is a DIRECTORY  → main checkout; HEAD is <root>/.git/HEAD.
+//   * <root>/.git is a FILE       → `gitdir: <path>` pointer. When <path>
+//     matches `.../.git/worktrees/<name>` exactly, the root is a linked
+//     worktree of the main repo three levels up; any other pointer target
+//     (a submodule's .git/modules/<n>, a relocated gitdir) is treated as a
+//     plain checkout — branch at most, never a guessed worktree/repoRoot.
+//   * anything else               → not a git checkout; previously-known
+//     values are PRESERVED, not cleared (stale beats flapping, same doctrine
+//     as `title` — clients treat an absent field as "keep what you knew").
+// HEAD reads are stat-gated on (headPath, mtime, size) like titleCache: an
+// unchanged HEAD costs one stat and no read, and a branch switch rewrites
+// HEAD so the cache invalidates naturally.
+
+// A real .git pointer file is one short line; HEAD is a ref line or a 40-hex
+// sha. Anything bigger is not what we think it is and gets skipped outright.
+const GIT_FILE_SCAN_BYTES = 8 * 1024;
+const GIT_HEAD_SCAN_BYTES = 1024;
+
+// Bounded read of an already-stat'ed regular file (callers hold the stat and
+// have applied the isFile()/size gates — see refreshSessionTitle for why a
+// FIFO or device node must never reach an open/read here). Throws I/O errors;
+// callers absorb them.
+function readFileBounded(filePath, size) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buf = Buffer.alloc(size);
+    const read = fs.readSync(fd, buf, 0, size, 0);
+    return buf.toString("utf-8", 0, read);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Resolve where the root's HEAD file lives and what kind of checkout the root
+// is. Returns { headPath, worktree, repoRoot } — repoRoot only for a verified
+// linked-worktree structure — or null when the root is not a git checkout (or
+// its .git pointer is unreadable/malformed). Throws only I/O errors from the
+// stat/read; the caller absorbs them.
+function resolveGitLayout(root) {
+  const dotGit = path.join(root, ".git");
+  let stat;
+  try { stat = fs.statSync(dotGit); } catch { return null; }
+  if (stat.isDirectory()) {
+    return { headPath: path.join(dotGit, "HEAD"), worktree: false, repoRoot: null };
+  }
+  // Not a regular file (FIFO, device, socket): never open it (see the
+  // isFile() discipline above) — treat as not-a-checkout.
+  if (!stat.isFile() || stat.size > GIT_FILE_SCAN_BYTES) return null;
+  const text = readFileBounded(dotGit, stat.size);
+  if (!text.startsWith("gitdir:")) return null;
+  let gitdir = text.slice("gitdir:".length).split("\n", 1)[0].trim();
+  if (!gitdir) return null;
+  // A relative gitdir is relative to the directory holding the .git file.
+  if (!path.isAbsolute(gitdir)) gitdir = path.resolve(root, gitdir);
+  // Linked worktree ONLY when the pointer target matches .../.git/worktrees/<name>
+  // exactly: both the "worktrees" segment and its ".git" parent are verified,
+  // so a lookalike path can never yield a wrong repoRoot (never guess).
+  const worktreesDir = path.dirname(gitdir);
+  const mainGitDir = path.dirname(worktreesDir);
+  if (path.basename(worktreesDir) === "worktrees" && path.basename(mainGitDir) === ".git") {
+    return { headPath: path.join(gitdir, "HEAD"), worktree: true, repoRoot: path.dirname(mainGitDir) };
+  }
+  return { headPath: path.join(gitdir, "HEAD"), worktree: false, repoRoot: null };
+}
+
+// Parse HEAD content into a branch label: `ref: refs/heads/<branch>` → the
+// branch (slashes included: "feature/x"), a bare 40-hex sha (detached HEAD) →
+// its 7-char short form. Anything else → null (caller leaves the slot as-is).
+function parseGitHead(text) {
+  const line = text.split("\n", 1)[0].trim();
+  if (line.startsWith("ref: refs/heads/")) {
+    return line.slice("ref: refs/heads/".length).trim() || null;
+  }
+  if (/^[0-9a-f]{40}$/.test(line)) return line.slice(0, 7);
+  return null;
+}
+
+// Refresh a slot's git metadata from its bound root, stat-gated by
+// slot.gitMetaCache. Returns true when branch/worktree/repoRoot actually
+// changed. Never throws; any failure (no checkout, unreadable HEAD) preserves
+// previously-known values — see the section comment for the doctrine.
+export function refreshGitMetadata(slot) {
+  if (!slot || typeof slot.cwd !== "string" || !slot.cwd) return false;
+  try {
+    const layout = resolveGitLayout(slot.cwd);
+    if (!layout) return false;
+    const stat = fs.statSync(layout.headPath);
+    if (!stat.isFile()) return false;
+    const cache = slot.gitMetaCache;
+    if (cache && cache.headPath === layout.headPath && cache.mtimeMs === stat.mtimeMs && cache.size === stat.size) {
+      return false; // unchanged HEAD: one stat, no read
+    }
+    if (stat.size > GIT_HEAD_SCAN_BYTES) return false;
+    const branch = parseGitHead(readFileBounded(layout.headPath, stat.size));
+    // Cache even a parse failure so a persistently-weird HEAD costs one stat
+    // per refresh, not one read.
+    slot.gitMetaCache = { headPath: layout.headPath, mtimeMs: stat.mtimeMs, size: stat.size };
+    if (!branch) return false; // unparseable HEAD content: leave unchanged
+    // A definitive derivation replaces all three fields together (a rebind
+    // from a worktree to a main checkout must drop the worktree claim);
+    // worktree/repoRoot are stored as undefined — not false/null — so the
+    // payload/snapshot spreads omit them entirely per the wire contract.
+    const worktree = layout.worktree ? true : undefined;
+    const repoRoot = layout.repoRoot ?? undefined;
+    if (slot.branch === branch && slot.worktree === worktree && slot.repoRoot === repoRoot) return false;
+    slot.branch = branch;
+    slot.worktree = worktree;
+    slot.repoRoot = repoRoot;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // The additive `title` field rides every session payload once known; absent
-// until derivable (clients must tolerate either, per PROTOCOL.md). A
-// hook-created (external, PTY-less) slot is ALSO tagged `external: true` here,
-// uniformly on EVERY session event (running/ended + the connect-time sync), so
-// clients can offer an honest "hide" instead of a kill for a process the
-// bridge does not own. The flag is OMITTED for bridge-owned PTY slots — older
-// clients tolerate that, and clients treat absent as external=false (killable).
+// until derivable (clients must tolerate either, per PROTOCOL.md). The same
+// absent-means-preserve doctrine covers the additive git-metadata fields
+// (branch/worktree/repoRoot, issue #54) and the workflow-activity `agents`
+// object (issue #55 — completion is the EXPLICIT {running: 0, done: N},
+// because omission can never clear). A hook-created (external, PTY-less) slot
+// is ALSO tagged `external: true` here, uniformly on EVERY session event
+// (running/ended + the connect-time sync), so clients can offer an honest
+// "hide" instead of a kill for a process the bridge does not own. The flag is
+// OMITTED for bridge-owned PTY slots — older clients tolerate that, and
+// clients treat absent as external=false (killable). Kept in lockstep with
+// getSessionsSnapshot.
 function sessionEventPayload(slot, fields) {
-  const withTitle = slot.title ? { ...fields, title: slot.title } : fields;
-  return slot.hookCreated ? { ...withTitle, external: true } : withTitle;
+  const payload = { ...fields };
+  if (slot.title) payload.title = slot.title;
+  if (slot.branch) payload.branch = slot.branch;
+  if (slot.worktree) payload.worktree = true;
+  if (slot.repoRoot) payload.repoRoot = slot.repoRoot;
+  if (slot.agents) payload.agents = slot.agents;
+  if (slot.hookCreated) payload.external = true;
+  return payload;
 }
 
 // Refresh + broadcast: when an opportunistic refresh changes a running slot's
-// title, clients learn it through an idempotent `session` running event (the
-// same shape the connect-time sync re-sends).
-function announceTitleRefresh(slot, transcriptPath) {
-  if (!refreshSessionTitle(slot, transcriptPath)) return;
+// title OR git metadata, clients learn it through ONE idempotent `session`
+// running event (the same shape the connect-time sync re-sends) — the two
+// refreshes share a broadcast instead of each pushing their own.
+function announceMetadataRefresh(slot, transcriptPath) {
+  const titleChanged = refreshSessionTitle(slot, transcriptPath);
+  const gitChanged = refreshGitMetadata(slot);
+  if (!titleChanged && !gitChanged) return;
   if (slot.state !== "running") return;
   pushSseEvent(
     "session",
@@ -371,15 +514,186 @@ function announceTitleRefresh(slot, transcriptPath) {
 
 // Opportunistic refresh from a hook body (Stop is the natural moment: the
 // turn just finished, so the transcript — and possibly its ai-title — just
-// changed). Remembers the transcript path on the slot so later refreshes work
-// even from payloads that omit it.
+// changed; a `git switch` typed since the last turn surfaces here too).
+// Remembers the transcript path on the slot so later refreshes work even from
+// payloads that omit it. The exported name predates the git-metadata refresh
+// riding along and is kept for compatibility.
 export function refreshHookSessionTitle(sessionId, body) {
   const slot = sessions.get(sessionId);
   if (!slot) return;
   const transcriptPath = transcriptPathOf(body);
   if (transcriptPath) slot.transcriptPath = transcriptPath;
-  announceTitleRefresh(slot, slot.transcriptPath);
+  announceMetadataRefresh(slot, slot.transcriptPath);
 }
+
+// --- Workflow activity (issue #55) ------------------------------------------
+// The Workflow tool runs subagents whose only bridge-observable trail is the
+// per-workflow journal Claude Code writes next to the transcript:
+//   <transcriptPath minus ".jsonl">/subagents/workflows/wf_*/journal.jsonl
+// with one {"type":"started","key":…,"agentId":…} line per launched agent and
+// one {"type":"result","key":…} line per finished one (matched on `key`,
+// falling back to agentId for records that lack it). running = started keys
+// without a matching result key.
+//
+// Lifecycle: a PostToolUse hook with tool_name "Workflow" is the launch
+// signal (hooks.js calls markWorkflowActivity) — it flips the slot
+// workflow-active and runs the first scan immediately so the indicator does
+// not wait out a poll interval. A module-level poll then re-scans ONLY active
+// slots every WORKFLOW_POLL_MS; when a scan finds zero running agents the
+// explicit {running: 0, done: N} completion state is broadcast once and the
+// slot goes workflow-inactive (the poll's cheap boolean gate makes idle ticks
+// free). A bridge restarted mid-workflow never sees the launch signal and
+// shows no indicator — accepted, documented in PROTOCOL.md.
+//
+// Staleness: a journal whose mtime is older than WORKFLOW_STALE_MS counts as
+// dead regardless of its started/result balance — a killed workflow never
+// writes its result lines, and without this it would pin the indicator
+// forever. `done` aggregates only live (non-stale) journals, so a long
+// session's completed workflow history cannot inflate the count.
+
+// A real journal is a few KB. Reading only a prefix of an oversized one could
+// see a `started` whose `result` sits beyond the cap — a phantom running
+// agent forever — so oversized journals are skipped entirely, not truncated.
+const WORKFLOW_JOURNAL_MAX_BYTES = 1024 * 1024;
+
+// Cheap gate for the poll tick: false ⇒ the tick returns without touching the
+// sessions map at all.
+let anyWorkflowActive = false;
+
+// Count one journal's agents: running = started keys without a result, done =
+// started keys WITH one (an orphan result whose started line we never saw is
+// ignored rather than counted). Malformed lines are skipped silently, same as
+// transcript parsing. Throws only I/O errors; the caller absorbs them.
+function countWorkflowJournal(journalPath, size) {
+  const started = new Set();
+  const finished = new Set();
+  for (const line of readFileBounded(journalPath, size).split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let record;
+    try { record = JSON.parse(trimmed); } catch { continue; }
+    if (!record || typeof record !== "object") continue;
+    const key = (typeof record.key === "string" && record.key) ? record.key
+      : (typeof record.agentId === "string" && record.agentId) ? record.agentId
+      : null;
+    if (!key) continue;
+    if (record.type === "started") started.add(key);
+    else if (record.type === "result") finished.add(key);
+  }
+  let running = 0;
+  let done = 0;
+  for (const key of started) {
+    if (finished.has(key)) done++;
+    else running++;
+  }
+  return { running, done };
+}
+
+// Enumerate the slot's wf_* journal dirs and aggregate {running, done} over
+// the live (non-stale) ones. Returns null when there is no journal tree to
+// observe (no transcript, no workflows dir yet). Per-journal results are
+// cached stat-gated on (mtime, size) — an unchanged journal costs one stat.
+// Never throws.
+function scanWorkflowActivity(slot, now) {
+  const transcriptPath = slot.transcriptPath;
+  if (typeof transcriptPath !== "string" || !transcriptPath.endsWith(".jsonl")) return null;
+  const wfRoot = path.join(transcriptPath.slice(0, -".jsonl".length), "subagents", "workflows");
+  let entries;
+  try { entries = fs.readdirSync(wfRoot, { withFileTypes: true }); } catch { return null; }
+  const cache = slot.workflowJournalCache ?? (slot.workflowJournalCache = new Map());
+  const seen = new Set();
+  let running = 0;
+  let done = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("wf_")) continue;
+    const journalPath = path.join(wfRoot, entry.name, "journal.jsonl");
+    let stat;
+    try { stat = fs.statSync(journalPath); } catch { continue; }
+    if (!stat.isFile()) continue; // never open a non-regular file (see readFileBounded)
+    seen.add(journalPath);
+    if (now - stat.mtimeMs > WORKFLOW_STALE_MS) continue; // dead workflow dir
+    let counts = cache.get(journalPath);
+    if (!counts || counts.mtimeMs !== stat.mtimeMs || counts.size !== stat.size) {
+      if (stat.size > WORKFLOW_JOURNAL_MAX_BYTES) continue; // see the cap comment
+      try {
+        counts = { mtimeMs: stat.mtimeMs, size: stat.size, ...countWorkflowJournal(journalPath, stat.size) };
+      } catch { continue; }
+      cache.set(journalPath, counts);
+    }
+    running += counts.running;
+    done += counts.done;
+  }
+  // Drop cache entries for vanished journals so the map cannot grow forever.
+  for (const key of cache.keys()) {
+    if (!seen.has(key)) cache.delete(key);
+  }
+  return { running, done };
+}
+
+// Scan one active slot; on a change to {running, done}, update slot.agents (a
+// REPLACED object, never mutated in place — broadcast payloads hold a
+// reference) and push the idempotent running `session` event. Completion
+// (running === 0) additionally flips the slot workflow-inactive so the poll
+// goes quiet — the explicit present-but-zero state was broadcast, and only a
+// fresh Workflow hook re-arms scanning.
+function scanAndAnnounceWorkflowActivity(slot, now) {
+  const counts = scanWorkflowActivity(slot, now);
+  if (!counts) {
+    // Nothing observable (journal tree absent). Stay armed for the next poll,
+    // but give up after the staleness window so a Workflow hook whose journals
+    // never materialize cannot pin the poll on forever.
+    if (slot.workflowActivatedAt !== undefined && now - slot.workflowActivatedAt > WORKFLOW_STALE_MS) {
+      slot.workflowActive = false;
+    }
+    return;
+  }
+  if (counts.running === 0) slot.workflowActive = false;
+  const prev = slot.agents;
+  if (prev && prev.running === counts.running && prev.done === counts.done) return;
+  slot.agents = { running: counts.running, done: counts.done };
+  if (slot.state !== "running") return;
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, { state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName }),
+    slot.id,
+  );
+}
+
+// Launch signal, called by hooks.js when a PostToolUse for the Workflow tool
+// resolves to this slot. Marks the slot active and scans immediately so the
+// indicator appears without waiting out a poll interval.
+export function markWorkflowActivity(sessionId) {
+  const slot = sessions.get(sessionId);
+  if (!slot) return;
+  slot.workflowActive = true;
+  slot.workflowActivatedAt = Date.now();
+  anyWorkflowActive = true;
+  scanAndAnnounceWorkflowActivity(slot, Date.now());
+}
+
+// Poll tick (exported so tests can drive it with an injectable `now` instead
+// of racing the interval). MUST stay a no-op when nothing is workflow-active:
+// the boolean gate keeps the idle cost at one comparison, and per-slot
+// workflowActive keeps a busy bridge from scanning uninvolved sessions.
+export function pollWorkflowActivity(now = Date.now()) {
+  if (!anyWorkflowActive) return;
+  let stillActive = false;
+  for (const [, slot] of sessions) {
+    if (!slot.workflowActive) continue;
+    if (slot.state !== "running") {
+      // An ended slot's indicator is moot; let the poll go quiet for it.
+      slot.workflowActive = false;
+      continue;
+    }
+    scanAndAnnounceWorkflowActivity(slot, now);
+    if (slot.workflowActive) stillActive = true;
+  }
+  anyWorkflowActive = stillActive;
+}
+
+// unref() so importing this module never keeps the process alive on its own
+// (same pattern as the prune interval below).
+setInterval(() => pollWorkflowActivity(), WORKFLOW_POLL_MS).unref();
 
 // Invoked when a PTY-backed session ends so codex.js can clear its synthetic
 // permission state without a circular import (codex.js imports sessions.js,
@@ -541,7 +855,11 @@ export function spawnSession(agent, cwd) {
   sessions.set(sessionId, slot);
   bindPtyProcess(slot, proc);
 
-  pushSseEvent("session", { state: "running", agent, cwd, folderName }, sessionId);
+  // PTY slots have a real cwd too: derive git metadata once at creation so
+  // the initial running event (built via sessionEventPayload, which folds the
+  // additive fields) already carries it.
+  refreshGitMetadata(slot);
+  pushSseEvent("session", sessionEventPayload(slot, { state: "running", agent, cwd, folderName }), sessionId);
 
   log("info", `${agent} session ${sessionId} started (${folderName}), pid: ${proc.pid}`);
   return sessionId;
@@ -558,6 +876,9 @@ export function attachPtyToSession(slot) {
   if (!proc) return null;
 
   bindPtyProcess(slot, proc);
+  // Re-attach is an opportunistic metadata moment: the slot may have sat
+  // PTY-less for a while, so its transcript title or git branch can be stale.
+  announceMetadataRefresh(slot, slot.transcriptPath);
   log("info", `Attached PTY to session ${slot.id} (${slot.agent}), pid: ${proc.pid}`);
   return proc;
 }
@@ -640,6 +961,15 @@ export function getSessionsSnapshot() {
     createdAt: s.createdAt,
     // Additive optional field: only present once derived from the transcript.
     ...(s.title ? { title: s.title } : {}),
+    // Additive git metadata (issue #54): branch once derivable at the root;
+    // worktree/repoRoot ONLY for a verified linked worktree. Mirrors
+    // sessionEventPayload.
+    ...(s.branch ? { branch: s.branch } : {}),
+    ...(s.worktree ? { worktree: true } : {}),
+    ...(s.repoRoot ? { repoRoot: s.repoRoot } : {}),
+    // Additive workflow activity (issue #55): present once observed; the
+    // completion state is the explicit {running: 0, done: N}.
+    ...(s.agents ? { agents: s.agents } : {}),
     // Additive: present (=true) only for hook-created (external) slots the
     // bridge does not own; omitted for PTY slots (clients treat absent as
     // external=false). Kept in lockstep with sessionEventPayload's SSE tag.
@@ -748,6 +1078,8 @@ function createExternalSession({ source, cwd, hookSessionId, transcriptPath }) {
     // title now so the initial "running" event already carries it.
     refreshSessionTitle(slot, transcriptPath);
   }
+  // Same moment for git metadata (the slot just got its bound root).
+  refreshGitMetadata(slot);
   sessions.set(sessionId, slot);
 
   log("info", `Auto-created session ${sessionId} for external ${agent} (${folderName})`);
@@ -807,10 +1139,11 @@ export function resolveHookSession(body) {
         if (slot.state === "running" && slot.ptyProcess && slot.cwd === cwd && !slot.hookSessionId) {
           bindHookSession(slot, hookSessionId);
           // A fresh binding is session creation from the slot's point of
-          // view: derive the title now and broadcast it if it changed.
+          // view: derive the title (and git metadata) now and broadcast one
+          // idempotent running event if anything changed.
           if (transcriptPath) {
             slot.transcriptPath = transcriptPath;
-            announceTitleRefresh(slot, transcriptPath);
+            announceMetadataRefresh(slot, transcriptPath);
           }
           return slot.id;
         }
@@ -851,10 +1184,12 @@ export function endHookSession(body) {
   }
   if (!slot || slot.state === "ended") return slot?.id ?? null;
   // Last chance to read the final transcript state (SessionEnd is an
-  // opportunistic refresh point) so the "ended" event carries the final title.
+  // opportunistic refresh point) so the "ended" event carries the final title
+  // and git metadata.
   const transcriptPath = transcriptPathOf(body);
   if (transcriptPath) slot.transcriptPath = transcriptPath;
   refreshSessionTitle(slot, slot.transcriptPath);
+  refreshGitMetadata(slot);
   if (slot.ptyProcess) {
     // Bridge-owned: the PTY close handler ends the slot, not this hook. But
     // the Claude Code instance behind this session_id is gone — /clear and

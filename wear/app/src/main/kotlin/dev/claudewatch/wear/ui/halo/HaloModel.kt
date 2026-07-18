@@ -24,7 +24,24 @@ data class HaloSession(
      * (issue #53). False for bridge-owned PTY sessions (real kill).
      */
     val external: Boolean = false,
-)
+    /** Git branch of the session's root (issue #54); null hides the ⎇ badge. */
+    val branch: String? = null,
+    /** True when the session runs in a linked git worktree (issue #54). */
+    val worktree: Boolean = false,
+    /**
+     * Workflow subagents currently in flight (issue #55). The indicator shows
+     * ONLY while > 0 — indicator only, no control affordance (a watch cannot
+     * stop a workflow; #53's honesty lesson).
+     */
+    val agentsRunning: Int = 0,
+) {
+    /**
+     * The ⎇ badge text — "⎇ main", "⎇ issue-53-fix · wt" for a worktree — or
+     * null when no branch is known (non-git root, older bridge: no badge).
+     */
+    val branchLabel: String?
+        get() = branch?.let { if (worktree) "⎇ $it · wt" else "⎇ $it" }
+}
 
 /** A project groups the sessions sharing a working directory. */
 data class HaloProject(
@@ -58,7 +75,13 @@ data class HaloModel(
                     s.thinking || s.activity == SessionActivity.WORKING -> SessionState.RUNNING
                     else -> SessionState.IDLE
                 }
-                val project = s.folderName
+                // A worktree session reports its MAIN repo root (issue #54):
+                // grouping under basename(repoRoot) folds it into its real
+                // project instead of a lonely group named after the worktree
+                // directory. folderName/cwd remain the non-worktree path.
+                val project = s.repoRoot?.trimEnd('/')?.substringAfterLast('/')
+                    .takeUnless { it.isNullOrBlank() }
+                    ?: s.folderName
                     ?: s.cwd?.trimEnd('/')?.substringAfterLast('/').takeUnless { it.isNullOrBlank() }
                     ?: "workspace"
                 HaloSession(
@@ -75,6 +98,9 @@ data class HaloModel(
                     state = state,
                     pending = pending,
                     external = s.external,
+                    branch = s.branch,
+                    worktree = s.worktree,
+                    agentsRunning = s.agents?.running ?: 0,
                 )
             }
 

@@ -50,6 +50,21 @@ enum class SessionRunState {
 }
 
 /**
+ * Additive optional `agents` object on `session` payloads (issue #55): the
+ * bridge's observed workflow activity for the slot — [running] subagents in
+ * flight, [done] completed. Completion is signaled EXPLICITLY by re-announcing
+ * with `{running: 0, done: N}` (present-but-zero), never by omitting the
+ * field: absent means "preserve what you knew" under the same merge doctrine
+ * as `title`, so omission cannot clear. Clients show an indicator only while
+ * [running] > 0.
+ */
+@Serializable
+data class AgentsActivity(
+    val running: Int = 0,
+    val done: Int = 0,
+)
+
+/**
  * `session` — session lifecycle. `running` and `ended` MUST be attributed to
  * a session; the end-of-life extras (`exitCode`/`signal`/`killed`/`reason`/
  * `error`) vary by how the session ended and are all optional.
@@ -75,6 +90,26 @@ data class SessionEvent(
      * every session event of a hook-created slot (see PROTOCOL.md).
      */
     val external: Boolean? = null,
+    /**
+     * Additive git metadata (issue #54): the branch of the session's project
+     * root ("main", "issue-53-fix"; detached HEAD → the 7-char short sha).
+     * Absent when the root is not a git checkout or HEAD is unreadable —
+     * absent preserves what the client knew, same merge doctrine as [title].
+     */
+    val branch: String? = null,
+    /**
+     * PRESENT (=true) ONLY when the session's root is a LINKED git worktree
+     * (its .git is a file, not a directory); omitted otherwise (issue #54).
+     */
+    val worktree: Boolean? = null,
+    /**
+     * The MAIN repo root path; PRESENT ONLY for worktrees, where it differs
+     * from the session's own root. Clients group the session under
+     * basename(repoRoot) when present (issue #54).
+     */
+    val repoRoot: String? = null,
+    /** Workflow activity (issue #55) — see [AgentsActivity]; absent preserves. */
+    val agents: AgentsActivity? = null,
     val reason: String? = null,
     val exitCode: Int? = null,
     val signal: String? = null,

@@ -265,6 +265,81 @@ class BridgeEventReducerTest {
     }
 
     @Test
+    fun gitMetadataIsParsedAndSurvivesMetadatalessResends() {
+        // Issue #54: a worktree session's `running` carries branch/worktree/
+        // repoRoot; all three land on the session state.
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/w/alpha-fix","folderName":"alpha-fix","branch":"issue-53-fix","worktree":true,"repoRoot":"/home/dev/alpha","sessionId":"A"}"""),
+            ),
+        )
+        val a = state.sessions.getValue("A")
+        assertEquals("issue-53-fix", a.branch)
+        assertTrue("worktree:true must parse onto the session", a.worktree)
+        assertEquals("/home/dev/alpha", a.repoRoot)
+
+        // A resend WITHOUT the fields (older bridge, partial payload) must
+        // not erase any of them — same preserve-on-absence rule as title.
+        val bare = SseFrame(null, "session", """{"state":"running","agent":"claude","sessionId":"A"}""")
+        val afterSync = (BridgeEventReducer.reduce(state, bare, 1_002_000L) as BridgeEventReducer.Applied).state
+        val synced = afterSync.sessions.getValue("A")
+        assertEquals("issue-53-fix", synced.branch)
+        assertTrue("a worktree-less resend must not clear the worktree flag", synced.worktree)
+        assertEquals("/home/dev/alpha", synced.repoRoot)
+
+        // A branch switch is broadcast as an idempotent re-sent `running`
+        // with the new value: present replaces.
+        val switched = SseFrame("2", "session", """{"state":"running","branch":"main","sessionId":"A"}""")
+        val afterSwitch = (BridgeEventReducer.reduce(afterSync, switched, 1_003_000L) as BridgeEventReducer.Applied).state
+        assertEquals("main", afterSwitch.sessions.getValue("A").branch)
+
+        // A brand-new session with none of the fields (non-git root) defaults
+        // to no metadata.
+        val nonGit = fold(
+            listOf(
+                SseFrame("3", "session", """{"state":"running","agent":"claude","cwd":"/b","folderName":"b","sessionId":"B"}"""),
+            ),
+        )
+        val b = nonGit.sessions.getValue("B")
+        assertNull(b.branch)
+        assertFalse(b.worktree)
+        assertNull(b.repoRoot)
+    }
+
+    @Test
+    fun agentsActivityPreservesOnAbsenceAndClearsOnlyByExplicitZero() {
+        // Issue #55: workflow activity lands on the session state.
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","agents":{"running":3,"done":1},"sessionId":"A"}"""),
+            ),
+        )
+        assertEquals(3, state.sessions.getValue("A").agents?.running)
+        assertEquals(1, state.sessions.getValue("A").agents?.done)
+
+        // An agents-less resend (connect-time sync, title refresh) must NOT
+        // clear it — absence preserves, so omission cannot end a workflow.
+        val agentless = SseFrame(null, "session", """{"state":"running","agent":"claude","sessionId":"A"}""")
+        val afterSync = (BridgeEventReducer.reduce(state, agentless, 1_002_000L) as BridgeEventReducer.Applied).state
+        assertEquals(3, afterSync.sessions.getValue("A").agents?.running)
+
+        // The bridge's ONLY clear path: an explicit present-but-zero
+        // {running:0, done:N} REPLACES the previous {running:3, done:1}.
+        val cleared = SseFrame("2", "session", """{"state":"running","agents":{"running":0,"done":4},"sessionId":"A"}""")
+        val afterClear = (BridgeEventReducer.reduce(afterSync, cleared, 1_003_000L) as BridgeEventReducer.Applied).state
+        assertEquals(0, afterClear.sessions.getValue("A").agents?.running)
+        assertEquals(4, afterClear.sessions.getValue("A").agents?.done)
+
+        // No workflow ever observed: stays null.
+        val quiet = fold(
+            listOf(
+                SseFrame("3", "session", """{"state":"running","agent":"claude","cwd":"/b","folderName":"b","sessionId":"B"}"""),
+            ),
+        )
+        assertNull(quiet.sessions.getValue("B").agents)
+    }
+
+    @Test
     fun resentRunningStillRefreshesSessionMetadata() {
         val state = fold(
             listOf(

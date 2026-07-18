@@ -57,6 +57,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -387,6 +388,18 @@ private fun RowContent(session: HaloSession, waiting: Boolean) {
                 color = if (waiting) Halo.Palette.WaitingForYou else Halo.Palette.TextFaint,
                 maxLines = 1,
             )
+            // ⎇ branch (· wt for a worktree) — issue #54. Absent branch =
+            // absent line (back-compat with a bridge that doesn't send it);
+            // single faint ellipsized line, glanceability first.
+            session.branchLabel?.let { label ->
+                Text(
+                    text = label,
+                    fontSize = Halo.Type.Min,
+                    color = Halo.Palette.TextFaint,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }
