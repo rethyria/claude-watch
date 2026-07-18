@@ -7,7 +7,10 @@
 // done = matched ones in LIVE (non-stale) journals. The completion state is
 // the EXPLICIT {running: 0, done: N} broadcast — absence never clears — after
 // which the poll goes quiet for the slot until a fresh Workflow hook re-arms
-// it. Stale journals (a killed workflow never writes its results) count as
+// it. The launch signal races the runner's first journal write, so a zero
+// only counts as completion once the workflow was actually OBSERVED since
+// arming (running agents seen, or a journal written after the signal).
+// Stale journals (a killed workflow never writes its results) count as
 // dead so the indicator cannot stick.
 //
 // Env overrides must be set before any bridge module loads (config.js reads
@@ -114,19 +117,80 @@ test("completion is the explicit {running: 0} broadcast, after which the poll is
   }
 });
 
-test("a stale journal (killed workflow) counts as dead — the indicator cannot stick", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity } = await import("../sessions.js");
+test("a launch signal that sees only a stale journal stays armed — the new workflow's journal still surfaces {running: N}", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
 
+  // An earlier workflow's long-dead journal is already on disk, so the
+  // workflows dir EXISTS when the launch signal for the next workflow fires
+  // — but the runner has not written the new journal yet.
   const { cwd, transcriptPath, journalPath } = makeWorkflowTree("stale", "cc-wf-stale",
-    [started("k1")]); // started, never finished — a killed workflow's shape
+    [started("k1")]);
   const old = new Date(Date.now() - 2 * STALE_MS);
   fs.utimesSync(journalPath, old, old);
   const id = resolveHookSession({ session_id: "cc-wf-stale", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
   try {
     markWorkflowActivity(id);
     const slot = sessions.get(id);
+    assert.equal(slot.agents, undefined, "observed nothing live — no spurious {running: 0, done: 0} completion");
+    assert.equal(slot.workflowActive, true, "stays armed for the new workflow's journal to appear");
+
+    // The new workflow's journal materializes a beat later: the poll must
+    // surface its running agents instead of having gone quiet.
+    const wfDirB = path.join(path.dirname(path.dirname(journalPath)), "wf_b");
+    fs.mkdirSync(wfDirB, { recursive: true });
+    fs.writeFileSync(path.join(wfDirB, "journal.jsonl"),
+      [started("b1"), started("b2"), started("b3")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(sessions.get(id).agents, { running: 3, done: 0 });
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(event, "the running state was broadcast");
+    assert.deepEqual(event.agents, { running: 3, done: 0 });
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("only stale journals and nothing ever materializing: give up quietly after the stale window", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("stale-giveup", "cc-wf-stale-giveup",
+    [started("k1")]);
+  const old = new Date(Date.now() - 10 * STALE_MS);
+  fs.utimesSync(journalPath, old, old);
+  const id = resolveHookSession({ session_id: "cc-wf-stale-giveup", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    markWorkflowActivity(id);
+    const slot = sessions.get(id);
+    assert.equal(slot.workflowActive, true, "stays armed at first");
+    pollWorkflowActivity(Date.now() + STALE_MS + 1_000);
+    assert.equal(slot.workflowActive, false, "gave up after the stale window");
+    assert.equal(slot.agents, undefined, "never broadcast a phantom agents state");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("an OBSERVED workflow whose journal goes stale gets the explicit zero — the indicator cannot stick", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("stuck", "cc-wf-stuck",
+    [started("k1")]); // started, never finished — a killed workflow's shape
+  const id = resolveHookSession({ session_id: "cc-wf-stuck", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    markWorkflowActivity(id);
+    assert.deepEqual(sessions.get(id).agents, { running: 1, done: 0 }, "the workflow was observed running");
+
+    // The workflow is killed: its journal never gets result lines and goes
+    // stale. Because running agents WERE observed since arming, the stale
+    // scan's zero is a real completion state, not a launch race.
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    const slot = sessions.get(id);
     assert.deepEqual(slot.agents, { running: 0, done: 0 }, "a stale journal never yields running agents");
-    assert.equal(slot.workflowActive, false, "the poll went quiet immediately");
+    assert.equal(slot.workflowActive, false, "the poll went quiet");
   } finally {
     sessions.delete(id);
   }
@@ -154,6 +218,39 @@ test("a launch signal with no observable journal tree stays armed, then gives up
     assert.equal(slot.agents, undefined, "never broadcast a phantom agents state");
     const event = lastSessionEvent(sseBuffer, id);
     assert.ok(!Object.hasOwn(event, "agents"), "payloads never grew an agents field");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("an oversized live journal is indeterminate: last-known counts carry forward, no false completion", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("oversized", "cc-wf-big",
+    [started("k1"), started("k2")]);
+  const id = resolveHookSession({ session_id: "cc-wf-big", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    markWorkflowActivity(id);
+    assert.deepEqual(sessions.get(id).agents, { running: 2, done: 0 });
+
+    // The journal outgrows the 1 MB read cap while its agents still run: the
+    // scan must NOT mistake "could not read" for "observed completion".
+    fs.appendFileSync(journalPath, "x".repeat(1024 * 1024 + 1) + "\n");
+    const before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    const slot = sessions.get(id);
+    assert.deepEqual(slot.agents, { running: 2, done: 0 }, "last-known counts carry forward");
+    assert.equal(slot.workflowActive, true, "indeterminate is not completion — stays armed");
+    assert.equal(lastSessionEvent(sseBuffer.slice(before), id), null, "no false {running: 0} broadcast");
+
+    // Once the oversized journal goes stale, the ordinary staleness gate
+    // retires it and the explicit zero lands.
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.equal(sessions.get(id).agents.running, 0, "stale retires it and completion proceeds");
+    assert.equal(sessions.get(id).workflowActive, false);
   } finally {
     sessions.delete(id);
   }

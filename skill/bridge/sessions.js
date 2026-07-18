@@ -33,7 +33,7 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 //   the slot's root (issue #54, see the git-metadata section below);
 //   agents/workflowActive/workflowActivatedAt/workflowJournalCache track
 //   subagent workflow activity (issue #55, see the workflow-activity section).
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -539,11 +539,14 @@ export function refreshHookSessionTitle(sessionId, body) {
 // signal (hooks.js calls markWorkflowActivity) — it flips the slot
 // workflow-active and runs the first scan immediately so the indicator does
 // not wait out a poll interval. A module-level poll then re-scans ONLY active
-// slots every WORKFLOW_POLL_MS; when a scan finds zero running agents the
-// explicit {running: 0, done: N} completion state is broadcast once and the
-// slot goes workflow-inactive (the poll's cheap boolean gate makes idle ticks
-// free). A bridge restarted mid-workflow never sees the launch signal and
-// shows no indicator — accepted, documented in PROTOCOL.md.
+// slots every WORKFLOW_POLL_MS; when a scan finds zero running agents AFTER
+// the workflow was actually observed (a running agent on some scan, or a
+// journal written since the launch signal — the signal races the runner's
+// first journal write, so an early scan can see nothing live) the explicit
+// {running: 0, done: N} completion state is broadcast once and the slot goes
+// workflow-inactive (the poll's cheap boolean gate makes idle ticks free). A
+// bridge restarted mid-workflow never sees the launch signal and shows no
+// indicator — accepted, documented in PROTOCOL.md.
 //
 // Staleness: a journal whose mtime is older than WORKFLOW_STALE_MS counts as
 // dead regardless of its started/result balance — a killed workflow never
@@ -590,9 +593,12 @@ function countWorkflowJournal(journalPath, size) {
 }
 
 // Enumerate the slot's wf_* journal dirs and aggregate {running, done} over
-// the live (non-stale) ones. Returns null when there is no journal tree to
-// observe (no transcript, no workflows dir yet). Per-journal results are
-// cached stat-gated on (mtime, size) — an unchanged journal costs one stat.
+// the live (non-stale) ones, plus latestMtimeMs — the newest journal mtime
+// seen (0 when there are none), which lets the caller tell "a journal was
+// written since the launch signal" apart from "only leftovers from an earlier
+// workflow". Returns null when there is no journal tree to observe (no
+// transcript, no workflows dir yet). Per-journal results are cached
+// stat-gated on (mtime, size) — an unchanged journal costs one stat.
 // Never throws.
 function scanWorkflowActivity(slot, now) {
   const transcriptPath = slot.transcriptPath;
@@ -604,6 +610,8 @@ function scanWorkflowActivity(slot, now) {
   const seen = new Set();
   let running = 0;
   let done = 0;
+  let latestMtimeMs = 0;
+  let unreadableLive = false;
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith("wf_")) continue;
     const journalPath = path.join(wfRoot, entry.name, "journal.jsonl");
@@ -611,13 +619,30 @@ function scanWorkflowActivity(slot, now) {
     try { stat = fs.statSync(journalPath); } catch { continue; }
     if (!stat.isFile()) continue; // never open a non-regular file (see readFileBounded)
     seen.add(journalPath);
+    if (stat.mtimeMs > latestMtimeMs) latestMtimeMs = stat.mtimeMs;
     if (now - stat.mtimeMs > WORKFLOW_STALE_MS) continue; // dead workflow dir
     let counts = cache.get(journalPath);
     if (!counts || counts.mtimeMs !== stat.mtimeMs || counts.size !== stat.size) {
-      if (stat.size > WORKFLOW_JOURNAL_MAX_BYTES) continue; // see the cap comment
+      // A LIVE journal the scan cannot read — outgrown the cap (see the cap
+      // comment) or a racing I/O failure — is INDETERMINATE, not absent:
+      // fall back to its last-known counts and flag the scan, so a
+      // zero-running aggregate is never mistaken for completion while an
+      // unreadable live journal exists (skipping it outright made the
+      // indicator vanish mid-run, and the disarm is final until the next
+      // Workflow hook). Once the journal goes stale the ordinary staleness
+      // gate above retires it and completion proceeds normally.
+      if (stat.size > WORKFLOW_JOURNAL_MAX_BYTES) {
+        unreadableLive = true;
+        if (counts) { running += counts.running; done += counts.done; }
+        continue;
+      }
       try {
         counts = { mtimeMs: stat.mtimeMs, size: stat.size, ...countWorkflowJournal(journalPath, stat.size) };
-      } catch { continue; }
+      } catch {
+        unreadableLive = true;
+        if (counts) { running += counts.running; done += counts.done; }
+        continue;
+      }
       cache.set(journalPath, counts);
     }
     running += counts.running;
@@ -627,7 +652,7 @@ function scanWorkflowActivity(slot, now) {
   for (const key of cache.keys()) {
     if (!seen.has(key)) cache.delete(key);
   }
-  return { running, done };
+  return { running, done, latestMtimeMs, unreadableLive };
 }
 
 // Scan one active slot; on a change to {running, done}, update slot.agents (a
@@ -638,15 +663,32 @@ function scanWorkflowActivity(slot, now) {
 // fresh Workflow hook re-arms scanning.
 function scanAndAnnounceWorkflowActivity(slot, now) {
   const counts = scanWorkflowActivity(slot, now);
-  if (!counts) {
-    // Nothing observable (journal tree absent). Stay armed for the next poll,
-    // but give up after the staleness window so a Workflow hook whose journals
-    // never materialize cannot pin the poll on forever.
+  if (counts && counts.running > 0) slot.workflowSawRunning = true;
+  // A zero-running scan is a COMPLETION only if this arming actually observed
+  // its workflow: a running agent on some scan since the launch signal, or a
+  // journal written since it. Otherwise the launch signal beat the runner's
+  // first journal write (the workflows dir holding nothing, or only stale
+  // leftovers from an earlier workflow) — that is "observed nothing live",
+  // not "observed completion", and must be treated exactly like an absent
+  // journal tree below rather than broadcast as a spurious {running: 0}.
+  const observed = counts !== null && (
+    slot.workflowSawRunning === true ||
+    (slot.workflowActivatedAt !== undefined && counts.latestMtimeMs >= slot.workflowActivatedAt)
+  );
+  if (!counts || (counts.running === 0 && !observed)) {
+    // Nothing observable (journal tree absent, or nothing live since the
+    // launch signal). Stay armed for the next poll, but give up after the
+    // staleness window so a Workflow hook whose journals never materialize
+    // cannot pin the poll on forever.
     if (slot.workflowActivatedAt !== undefined && now - slot.workflowActivatedAt > WORKFLOW_STALE_MS) {
       slot.workflowActive = false;
     }
     return;
   }
+  // Zero running while a LIVE journal was unreadable (oversized/racing I/O)
+  // is indeterminate, not completion: keep the last broadcast state and stay
+  // armed. The journal going stale — or readable again — resolves it.
+  if (counts.running === 0 && counts.unreadableLive) return;
   if (counts.running === 0) slot.workflowActive = false;
   const prev = slot.agents;
   if (prev && prev.running === counts.running && prev.done === counts.done) return;
@@ -667,6 +709,9 @@ export function markWorkflowActivity(sessionId) {
   if (!slot) return;
   slot.workflowActive = true;
   slot.workflowActivatedAt = Date.now();
+  // Each arming must observe ITS workflow before a zero-running scan may
+  // count as completion (see scanAndAnnounceWorkflowActivity).
+  slot.workflowSawRunning = false;
   anyWorkflowActive = true;
   scanAndAnnounceWorkflowActivity(slot, Date.now());
 }

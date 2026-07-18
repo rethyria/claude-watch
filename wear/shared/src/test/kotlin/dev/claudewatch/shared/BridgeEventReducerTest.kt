@@ -307,6 +307,27 @@ class BridgeEventReducerTest {
     }
 
     @Test
+    fun branchBearingPayloadWithoutWorktreeDropsTheWorktreeClaim() {
+        // Issue #54 follow-up: git metadata is ONE atomic group keyed on
+        // branch presence. The bridge's rebind from a linked worktree to the
+        // plain main checkout (issue #52 ancestor rebind) re-derives metadata
+        // and broadcasts `running` with branch present but worktree/repoRoot
+        // OMITTED (the wire carries them only when truthy) — the reducer must
+        // read that as the drop, not preserve the stale worktree claim.
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/home/dev/alpha/wt/fix","folderName":"fix","branch":"issue-53-fix","worktree":true,"repoRoot":"/home/dev/alpha","sessionId":"A"}"""),
+            ),
+        )
+        val rebound = SseFrame("2", "session", """{"state":"running","branch":"main","sessionId":"A"}""")
+        val afterRebind = (BridgeEventReducer.reduce(state, rebound, 1_002_000L) as BridgeEventReducer.Applied).state
+        val a = afterRebind.sessions.getValue("A")
+        assertEquals("main", a.branch)
+        assertFalse("a branch-bearing payload without worktree must drop the worktree claim", a.worktree)
+        assertNull("a branch-bearing payload without repoRoot must drop the stale repoRoot", a.repoRoot)
+    }
+
+    @Test
     fun agentsActivityPreservesOnAbsenceAndClearsOnlyByExplicitZero() {
         // Issue #55: workflow activity lands on the session state.
         val state = fold(

@@ -431,8 +431,15 @@ are present **only** when the pointer target matches the
 relocated gitdir) yields at most `branch`, never a guessed `repoRoot`. Clients
 group a session under `basename(repoRoot)` when present. Absent fields mean
 **preserve what you knew** (the `title` doctrine): a non-git root or an
-unreadable HEAD never clears previously-broadcast values. Refreshed at the
-same opportunistic points as `title`; a change is broadcast as the idempotent
+unreadable HEAD never clears previously-broadcast values — with one
+refinement: the trio travels as **one atomic group keyed on `branch`**. A
+payload carrying `branch` is authoritative for all three (the bridge always
+re-derives them together, emitting `worktree`/`repoRoot` iff true), so a
+branch-bearing payload that omits `worktree`/`repoRoot` DROPS a
+previously-known worktree claim — that is how a session rebound from a
+worktree onto its main checkout sheds the stale `wt` badge. Only a payload
+with no `branch` at all preserves the whole trio. Refreshed at the same
+opportunistic points as `title`; a change is broadcast as the idempotent
 `running` event.
 
 **`agents`** (object `{ "running": n, "done": n }`, **optional, additive** —
