@@ -1,8 +1,11 @@
 package dev.claudewatch.wear
 
+import android.Manifest
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognizerIntent
 import androidx.activity.ComponentActivity
@@ -17,24 +20,63 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.wear.ambient.AmbientLifecycleObserver
 import androidx.wear.compose.material.MaterialTheme
 import dev.claudewatch.wear.ui.halo.HaloActions
 import dev.claudewatch.wear.ui.halo.HaloApp
 import dev.claudewatch.wear.ui.halo.HaloModel
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+
+/**
+ * POST_NOTIFICATIONS is asked at most ONCE per process (issue #24): the
+ * paired trigger below fires on every return to a paired app, and re-asking
+ * a user who dismissed the dialog on every resume is nagging, not consent.
+ * Denial is tolerated everywhere — the foreground service still runs, only
+ * its notification/chip is invisible.
+ */
+private var notificationPermissionAsked = false
 
 /**
  * Entry point: the Halo UI (see ui/halo/HaloApp.kt) — ring home, per-project
  * pages, drill-down lists/feeds, approval cards — rendered from the shared
  * reducer's state. The previous pager (ui/SessionPagerScreen.kt) is kept
  * compiling for the instrumented tests until they migrate to Halo.
+ *
+ * The activity is a THIN attachment point since issue #24: the engine lives
+ * in [BridgeViewModel.singleton] with process lifetime, held open by
+ * [BridgeSessionService] — this activity only renders it, resumes it on
+ * every ON_START (catch-up-on-open after a notification Disconnect or a
+ * process death), and feeds it the ambient flag.
  */
 class MainActivity : ComponentActivity() {
+
+    private val ambientState = AmbientState()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Wrist-down detection (issue #24): the platform observer drives the
+        // holder's flag; HaloApp renders the dimmed, animation-free terminal.
+        lifecycle.addObserver(AmbientLifecycleObserver(this, ambientState.callback))
+        // Catch-up-on-open: EVERY return to the activity resumes the engine.
+        // start() is guarded upstream — a live engine no-ops, and without
+        // credentials it stays Stopped — so this is free when nothing was
+        // disconnected and load-bearing when something was.
+        lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStart(owner: LifecycleOwner) {
+                BridgeViewModel.singleton(applicationContext).resume()
+            }
+        })
         setContent {
             MaterialTheme {
-                WatchApp()
+                val ambient by ambientState.isAmbient.collectAsState()
+                WatchApp(ambient = ambient)
             }
         }
     }
@@ -42,11 +84,45 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun WatchApp(
-    viewModel: BridgeViewModel = viewModel(
-        factory = BridgeViewModel.factory(LocalContext.current.applicationContext),
-    ),
+    ambient: Boolean = false,
+    // The process-lifetime singleton, NOT viewModel(factory): a
+    // ViewModelStore-scoped instance died with the activity (onCleared →
+    // engine.shutdown()), killing the SSE stream on every destroy — the
+    // exact defect issue #24 exists to fix.
+    viewModel: BridgeViewModel = BridgeViewModel.singleton(LocalContext.current.applicationContext),
 ) {
     val context = LocalContext.current
+    // Foreground-service wiring (issue #24): once the UI state turns paired,
+    // ask for POST_NOTIFICATIONS (API 33+, once per process — see the flag's
+    // doc) and start BridgeSessionService. Gated on RESUMED via the standard
+    // repeatOnLifecycle idiom (same as HaloApp's usage auto-poll): Android
+    // 12+ only allows FGS starts from a foreground app, and while the
+    // composition being alive USUALLY implies that, a backgrounded activity
+    // keeps its composition — the lifecycle gate makes it airtight. Paired
+    // flipping FALSE needs nothing from here: the service watches the
+    // connection state itself and dies on terminal states.
+    val notificationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { /* denial tolerated: the FGS runs, only the chip is invisible */ }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(viewModel, lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            viewModel.state.map { it.paired }.distinctUntilChanged().collect { paired ->
+                if (!paired) return@collect
+                if (Build.VERSION.SDK_INT >= 33 &&
+                    !notificationPermissionAsked &&
+                    ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    notificationPermissionAsked = true
+                    notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                BridgeSessionService.start(context)
+            }
+        }
+    }
     // Swap the no-op default for the real vibrator grammar (issue #20).
     LaunchedEffect(viewModel) { viewModel.haptics = VibratorHaptics(context) }
     val state by viewModel.state.collectAsState()
@@ -117,6 +193,7 @@ fun WatchApp(
     }
     HaloApp(
         ui = state,
+        ambient = ambient,
         actions = HaloActions(
             onPair = viewModel::pair,
             onUnpair = viewModel::unpair,

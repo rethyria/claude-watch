@@ -572,6 +572,74 @@ class ConnectionEngineTest {
         assertEquals(6, server.requestCount)
     }
 
+    // -- Disconnect (issue #24: the notification's stop affordance) ---------
+
+    /**
+     * disconnect() is the middle teardown: like stop() it lands in Stopped,
+     * cancels the stream and every reconnect, and lets nothing further reach
+     * the bridge — but UNLIKE stop() it never touches the store. Credentials
+     * AND the persisted replay cursor survive, so a later start() resumes
+     * from them: the reconnect's Last-Event-ID carries the last APPLIED
+     * (acked) id, never FULL_REPLAY — the catch-up contract the foreground
+     * service's Disconnect action and the activity's ON_START resume() ride.
+     */
+    @Test
+    fun disconnectKeepsCredentialsCancelsReconnectsAndStartResumesFromThePersistedCursor() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        // A healthy stream delivering event 7, then held open: disconnect()
+        // must be what ends it, not the body running out.
+        server.enqueue(sseHeld("id: 7\nevent: tool-output\ndata: {\"n\":1}\n\n"))
+
+        val engine = newEngine()
+        // ACK applied frames like the ViewModel does (issue #48): only the
+        // ack advances the persisted cursor the resume below must honor.
+        scope.launch { engine.events.collect { it.id?.let { id -> engine.ackApplied(id) } } }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        // The ack's PERSISTENCE must land before the disconnect — that write
+        // is exactly what the resumed start() reads back.
+        awaitCondition { runBlocking { store.read().lastEventId } == "7" }
+
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("/v1/events", takeRequest().path)
+
+        val requestsBeforeDisconnect = server.requestCount
+        engine.disconnect()
+        awaitCondition { engine.state.value == ConnectionState.Stopped }
+
+        // NOT an unpair: the store is untouched — credentials and cursor stay.
+        assertNotNull("disconnect must never clear credentials", credentialsInStore())
+        assertEquals("7", runBlocking { store.read().lastEventId })
+
+        // Like stop(): nothing retries, zero further requests, authed calls
+        // refuse locally.
+        Thread.sleep(1_500)
+        assertEquals(
+            "zero further requests may reach the bridge after disconnect",
+            requestsBeforeDisconnect,
+            server.requestCount,
+        )
+        assertEquals(ConnectionState.Stopped, engine.state.value)
+        assertNull(runBlocking { engine.sendCommand("s-1", "hello") })
+
+        // start() resumes from PERSISTED credentials + cursor: the cold-start
+        // discovery preflight, then the stream reopens with Last-Event-ID 7 —
+        // the persisted ACK cursor, never "0"/FULL_REPLAY (teardown reset only
+        // the in-memory copy) and never a skip past the unreplayed tail.
+        server.enqueue(pingResponse())
+        server.enqueue(sseHeld(":connected\n\n"))
+        engine.start()
+        assertEquals("/v1/ping", takeRequest().path)
+        takeRequest().let {
+            assertEquals("/v1/events", it.path)
+            assertEquals("7", it.getHeader("Last-Event-ID"))
+        }
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+    }
+
     // -- Pairing gates ------------------------------------------------------
 
     @Test

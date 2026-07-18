@@ -1,5 +1,7 @@
 package dev.claudewatch.wear
 
+import android.os.Build
+import android.os.ParcelFileDescriptor
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.SemanticsMatcher
@@ -22,6 +24,9 @@ import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.rule.GrantPermissionRule
+import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
+import androidx.test.runner.lifecycle.Stage
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -61,6 +66,17 @@ class WalkingSkeletonTest {
 
     @get:Rule
     val compose = createAndroidComposeRule<MainActivity>()
+
+    // Pairing flips `paired`, which triggers the POST_NOTIFICATIONS ask on
+    // API 33+ (issue #24) — a SYSTEM dialog that would cover the compose tree
+    // and swallow every interaction below. Pre-granting keeps the run
+    // dialog-free (WatchApp only launches the request when not yet granted).
+    @get:Rule
+    val notificationPermission: GrantPermissionRule = if (Build.VERSION.SDK_INT >= 33) {
+        GrantPermissionRule.grant(android.Manifest.permission.POST_NOTIFICATIONS)
+    } else {
+        GrantPermissionRule.grant()
+    }
 
     private val args = InstrumentationRegistry.getArguments()
     private val bridgeHost: String = args.getString("bridgeHost") ?: "10.0.2.2"
@@ -210,6 +226,39 @@ class WalkingSkeletonTest {
         compose.waitUntil(30_000) { !tagExists("haloCard") }
     }
 
+    /**
+     * Run [command] through UiAutomation and read the output FULLY. The pfd
+     * must be drained to the end: dumpsys writes into a pipe, and abandoning
+     * it early both truncates the output and can block the shell side.
+     */
+    private fun shell(command: String): String {
+        val pfd = InstrumentationRegistry.getInstrumentation()
+            .uiAutomation.executeShellCommand(command)
+        return ParcelFileDescriptor.AutoCloseInputStream(pfd).use { stream ->
+            stream.readBytes().toString(Charsets.UTF_8)
+        }
+    }
+
+    /**
+     * The BridgeSessionService is alive AND foregrounded (issue #24), per the
+     * activity manager's own books: a ServiceRecord exists for it and it is
+     * flagged isForeground — dumpsys, not app-side APIs, because the whole
+     * point is what the SYSTEM believes survives backgrounding.
+     */
+    private fun serviceIsForeground(): Boolean {
+        val dump = shell("dumpsys activity services dev.claudewatch.wear/.BridgeSessionService")
+        return dump.contains("ServiceRecord") && dump.contains("isForeground=true")
+    }
+
+    private fun awaitServiceForeground(timeoutMs: Long = 30_000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (serviceIsForeground()) return
+            Thread.sleep(300)
+        }
+        throw AssertionError("BridgeSessionService not foregrounded within ${timeoutMs}ms")
+    }
+
     @Test
     fun pairStreamApproveQuestionSpawnKill() {
         // --- Pair via manual IP:port + code entry -------------------------
@@ -234,6 +283,52 @@ class WalkingSkeletonTest {
         // connecting with backlog replay to follow), not on a status string:
         // Halo tears the status line down the moment it leaves the offline
         // screen, so it never reads "paired, stream open".
+        waitForOnlineHome()
+
+        // --- Foreground service + chip + backgrounding (issue #24) --------
+        // Pairing flipped `paired` true, which starts BridgeSessionService
+        // from the RESUMED activity; the system must record it as a
+        // FOREGROUND service (the process-lifetime guarantee, not a plain
+        // started service Doze can shrug off).
+        awaitServiceForeground()
+        // The FGS notification exists, on our channel — the OngoingActivity
+        // chip rides this notification, so its presence is the chip's.
+        val notificationDump = shell("dumpsys notification --noredact")
+        assertTrue(
+            "the FGS notification (channel ${BridgeSessionService.CHANNEL_ID}) must exist",
+            notificationDump.contains(BridgeSessionService.CHANNEL_ID),
+        )
+        // Acceptance 1: the connection survives app backgrounding. HOME the
+        // app (keyevent 3), give the system a moment to settle, and the
+        // service — and with it the SSE stream — must still be foreground.
+        shell("input keyevent 3")
+        Thread.sleep(2_000)
+        assertTrue(
+            "the service must survive app backgrounding",
+            serviceIsForeground(),
+        )
+        // Bring the activity back for the rest of the flow and wait until it
+        // is actually RESUMED with the compose tree answering again — the
+        // remaining legs (approve/question/spawn/kill) drive that tree.
+        shell("am start -n dev.claudewatch.wear/.MainActivity")
+        // NOT compose.activity.lifecycle: on a memory-tight image the system
+        // may have DESTROYED the backgrounded activity, making `am start`
+        // create a fresh instance the rule's activity reference knows nothing
+        // about — that wait would poll a corpse for 30s and fail even though
+        // the service (the thing under test) survived. The lifecycle monitor
+        // registry tracks whichever MainActivity instance is ACTUALLY
+        // resumed, old or new; compose node queries find the new tree either
+        // way (root discovery is process-global, not scenario-scoped).
+        compose.waitUntil(30_000) {
+            var resumed = false
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                resumed = ActivityLifecycleMonitorRegistry.getInstance()
+                    .getActivitiesInStage(Stage.RESUMED)
+                    .any { it is MainActivity }
+            }
+            resumed
+        }
+        compose.waitForIdle()
         waitForOnlineHome()
 
         // --- An SSE event arrives and renders in the session's feed -------
