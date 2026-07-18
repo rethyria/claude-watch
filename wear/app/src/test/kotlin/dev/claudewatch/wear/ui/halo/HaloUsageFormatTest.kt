@@ -21,10 +21,17 @@ import org.junit.Test
  *   resetsAt degrades to NO reset line — never a crash, never a dropped bar.
  *   Expected values are built from instants constructed against
  *   ZoneId.systemDefault(), so the suite passes in ANY zone.
- * - the always-on freshness label: "as of just now" / "Xm ago" / "Xh ago"
- *   buckets, clamped at zero age.
- * - chord-fitted widths: exact px values of the design's formula
- *   min(336, round(2·√(max(R²−dy², 115²))·0.97)), R=169.
+ * - the reset DEGRADATION LADDER (usageResetLabelVariants): every form as a
+ *   longest-first variant list — relative ["resets in 3h 40m",
+ *   "reset 3h 40m", "3h 40m"], absolute ["resets Sat 10am", "Sat 10am"],
+ *   elapsed ["resets soon", "soon"], malformed/absent → empty — so the row
+ *   can render the longest variant that fits instead of ellipsizing.
+ * - the freshness label: SILENT (null) under a minute — fresh data needs no
+ *   caveat — then full words with honest singular/plural ("as of 1 minute
+ *   ago" / "as of 5 minutes ago" / "as of 1 hour ago" / "as of 3 hours
+ *   ago") in the same minute/hour buckets, clamped at zero age.
+ * - chord-fitted widths: exact px values of the widened formula
+ *   min(360, round(2·√(max(R²−dy², 115²))·1.06)), R=169.
  * - semantic tiers, SEVERITY-FIRST: the server's own `severity` coding wins
  *   when present and non-"normal" (escalate-only), the local REMAINING
  *   thresholds (= 100 − wire USED percent; orange ≥75% used, red ≥95%) are
@@ -152,49 +159,102 @@ class HaloUsageFormatTest {
         assertNull(usageResetLabel("2026-07-24", nowMs))
     }
 
-    // ── The always-on freshness label ───────────────────────────────────────
+    // ── Reset label degradation ladder ──────────────────────────────────────
 
     @Test
-    fun updatedLabelBucketsJustNowMinutesHours() {
-        assertEquals("as of just now", usageUpdatedLabel(nowMs, nowMs))
-        assertEquals("as of just now", usageUpdatedLabel(nowMs - 59_000L, nowMs))
-        assertEquals("as of 1m ago", usageUpdatedLabel(nowMs - minuteMs, nowMs))
-        assertEquals("as of 5m ago", usageUpdatedLabel(nowMs - 5 * minuteMs, nowMs))
-        assertEquals("as of 59m ago", usageUpdatedLabel(nowMs - 60 * minuteMs + 1, nowMs))
-        assertEquals("as of 1h ago", usageUpdatedLabel(nowMs - hourMs, nowMs))
-        assertEquals("as of 26h ago", usageUpdatedLabel(nowMs - 26 * hourMs, nowMs))
+    fun relativeResetVariantsDegradeLongestFirst() {
+        // The middle rung is literally the user-specified "reset 3h 40m".
+        assertEquals(
+            listOf("resets in 3h 40m", "reset 3h 40m", "3h 40m"),
+            usageResetLabelVariants(resetsAtIn(3 * hourMs + 40 * minuteMs), nowMs),
+        )
+        // Hours-omitted form degrades the same way.
+        assertEquals(
+            listOf("resets in 42m", "reset 42m", "42m"),
+            usageResetLabelVariants(resetsAtIn(42 * minuteMs), nowMs),
+        )
     }
 
     @Test
-    fun updatedLabelClampsASkewedFutureStampToJustNow() {
+    fun absoluteResetVariantsDropTheVerb() {
+        val target = zonedAt(3, 10, 0)
+        val now = target.toInstant().toEpochMilli() - 48 * hourMs
+        val weekday = target.format(DateTimeFormatter.ofPattern("EEE"))
+        assertEquals(
+            listOf("resets $weekday 10am", "$weekday 10am"),
+            usageResetLabelVariants(target.toOffsetDateTime().toString(), now),
+        )
+    }
+
+    @Test
+    fun elapsedResetVariantsShrinkToSoon() {
+        assertEquals(listOf("resets soon", "soon"), usageResetLabelVariants(resetsAtIn(0L), nowMs))
+        assertEquals(listOf("resets soon", "soon"), usageResetLabelVariants(resetsAtIn(-5 * minuteMs), nowMs))
+    }
+
+    @Test
+    fun malformedOrAbsentResetsAtYieldsAnEmptyLadder() {
+        assertEquals(emptyList<String>(), usageResetLabelVariants(null, nowMs))
+        assertEquals(emptyList<String>(), usageResetLabelVariants("not-a-timestamp", nowMs))
+        assertEquals(emptyList<String>(), usageResetLabelVariants("2026-07-24", nowMs))
+    }
+
+    @Test
+    fun theSingleResetLabelIsTheLaddersHead() {
+        // usageResetLabel stays the "full form" seam: exactly the ladder's
+        // longest rung, so the two functions can never drift apart.
+        val at = resetsAtIn(3 * hourMs + 40 * minuteMs)
+        assertEquals(usageResetLabelVariants(at, nowMs).first(), usageResetLabel(at, nowMs))
+    }
+
+    // ── The freshness label ─────────────────────────────────────────────────
+
+    @Test
+    fun updatedLabelIsSilentUnderAMinuteThenSpeaksFullWords() {
+        // Under a minute the label DIES (2026-07-18 refinement): fresh data
+        // needs no caveat — null, not "as of just now".
+        assertNull(usageUpdatedLabel(nowMs, nowMs))
+        assertNull(usageUpdatedLabel(nowMs - 59_000L, nowMs))
+        // Past the minute: full words, honest singular/plural, same buckets.
+        assertEquals("as of 1 minute ago", usageUpdatedLabel(nowMs - minuteMs, nowMs))
+        assertEquals("as of 5 minutes ago", usageUpdatedLabel(nowMs - 5 * minuteMs, nowMs))
+        assertEquals("as of 59 minutes ago", usageUpdatedLabel(nowMs - 60 * minuteMs + 1, nowMs))
+        assertEquals("as of 1 hour ago", usageUpdatedLabel(nowMs - hourMs, nowMs))
+        assertEquals("as of 3 hours ago", usageUpdatedLabel(nowMs - 3 * hourMs, nowMs))
+        assertEquals("as of 26 hours ago", usageUpdatedLabel(nowMs - 26 * hourMs, nowMs))
+    }
+
+    @Test
+    fun updatedLabelClampsASkewedFutureStampToSilent() {
         // A fetchedAtMs ahead of the local clock (skew) never renders a
-        // negative age — it clamps to the freshest bucket.
-        assertEquals("as of just now", usageUpdatedLabel(nowMs + 5 * minuteMs, nowMs))
+        // negative age — it clamps to zero, which is the silent bucket.
+        assertNull(usageUpdatedLabel(nowMs + 5 * minuteMs, nowMs))
     }
 
     // ── Chord-fitted widths ─────────────────────────────────────────────────
 
     @Test
     fun chordWidthsForThreeRowsMatchTheDesignExactly() {
-        // pitch 63, dy = −63/0/63: the CENTER row is 2·169·0.97 = 327.86 →
-        // 328 — under the 336 cap, so the cap never bites at n=3; the outer
-        // rows shorten to the circle's chord at ±63px.
-        assertEquals(listOf(304, 328, 304), usageChordWidthsPx(3))
+        // Widened factor (2026-07-18): pitch 63, dy = −63/0/63. The CENTER
+        // row is 2·169·1.06 = 358.28 → 358 — under the 360 cap, so the cap
+        // never bites at n=3; the outer rows shorten to the circle's chord
+        // at ±63px: 2·√(169²−63²)·1.06 = 332.45 → 332.
+        assertEquals(listOf(332, 358, 332), usageChordWidthsPx(3))
     }
 
     @Test
     fun chordWidthsTightenPitchAsRowsAreAdded() {
-        assertEquals(listOf(328), usageChordWidthsPx(1))
-        assertEquals(listOf(322, 322), usageChordWidthsPx(2))
-        assertEquals(listOf(288, 324, 324, 288), usageChordWidthsPx(4)) // pitch 54
-        assertEquals(listOf(275, 315, 328, 315, 275), usageChordWidthsPx(5)) // pitch 46
+        assertEquals(listOf(358), usageChordWidthsPx(1))
+        assertEquals(listOf(352, 352), usageChordWidthsPx(2))
+        assertEquals(listOf(314, 354, 354, 314), usageChordWidthsPx(4)) // pitch 54
+        assertEquals(listOf(301, 345, 358, 345, 301), usageChordWidthsPx(5)) // pitch 46
     }
 
     @Test
     fun chordWidthsFloorAtThe115HalfWidthForFarOutRows() {
         // n=7 puts the outermost rows at dy = ±138 — past the circle — where
-        // the 115 floor yields 2·115·0.97 = 223.1 → 223, still usable.
-        assertEquals(listOf(223, 275, 315, 328, 315, 275, 223), usageChordWidthsPx(7))
+        // the 115 floor yields 2·115·1.06 = 243.8 → 244, still usable.
+        assertEquals(listOf(244, 301, 345, 358, 345, 301, 244), usageChordWidthsPx(7))
     }
 
     // ── Semantic tiers (severity-first; local fallback from REMAINING) ──────

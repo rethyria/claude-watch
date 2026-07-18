@@ -27,11 +27,12 @@ import org.junit.runner.RunWith
  * RECORDED onUsageOpen action seam — no bridge, no network. Swipe right from
  * home lands on usage and fires the fetch seam (on EVERY entry — fetch-on-open
  * is the whole caching policy); swipe left returns home; the bars render from
- * injected Data (including the ALWAYS-ON "as of ..." freshness label —
- * cache and live api alike); the eyebrow toggles the REMAINING/USED reading
- * of a known wire percent; Error renders the message with a tappable retry
- * that re-fires the seam; and the page has no drill-down — swipe up stays
- * put.
+ * injected Data (including the "as of ..." freshness label once the data is
+ * MORE THAN A MINUTE old — cache and live api alike — absent under that,
+ * and tappable: the tap fires the recorded onUsageRefresh force seam); the
+ * eyebrow toggles the REMAINING/USED reading of a known wire percent; Error
+ * renders the message with a tappable retry that re-fires the seam; and the
+ * page has no drill-down — swipe up stays put.
  */
 @RunWith(AndroidJUnit4::class)
 class HaloUsagePageTest {
@@ -193,10 +194,27 @@ class HaloUsagePageTest {
     }
 
     @Test
-    fun apiSourceRendersTheAlwaysOnUpdatedLabel() {
-        // 2026-07-18 refinement: the freshness label is ALWAYS-ON — a live
-        // api result renders it too (stamped at parse time, so fresh data
-        // reads "as of just now" under the last bar).
+    fun apiSourceRendersTheUpdatedLabelOncePastAMinute() {
+        // 2026-07-18 refinements: the freshness label is not cache-only — a
+        // live api result older than a minute renders it too. 90s old keeps
+        // the assertion stable ("as of 1 minute ago" holds until the age
+        // crosses 2 minutes — far beyond any test runtime).
+        compose.setContent {
+            HaloApp(
+                ui = ui(fixtureData(source = "api", fetchedAtMs = System.currentTimeMillis() - 90_000L)),
+                actions = HaloActions(),
+            )
+        }
+        swipeToUsage()
+        compose.onNodeWithTag("haloUsage").assertIsDisplayed()
+        compose.onNodeWithTag("haloUsageStale").assertIsDisplayed()
+        compose.onNode(hasText("as of 1 minute ago")).assertIsDisplayed()
+    }
+
+    @Test
+    fun freshDataUnderAMinuteRendersNoUpdatedLabel() {
+        // Under a minute the label DIES (2026-07-18): fresh bars need no
+        // caveat — the tag itself is absent, not just an empty string.
         compose.setContent {
             HaloApp(
                 ui = ui(fixtureData(source = "api", fetchedAtMs = System.currentTimeMillis())),
@@ -205,8 +223,32 @@ class HaloUsagePageTest {
         }
         swipeToUsage()
         compose.onNodeWithTag("haloUsage").assertIsDisplayed()
+        compose.onNodeWithTag("haloUsageStale").assertDoesNotExist()
+    }
+
+    @Test
+    fun tappingTheUpdatedLabelFiresTheForcedRefreshSeam() {
+        // The freshness label doubles as the manual-refresh affordance: the
+        // tap fires onUsageRefresh (wired to fetchUsage(force = true) in
+        // MainActivity), NOT the non-forced onUsageOpen entry seam.
+        var refreshes = 0
+        var opens = 0
+        compose.setContent {
+            HaloApp(
+                ui = ui(fixtureData(source = "api", fetchedAtMs = System.currentTimeMillis() - 5 * 60_000L)),
+                actions = HaloActions(
+                    onUsageOpen = { opens++ },
+                    onUsageRefresh = { refreshes++ },
+                ),
+            )
+        }
+        swipeToUsage()
+        val entryOpens = opens // the page entry fired the non-forced seam
         compose.onNodeWithTag("haloUsageStale").assertIsDisplayed()
-        compose.onNode(hasText("as of just now")).assertIsDisplayed()
+        compose.onNodeWithTag("haloUsageStale").performClick()
+        compose.waitForIdle()
+        assertEquals("tapping the as-of label fires the forced refresh", 1, refreshes)
+        assertEquals("the tap never doubles as a page entry", entryOpens, opens)
     }
 
     @Test

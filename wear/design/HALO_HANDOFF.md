@@ -185,11 +185,16 @@ single centered column — a fixed header would collide with the taller stack.
   19 `#63615B`, `usageResetLabel` below · percent 30/500 pushed to the right
   edge) over an 8px r4 bar (track `#3A3C42`, fill width = shown percent).
   Compact when n ≥ 4: percent 25, in-row gap 5px (else 8px), 17px stack gaps.
-  An ALWAYS-ON freshness label (19, `#8D8B84`, tag `haloUsageStale` — the
-  historical cache-only name, kept for the instrumented tests) renders
-  **under the last bar** in both layouts: pinned (n ≤ 3) at BottomCenter with
-  32dp bottom padding (the honest band between the stack and the page dots),
-  compact (n ≥ 4) as the column's last child.
+  A freshness label (19, `#8D8B84`, tag `haloUsageStale` — the historical
+  cache-only name, kept for the instrumented tests, on the TAPPABLE node)
+  renders **under the last bar** in both layouts once the data is MORE THAN
+  A MINUTE old (under that: nothing — fresh bars need no caveat; the ~30s
+  ticker pops it in on time): pinned (n ≤ 3) at BottomCenter with 32dp
+  bottom padding (the honest band between the stack and the page dots),
+  compact (n ≥ 4) as the column's last child. **Tapping it is a manual
+  force-refresh** (`onUsageRefresh` → `fetchUsage(force = true)`): the
+  eyebrow's enlarged-target idiom (48×24 min, bottom-aligned glyphs so the
+  slack grows upward, never over the page dots).
 - **Error:** "usage unavailable" 27/500 `#E5484D`; the dynamic failure detail
   21 `#8D8B84` (single line, ellipsized); Retry pill (tag `haloUsageRetry`) —
   64px tall, 40px side padding, fully rounded, `#D97757` fill, "Retry" 24/500
@@ -198,24 +203,52 @@ single centered column — a fixed header would collide with the taller stack.
 **Fetch rate limit** (client-side, in `BridgeViewModel.fetchUsage`): the
 upstream endpoint aggressively 429s pollers, so when fresh **live** bars are
 on screen (`Data` with `source == "api"`, within 5 minutes of the last api
-success) a page re-entry is a complete no-op — no request, no Loading
-flicker, instant re-entry. Only a successful api parse arms the window;
-Error-Retry and cache-fallback entries always refetch (no force parameter).
+success) a NON-FORCED page re-entry is a complete no-op — no request, no
+Loading flicker, instant re-entry. Only a successful api parse arms the
+window; Error-Retry and cache-fallback entries always refetch.
+`fetchUsage(force = true)` — the freshness label's tap — bypasses the
+limiter (page entry / retry / auto-poll all stay non-forced).
 
-**Reset labels** (`usageResetLabel(resetsAt, nowMs)`, 2026-07-18 refinement —
-one UNIFORM time-to-reset rule, no kind parameter; a session window is always
-< 24h out so it naturally gets the relative form): delta ≤ 0 → "resets soon";
-delta < 24h → "resets in 4h 13m" (hours omitted when zero — "resets in 42m";
-minutes always shown and FLOORED); delta ≥ 24h → "resets Sat 10am" (weekday +
-local 12-hour clock, lowercase am/pm, 12am/12pm never 0am, minutes only when
-non-zero — "Sat 10:30am"). Malformed/absent resetsAt → no reset line, never a
-dropped bar.
+**Silent refresh** (2026-07-18): a fetch started while `Data` is already on
+screen — forced or not — never flips to Loading: the bars stay put and swap
+when the result lands, and a FAILED silent refresh keeps the old Data (the
+aging as-of label is the honest signal that refreshes are not landing).
+Error/Idle starts still flip to Loading as before.
 
-**Freshness label** (`usageUpdatedLabel(fetchedAtMs, nowMs)`): "as of just
-now" (< 60s) / "as of Xm ago" (< 60m) / "as of Xh ago". Always-on:
-`UsageUi.Data.fetchedAtMs` is non-null in the client model — a cache result
-keeps the bridge's value (the data's true age), a live api result is stamped
-at parse time (the wire still only sends fetchedAtMs for cache fallbacks).
+**On-page auto-poll** (2026-07-18, `HaloApp.PagerLayer`): while the usage
+page is the current pager page AND the lifecycle is RESUMED
+(`LocalLifecycleOwner` + `repeatOnLifecycle`), a loop fires the non-forced
+`onUsageOpen` every `USAGE_AUTO_POLL_MS` = 310s — the VM's 300s limiter plus
+a 10s buffer so the poll always lands past the window despite clock jitter.
+STRICTLY FOREGROUND-ONLY (user directive): leaving the page, leaving the
+screen, backgrounding, or ambient all cancel/suspend the loop; returning
+restarts the wait from zero (the page-entry fetch covers the return case —
+the loop only handles sit-and-watch). The silent-refresh rule makes each
+swap invisible.
+
+**Reset labels** (`usageResetLabelVariants(resetsAt, nowMs)`, 2026-07-18
+refinements — one UNIFORM time-to-reset rule, no kind parameter; a session
+window is always < 24h out so it naturally gets the relative form), now a
+DEGRADATION LADDER of variants, longest first: delta ≤ 0 → `["resets soon",
+"soon"]`; delta < 24h → `["resets in 3h 40m", "reset 3h 40m", "3h 40m"]`
+(hours omitted when zero — "resets in 42m"; minutes always shown and
+FLOORED); delta ≥ 24h → `["resets Sat 10am", "Sat 10am"]` (weekday + local
+12-hour clock, lowercase am/pm, 12am/12pm never 0am, minutes only when
+non-zero — "Sat 10:30am"). Malformed/absent resetsAt → empty list = no reset
+line, never a dropped bar. `usageResetLabel` stays as the ladder's head.
+`UsageRow` renders the ladder width-aware: a `BoxWithConstraints` in the
+reset's slot measures each rung with `rememberTextMeasurer` against the
+space the row actually left (name keeps natural width — the name-wins
+truncation priority survives) and renders the FIRST variant that fits;
+ellipsis only when even the shortest rung overflows.
+
+**Freshness label** (`usageUpdatedLabel(fetchedAtMs, nowMs)`): null (no
+label) under 60s; then full words with honest singular/plural — "as of 1
+minute ago" / "as of 5 minutes ago" (< 60m) / "as of 1 hour ago" / "as of
+3 hours ago". `UsageUi.Data.fetchedAtMs` is non-null in the client model —
+a cache result keeps the bridge's value (the data's true age), a live api
+result is stamped at parse time (the wire still only sends fetchedAtMs for
+cache fallbacks).
 
 **Minute ticker:** both label families are computed from NOW and nothing else
 recomposes while the page sits open, so the screen keeps a remembered tick
@@ -226,10 +259,13 @@ with the screen.
 **Display names** (presentation-only): kind `session` → "Session",
 `weekly_all` → "Weekly", any other kind keeps its wire label (e.g. "Fable").
 
-**Chord-fitted widths:** row i of n gets
-`min(336, round(2·√(max(R²−dy², 115²))·0.97))` px at the 450 ref, with
-R = 169, dy = (i−(n−1)/2)·pitch, pitch = 63 (n≤3) / 54 (n=4) / 46 (n≥5); each
-row is individually centered so the stack hugs the circle (n=3 ⇒ 304/328/304).
+**Chord-fitted widths** (widened 2026-07-18: factor 0.97 → 1.06, cap 336 →
+360 — the mock's chord was conservative; every row gains ~6–9% and even the
+top n=3 row's 332px sits well under the physical screen chord ≈432px at that
+height): row i of n gets `min(360, round(2·√(max(R²−dy², 115²))·1.06))` px
+at the 450 ref, with R = 169, dy = (i−(n−1)/2)·pitch, pitch = 63 (n≤3) / 54
+(n=4) / 46 (n≥5); each row is individually centered so the stack hugs the
+circle (n=3 ⇒ 332/358/332).
 
 **Semantic tiers** — SEVERITY-FIRST, never from the shown number: the wire's
 `severity` is the server's own (undocumented-threshold) color coding, so when

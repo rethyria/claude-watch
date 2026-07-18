@@ -148,7 +148,11 @@ fun WatchApp(
             onSpawn = viewModel::spawnSession,
             onKill = viewModel::killSession,
             onHide = viewModel::hideSession,
-            onUsageOpen = viewModel::fetchUsage,
+            // Page entry / retry / auto-poll: the NON-FORCED fetch (the VM's
+            // rate limit may skip it). The freshness label's tap is the
+            // explicit "refresh NOW" and bypasses the limiter.
+            onUsageOpen = { viewModel.fetchUsage() },
+            onUsageRefresh = { viewModel.fetchUsage(force = true) },
         ),
     )
 }

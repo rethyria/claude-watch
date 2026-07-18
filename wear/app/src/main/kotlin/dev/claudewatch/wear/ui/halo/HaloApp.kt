@@ -59,7 +59,12 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material.TimeText
 import androidx.wear.compose.material.TimeTextDefaults
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import dev.claudewatch.wear.BridgeViewModel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -104,11 +109,19 @@ data class HaloActions(
     val onHide: (sessionId: String) -> Unit = {},
     /**
      * The usage page became current (issue #57): fetch GET /v1/usage. Fired
-     * on EVERY entry (fetch-on-open is the whole caching policy) and by the
-     * usage screen's error-retry tap. An action seam — not a VM call — so
-     * instrumented tests can record entries and inject states.
+     * on EVERY entry (fetch-on-open is the whole caching policy), by the
+     * usage screen's error-retry tap, and by the on-page auto-poll — all the
+     * NON-FORCED path (the VM's rate limit may skip it). An action seam —
+     * not a VM call — so instrumented tests can record entries and inject
+     * states.
      */
     val onUsageOpen: () -> Unit = {},
+    /**
+     * Manual usage refresh (2026-07-18): the freshness label's tap. Wired to
+     * fetchUsage(force = true) — bypasses the VM's rate limiter; the
+     * silent-refresh rule keeps the bars on screen while it lands.
+     */
+    val onUsageRefresh: () -> Unit = {},
 )
 
 /** Handoff motion: 300ms cubic-bezier(0.2,0.7,0.3,1), 70px slide at 450 ref. */
@@ -121,6 +134,15 @@ private const val SWIPE_THRESHOLD_FRACTION = 60f / HALO_REF_PX
 
 /** A swipe suppresses the synthetic tap that can follow it for this long. */
 private const val TAP_GUARD_MS = 300L
+
+/**
+ * On-page usage auto-poll period: the VM's `usageRateLimitMs` (300_000L)
+ * plus a 10s buffer. The buffer guarantees each non-forced poll lands PAST
+ * the limiter even with clock jitter between delay's monotonic clock and
+ * the limiter's System.currentTimeMillis() — delay never fires early, so
+ * every tick is a real refetch, never a silently-skipped one.
+ */
+private const val USAGE_AUTO_POLL_MS = 310_000L
 
 @Composable
 fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
@@ -254,6 +276,7 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                         }
                     },
                     onUsageOpen = actions.onUsageOpen,
+                    onUsageRefresh = actions.onUsageRefresh,
                 )
                 is Layer.SessionList -> InnerScreen(
                     onBack = { nav = nav.back() },
@@ -639,6 +662,7 @@ private fun PagerLayer(
     onDrill: () -> Unit,
     onTapCenter: () -> Unit,
     onUsageOpen: () -> Unit,
+    onUsageRefresh: () -> Unit,
 ) {
     // Pager slot 0 is the USAGE page (issue #57), so pagerIndex = nav.page + 1:
     // All keeps nav.page 0 (slot 1, the initial page) and every existing
@@ -658,9 +682,38 @@ private fun PagerLayer(
             onPageChange(pagerIndex - 1)
             // Fetch-on-open (issue #57): EVERY landing on the usage page —
             // swipe, dot tap, re-entry after a depth round trip — re-fetches.
-            // No polling and no client cache by design; this snapshotFlow IS
-            // the "page became current" seam.
+            // No client cache by design; this snapshotFlow IS the "page
+            // became current" seam. (The sit-and-watch case is the separate
+            // auto-poll loop below.)
             if (pagerIndex == 0) usageOpen()
+        }
+    }
+    // On-page auto-poll (2026-07-18, user-directed): sitting on the usage
+    // page refreshes when the data hits the rate-limit age instead of
+    // waiting for a re-navigation. STRICTLY FOREGROUND-ONLY ("only auto-poll
+    // if the page is open, don't poll in the background"): being the current
+    // pager page is NOT enough — a backgrounded activity keeps its
+    // composition alive — so the delay loop ALSO gates on the lifecycle
+    // being RESUMED via the standard repeatOnLifecycle idiom. Leaving the
+    // page (collectLatest cancels the inner block), leaving the screen (the
+    // LaunchedEffect dies with the composition), backgrounding the app, or
+    // the watch going ambient/inactive (repeatOnLifecycle suspends below
+    // RESUMED) all stop the poll; returning restarts the wait from zero —
+    // and the page-ENTRY fetch above already covers the return-to-app case,
+    // so the loop only ever handles sit-and-watch. Each poll goes through
+    // the NON-FORCED onUsageOpen: the VM's limiter still owns the request
+    // budget, and the silent-refresh rule makes the swap invisible.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(pagerState, lifecycleOwner) {
+        snapshotFlow { pagerState.currentPage == 0 }.collectLatest { onUsagePage ->
+            if (onUsagePage) {
+                lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                    while (true) {
+                        delay(USAGE_AUTO_POLL_MS)
+                        usageOpen()
+                    }
+                }
+            }
         }
     }
 
@@ -683,8 +736,13 @@ private fun PagerLayer(
         HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { index ->
             when {
                 // No centerpiece and no drill-down on the usage page: bars
-                // only, retry re-fires the same fetch the entry did.
-                index == 0 -> HaloUsageScreen(usage = usage, onRetry = usageOpen)
+                // only, retry re-fires the same fetch the entry did; the
+                // freshness label's tap is the forced-refresh seam.
+                index == 0 -> HaloUsageScreen(
+                    usage = usage,
+                    onRetry = usageOpen,
+                    onRefresh = onUsageRefresh,
+                )
                 index == 1 -> HaloAllPage(model = model, onTapCenter = onTapCenter)
                 else -> {
                     // The pager can briefly ask for a page past a shrunken model.
