@@ -3,7 +3,7 @@
 import crypto from "node:crypto";
 import { log, jsonResponse, readBody, isLoopbackAddress } from "./util.js";
 import { pushSseEvent, sseClients } from "./transport-sse.js";
-import { resolveHookSession, endHookSession, refreshHookSessionTitle } from "./sessions.js";
+import { resolveHookSession, endHookSession, refreshHookSessionTitle, markWorkflowActivity } from "./sessions.js";
 import {
   waitForPermission,
   cancelPermission,
@@ -65,6 +65,11 @@ export async function handleHookToolOutput(req, res) {
   const sid = resolveHookSession(body);
   const source = body.source || "claude";
   log("info", `Hook: ${source === "codex" ? "Codex" : "PostToolUse"} received [${source}]${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
+  // Workflow launch signal (issue #55): the Workflow tool returns immediately
+  // (it runs in the background), so this PostToolUse is the ONLY hook-side
+  // moment the bridge learns a workflow started — arm the journal scan now;
+  // completion is discovered by the poll, never by another hook.
+  if (sid && body.tool_name === "Workflow") markWorkflowActivity(sid);
   pushSseEvent("tool-output", { ...body, source }, sid);
   return jsonResponse(res, 200, { ok: true });
 }

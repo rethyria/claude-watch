@@ -46,6 +46,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
@@ -192,6 +193,27 @@ private fun FeedHeader(
                 color = Halo.Palette.TextFaint,
                 maxLines = 1,
             )
+            // ⎇ branch badge (issue #54) and workflow-agents indicator
+            // (issue #55) share one faint ellipsized line under the title
+            // area — glanceability first on the round screen. The agents
+            // indicator shows ONLY while subagents are running; it is an
+            // indicator, not a control (a watch cannot stop a workflow). No
+            // branch and nothing running = no line (back-compat).
+            val details = listOfNotNull(
+                session.branchLabel,
+                session.agentsRunning.takeIf { it > 0 }?.let { n ->
+                    if (n == 1) "⚙ 1 agent" else "⚙ $n agents"
+                },
+            )
+            if (details.isNotEmpty()) {
+                Text(
+                    text = details.joinToString(" · "),
+                    fontSize = Halo.Type.Min,
+                    color = Halo.Palette.TextFaint,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         CycleArrow(glyph = "›", visible = count > 1, onClick = onNext)
     }

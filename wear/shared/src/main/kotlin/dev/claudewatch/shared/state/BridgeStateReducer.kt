@@ -13,6 +13,7 @@
 //    connection-lifecycle issue.
 package dev.claudewatch.shared.state
 
+import dev.claudewatch.shared.protocol.AgentsActivity
 import dev.claudewatch.shared.protocol.BridgeEvent
 import dev.claudewatch.shared.protocol.BridgeEventParser
 import dev.claudewatch.shared.protocol.ErrorEvent
@@ -59,6 +60,30 @@ data class SessionState(
      * flag and default to false (killable). Additive wire field (issue #53).
      */
     val external: Boolean = false,
+    /**
+     * Git branch of the session's project root (additive wire field, issue
+     * #54); null until the bridge reports one (non-git root, older bridge).
+     */
+    val branch: String? = null,
+    /**
+     * True when the session's root is a LINKED git worktree. The wire carries
+     * the flag ONLY when true; absence preserves UNLESS the payload carries a
+     * branch — a branch-bearing payload without the flag is the bridge's
+     * worktree-to-plain-checkout drop and clears it (issue #54).
+     */
+    val worktree: Boolean = false,
+    /**
+     * The MAIN repo root path — present ONLY for worktree sessions, where it
+     * differs from the session's own root; the UI groups the session under
+     * basename(repoRoot) when set (issue #54).
+     */
+    val repoRoot: String? = null,
+    /**
+     * Observed workflow activity (issue #55); null until the bridge has seen
+     * any. The bridge CLEARS by re-announcing an explicit `{running: 0,
+     * done: N}` — a present value always replaces, absence always preserves.
+     */
+    val agents: AgentsActivity? = null,
     val activity: SessionActivity = SessionActivity.WORKING,
     val activeSinceMs: Long? = null,
     val frozenElapsedMs: Long? = null,
@@ -265,6 +290,22 @@ object BridgeEventReducer {
                     // older bridge) must not erase a known external flag — same
                     // preserve-on-resend rule as folderName/title.
                     external = event.external ?: existing.external,
+                    // Git metadata (issue #54) is ONE atomic group keyed on
+                    // branch presence: whenever the bridge derives any git
+                    // metadata it always sends branch, and worktree/repoRoot
+                    // only when truthy — so a branch-bearing payload with
+                    // worktree/repoRoot ABSENT is the bridge's worktree-to-
+                    // plain-checkout drop, not a partial resend, and must
+                    // clear both. Only a branch-less payload (older bridge,
+                    // no derivation) preserves the trio. Workflow activity
+                    // (issue #55) keeps plain preserve-on-absence. Note
+                    // agents: an explicit {running:0, done:N} IS a value and
+                    // replaces — that present-but-zero re-announce is the
+                    // bridge's ONLY clear path (absence cannot clear).
+                    branch = event.branch ?: existing.branch,
+                    worktree = if (event.branch != null) event.worktree ?: false else existing.worktree,
+                    repoRoot = if (event.branch != null) event.repoRoot else existing.repoRoot,
+                    agents = event.agents ?: existing.agents,
                 ) ?: SessionState(
                     sessionId = id,
                     agent = event.agent,
@@ -272,6 +313,10 @@ object BridgeEventReducer {
                     folderName = event.folderName,
                     title = event.title,
                     external = event.external ?: false,
+                    branch = event.branch,
+                    worktree = event.worktree ?: false,
+                    repoRoot = event.repoRoot,
+                    agents = event.agents,
                     activity = SessionActivity.WORKING,
                     activeSinceMs = nowMs,
                     frozenElapsedMs = null,

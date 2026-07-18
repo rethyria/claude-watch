@@ -217,6 +217,14 @@ export const SPAWN_INJECT_TIMEOUT_MS = testOverridable(
   "CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS",
   15_000,
 );
+// Workflow-activity scanning (issue #55). The poll re-reads workflow journals
+// only for slots a Workflow tool hook marked active, so the interval can stay
+// coarse; the staleness window declares a journal untouched this long dead —
+// a killed workflow must clear its indicator instead of pinning it forever.
+// Overridable via CLAUDE_WATCH_WORKFLOW_POLL_MS /
+// CLAUDE_WATCH_WORKFLOW_STALE_MS (test-only).
+export const WORKFLOW_POLL_MS = testOverridable("CLAUDE_WATCH_WORKFLOW_POLL_MS", 20_000);
+export const WORKFLOW_STALE_MS = testOverridable("CLAUDE_WATCH_WORKFLOW_STALE_MS", 300_000);
 export const CODEX_SESSION_SCAN_INTERVAL_MS = 1_500;
 export const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 export const CODEX_SESSION_SCAN_LIMIT = 25;

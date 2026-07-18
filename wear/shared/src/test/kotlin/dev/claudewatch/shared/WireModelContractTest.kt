@@ -191,6 +191,68 @@ class WireModelContractTest {
     }
 
     @Test
+    fun gitMetadataParsesWhenPresentAndIsNullWhenOmitted() {
+        // Issue #54: a worktree session carries all three additive fields.
+        val worktree = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-1","branch":"issue-53-fix",""" +
+                """"worktree":true,"repoRoot":"/home/dev/projects/alpha"}""",
+        ) as SessionEvent
+        assertEquals("issue-53-fix", worktree.branch)
+        assertEquals(true, worktree.worktree)
+        assertEquals("/home/dev/projects/alpha", worktree.repoRoot)
+
+        // A main-checkout session carries only `branch` — `worktree` and
+        // `repoRoot` are present ONLY for linked worktrees.
+        val checkout = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-2","branch":"main"}""",
+        ) as SessionEvent
+        assertEquals("main", checkout.branch)
+        assertNull(checkout.worktree)
+        assertNull(checkout.repoRoot)
+
+        // Non-git root / older bridge: all absent, and absence never fails
+        // the frame (absent = preserve previously-known, per the contract).
+        val nonGit = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-3"}""",
+        ) as SessionEvent
+        assertNull(nonGit.branch)
+        assertNull(nonGit.worktree)
+        assertNull(nonGit.repoRoot)
+    }
+
+    @Test
+    fun agentsActivityParsesWhenPresentAndIsNullWhenOmitted() {
+        // Issue #55: workflow activity arrives as a nested {running, done}
+        // object once the bridge has observed any.
+        val active = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-1","agents":{"running":3,"done":1}}""",
+        ) as SessionEvent
+        assertEquals(3, active.agents?.running)
+        assertEquals(1, active.agents?.done)
+
+        // The explicit completion re-announce: present-but-zero IS a value
+        // (the bridge's only clear path), so it must parse as one.
+        val completed = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-1","agents":{"running":0,"done":4}}""",
+        ) as SessionEvent
+        assertEquals(0, completed.agents?.running)
+        assertEquals(4, completed.agents?.done)
+
+        // Absent (no workflow observed / older bridge) stays null without
+        // failing the frame.
+        val absent = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-2"}""",
+        ) as SessionEvent
+        assertNull(absent.agents)
+    }
+
+    @Test
     fun unknownEventTypesAreToleratedNotFatal() {
         val event = BridgeEventParser.parse("shiny-new-event", """{"anything":true}""")
         assertTrue(event is UnknownEvent)
