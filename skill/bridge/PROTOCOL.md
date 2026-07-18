@@ -236,6 +236,16 @@ Authenticated snapshot:
   hook-created (external, PTY-less) session whose process the bridge does not
   own; **omitted** for bridge-owned PTY slots. Clients must treat its absence
   as `external: false` (killable). See the [`session`](#session) event.
+- `sessions[].branch` / `sessions[].worktree` / `sessions[].repoRoot`
+  (**optional, additive**): git metadata of the session's project root —
+  branch name (detached HEAD → 7-char short sha); `worktree: true` plus the
+  main repo's `repoRoot` **only** for a linked git worktree. Absent for
+  non-git roots. See the [`session`](#session) event for derivation and the
+  absent-means-preserve doctrine.
+- `sessions[].agents` (object, **optional, additive**):
+  `{ "running": n, "done": n }` — workflow subagent activity, present once
+  observed. Completion is the **explicit** `{running: 0, ...}` state; absence
+  preserves the last known value. See the [`session`](#session) event.
 - `hasPty` / `activeAgent`: legacy conveniences describing the most recent
   active session; prefer `sessions[]`.
 
@@ -409,6 +419,35 @@ hook the bridge **revives** it — re-broadcasting the idempotent `running` even
 (and clearing the zombie `ended` state) rather than swallowing the event.
 Only an authoritative end (the `SessionEnd` hook, or a bridge-owned PTY exit)
 is final and never revives.
+
+**`branch`** / **`worktree`** / **`repoRoot`** (**optional, additive** — issue
+#54): git metadata of the session's project root, derived from **file reads
+only** (never a spawned `git`): the root's `.git` directory (main checkout) or
+`.git` pointer file (linked worktree, `gitdir: …/.git/worktrees/<name>`), and
+the applicable `HEAD` file. `branch` is the branch name (a detached HEAD
+yields the 7-char short sha). `worktree: true` and the main repo's `repoRoot`
+are present **only** when the pointer target matches the
+`…/.git/worktrees/<name>` structure exactly — any other layout (submodule,
+relocated gitdir) yields at most `branch`, never a guessed `repoRoot`. Clients
+group a session under `basename(repoRoot)` when present. Absent fields mean
+**preserve what you knew** (the `title` doctrine): a non-git root or an
+unreadable HEAD never clears previously-broadcast values. Refreshed at the
+same opportunistic points as `title`; a change is broadcast as the idempotent
+`running` event.
+
+**`agents`** (object `{ "running": n, "done": n }`, **optional, additive** —
+issue #55): multi-agent workflow activity observed for this session. The
+bridge learns a workflow **started** from the Workflow tool's PostToolUse hook
+and then watches the session's workflow journals on a slow poll; `running`
+counts agents started without a result, `done` counts completed agents of
+currently-live workflows. Completion is signaled by the **explicit**
+`{"running": 0, "done": n}` broadcast — absence, as everywhere, means
+preserve, so omission can never clear the indicator. Stale journals (no write
+for ~5 min, e.g. a killed workflow) are treated as dead so the indicator
+cannot stick. A bridge restarted mid-workflow misses the launch hook and
+shows no indicator — accepted. Clients should render an indicator only while
+`running > 0`, and must not offer any control affordance (a workflow cannot
+be stopped from a client).
 
 ### `pty-output`
 Raw terminal output from a bridge-owned PTY (ANSI escapes included) or from a
