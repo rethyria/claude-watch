@@ -147,6 +147,37 @@ function testOverridable(envName, productionValue) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : productionValue;
 }
 
+// String sibling of testOverridable for paths and URLs (same contract:
+// test-only, read once at module load, unset falls back to the production
+// default). Production deployments must never set these variables.
+function testOverridableString(envName, productionValue) {
+  const raw = process.env[envName];
+  return raw === undefined || raw === "" ? productionValue : raw;
+}
+
+// GET /v1/usage plan-limit fetch (issue #57). The API base URL is
+// overridable so tests point the handler at a local mock server; the
+// credentials/cache paths are overridable so tests feed fixture files instead
+// of the real ~/.claude state. The timeout bounds the on-demand upstream
+// fetch (the handler runs per page-open, so a hung API must fail over to the
+// cache quickly instead of pinning the request).
+export const USAGE_API_URL = testOverridableString(
+  "CLAUDE_WATCH_USAGE_API_URL",
+  "https://api.anthropic.com",
+);
+export const USAGE_CREDENTIALS_PATH = testOverridableString(
+  "CLAUDE_WATCH_USAGE_CREDENTIALS_PATH",
+  path.join(os.homedir(), ".claude", ".credentials.json"),
+);
+export const USAGE_CACHE_PATH = testOverridableString(
+  "CLAUDE_WATCH_USAGE_CACHE_PATH",
+  path.join(os.homedir(), ".claude.json"),
+);
+export const USAGE_FETCH_TIMEOUT_MS = testOverridable(
+  "CLAUDE_WATCH_USAGE_FETCH_TIMEOUT_MS",
+  8_000,
+);
+
 // Overridable via CLAUDE_WATCH_SSE_BUFFER_SIZE (test-only): lets eviction
 // tests roll the ring buffer over without pushing 500+ events.
 export const SSE_BUFFER_SIZE = testOverridable("CLAUDE_WATCH_SSE_BUFFER_SIZE", 500);

@@ -29,6 +29,7 @@ import { sessions } from "./sessions.js";
 import { pendingPermissions } from "./permissions.js";
 import { startCodexMonitor, stopCodexMonitor } from "./codex.js";
 import { handlePair, handleCommand, handleStatus, handlePing } from "./commands.js";
+import { handleUsage } from "./usage.js";
 import {
   handleHookToolOutput,
   handleHookPermission,
@@ -92,6 +93,7 @@ const routes = {
   "POST /hooks/error": handleHookError,
   "POST /hooks/notification": handleHookNotification,
   "GET /status": handleStatus,
+  "GET /usage": handleUsage,
   "GET /ping": handlePing,
 };
 

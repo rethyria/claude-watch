@@ -2,7 +2,9 @@
 // (spawn/kill/permission-decision/PTY injection), GET /status, and the
 // unauthenticated GET /ping discovery probe.
 import { spawn as childSpawn } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { log, jsonResponse, readBody } from "./util.js";
 import {
   BRIDGE_ID,
@@ -150,6 +152,32 @@ export async function handlePair(req, res) {
   return jsonResponse(res, 200, response);
 }
 
+// Resolve the working directory for a spawn (issue #56), shared by the
+// explicit spawn action and the auto-spawn of the command-injection fallback.
+// The literal "~" is the "no project" sentinel: the watch cannot know the
+// bridge user's home path, so it sends "~" and the bridge resolves it to
+// os.homedir(). Any other provided value must be an absolute path to an
+// existing directory — before validation, a bogus target reached the PTY
+// spawn and died into an instantly-ended session, which from the wrist looked
+// like a silent no-op. An omitted (or empty) cwd keeps the historical
+// fallback chain unchanged: bridge CLI positional arg → $HOME → bridge cwd.
+// Returns the resolved directory, or null AFTER writing the 400 response —
+// callers must return immediately on null so no session slot is ever created
+// for an invalid target.
+function resolveSpawnCwd(res, requestedCwd) {
+  if (!requestedCwd) {
+    return CLI_CWD || process.env.HOME || process.cwd();
+  }
+  const resolved = requestedCwd === "~" ? os.homedir() : requestedCwd;
+  try {
+    if (path.isAbsolute(resolved) && fs.statSync(resolved).isDirectory()) {
+      return resolved;
+    }
+  } catch { /* ENOENT/EACCES — fall through to the 400 */ }
+  jsonResponse(res, 400, { error: `spawn cwd is not a directory: ${resolved}` });
+  return null;
+}
+
 // Run a dictated prompt for a session the bridge owns no PTY for (external
 // hook-created sessions): invoke the agent CLI headlessly in the session's
 // cwd and stream its output as pty-output events. Used both when the client
@@ -238,7 +266,8 @@ export async function handleCommand(req, res) {
     if (!validAgents.includes(spawnRequest)) {
       return jsonResponse(res, 400, { error: `Invalid agent: ${spawnRequest}. Use: ${validAgents.join(", ")}` });
     }
-    const cwd = body.cwd || CLI_CWD || process.env.HOME || process.cwd();
+    const cwd = resolveSpawnCwd(res, body.cwd);
+    if (cwd === null) return; // 400 already sent — no session slot created
     const newId = spawnSession(spawnRequest, cwd);
     if (!newId) {
       return jsonResponse(res, 500, { error: `Failed to spawn ${spawnRequest}` });
@@ -323,7 +352,8 @@ export async function handleCommand(req, res) {
       // write silently dropped the command when the PTY died or wasn't ready,
       // while the client still saw ok:true.
       const requestedAgent = agent || "claude";
-      const cwd = body.cwd || CLI_CWD || process.env.HOME || process.cwd();
+      const cwd = resolveSpawnCwd(res, body.cwd);
+      if (cwd === null) return; // 400 already sent — no session slot created
       const newId = spawnSession(requestedAgent, cwd);
       if (!newId) {
         return jsonResponse(res, 500, { error: `Failed to spawn ${requestedAgent}` });
