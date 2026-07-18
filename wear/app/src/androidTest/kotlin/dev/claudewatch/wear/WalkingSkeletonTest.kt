@@ -254,9 +254,13 @@ class WalkingSkeletonTest {
         compose.waitUntil(30_000) {
             compose.onAllNodes(hasText(marker, substring = true)).fetchSemanticsNodes().isNotEmpty()
         }
-        // TimeText tap = jump home, ready for the approval legs.
-        compose.onNodeWithTag("haloHome").performClick()
+        // Back home the way a user does: swipe down twice (feed → list →
+        // page). The clock is deliberately not a tap target anymore.
+        compose.onNodeWithTag("haloFeed-$markerSession").performTouchInput { swipeDown() }
         compose.waitForIdle()
+        compose.onNode(hasScrollAction()).performTouchInput { swipeDown() }
+        compose.waitForIdle()
+        waitForText("haloCensus", "session")
 
         // --- Concurrent blocking permission hooks (issue #17) -------------
         // Two curl-simulated sessions ask at once: both must queue (neither

@@ -31,11 +31,16 @@ export PATH="$HOME/.local/bin:$PATH"
 # Fresh credentials dir: the bridge must start unpaired and print a code.
 export CLAUDE_WATCH_CREDENTIALS_DIR="$(mktemp -d)"
 
-node skill/bridge/server.js > bridge.log 2>&1 &
+# A UNIQUE log file, not repo-root bridge.log: a developer's live bridge often
+# logs there, and sharing the path both interleaves two processes' output and
+# poisons the scrape below (stray ANSI bytes make grep call the file binary).
+# -a keeps the scrape working even if PTY escapes end up in OUR log.
+BRIDGE_LOG="$(mktemp "${TMPDIR:-/tmp}/wear-e2e-bridge.XXXXXX")"
+node skill/bridge/server.js > "$BRIDGE_LOG" 2>&1 &
 BRIDGE_PID=$!
 cleanup() {
-  echo "--- bridge.log ---"
-  cat bridge.log || true
+  echo "--- bridge log ($BRIDGE_LOG) ---"
+  cat "$BRIDGE_LOG" || true
   kill "$BRIDGE_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -43,8 +48,8 @@ trap cleanup EXIT
 PORT=""
 CODE=""
 for _ in $(seq 1 60); do
-  PORT="$(grep -oE 'Port:[[:space:]]+[0-9]+' bridge.log | grep -oE '[0-9]+' | head -1 || true)"
-  CODE="$(grep -oE 'Pairing Code:[[:space:]]+[0-9]{6}' bridge.log | grep -oE '[0-9]{6}' | head -1 || true)"
+  PORT="$(grep -a -oE 'Port:[[:space:]]+[0-9]+' "$BRIDGE_LOG" | grep -oE '[0-9]+' | head -1 || true)"
+  CODE="$(grep -a -oE 'Pairing Code:[[:space:]]+[0-9]{6}' "$BRIDGE_LOG" | grep -oE '[0-9]{6}' | head -1 || true)"
   if [ -n "$PORT" ] && [ -n "$CODE" ]; then break; fi
   if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
     echo "bridge exited early" >&2

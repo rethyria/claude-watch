@@ -52,7 +52,9 @@ round caps, colored by state; equal segments with small gaps. Center: time (88
 light) + subtitle "3 projects · 5 sessions" (22, `#8D8B84`). Bottom: page dots
 (y≈414). Tap center → opens the first waiting item directly. No top `TimeText`
 on pages showing the centerpiece time; inner screens show top `TimeText` (20,
-`#7E7C76`) and tapping it jumps home.
+`#7E7C76`); it is purely decorative — swipe-down steps back up the depth
+stack (the clock is deliberately not a tap target: an invisible hotspot over
+the time read as an accidental-jump trap in live testing).
 
 ### 2. Project page (pages 1..n)
 Ring: that project's sessions only (1 session ⇒ near-full ring). Center: time +
@@ -135,7 +137,7 @@ the full screen in place.
 
 ## Interactions & Motion
 Page/screen transitions: 300ms cubic-bezier(0.2,0.7,0.3,1), 70px directional
-slide + fade from swipe direction; non-spatial jumps (tap time, post-flash) fast
+slide + fade from swipe direction; non-spatial jumps (post-flash) fast
 fade. Row action reveal 250ms/46px. Swipe threshold ≈60px (row-action ≈40px);
 suppress the synthetic tap after a swipe (~300ms guard). Rotary scrolls
 lists/feeds. Live feed streams; keep visible tail (~6 lines), bottom-anchored.

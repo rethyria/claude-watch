@@ -1,9 +1,9 @@
 // The Halo root: horizontal pager (All + one page per project) with tappable
 // dots, vertical swipes for depth, 300ms directional slide+fade between
-// depths, TimeText-as-home on inner screens, and the approval/question card
-// as a top overlay chained off the waiting queue. Navigation state itself is
-// the pure HaloNavState machine (HaloNav.kt); this file only binds gestures,
-// animation, and the screen composables to it.
+// depths, a decorative (non-tappable) TimeText on inner screens, and the
+// approval/question card as a top overlay chained off the waiting queue.
+// Navigation state itself is the pure HaloNavState machine (HaloNav.kt); this
+// file only binds gestures, animation, and the screen composables to it.
 package dev.claudewatch.wear.ui.halo
 
 import android.os.SystemClock
@@ -234,7 +234,6 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                 )
                 is Layer.SessionList -> InnerScreen(
                     onBack = { nav = nav.back() },
-                    onHome = { nav = nav.jumpHome() },
                 ) {
                     // Same API 31+ trap as the card overlay below: once the
                     // stretch-overscroll starts (first overpull frame), it
@@ -264,7 +263,6 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                 }
                 is Layer.Feed -> InnerScreen(
                     onBack = { nav = nav.back() },
-                    onHome = { nav = nav.jumpHome() },
                 ) {
                     HaloSessionFeed(
                         model = model,
@@ -345,9 +343,9 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                     // The card is modal (handoff §5: answering or "decide
                     // later" are the only exits): this pointer node keeps
                     // taps and swipes off the invisible screens underneath —
-                    // without it the top TimeText strip and the back detector
-                    // still receive input — and owns swipe-down as the
-                    // "decide later" exit.
+                    // without it the back detector under the card still
+                    // receives input — and owns swipe-down as the "decide
+                    // later" exit.
                     .pointerInput(Unit) {
                         val threshold = size.height * SWIPE_THRESHOLD_FRACTION
                         var total = 0f
@@ -654,17 +652,19 @@ private fun PageDots(
 // ── Inner-screen chrome (depth = LIST / SESSION) ────────────────────────────
 
 /**
- * Wraps every screen below the pager with the shared chrome: top TimeText
- * (tap = jump home) and the swipe-down-to-go-back gesture. The back detector
- * sits UNDER the content, so it only covers screens without a full-screen
- * scrollable: a scrollable child consumes every vertical drag (its leftover
- * goes to nested scroll, never back to pointer input) and must re-provide
- * back itself, as HaloSessionList does.
+ * Wraps every screen below the pager with the shared chrome: a purely
+ * decorative top TimeText and the swipe-down-to-go-back gesture. The clock is
+ * deliberately NOT a tap target: swipe-down is the one way back up the depth
+ * stack (an invisible hotspot over the time read as an accidental-jump trap
+ * in live testing, and a clock that navigates surprises more than it helps).
+ * The back detector sits UNDER the content, so it only covers screens without
+ * a full-screen scrollable: a scrollable child consumes every vertical drag
+ * (its leftover goes to nested scroll, never back to pointer input) and must
+ * re-provide back itself, as HaloSessionList does.
  */
 @Composable
 private fun InnerScreen(
     onBack: () -> Unit,
-    onHome: () -> Unit,
     content: @Composable () -> Unit,
 ) {
     val back by rememberUpdatedState(onBack)
@@ -687,16 +687,6 @@ private fun InnerScreen(
                 color = Color(0xFF7E7C76),
                 fontSize = Halo.Type.Min,
             ),
-        )
-        // TimeText itself is not clickable; a transparent strip over it is
-        // the actual "jump home" target (48dp-tall per touch minimums).
-        Box(
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .width(96.dp)
-                .height(36.dp)
-                .clickable(onClick = onHome)
-                .testTag("haloHome"),
         )
     }
 }
