@@ -3,6 +3,7 @@ package dev.claudewatch.wear
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
@@ -149,6 +150,40 @@ class HaloNavigationTest {
         openFeed(beta)
         compose.onNodeWithTag("haloFeed-$beta").assertIsDisplayed()
         compose.onNode(hasText("npm test", substring = true)).assertIsDisplayed()
+    }
+
+    /**
+     * Swipe down ON THE LIST steps back to home. This is the OTHER back path:
+     * the feed's swipe-down (tested above) reaches the screen-level detector
+     * directly, but the list's scrollable owns every vertical drag, so its
+     * back is rebuilt from nested-scroll leftovers — the path the API 31+
+     * stretch-overscroll used to eat (only the first overpull frame reached
+     * the detector; a real finger could never cross the 60px threshold, while
+     * anything asserting via the feed path stayed green). The multi-frame
+     * drag swipeDown() injects exercises exactly that stretch interaction.
+     */
+    @Test
+    fun listSwipeDownStepsBackToHome() {
+        val bridge = fold(fixtureFrames())
+        compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
+        drillToList()
+        compose.onNode(hasScrollAction()).assertIsDisplayed() // sanity: we are on the list
+
+        // A real finger's drag: ~30px per 16ms frame, as DISTINCT timestamped
+        // moves. swipeDown() would batch its path into one frame-sized delta
+        // that crosses the back threshold before the stretch-overscroll ever
+        // engages — the exact false-green that let this regression ship while
+        // every real finger was broken. Frame-by-frame moves reproduce the
+        // per-delta consumption the stretch does on API 31+.
+        compose.onNode(hasScrollAction()).performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(0f, 30f), delayMillis = 16L) }
+            up()
+        }
+        compose.waitForIdle()
+        // Unmerged: the census sits inside the centerpiece's mergeDescendants
+        // clickable (same gotcha WalkingSkeletonTest documents for this tag).
+        compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
     }
 
     @Test

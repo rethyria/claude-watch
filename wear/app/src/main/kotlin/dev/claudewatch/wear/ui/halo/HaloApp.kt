@@ -236,18 +236,31 @@ fun HaloApp(ui: BridgeViewModel.UiState, actions: HaloActions) {
                     onBack = { nav = nav.back() },
                     onHome = { nav = nav.jumpHome() },
                 ) {
-                    HaloSessionList(
-                        model = model,
-                        scope = layer.scope,
-                        onOpenSession = { nav = nav.drillToSession(it) },
-                        onKill = actions.onKill,
-                        onHide = actions.onHide,
-                        onSpawn = actions.onSpawn,
-                        // The list's scrollable eats every vertical drag, so
-                        // InnerScreen's back detector can't fire under it; the
-                        // list re-triggers back itself via nested scroll.
-                        onBack = { nav = nav.back() },
-                    )
+                    // Same API 31+ trap as the card overlay below: once the
+                    // stretch-overscroll starts (first overpull frame), it
+                    // consumes every subsequent drag delta BEFORE the list's
+                    // nested-scroll chain sees it, so the list's rebuilt
+                    // swipe-down-back accumulates only the first frame's few
+                    // px and never crosses its threshold — a real finger can
+                    // never swipe back, only the synthetic single-delta test
+                    // swipe could. The list sits on a round watch with edge
+                    // fades, not a stretchy phone surface: drop the effect so
+                    // the pull-down leftovers reach the back detector.
+                    @OptIn(ExperimentalFoundationApi::class)
+                    CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
+                        HaloSessionList(
+                            model = model,
+                            scope = layer.scope,
+                            onOpenSession = { nav = nav.drillToSession(it) },
+                            onKill = actions.onKill,
+                            onHide = actions.onHide,
+                            onSpawn = actions.onSpawn,
+                            // The list's scrollable eats every vertical drag, so
+                            // InnerScreen's back detector can't fire under it; the
+                            // list re-triggers back itself via nested scroll.
+                            onBack = { nav = nav.back() },
+                        )
+                    }
                 }
                 is Layer.Feed -> InnerScreen(
                     onBack = { nav = nav.back() },
