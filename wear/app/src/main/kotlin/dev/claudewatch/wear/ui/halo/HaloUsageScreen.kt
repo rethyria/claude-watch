@@ -12,9 +12,11 @@
 // on error. Glanceable by design: label + bar + reset time, no charts, no
 // scrolling for the expected three bars, no centerpiece and no drill-down
 // (HaloNav no-ops both). Fetch-on-open drives the states: skeletons while
-// loading, bars on data (with an ALWAYS-ON "as of Xm ago" freshness label
-// under the last bar — live or cache alike), message + retry on error. A ~30s
-// ticker keeps the now-derived labels honest while the page sits open.
+// loading, bars on data (with an "as of 5 minutes ago" freshness label under
+// the last bar once the data is MORE THAN A MINUTE old — under that the label
+// stays silent; tapping it is a manual force-refresh), message + retry on
+// error. A ~30s ticker keeps the now-derived labels honest while the page
+// sits open.
 // Round-safe: every row is cut
 // to the chord of the circle at its own vertical position — which is why the
 // expected ≤3-row stack is centered by ITSELF (the header pins to the top):
@@ -34,6 +36,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -61,11 +64,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import androidx.wear.compose.material.LocalTextStyle
 import androidx.wear.compose.material.Text
 import androidx.wear.compose.material.TimeText
 import androidx.wear.compose.material.TimeTextDefaults
@@ -158,12 +163,16 @@ internal fun usageBarFraction(wirePercent: Double, usedMode: Boolean): Float {
 /**
  * Chord-fitted row widths, in px at the 450 reference, per the Halo usage
  * design: row i of n sits dy = (i − (n−1)/2) · pitch from the vertical
- * center, and gets 97% of the circle's chord at that height (R = 169),
+ * center, and gets 106% of the circle's chord at that height (R = 169),
  * floored at the chord's 115-half-width so far-out rows stay usable and
- * capped at 336 (the design's max content width). Rows are individually
- * centered, so the stack hugs the round display instead of fighting it.
- * Pitch tightens as rows are added: 63 for the expected ≤3, 54 for 4, 46
- * beyond.
+ * capped at 360 (the widened max content width). The mock's 0.97 chord
+ * factor was conservative (user-directed widening, 2026-07-18): 1.06 with
+ * the 360 cap widens every row ~6–9% while staying comfortably inside the
+ * PHYSICAL circle — even the top n=3 row's 332px sits well under the actual
+ * screen chord ≈432px at that height (screen R = 225, dy = 63). Rows are
+ * individually centered, so the stack hugs the round display instead of
+ * fighting it. Pitch tightens as rows are added: 63 for the expected ≤3, 54
+ * for 4, 46 beyond.
  */
 internal fun usageChordWidthsPx(n: Int): List<Int> {
     val pitch = when {
@@ -174,43 +183,52 @@ internal fun usageChordWidthsPx(n: Int): List<Int> {
     val r = 169.0
     return List(n) { i ->
         val dy = (i - (n - 1) / 2.0) * pitch
-        min(336, (2.0 * sqrt(max(r * r - dy * dy, 115.0 * 115.0)) * 0.97).roundToInt())
+        min(360, (2.0 * sqrt(max(r * r - dy * dy, 115.0 * 115.0)) * 1.06).roundToInt())
     }
 }
 
 /**
- * Time-to-reset aware reset line (2026-07-18 refinement) — one UNIFORM rule
- * keyed on how far away the reset is, not on the window's kind (a 5-hour
- * session window is always < 24h out, so it naturally lands in the relative
- * form; render-what-you-get includes the reset line for unknown kinds too):
- *  - delta ≤ 0   → "resets soon" — clock skew or a just-elapsed window; the
- *    next fetch replaces the window anyway, so no countdown theater;
- *  - delta < 24h → "resets in 4h 13m" — hours OMITTED when zero ("resets in
- *    42m"), minutes always shown, and the minutes are FLOORED (a 4h 13m 59s
- *    delta reads 4h 13m — never optimistic rounding up);
- *  - delta ≥ 24h → "resets Sat 10am" — weekday + LOCAL 12-hour clock with
- *    lowercase am/pm (12am/12pm correct, never 0am), minutes only when
- *    non-zero ("Sat 10:30am").
- * A malformed/absent resetsAt yields null: the bar renders without a reset
- * line, never a crash and never a dropped bar. Pure (nowMs injected), so
- * plain-JVM tests can pin the formats.
+ * Time-to-reset aware reset line, as a DEGRADATION LADDER of variants,
+ * longest first (2026-07-18 refinements) — one UNIFORM rule keyed on how far
+ * away the reset is, not on the window's kind (a 5-hour session window is
+ * always < 24h out, so it naturally lands in the relative form;
+ * render-what-you-get includes the reset line for unknown kinds too):
+ *  - delta ≤ 0   → ["resets soon", "soon"] — clock skew or a just-elapsed
+ *    window; the next fetch replaces the window anyway, so no countdown
+ *    theater;
+ *  - delta < 24h → ["resets in 3h 40m", "reset 3h 40m", "3h 40m"] (the
+ *    middle form is literally the user-specified "reset 3h 40m") — hours
+ *    OMITTED when zero ("resets in 42m"), minutes always shown, and the
+ *    minutes are FLOORED (a 4h 13m 59s delta reads 4h 13m — never
+ *    optimistic rounding up);
+ *  - delta ≥ 24h → ["resets Sat 10am", "Sat 10am"] — weekday + LOCAL
+ *    12-hour clock with lowercase am/pm (12am/12pm correct, never 0am),
+ *    minutes only when non-zero ("Sat 10:30am").
+ * A malformed/absent resetsAt yields the EMPTY list: the bar renders without
+ * a reset line, never a crash and never a dropped bar. The list exists so
+ * the row can render the LONGEST variant that actually FITS the width left
+ * over by the window's name (see UsageRow): the full label must always be
+ * readable, never ellipsized mid-word — only when even the shortest variant
+ * overflows does ellipsis apply. Pure (nowMs injected), so plain-JVM tests
+ * can pin every rung.
  */
-internal fun usageResetLabel(resetsAt: String?, nowMs: Long): String? {
-    if (resetsAt == null) return null
+internal fun usageResetLabelVariants(resetsAt: String?, nowMs: Long): List<String> {
+    if (resetsAt == null) return emptyList()
     val parsed = try {
         OffsetDateTime.parse(resetsAt)
     } catch (_: Exception) {
-        return null
+        return emptyList()
     }
     val deltaMs = parsed.toInstant().toEpochMilli() - nowMs
     return when {
-        deltaMs <= 0 -> "resets soon"
+        deltaMs <= 0 -> listOf("resets soon", "soon")
         deltaMs < 24 * 3_600_000L -> {
             // Integer division IS the floor (delta > 0 here, no sign trap).
             val totalMin = deltaMs / 60_000L
             val h = totalMin / 60
             val m = totalMin % 60
-            if (h > 0) "resets in ${h}h ${m}m" else "resets in ${m}m"
+            val core = if (h > 0) "${h}h ${m}m" else "${m}m"
+            listOf("resets in $core", "reset $core", core)
         }
         else -> {
             val local = parsed.atZoneSameInstant(ZoneId.systemDefault())
@@ -221,25 +239,45 @@ internal fun usageResetLabel(resetsAt: String?, nowMs: Long): String? {
             // Zero-padded minutes only when non-zero ("10:05am", plain
             // "10am"); padStart, not String.format, so no locale surprises.
             val minutes = if (local.minute == 0) "" else ":" + local.minute.toString().padStart(2, '0')
-            "resets " + local.format(DateTimeFormatter.ofPattern("EEE")) + " $hour12$minutes$ampm"
+            val core = local.format(DateTimeFormatter.ofPattern("EEE")) + " $hour12$minutes$ampm"
+            listOf("resets $core", core)
         }
     }
 }
 
 /**
- * The ALWAYS-ON freshness line under the last bar (2026-07-18 refinement):
- * "as of just now" under a minute, "as of Xm ago" under an hour,
- * "as of Xh ago" beyond — computed from [UsageUi.Data.fetchedAtMs], which
- * the client model guarantees non-null (live parses stamp it, cache keeps
- * the bridge's value). Age clamps at 0 so a skewed clock never renders
- * "as of -1m ago". Pure, so plain-JVM tests can pin the buckets.
+ * The FULL (longest) reset label — the ladder's head, or null for a
+ * malformed/absent resetsAt. Kept as the single-string seam the format tests
+ * pin: the ladder degrades from exactly this string.
  */
-internal fun usageUpdatedLabel(fetchedAtMs: Long, nowMs: Long): String {
+internal fun usageResetLabel(resetsAt: String?, nowMs: Long): String? =
+    usageResetLabelVariants(resetsAt, nowMs).firstOrNull()
+
+/**
+ * The freshness line under the last bar (2026-07-18 refinements): NULL —
+ * meaning no label at all — while the data is under a minute old (a "just
+ * now" line is noise: fresh data needs no caveat, and the ~30s ticker pops
+ * the label in right on time once the minute passes), then full words with
+ * honest singular/plural in the same buckets as before: "as of 1 minute
+ * ago" / "as of 5 minutes ago" under an hour, "as of 1 hour ago" / "as of
+ * 3 hours ago" beyond. Computed from [UsageUi.Data.fetchedAtMs], which the
+ * client model guarantees non-null (live parses stamp it, cache keeps the
+ * bridge's value). Age clamps at 0 so a skewed clock never renders a
+ * negative age — a future stamp is simply "fresh", i.e. null. Pure, so
+ * plain-JVM tests can pin the buckets.
+ */
+internal fun usageUpdatedLabel(fetchedAtMs: Long, nowMs: Long): String? {
     val ageMs = (nowMs - fetchedAtMs).coerceAtLeast(0L)
     return when {
-        ageMs < 60_000L -> "as of just now"
-        ageMs < 3_600_000L -> "as of ${ageMs / 60_000L}m ago"
-        else -> "as of ${ageMs / 3_600_000L}h ago"
+        ageMs < 60_000L -> null
+        ageMs < 3_600_000L -> {
+            val m = ageMs / 60_000L
+            "as of $m minute${if (m == 1L) "" else "s"} ago"
+        }
+        else -> {
+            val h = ageMs / 3_600_000L
+            "as of $h hour${if (h == 1L) "" else "s"} ago"
+        }
     }
 }
 
@@ -264,6 +302,13 @@ private val UsageHeaderTop = 34.dp
 fun HaloUsageScreen(
     usage: UsageUi,
     onRetry: () -> Unit,
+    /**
+     * Manual FORCE refresh — the freshness label's tap (2026-07-18): unlike
+     * [onRetry]/page entry (the non-forced fetch, which the VM's rate limit
+     * may skip), this bypasses the limiter. The silent-refresh rule keeps
+     * the bars on screen while it lands.
+     */
+    onRefresh: () -> Unit = {},
     modifier: Modifier = Modifier,
     nowMs: () -> Long = System::currentTimeMillis,
 ) {
@@ -311,6 +356,7 @@ fun HaloUsageScreen(
                 data = usage,
                 usedMode = usedMode,
                 onToggleMode = toggleMode,
+                onRefresh = onRefresh,
                 // Sampled ON the tick (and on fresh data): reading `tick` in
                 // the remember key is the subscription that re-evaluates
                 // nowMs() every ~30s, flowing a new Long down so every
@@ -373,6 +419,7 @@ private fun UsageData(
     data: UsageUi.Data,
     usedMode: Boolean,
     onToggleMode: () -> Unit,
+    onRefresh: () -> Unit,
     nowMs: Long,
 ) {
     val widthsPx = usageChordWidthsPx(data.limits.size)
@@ -394,10 +441,10 @@ private fun UsageData(
             data.limits.forEachIndexed { i, limit ->
                 UsageRow(limit = limit, widthPx = widthsPx[i], compact = true, usedMode = usedMode, nowMs = nowMs)
             }
-            // The always-on freshness label as the column's LAST child —
-            // "under the last bar", the same reading order as the pinned
-            // layout's bottom band.
-            UsageUpdatedLabel(data = data, nowMs = nowMs)
+            // The freshness label as the column's LAST child — "under the
+            // last bar", the same reading order as the pinned layout's
+            // bottom band (absent while the data is under a minute old).
+            UsageUpdatedLabel(data = data, nowMs = nowMs, onRefresh = onRefresh)
         }
     } else {
         // ≤3 rows (the real-world case): the ROW STACK is centered by ITSELF
@@ -415,6 +462,7 @@ private fun UsageData(
             UsageUpdatedLabel(
                 data = data,
                 nowMs = nowMs,
+                onRefresh = onRefresh,
                 // Under the LAST bar: between the stack's bottom (~162dp) and
                 // the page dots — the one honest empty band in the pinned
                 // layout, visually "under the Fable bar" and clear of the
@@ -445,23 +493,47 @@ private fun UsageData(
 }
 
 /**
- * The ALWAYS-ON "as of ..." freshness label (2026-07-18 refinement; was the
+ * The "as of ..." freshness label (2026-07-18 refinements; was the
  * cache-only "as of" caveat) — rendered under the last bar in BOTH layouts:
  * the pinned (n ≤ 3) layout pins it to the BottomCenter band below the row
  * stack, the compact (n ≥ 4) stack appends it as the column's last child.
  * Live and cache alike: fetchedAtMs is when these numbers were current, and
- * saying so beats pretending "live" means "this second". The testTag keeps
- * the historical "haloUsageStale" name — instrumented tests key on it.
+ * saying so beats pretending "live" means "this second" — but only once the
+ * data is MORE THAN A MINUTE old (usageUpdatedLabel returns null under
+ * that, and this composable renders NOTHING on null; the screen's ~30s
+ * ticker pops the label in on time). TAPPING it is a manual force-refresh
+ * ([onRefresh] → fetchUsage(force = true)): the label is the page's honest
+ * age readout, so the age readout is also the "get me fresh numbers" seam.
+ * Same enlarged-target idiom as the eyebrow: the clickable wraps a Box
+ * grown toward the 48×24 minimum with BOTTOM-aligned glyphs, so the text
+ * keeps its exact visual position and the tap slack extends upward into the
+ * empty band above (never down over the page dots). The testTag keeps the
+ * historical "haloUsageStale" name — instrumented tests key on it — and
+ * sits on the TAPPABLE node.
  */
 @Composable
-private fun UsageUpdatedLabel(data: UsageUi.Data, nowMs: Long, modifier: Modifier = Modifier) {
-    Text(
-        text = usageUpdatedLabel(data.fetchedAtMs, nowMs),
-        fontSize = 9.5.sp, // 19px caveat
-        color = Halo.Palette.TextSecondary,
-        textAlign = TextAlign.Center,
-        modifier = modifier.testTag("haloUsageStale"),
-    )
+private fun UsageUpdatedLabel(
+    data: UsageUi.Data,
+    nowMs: Long,
+    onRefresh: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // Fresh data (< 1 minute old): no caveat, no tap target, nothing at all.
+    val label = usageUpdatedLabel(data.fetchedAtMs, nowMs) ?: return
+    Box(
+        contentAlignment = Alignment.BottomCenter,
+        modifier = modifier
+            .defaultMinSize(minWidth = 48.dp, minHeight = 24.dp)
+            .clickable(onClick = onRefresh)
+            .testTag("haloUsageStale"),
+    ) {
+        Text(
+            text = label,
+            fontSize = 9.5.sp, // 19px caveat
+            color = Halo.Palette.TextSecondary,
+            textAlign = TextAlign.Center,
+        )
+    }
 }
 
 /** Header line (name · reset · percent) + tiered bar — one window. */
@@ -503,13 +575,11 @@ private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode
         ) {
             Row(modifier = Modifier.alignByBaseline().weight(1f, fill = false)) {
                 // Truncation priority: the window's NAME wins, the reset
-                // detail compresses. The relative countdown ("resets in
-                // 4h 10m") is wider than the old clock form and squeezed
-                // "Session" to "Sessi…" on the top chord row — the name is
-                // primary data, the reset is secondary, so the RESET is the
-                // weighted (flexible) child now and ellipsizes first. The
-                // unweighted name is still bounded by the row, so a
-                // pathological wire label ellipsizes rather than clipping.
+                // detail compresses. The name is primary data, the reset is
+                // secondary, so the RESET is the weighted (flexible) child
+                // and adapts first. The unweighted name is still bounded by
+                // the row, so a pathological wire label ellipsizes rather
+                // than clipping.
                 Text(
                     text = usageDisplayName(limit.kind, limit.label),
                     fontSize = 11.sp, // 22px window name
@@ -518,16 +588,38 @@ private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.alignByBaseline(),
                 )
-                usageResetLabel(limit.resetsAt, nowMs)?.let { resets ->
+                val resetVariants = usageResetLabelVariants(limit.resetsAt, nowMs)
+                if (resetVariants.isNotEmpty()) {
                     Spacer(modifier = Modifier.width(5.dp)) // 10px baseline gap
-                    Text(
-                        text = resets,
-                        fontSize = 9.5.sp, // 19px reset time
-                        color = Halo.Palette.TextFaint,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                    // Width-aware DEGRADATION instead of ellipsis (2026-07-18
+                    // refinement): a mid-word "resets in 3h…" hid the one
+                    // number the line exists to show. The BoxWithConstraints
+                    // sits exactly where the old reset Text did (weighted,
+                    // fill = false), so its maxWidth IS the space the row
+                    // actually left for the reset after the name took its
+                    // natural width and the percent claimed the right edge.
+                    // Each ladder rung is measured with the SAME style the
+                    // Text below renders in; the first (longest) variant
+                    // that fits wins. Only when even the shortest rung
+                    // overflows does the maxLines=1 ellipsis apply — the
+                    // last-resort a degradation ladder cannot dodge.
+                    BoxWithConstraints(
                         modifier = Modifier.alignByBaseline().weight(1f, fill = false),
-                    )
+                    ) {
+                        val measurer = rememberTextMeasurer()
+                        val style = LocalTextStyle.current.copy(fontSize = 9.5.sp)
+                        val available = constraints.maxWidth
+                        val resets = resetVariants.firstOrNull { candidate ->
+                            measurer.measure(candidate, style, maxLines = 1).size.width <= available
+                        } ?: resetVariants.last()
+                        Text(
+                            text = resets,
+                            fontSize = 9.5.sp, // 19px reset time
+                            color = Halo.Palette.TextFaint,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
             }
             Text(

@@ -8,6 +8,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -1050,6 +1052,149 @@ class BridgeViewModelTest {
         // BOTH page entries reached the bridge: cache results never gate.
         server.takeRequest(10, TimeUnit.SECONDS)
             ?: throw AssertionError("a cache-fallback page entry must refetch")
+    }
+
+    /**
+     * Force (2026-07-18 — the freshness label's tap): fetchUsage(force =
+     * true) bypasses the client-side rate limiter. Inside the window where
+     * the non-forced path is a complete no-op (pinned above), the forced
+     * path still reaches the bridge — request count 2 — and lands the new
+     * numbers.
+     */
+    @Test
+    fun usageForcedRefreshBypassesTheRateLimiter() {
+        pairAndDrain()
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":50,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+            ),
+        )
+        viewModel.fetchUsage()
+        awaitState { it.usage is BridgeViewModel.UsageUi.Data }
+        server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("the first page entry must fetch")
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":51,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+            ),
+        )
+        viewModel.fetchUsage(force = true)
+        server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError(
+                "a forced refresh must reach the bridge inside the limiter window (request count 2)",
+            )
+        awaitState {
+            (it.usage as? BridgeViewModel.UsageUi.Data)?.limits?.firstOrNull()?.percent == 51.0
+        }
+    }
+
+    /**
+     * The silent-refresh rule (2026-07-18): a fetch started while Data is
+     * already on screen — forced or not — must never flip through Loading;
+     * the bars stay put and swap when the result lands. The collector
+     * records every usage state the StateFlow exposes, and the held-back
+     * response widens any wrongly-emitted Loading window to ~300ms — far
+     * above the recording resolution, so a regression cannot slip between
+     * samples.
+     */
+    @Test
+    fun silentRefreshNeverEmitsLoadingBetweenTwoDataStates() {
+        pairAndDrain()
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":50,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+            ),
+        )
+        viewModel.fetchUsage()
+        val first = awaitState { it.usage is BridgeViewModel.UsageUi.Data }
+        server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("the first page entry must fetch")
+
+        val seen = java.util.concurrent.CopyOnWriteArrayList<BridgeViewModel.UsageUi>()
+        val collector = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        collector.launch { viewModel.state.collect { seen += it.usage } }
+        try {
+            server.enqueue(
+                MockResponse()
+                    .setHeadersDelay(300, TimeUnit.MILLISECONDS)
+                    .setBody(
+                        """{"limits":[{"kind":"session","label":"5-hour","percent":51,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+                    ),
+            )
+            viewModel.fetchUsage(force = true)
+            // The synchronous half of the proof: the call returned without
+            // touching the on-screen Data (the pre-refinement code flipped
+            // to Loading right here, before the request even left).
+            assertSame(first.usage, viewModel.state.value.usage)
+            awaitState {
+                (it.usage as? BridgeViewModel.UsageUi.Data)?.limits?.firstOrNull()?.percent == 51.0
+            }
+        } finally {
+            collector.cancel()
+        }
+        assertFalse(
+            "a silent refresh must never emit Loading between two Data states",
+            seen.any { it is BridgeViewModel.UsageUi.Loading },
+        )
+    }
+
+    /**
+     * A FAILED silent refresh keeps the prior Data on screen: live bars are
+     * never replaced by an error page just because a background refresh
+     * died — the aging "as of" label is the honest signal that refreshes
+     * are not landing. The follow-up success is the synchronization
+     * barrier: its Data landing proves the whole failure path executed
+     * before the recorder is inspected.
+     */
+    @Test
+    fun failedSilentRefreshKeepsThePriorData() {
+        pairAndDrain()
+
+        server.enqueue(
+            MockResponse().setBody(
+                """{"limits":[{"kind":"session","label":"5-hour","percent":50,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+            ),
+        )
+        viewModel.fetchUsage()
+        awaitState { it.usage is BridgeViewModel.UsageUi.Data }
+        server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("the first page entry must fetch")
+
+        val seen = java.util.concurrent.CopyOnWriteArrayList<BridgeViewModel.UsageUi>()
+        val collector = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        collector.launch { viewModel.state.collect { seen += it.usage } }
+        try {
+            server.enqueue(
+                MockResponse().setResponseCode(503)
+                    .setBody("""{"error":"usage unavailable: upstream 429"}"""),
+            )
+            viewModel.fetchUsage(force = true)
+            server.takeRequest(10, TimeUnit.SECONDS)
+                ?: throw AssertionError("the failing forced refresh must still reach the bridge")
+
+            server.enqueue(
+                MockResponse().setBody(
+                    """{"limits":[{"kind":"session","label":"5-hour","percent":52,"resetsAt":"2026-07-18T19:10:00Z"}],"source":"api"}""",
+                ),
+            )
+            viewModel.fetchUsage(force = true)
+            awaitState {
+                (it.usage as? BridgeViewModel.UsageUi.Data)?.limits?.firstOrNull()?.percent == 52.0
+            }
+        } finally {
+            collector.cancel()
+        }
+        assertFalse(
+            "a failed silent refresh must never surface Error over live bars",
+            seen.any { it is BridgeViewModel.UsageUi.Error },
+        )
+        assertFalse(
+            "silent refreshes never pass through Loading either",
+            seen.any { it is BridgeViewModel.UsageUi.Loading },
+        )
     }
 
     /** Records the haptic grammar so JVM tests can assert ack vs failure verbs. */

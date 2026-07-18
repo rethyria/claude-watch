@@ -91,15 +91,18 @@ class BridgeViewModel(
     )
 
     /**
-     * The usage page's state (issue #57). Fetch-on-open only: [fetchUsage]
-     * flips to [Loading] on every page entry, no polling, no client caching —
-     * [Data.source] == "cache" is the BRIDGE's fallback (its own OAuth call
-     * failed). [Data.fetchedAtMs] is WHEN THESE NUMBERS WERE CURRENT — a
-     * client-model guarantee, always non-null: a cache result keeps the
-     * bridge's value (the data's true age), a live api result is stamped
-     * System.currentTimeMillis() at parse time. (The WIRE still only sends
-     * fetchedAtMs for cache fallbacks — the stamp is ours.) The screen
-     * renders it as the always-on "as of Xm ago" freshness label.
+     * The usage page's state (issue #57). Fetch-on-open: [fetchUsage] flips
+     * to [Loading] on a page entry from Idle/Error — but a fetch started
+     * while [Data] is already on screen is a SILENT refresh (the bars stay
+     * put and swap when the result lands; see [fetchUsage]). No client
+     * caching — [Data.source] == "cache" is the BRIDGE's fallback (its own
+     * OAuth call failed). [Data.fetchedAtMs] is WHEN THESE NUMBERS WERE
+     * CURRENT — a client-model guarantee, always non-null: a cache result
+     * keeps the bridge's value (the data's true age), a live api result is
+     * stamped System.currentTimeMillis() at parse time. (The WIRE still only
+     * sends fetchedAtMs for cache fallbacks — the stamp is ours.) The screen
+     * renders it as the tappable "as of 5 minutes ago" freshness label once
+     * the data is over a minute old.
      */
     sealed interface UsageUi {
         /** Never fetched (the page has not been opened this session). */
@@ -503,34 +506,48 @@ class BridgeViewModel(
      * Epoch ms of the last SUCCESSFUL `source == "api"` usage parse — the
      * ONLY thing that arms the limiter. Errors and cache fallbacks never
      * touch it, so the Error screen's Retry and a cache-served page entry
-     * always refetch (no force parameter needed anywhere). 0 = never.
+     * always refetch without needing force. 0 = never.
      */
     private var lastUsageApiSuccessMs = 0L
 
     /**
      * Fetch GET /v1/usage for the usage page (issue #57). Called on EVERY
-     * entry to the page (and by its error-retry tap) — fetch-on-open is the
-     * whole caching policy, so each call flips to [UsageUi.Loading] first and
-     * lands in [UsageUi.Data] or [UsageUi.Error]. Render-what-you-get
-     * parsing: every `limits[]` entry becomes a bar, unknown kinds included;
-     * a 503 (neither the bridge's API call nor its cache fallback yielded
-     * data) surfaces the bridge's error string.
+     * entry to the page (and by its error-retry tap, and the on-page ~5min
+     * auto-poll) — all non-forced; the freshness label's tap passes
+     * [force] = true. Render-what-you-get parsing: every `limits[]` entry
+     * becomes a bar, unknown kinds included; a 503 (neither the bridge's API
+     * call nor its cache fallback yielded data) surfaces the bridge's error
+     * string.
      *
-     * Rate-limited (see [usageRateLimitMs]): when fresh LIVE bars are already
-     * on screen, a re-entry inside the window returns WITHOUT any state
-     * change — the bars stay put (no Loading flicker) and no request leaves
-     * the watch. The gate deliberately keys on the CURRENT state being a
-     * live [UsageUi.Data]: an Error or cache-fallback state means the user is
-     * looking at something worth replacing, so those always refetch.
+     * Rate-limited (see [usageRateLimitMs]) unless [force]d: when fresh LIVE
+     * bars are already on screen, a non-forced re-entry inside the window
+     * returns WITHOUT any state change and no request leaves the watch. The
+     * gate deliberately keys on the CURRENT state being a live
+     * [UsageUi.Data]: an Error or cache-fallback state means the user is
+     * looking at something worth replacing, so those always refetch. [force]
+     * (the label tap — an explicit "refresh NOW") bypasses the limiter but
+     * never the honesty contract below.
+     *
+     * SILENT refresh (2026-07-18): when the current state is already
+     * [UsageUi.Data] — forced or not — the fetch does NOT flip to [Loading]:
+     * the bars stay on screen and simply swap when the result lands, and a
+     * FAILED silent refresh keeps the old Data rather than replacing live
+     * bars with an error page (the aging "as of" label is the honest signal
+     * that refreshes are not landing). Error/Idle starts still flip to
+     * Loading exactly as before — there is nothing on screen worth keeping.
      */
-    fun fetchUsage() {
+    fun fetchUsage(force: Boolean = false) {
         val current = _state.value.usage
-        if (current is UsageUi.Data && current.source == "api" &&
+        if (!force && current is UsageUi.Data && current.source == "api" &&
             System.currentTimeMillis() - lastUsageApiSuccessMs < usageRateLimitMs
         ) {
             return
         }
-        _state.update { it.copy(usage = UsageUi.Loading) }
+        // Silent-refresh rule: only flip to Loading when there are no bars
+        // to keep on screen (Idle/Loading/Error starts).
+        if (current !is UsageUi.Data) {
+            _state.update { it.copy(usage = UsageUi.Loading) }
+        }
         engineScope.launch {
             val next = try {
                 val result = engine.fetchUsage()
@@ -553,7 +570,14 @@ class BridgeViewModel(
             if (next is UsageUi.Data && next.source == "api") {
                 lastUsageApiSuccessMs = System.currentTimeMillis()
             }
-            _state.update { it.copy(usage = next) }
+            _state.update {
+                // A failed SILENT refresh keeps the Data on screen (checked
+                // at landing time: a silent start never wrote Loading, so
+                // Data-on-screen here means there are live bars to protect;
+                // an Error/Idle start is Loading here and lands the Error).
+                if (next is UsageUi.Error && it.usage is UsageUi.Data) it
+                else it.copy(usage = next)
+            }
         }
     }
 

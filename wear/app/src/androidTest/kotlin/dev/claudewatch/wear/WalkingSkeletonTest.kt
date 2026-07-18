@@ -217,7 +217,11 @@ class WalkingSkeletonTest {
         // leave the app PAIRED (to a long-gone bridge): the offline screen
         // then folds the form behind the "re-pair watch" chip. Open it —
         // re-pairing goes through the exact same manual-entry path.
-        compose.waitForIdle()
+        // waitUntil, not waitForIdle: on a cold-booted emulator the activity
+        // can still be inflating when the rule returns, and the first fill()
+        // raced it into a missing-'host'-node failure once — wait for the
+        // offline screen's first interactive node before touching anything.
+        compose.waitUntil(30_000) { tagExists("host") || tagExists("repairButton") }
         if (tagExists("repairButton")) {
             compose.onNodeWithTag("repairButton").performScrollTo().performClick()
             compose.waitForIdle()
