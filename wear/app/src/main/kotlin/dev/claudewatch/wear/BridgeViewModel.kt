@@ -94,8 +94,12 @@ class BridgeViewModel(
      * The usage page's state (issue #57). Fetch-on-open only: [fetchUsage]
      * flips to [Loading] on every page entry, no polling, no client caching —
      * [Data.source] == "cache" is the BRIDGE's fallback (its own OAuth call
-     * failed), rendered with an "as of Xm ago" staleness line from
-     * [Data.fetchedAtMs] (present only for cache per the wire contract).
+     * failed). [Data.fetchedAtMs] is WHEN THESE NUMBERS WERE CURRENT — a
+     * client-model guarantee, always non-null: a cache result keeps the
+     * bridge's value (the data's true age), a live api result is stamped
+     * System.currentTimeMillis() at parse time. (The WIRE still only sends
+     * fetchedAtMs for cache fallbacks — the stamp is ours.) The screen
+     * renders it as the always-on "updated Xm ago" freshness label.
      */
     sealed interface UsageUi {
         /** Never fetched (the page has not been opened this session). */
@@ -104,7 +108,7 @@ class BridgeViewModel(
         data class Data(
             val limits: List<UsageLimit>,
             val source: String,
-            val fetchedAtMs: Long?,
+            val fetchedAtMs: Long,
         ) : UsageUi
         data class Error(val message: String) : UsageUi
     }
@@ -576,9 +580,17 @@ class BridgeViewModel(
         return UsageUi.Data(
             limits = limits,
             source = body.optString("source").takeUnless { it.isEmpty() } ?: "api",
-            // Present ONLY when source=="cache" per the wire contract; has()
-            // rather than a 0-default so a live "api" payload stays null.
-            fetchedAtMs = if (body.has("fetchedAtMs")) body.optLong("fetchedAtMs") else null,
+            // ALWAYS non-null in the client model ("when these numbers were
+            // current"): the wire carries fetchedAtMs only for cache
+            // fallbacks — keep that value (the data's true age) — while a
+            // live api payload is stamped NOW at parse time. A
+            // contract-violating cache body without the key also degrades to
+            // the now-stamp: least-wrong, and the label reads "just now".
+            fetchedAtMs = if (body.has("fetchedAtMs")) {
+                body.optLong("fetchedAtMs")
+            } else {
+                System.currentTimeMillis()
+            },
         )
     }
 
