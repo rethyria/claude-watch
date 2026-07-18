@@ -211,8 +211,8 @@ local 12-hour clock, lowercase am/pm, 12am/12pm never 0am, minutes only when
 non-zero — "Sat 10:30am"). Malformed/absent resetsAt → no reset line, never a
 dropped bar.
 
-**Freshness label** (`usageUpdatedLabel(fetchedAtMs, nowMs)`): "updated just
-now" (< 60s) / "updated Xm ago" (< 60m) / "updated Xh ago". Always-on:
+**Freshness label** (`usageUpdatedLabel(fetchedAtMs, nowMs)`): "as of just
+now" (< 60s) / "as of Xm ago" (< 60m) / "as of Xh ago". Always-on:
 `UsageUi.Data.fetchedAtMs` is non-null in the client model — a cache result
 keeps the bridge's value (the data's true age), a live api result is stamped
 at parse time (the wire still only sends fetchedAtMs for cache fallbacks).

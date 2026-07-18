@@ -21,7 +21,7 @@ import org.junit.Test
  *   resetsAt degrades to NO reset line — never a crash, never a dropped bar.
  *   Expected values are built from instants constructed against
  *   ZoneId.systemDefault(), so the suite passes in ANY zone.
- * - the always-on freshness label: "updated just now" / "Xm ago" / "Xh ago"
+ * - the always-on freshness label: "as of just now" / "Xm ago" / "Xh ago"
  *   buckets, clamped at zero age.
  * - chord-fitted widths: exact px values of the design's formula
  *   min(336, round(2·√(max(R²−dy², 115²))·0.97)), R=169.
@@ -156,20 +156,20 @@ class HaloUsageFormatTest {
 
     @Test
     fun updatedLabelBucketsJustNowMinutesHours() {
-        assertEquals("updated just now", usageUpdatedLabel(nowMs, nowMs))
-        assertEquals("updated just now", usageUpdatedLabel(nowMs - 59_000L, nowMs))
-        assertEquals("updated 1m ago", usageUpdatedLabel(nowMs - minuteMs, nowMs))
-        assertEquals("updated 5m ago", usageUpdatedLabel(nowMs - 5 * minuteMs, nowMs))
-        assertEquals("updated 59m ago", usageUpdatedLabel(nowMs - 60 * minuteMs + 1, nowMs))
-        assertEquals("updated 1h ago", usageUpdatedLabel(nowMs - hourMs, nowMs))
-        assertEquals("updated 26h ago", usageUpdatedLabel(nowMs - 26 * hourMs, nowMs))
+        assertEquals("as of just now", usageUpdatedLabel(nowMs, nowMs))
+        assertEquals("as of just now", usageUpdatedLabel(nowMs - 59_000L, nowMs))
+        assertEquals("as of 1m ago", usageUpdatedLabel(nowMs - minuteMs, nowMs))
+        assertEquals("as of 5m ago", usageUpdatedLabel(nowMs - 5 * minuteMs, nowMs))
+        assertEquals("as of 59m ago", usageUpdatedLabel(nowMs - 60 * minuteMs + 1, nowMs))
+        assertEquals("as of 1h ago", usageUpdatedLabel(nowMs - hourMs, nowMs))
+        assertEquals("as of 26h ago", usageUpdatedLabel(nowMs - 26 * hourMs, nowMs))
     }
 
     @Test
     fun updatedLabelClampsASkewedFutureStampToJustNow() {
         // A fetchedAtMs ahead of the local clock (skew) never renders a
         // negative age — it clamps to the freshest bucket.
-        assertEquals("updated just now", usageUpdatedLabel(nowMs + 5 * minuteMs, nowMs))
+        assertEquals("as of just now", usageUpdatedLabel(nowMs + 5 * minuteMs, nowMs))
     }
 
     // ── Chord-fitted widths ─────────────────────────────────────────────────

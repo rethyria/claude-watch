@@ -12,7 +12,7 @@
 // on error. Glanceable by design: label + bar + reset time, no charts, no
 // scrolling for the expected three bars, no centerpiece and no drill-down
 // (HaloNav no-ops both). Fetch-on-open drives the states: skeletons while
-// loading, bars on data (with an ALWAYS-ON "updated Xm ago" freshness label
+// loading, bars on data (with an ALWAYS-ON "as of Xm ago" freshness label
 // under the last bar — live or cache alike), message + retry on error. A ~30s
 // ticker keeps the now-derived labels honest while the page sits open.
 // Round-safe: every row is cut
@@ -227,18 +227,18 @@ internal fun usageResetLabel(resetsAt: String?, nowMs: Long): String? {
 
 /**
  * The ALWAYS-ON freshness line under the last bar (2026-07-18 refinement):
- * "updated just now" under a minute, "updated Xm ago" under an hour,
- * "updated Xh ago" beyond — computed from [UsageUi.Data.fetchedAtMs], which
+ * "as of just now" under a minute, "as of Xm ago" under an hour,
+ * "as of Xh ago" beyond — computed from [UsageUi.Data.fetchedAtMs], which
  * the client model guarantees non-null (live parses stamp it, cache keeps
  * the bridge's value). Age clamps at 0 so a skewed clock never renders
- * "updated -1m ago". Pure, so plain-JVM tests can pin the buckets.
+ * "as of -1m ago". Pure, so plain-JVM tests can pin the buckets.
  */
 internal fun usageUpdatedLabel(fetchedAtMs: Long, nowMs: Long): String {
     val ageMs = (nowMs - fetchedAtMs).coerceAtLeast(0L)
     return when {
-        ageMs < 60_000L -> "updated just now"
-        ageMs < 3_600_000L -> "updated ${ageMs / 60_000L}m ago"
-        else -> "updated ${ageMs / 3_600_000L}h ago"
+        ageMs < 60_000L -> "as of just now"
+        ageMs < 3_600_000L -> "as of ${ageMs / 60_000L}m ago"
+        else -> "as of ${ageMs / 3_600_000L}h ago"
     }
 }
 
@@ -270,7 +270,7 @@ fun HaloUsageScreen(
     // percent is always USED): rememberSaveable so a process-recreation
     // keeps the reader's choice, default REMAINING per the design.
     var usedMode by rememberSaveable { mutableStateOf(false) }
-    // Minute ticker: BOTH label families ("resets in 4h 13m", "updated Xm
+    // Minute ticker: BOTH label families ("resets in 4h 13m", "as of Xm
     // ago") are computed from NOW, and nothing else recomposes while the
     // page just sits open — without a tick they would silently go stale.
     // ~30s keeps the minute displays honest at half their resolution.
@@ -435,7 +435,7 @@ private fun UsageData(
 }
 
 /**
- * The ALWAYS-ON "updated ..." freshness label (2026-07-18 refinement; was the
+ * The ALWAYS-ON "as of ..." freshness label (2026-07-18 refinement; was the
  * cache-only "as of" caveat) — rendered under the last bar in BOTH layouts:
  * the pinned (n ≤ 3) layout pins it to the BottomCenter band below the row
  * stack, the compact (n ≥ 4) stack appends it as the column's last child.

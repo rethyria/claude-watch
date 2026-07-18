@@ -99,7 +99,7 @@ class BridgeViewModel(
      * bridge's value (the data's true age), a live api result is stamped
      * System.currentTimeMillis() at parse time. (The WIRE still only sends
      * fetchedAtMs for cache fallbacks — the stamp is ours.) The screen
-     * renders it as the always-on "updated Xm ago" freshness label.
+     * renders it as the always-on "as of Xm ago" freshness label.
      */
     sealed interface UsageUi {
         /** Never fetched (the page has not been opened this session). */

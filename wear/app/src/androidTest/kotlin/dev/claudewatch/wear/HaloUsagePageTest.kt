@@ -27,7 +27,7 @@ import org.junit.runner.RunWith
  * RECORDED onUsageOpen action seam — no bridge, no network. Swipe right from
  * home lands on usage and fires the fetch seam (on EVERY entry — fetch-on-open
  * is the whole caching policy); swipe left returns home; the bars render from
- * injected Data (including the ALWAYS-ON "updated ..." freshness label —
+ * injected Data (including the ALWAYS-ON "as of ..." freshness label —
  * cache and live api alike); the eyebrow toggles the REMAINING/USED reading
  * of a known wire percent; Error renders the message with a tappable retry
  * that re-fires the seam; and the page has no drill-down — swipe up stays
@@ -179,14 +179,14 @@ class HaloUsagePageTest {
         // how old the bars are instead of pretending they are live. (The tag
         // keeps its historical name — the label was once cache-only.)
         compose.onNodeWithTag("haloUsageStale").assertIsDisplayed()
-        compose.onNode(hasText("updated", substring = true)).assertIsDisplayed()
+        compose.onNode(hasText("as of", substring = true)).assertIsDisplayed()
     }
 
     @Test
     fun apiSourceRendersTheAlwaysOnUpdatedLabel() {
         // 2026-07-18 refinement: the freshness label is ALWAYS-ON — a live
         // api result renders it too (stamped at parse time, so fresh data
-        // reads "updated just now" under the last bar).
+        // reads "as of just now" under the last bar).
         compose.setContent {
             HaloApp(
                 ui = ui(fixtureData(source = "api", fetchedAtMs = System.currentTimeMillis())),
@@ -196,7 +196,7 @@ class HaloUsagePageTest {
         swipeToUsage()
         compose.onNodeWithTag("haloUsage").assertIsDisplayed()
         compose.onNodeWithTag("haloUsageStale").assertIsDisplayed()
-        compose.onNode(hasText("updated just now")).assertIsDisplayed()
+        compose.onNode(hasText("as of just now")).assertIsDisplayed()
     }
 
     @Test

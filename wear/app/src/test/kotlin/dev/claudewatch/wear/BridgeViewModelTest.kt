@@ -931,7 +931,7 @@ class BridgeViewModelTest {
 
     /** Issue #57: the bridge's cache fallback (`source: "cache"`) carries its
      *  fetchedAtMs through UNTOUCHED — the data's true age, never re-stamped
-     *  — so the screen's "updated Xm ago" label tells the truth. */
+     *  — so the screen's "as of Xm ago" label tells the truth. */
     @Test
     fun usageCacheFallbackCarriesItsStalenessMetadata() {
         pairAndDrain()
