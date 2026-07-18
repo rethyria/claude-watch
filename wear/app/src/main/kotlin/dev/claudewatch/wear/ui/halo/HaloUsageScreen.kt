@@ -492,13 +492,21 @@ private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Row(modifier = Modifier.alignByBaseline().weight(1f, fill = false)) {
+                // Truncation priority: the window's NAME wins, the reset
+                // detail compresses. The relative countdown ("resets in
+                // 4h 10m") is wider than the old clock form and squeezed
+                // "Session" to "Sessi…" on the top chord row — the name is
+                // primary data, the reset is secondary, so the RESET is the
+                // weighted (flexible) child now and ellipsizes first. The
+                // unweighted name is still bounded by the row, so a
+                // pathological wire label ellipsizes rather than clipping.
                 Text(
                     text = usageDisplayName(limit.kind, limit.label),
                     fontSize = 11.sp, // 22px window name
                     color = Halo.Palette.TextSecondary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.alignByBaseline().weight(1f, fill = false),
+                    modifier = Modifier.alignByBaseline(),
                 )
                 usageResetLabel(limit.resetsAt, nowMs)?.let { resets ->
                     Spacer(modifier = Modifier.width(5.dp)) // 10px baseline gap
@@ -507,7 +515,8 @@ private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode
                         fontSize = 9.5.sp, // 19px reset time
                         color = Halo.Palette.TextFaint,
                         maxLines = 1,
-                        modifier = Modifier.alignByBaseline(),
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.alignByBaseline().weight(1f, fill = false),
                     )
                 }
             }
