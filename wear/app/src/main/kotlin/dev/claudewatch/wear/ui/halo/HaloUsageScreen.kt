@@ -12,8 +12,10 @@
 // on error. Glanceable by design: label + bar + reset time, no charts, no
 // scrolling for the expected three bars, no centerpiece and no drill-down
 // (HaloNav no-ops both). Fetch-on-open drives the states: skeletons while
-// loading, bars on data (with an "as of Xm ago" caveat when the bridge served
-// its cache fallback), message + retry on error. Round-safe: every row is cut
+// loading, bars on data (with an ALWAYS-ON "updated Xm ago" freshness label
+// under the last bar — live or cache alike), message + retry on error. A ~30s
+// ticker keeps the now-derived labels honest while the page sits open.
+// Round-safe: every row is cut
 // to the chord of the circle at its own vertical position — which is why the
 // expected ≤3-row stack is centered by ITSELF (the header pins to the top):
 // usageChordWidthsPx assumes the rows straddle dead center, so the chords are
@@ -45,8 +47,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -73,6 +77,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlinx.coroutines.delay
 
 // ─── Pure presentation math (plain functions so JVM unit tests can pin the ───
 // ─── design's numbers without composing anything) ────────────────────────────
@@ -173,22 +178,68 @@ internal fun usageChordWidthsPx(n: Int): List<Int> {
 }
 
 /**
- * "resets 19:10" for the 5-hour session window (it lands today), "resets Fri"
- * for the weekly kinds — and for any UNKNOWN kind, whose cadence we cannot
- * guess (render-what-you-get includes the reset line). A malformed/absent
- * resetsAt yields null: the bar renders without a reset line, never a crash
- * and never a dropped bar. Pure, so plain-JVM tests can pin the formats.
+ * Time-to-reset aware reset line (2026-07-18 refinement) — one UNIFORM rule
+ * keyed on how far away the reset is, not on the window's kind (a 5-hour
+ * session window is always < 24h out, so it naturally lands in the relative
+ * form; render-what-you-get includes the reset line for unknown kinds too):
+ *  - delta ≤ 0   → "resets soon" — clock skew or a just-elapsed window; the
+ *    next fetch replaces the window anyway, so no countdown theater;
+ *  - delta < 24h → "resets in 4h 13m" — hours OMITTED when zero ("resets in
+ *    42m"), minutes always shown, and the minutes are FLOORED (a 4h 13m 59s
+ *    delta reads 4h 13m — never optimistic rounding up);
+ *  - delta ≥ 24h → "resets Sat 10am" — weekday + LOCAL 12-hour clock with
+ *    lowercase am/pm (12am/12pm correct, never 0am), minutes only when
+ *    non-zero ("Sat 10:30am").
+ * A malformed/absent resetsAt yields null: the bar renders without a reset
+ * line, never a crash and never a dropped bar. Pure (nowMs injected), so
+ * plain-JVM tests can pin the formats.
  */
-internal fun usageResetLabel(kind: String, resetsAt: String?): String? {
+internal fun usageResetLabel(resetsAt: String?, nowMs: Long): String? {
     if (resetsAt == null) return null
     val parsed = try {
         OffsetDateTime.parse(resetsAt)
     } catch (_: Exception) {
         return null
     }
-    val local = parsed.atZoneSameInstant(ZoneId.systemDefault())
-    val pattern = if (kind == "session") "HH:mm" else "EEE"
-    return "resets " + local.format(DateTimeFormatter.ofPattern(pattern))
+    val deltaMs = parsed.toInstant().toEpochMilli() - nowMs
+    return when {
+        deltaMs <= 0 -> "resets soon"
+        deltaMs < 24 * 3_600_000L -> {
+            // Integer division IS the floor (delta > 0 here, no sign trap).
+            val totalMin = deltaMs / 60_000L
+            val h = totalMin / 60
+            val m = totalMin % 60
+            if (h > 0) "resets in ${h}h ${m}m" else "resets in ${m}m"
+        }
+        else -> {
+            val local = parsed.atZoneSameInstant(ZoneId.systemDefault())
+            // 0→12am, 12→12pm, 13→1pm: the +11 %12 +1 dance is the standard
+            // 24h→12h mapping that never yields 0.
+            val hour12 = (local.hour + 11) % 12 + 1
+            val ampm = if (local.hour < 12) "am" else "pm"
+            // Zero-padded minutes only when non-zero ("10:05am", plain
+            // "10am"); padStart, not String.format, so no locale surprises.
+            val minutes = if (local.minute == 0) "" else ":" + local.minute.toString().padStart(2, '0')
+            "resets " + local.format(DateTimeFormatter.ofPattern("EEE")) + " $hour12$minutes$ampm"
+        }
+    }
+}
+
+/**
+ * The ALWAYS-ON freshness line under the last bar (2026-07-18 refinement):
+ * "updated just now" under a minute, "updated Xm ago" under an hour,
+ * "updated Xh ago" beyond — computed from [UsageUi.Data.fetchedAtMs], which
+ * the client model guarantees non-null (live parses stamp it, cache keeps
+ * the bridge's value). Age clamps at 0 so a skewed clock never renders
+ * "updated -1m ago". Pure, so plain-JVM tests can pin the buckets.
+ */
+internal fun usageUpdatedLabel(fetchedAtMs: Long, nowMs: Long): String {
+    val ageMs = (nowMs - fetchedAtMs).coerceAtLeast(0L)
+    return when {
+        ageMs < 60_000L -> "updated just now"
+        ageMs < 3_600_000L -> "updated ${ageMs / 60_000L}m ago"
+        else -> "updated ${ageMs / 3_600_000L}h ago"
+    }
 }
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
@@ -219,6 +270,20 @@ fun HaloUsageScreen(
     // percent is always USED): rememberSaveable so a process-recreation
     // keeps the reader's choice, default REMAINING per the design.
     var usedMode by rememberSaveable { mutableStateOf(false) }
+    // Minute ticker: BOTH label families ("resets in 4h 13m", "updated Xm
+    // ago") are computed from NOW, and nothing else recomposes while the
+    // page just sits open — without a tick they would silently go stale.
+    // ~30s keeps the minute displays honest at half their resolution.
+    // LaunchedEffect(Unit) scopes the loop to THIS screen: it cancels on
+    // dispose, so no ticker outlives the page (and the instrumented tests,
+    // which never advance 30s, never observe a tick).
+    var tick by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            tick++
+        }
+    }
     Box(
         modifier = modifier.fillMaxSize().testTag("haloUsage"),
         contentAlignment = Alignment.Center,
@@ -236,7 +301,12 @@ fun HaloUsageScreen(
                 data = usage,
                 usedMode = usedMode,
                 onToggleMode = { usedMode = !usedMode },
-                nowMs = nowMs,
+                // Sampled ON the tick (and on fresh data): reading `tick` in
+                // the remember key is the subscription that re-evaluates
+                // nowMs() every ~30s, flowing a new Long down so every
+                // now-derived label recomputes. Between ticks the value is
+                // stable — no per-frame clock reads.
+                nowMs = remember(tick, usage) { nowMs() },
             )
         }
         // The decorative top clock from the design mock — EXACTLY the
@@ -293,14 +363,14 @@ private fun UsageData(
     data: UsageUi.Data,
     usedMode: Boolean,
     onToggleMode: () -> Unit,
-    nowMs: () -> Long,
+    nowMs: Long,
 ) {
     val widthsPx = usageChordWidthsPx(data.limits.size)
     // 4+ rows tighten the typography so the stack still fits the circle.
     val compact = data.limits.size >= 4
     if (compact) {
-        // ≥4 rows: the single centered stack (header + rows centered as one).
-        // A fixed-top header would collide with the taller row pile, so
+        // ≥4 rows: the single centered stack (eyebrow + rows centered as
+        // one). A fixed-top header would collide with the taller row pile, so
         // everything centers together — accepting that the chord widths
         // (computed around dead center) are approximate for these rare tall
         // stacks.
@@ -310,29 +380,35 @@ private fun UsageData(
             verticalArrangement = Arrangement.spacedBy(8.5.dp, Alignment.CenterVertically),
             modifier = Modifier.fillMaxSize(),
         ) {
-            UsageHeaderBlock(data = data, usedMode = usedMode, onToggleMode = onToggleMode, nowMs = nowMs)
+            UsageEyebrow(usedMode = usedMode, onToggle = onToggleMode)
             data.limits.forEachIndexed { i, limit ->
-                UsageRow(limit = limit, widthPx = widthsPx[i], compact = true, usedMode = usedMode)
+                UsageRow(limit = limit, widthPx = widthsPx[i], compact = true, usedMode = usedMode, nowMs = nowMs)
             }
+            // The always-on freshness label as the column's LAST child —
+            // "under the last bar", the same reading order as the pinned
+            // layout's bottom band.
+            UsageUpdatedLabel(data = data, nowMs = nowMs)
         }
     } else {
         // ≤3 rows (the real-world case): the ROW STACK is centered by ITSELF
-        // and the header pins to the top. Centering the whole column as one
+        // and the eyebrow pins to the top. Centering the whole column as one
         // stack pushed the rows BELOW center — but usageChordWidthsPx assumes
         // row i sits dy = (i−(n−1)/2)·pitch around DEAD center, so the chords
         // are honest only when the rows actually straddle it.
         Box(modifier = Modifier.fillMaxSize()) {
-            // Eyebrow ONLY at the top anchor — the cache caveat moves below
-            // the stack here (see UsageStaleCaveat); keeping it in the header
-            // would draw it straight across the first row.
+            // Eyebrow ALONE at the top anchor — the freshness label lives
+            // below the stack (see UsageUpdatedLabel); in the header it
+            // would draw straight across the first row.
             Box(modifier = Modifier.align(Alignment.TopCenter).padding(top = UsageHeaderTop)) {
                 UsageEyebrow(usedMode = usedMode, onToggle = onToggleMode)
             }
-            UsageStaleCaveat(
+            UsageUpdatedLabel(
                 data = data,
                 nowMs = nowMs,
-                // Between the stack's bottom (~162dp) and the page dots: the
-                // one honest empty band in the pinned layout.
+                // Under the LAST bar: between the stack's bottom (~162dp) and
+                // the page dots — the one honest empty band in the pinned
+                // layout, visually "under the Fable bar" and clear of the
+                // dots at 32dp bottom padding.
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp),
             )
             Column(
@@ -351,7 +427,7 @@ private fun UsageData(
                     )
                 }
                 data.limits.forEachIndexed { i, limit ->
-                    UsageRow(limit = limit, widthPx = widthsPx[i], compact = false, usedMode = usedMode)
+                    UsageRow(limit = limit, widthPx = widthsPx[i], compact = false, usedMode = usedMode, nowMs = nowMs)
                 }
             }
         }
@@ -359,45 +435,18 @@ private fun UsageData(
 }
 
 /**
- * The eyebrow + (cache fallback only) the staleness caveat — one block with
- * IDENTICAL internals in both arrangements, so switching between the pinned
- * (n ≤ 3) and compact (n ≥ 4) layouts never changes what the header says.
+ * The ALWAYS-ON "updated ..." freshness label (2026-07-18 refinement; was the
+ * cache-only "as of" caveat) — rendered under the last bar in BOTH layouts:
+ * the pinned (n ≤ 3) layout pins it to the BottomCenter band below the row
+ * stack, the compact (n ≥ 4) stack appends it as the column's last child.
+ * Live and cache alike: fetchedAtMs is when these numbers were current, and
+ * saying so beats pretending "live" means "this second". The testTag keeps
+ * the historical "haloUsageStale" name — instrumented tests key on it.
  */
 @Composable
-private fun UsageHeaderBlock(
-    data: UsageUi.Data,
-    usedMode: Boolean,
-    onToggleMode: () -> Unit,
-    nowMs: () -> Long,
-    modifier: Modifier = Modifier,
-) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(2.dp), // 4px under the eyebrow
-        modifier = modifier,
-    ) {
-        UsageEyebrow(usedMode = usedMode, onToggle = onToggleMode)
-        // The bridge served its CACHE fallback (its upstream call
-        // failed): the bars are real but old — say how old, right under
-        // the eyebrow, instead of pretending live.
-        UsageStaleCaveat(data = data, nowMs = nowMs)
-    }
-}
-
-/**
- * "as of Xm ago" — rendered only for the bridge's cache fallback. Composable
- * on its own because the two layouts place it differently: the compact stack
- * keeps it under the eyebrow, while the pinned (n ≤ 3) layout moves it BELOW
- * the row stack — under the eyebrow it would render straight across the first
- * row (the pinned header has exactly the clearance the eyebrow needs, none
- * spare; review finding).
- */
-@Composable
-private fun UsageStaleCaveat(data: UsageUi.Data, nowMs: () -> Long, modifier: Modifier = Modifier) {
-    if (data.source != "cache" || data.fetchedAtMs == null) return
-    val ageMin = ((nowMs() - data.fetchedAtMs) / 60_000L).coerceAtLeast(0L)
+private fun UsageUpdatedLabel(data: UsageUi.Data, nowMs: Long, modifier: Modifier = Modifier) {
     Text(
-        text = "as of ${ageMin}m ago",
+        text = usageUpdatedLabel(data.fetchedAtMs, nowMs),
         fontSize = 9.5.sp, // 19px caveat
         color = Halo.Palette.TextSecondary,
         textAlign = TextAlign.Center,
@@ -407,7 +456,7 @@ private fun UsageStaleCaveat(data: UsageUi.Data, nowMs: () -> Long, modifier: Mo
 
 /** Header line (name · reset · percent) + tiered bar — one window. */
 @Composable
-private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode: Boolean) {
+private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode: Boolean, nowMs: Long) {
     // Severity-first (see usageTier): the wire's own coding escalates the
     // local remaining-based fallback, never downgrades it.
     val tier = usageTier(limit.percent, limit.severity)
@@ -451,7 +500,7 @@ private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.alignByBaseline().weight(1f, fill = false),
                 )
-                usageResetLabel(limit.kind, limit.resetsAt)?.let { resets ->
+                usageResetLabel(limit.resetsAt, nowMs)?.let { resets ->
                     Spacer(modifier = Modifier.width(5.dp)) // 10px baseline gap
                     Text(
                         text = resets,

@@ -868,12 +868,15 @@ class BridgeViewModelTest {
      * entry becomes a bar, an UNKNOWN kind included (a new upstream window
      * must appear without an app update), labels from the payload (kind as
      * the fallback), percent as USED percent untouched. A live "api" payload
-     * carries no fetchedAtMs.
+     * carries no fetchedAtMs on the WIRE — the client model stamps NOW at
+     * parse time ("when these numbers were current" is always non-null, so
+     * the screen's freshness label is always-on).
      */
     @Test
     fun usageFetchParsesRenderWhatYouGetIncludingUnknownKinds() {
         pairAndDrain()
 
+        val beforeMs = System.currentTimeMillis()
         server.enqueue(
             MockResponse()
                 // Held back briefly so the Loading state is observable.
@@ -899,7 +902,14 @@ class BridgeViewModelTest {
         val state = awaitState { it.usage is BridgeViewModel.UsageUi.Data }
         val data = state.usage as BridgeViewModel.UsageUi.Data
         assertEquals("api", data.source)
-        assertEquals("a live api payload has no fetchedAtMs", null, data.fetchedAtMs)
+        // The wire sent no fetchedAtMs (api result) — the parse stamped NOW,
+        // bracketed by the wall clock around the fetch: sane, never zero.
+        val afterMs = System.currentTimeMillis()
+        assertTrue(
+            "an api parse stamps fetchedAtMs at parse time (got ${data.fetchedAtMs}, " +
+                "expected within $beforeMs..$afterMs)",
+            data.fetchedAtMs in beforeMs..afterMs,
+        )
         assertEquals(
             "every entry renders, unknown kinds included",
             listOf("session", "weekly_all", "weekly_scoped", "lunar_window"),
@@ -920,7 +930,8 @@ class BridgeViewModelTest {
     }
 
     /** Issue #57: the bridge's cache fallback (`source: "cache"`) carries its
-     *  fetchedAtMs through, so the screen can render "as of Xm ago". */
+     *  fetchedAtMs through UNTOUCHED — the data's true age, never re-stamped
+     *  — so the screen's "updated Xm ago" label tells the truth. */
     @Test
     fun usageCacheFallbackCarriesItsStalenessMetadata() {
         pairAndDrain()

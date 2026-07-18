@@ -166,11 +166,10 @@ is just a clock).
 **Layout anchors** (2026-07-18 refinement): for the expected **n ≤ 3** rows
 (and always for the 3-row skeleton) the **row stack is centered by itself**
 (dead center — `usageChordWidthsPx` assumes rows straddle it, so the chords
-are only honest there) and the header block (eyebrow + stale caveat) pins
-**TopCenter at 118px** (the mock's eyebrow height, clear of the clock); the
-same anchors in Loading and Data, so the eyebrow never jumps when the fetch
-lands. **n ≥ 4** keeps the single centered column — a fixed header would
-collide with the taller stack.
+are only honest there) and the eyebrow ALONE pins **TopCenter at 118px** (the
+mock's eyebrow height, clear of the clock); the same anchors in Loading and
+Data, so the eyebrow never jumps when the fetch lands. **n ≥ 4** keeps the
+single centered column — a fixed header would collide with the taller stack.
 
 **States** (fetch-on-open drives them; Idle renders as Loading):
 - **Loading:** the eyebrow at 70% opacity (pinned as above), 3 skeleton rows
@@ -178,15 +177,19 @@ collide with the taller stack.
   an 8px track (`#22242A`), chord-fitted widths; alpha pulses 0.5↔1 over 1.2s
   ease-in-out, staggered 0.18s per row. Tag `haloUsageLoading` on the
   skeleton container.
-- **Data:** header + rows per the layout anchors above. Eyebrow `REMAINING` /
+- **Data:** eyebrow + rows per the layout anchors above. Eyebrow `REMAINING` /
   `USED` (19/500, letter-spacing 0.14em, `#63615B`) is **tappable** and
   toggles the mode (tag `haloUsageMode`) — screen-local UI state
-  (rememberSaveable), default REMAINING. Cache fallback adds "as of Xm ago"
-  (19, `#8D8B84`) directly under the eyebrow, 4px gap (tag `haloUsageStale`).
+  (rememberSaveable), default REMAINING.
   One row per wire window, wire order: header line (name 22 `#8D8B84` · reset
-  19 `#63615B`, the existing formatter · percent 30/500 pushed to the right
+  19 `#63615B`, `usageResetLabel` below · percent 30/500 pushed to the right
   edge) over an 8px r4 bar (track `#3A3C42`, fill width = shown percent).
   Compact when n ≥ 4: percent 25, in-row gap 5px (else 8px), 17px stack gaps.
+  An ALWAYS-ON freshness label (19, `#8D8B84`, tag `haloUsageStale` — the
+  historical cache-only name, kept for the instrumented tests) renders
+  **under the last bar** in both layouts: pinned (n ≤ 3) at BottomCenter with
+  32dp bottom padding (the honest band between the stack and the page dots),
+  compact (n ≥ 4) as the column's last child.
 - **Error:** "usage unavailable" 27/500 `#E5484D`; the dynamic failure detail
   21 `#8D8B84` (single line, ellipsized); Retry pill (tag `haloUsageRetry`) —
   64px tall, 40px side padding, fully rounded, `#D97757` fill, "Retry" 24/500
@@ -198,6 +201,27 @@ on screen (`Data` with `source == "api"`, within 5 minutes of the last api
 success) a page re-entry is a complete no-op — no request, no Loading
 flicker, instant re-entry. Only a successful api parse arms the window;
 Error-Retry and cache-fallback entries always refetch (no force parameter).
+
+**Reset labels** (`usageResetLabel(resetsAt, nowMs)`, 2026-07-18 refinement —
+one UNIFORM time-to-reset rule, no kind parameter; a session window is always
+< 24h out so it naturally gets the relative form): delta ≤ 0 → "resets soon";
+delta < 24h → "resets in 4h 13m" (hours omitted when zero — "resets in 42m";
+minutes always shown and FLOORED); delta ≥ 24h → "resets Sat 10am" (weekday +
+local 12-hour clock, lowercase am/pm, 12am/12pm never 0am, minutes only when
+non-zero — "Sat 10:30am"). Malformed/absent resetsAt → no reset line, never a
+dropped bar.
+
+**Freshness label** (`usageUpdatedLabel(fetchedAtMs, nowMs)`): "updated just
+now" (< 60s) / "updated Xm ago" (< 60m) / "updated Xh ago". Always-on:
+`UsageUi.Data.fetchedAtMs` is non-null in the client model — a cache result
+keeps the bridge's value (the data's true age), a live api result is stamped
+at parse time (the wire still only sends fetchedAtMs for cache fallbacks).
+
+**Minute ticker:** both label families are computed from NOW and nothing else
+recomposes while the page sits open, so the screen keeps a remembered tick
+incremented by a `LaunchedEffect(Unit)` loop (`delay(30_000)`); the tick keys
+the sampled `nowMs`, so the labels recompute every ~30s and the loop dies
+with the screen.
 
 **Display names** (presentation-only): kind `session` → "Session",
 `weekly_all` → "Weekly", any other kind keeps its wire label (e.g. "Fable").

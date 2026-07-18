@@ -1,18 +1,28 @@
 package dev.claudewatch.wear.ui.halo
 
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
  * The usage page's pure presentation math (issue #57, re-skinned per the Halo
  * usage design), all plain-JVM — no Compose:
- * - reset-time formatting: the 5-hour session window shows a clock time,
- *   weekly (and any UNKNOWN — render-what-you-get) kinds show a weekday, and
- *   a malformed/absent resetsAt degrades to NO reset line — never a crash,
- *   never a dropped bar. Asserted by shape, not exact value: the rendered
- *   time is in the device's zone.
+ * - reset-time formatting, TIME-TO-RESET aware (2026-07-18 refinement; one
+ *   uniform rule, no kind parameter): delta ≤ 0 → "resets soon", < 24h →
+ *   relative "resets in 4h 13m" (hours omitted at zero, minutes floored),
+ *   ≥ 24h → absolute "resets Sat 10am" (weekday + local 12-hour clock,
+ *   minutes only when non-zero, 12am/12pm never 0am). A malformed/absent
+ *   resetsAt degrades to NO reset line — never a crash, never a dropped bar.
+ *   Expected values are built from instants constructed against
+ *   ZoneId.systemDefault(), so the suite passes in ANY zone.
+ * - the always-on freshness label: "updated just now" / "Xm ago" / "Xh ago"
+ *   buckets, clamped at zero age.
  * - chord-fitted widths: exact px values of the design's formula
  *   min(336, round(2·√(max(R²−dy², 115²))·0.97)), R=169.
  * - semantic tiers, SEVERITY-FIRST: the server's own `severity` coding wins
@@ -25,32 +35,141 @@ import org.junit.Test
  */
 class HaloUsageFormatTest {
 
+    /** Any fixed "now" — the reset rule keys on the DELTA, not the date. */
+    private val nowMs = 1_752_850_000_000L
+
+    /** resetsAt wire string for now + [deltaMs], via the system zone. */
+    private fun resetsAtIn(deltaMs: Long): String =
+        Instant.ofEpochMilli(nowMs + deltaMs)
+            .atZone(ZoneId.systemDefault())
+            .toOffsetDateTime()
+            .toString()
+
+    private val minuteMs = 60_000L
+    private val hourMs = 3_600_000L
+
+    // ── Reset labels: relative form (delta < 24h) ───────────────────────────
+
     @Test
-    fun sessionKindFormatsAClockTime() {
-        val label = usageResetLabel("session", "2026-07-18T19:10:00Z")
-        assertTrue(
-            "expected 'resets HH:mm', got: $label",
-            label != null && Regex("""resets \d{2}:\d{2}""").matches(label),
+    fun under24hFormatsARelativeCountdown() {
+        assertEquals("resets in 4h 13m", usageResetLabel(resetsAtIn(4 * hourMs + 13 * minuteMs), nowMs))
+        // Just shy of the 24h boundary stays relative.
+        assertEquals("resets in 23h 59m", usageResetLabel(resetsAtIn(24 * hourMs - minuteMs), nowMs))
+    }
+
+    @Test
+    fun zeroHoursOmitsTheHoursPart() {
+        assertEquals("resets in 42m", usageResetLabel(resetsAtIn(42 * minuteMs), nowMs))
+        assertEquals("resets in 59m", usageResetLabel(resetsAtIn(59 * minuteMs), nowMs))
+    }
+
+    @Test
+    fun minutesAreAlwaysShownEvenAtZero() {
+        // "resets in 2h 0m", never a bare "resets in 2h" — the minute slot is
+        // the label's resolution and it never silently disappears.
+        assertEquals("resets in 2h 0m", usageResetLabel(resetsAtIn(2 * hourMs), nowMs))
+    }
+
+    @Test
+    fun minutesAreFlooredNeverRoundedUp() {
+        // 4h 13m 59s reads 4h 13m — never the optimistic 4h 14m.
+        assertEquals("resets in 4h 13m", usageResetLabel(resetsAtIn(4 * hourMs + 13 * minuteMs + 59_000L), nowMs))
+        assertEquals("resets in 42m", usageResetLabel(resetsAtIn(42 * minuteMs + 59_000L), nowMs))
+    }
+
+    @Test
+    fun elapsedOrExactlyNowSaysResetsSoon() {
+        // Clock skew / just-elapsed windows: the next fetch replaces the
+        // window anyway, so no negative countdowns and no "resets 5m ago".
+        assertEquals("resets soon", usageResetLabel(resetsAtIn(0L), nowMs))
+        assertEquals("resets soon", usageResetLabel(resetsAtIn(-5 * minuteMs), nowMs))
+    }
+
+    // ── Reset labels: absolute form (delta ≥ 24h) ───────────────────────────
+
+    /**
+     * A ZonedDateTime in the system zone [daysAhead] of today at the given
+     * WALL time — skipping (rare) DST-gap days where that wall time does not
+     * exist, so the suite passes in any zone, midnight-shifting ones included.
+     */
+    private fun zonedAt(daysAhead: Long, hour: Int, minute: Int): ZonedDateTime {
+        val zone = ZoneId.systemDefault()
+        var date = LocalDate.now(zone).plusDays(daysAhead)
+        repeat(7) {
+            val zdt = ZonedDateTime.of(date, LocalTime.of(hour, minute), zone)
+            if (zdt.hour == hour && zdt.minute == minute) return zdt
+            date = date.plusDays(1)
+        }
+        throw AssertionError("no non-DST-gap day found for $hour:$minute")
+    }
+
+    /** Assert the absolute form for a target wall time, from 48h before it. */
+    private fun assertAbsolute(expectedTime: String, target: ZonedDateTime) {
+        val now = target.toInstant().toEpochMilli() - 48 * hourMs
+        val weekday = target.format(DateTimeFormatter.ofPattern("EEE"))
+        assertEquals(
+            "resets $weekday $expectedTime",
+            usageResetLabel(target.toOffsetDateTime().toString(), now),
         )
     }
 
     @Test
-    fun weeklyAndUnknownKindsFormatAWeekday() {
-        for (kind in listOf("weekly_all", "weekly_scoped", "lunar_window")) {
-            val label = usageResetLabel(kind, "2026-07-24T00:00:00Z")
-            assertTrue(
-                "expected 'resets <weekday>' for $kind, got: $label",
-                label != null && Regex("""resets \p{L}+""").matches(label),
-            )
-        }
+    fun over24hFormatsWeekdayPlusLocalHour() {
+        assertAbsolute("10am", zonedAt(3, 10, 0))
+        assertAbsolute("7pm", zonedAt(3, 19, 0))
+    }
+
+    @Test
+    fun absoluteMinutesShowOnlyWhenNonZero() {
+        assertAbsolute("10:30am", zonedAt(3, 10, 30))
+        // Zero-padded when present: "10:05am", never "10:5am".
+        assertAbsolute("10:05am", zonedAt(3, 10, 5))
+    }
+
+    @Test
+    fun twelveHourClockHandlesMidnightAndNoon() {
+        // 12-hour clock edges: 0h is 12am (never 0am), 12h is 12pm.
+        assertAbsolute("12am", zonedAt(3, 0, 0))
+        assertAbsolute("12pm", zonedAt(3, 12, 0))
+    }
+
+    @Test
+    fun exactly24hOutTakesTheAbsoluteForm() {
+        // The boundary itself belongs to the absolute form: delta ≥ 24h.
+        val target = Instant.ofEpochMilli(nowMs + 24 * hourMs).atZone(ZoneId.systemDefault())
+        val label = usageResetLabel(target.toOffsetDateTime().toString(), nowMs)
+        assertEquals(
+            "resets " + target.format(DateTimeFormatter.ofPattern("EEE")),
+            label?.substringBeforeLast(' '),
+        )
     }
 
     @Test
     fun malformedOrAbsentResetsAtDegradesToNoLine() {
-        assertNull(usageResetLabel("session", null))
-        assertNull(usageResetLabel("session", "not-a-timestamp"))
+        assertNull(usageResetLabel(null, nowMs))
+        assertNull(usageResetLabel("not-a-timestamp", nowMs))
         // A bare date without an offset is not the wire's ISO8601 either.
-        assertNull(usageResetLabel("weekly_all", "2026-07-24"))
+        assertNull(usageResetLabel("2026-07-24", nowMs))
+    }
+
+    // ── The always-on freshness label ───────────────────────────────────────
+
+    @Test
+    fun updatedLabelBucketsJustNowMinutesHours() {
+        assertEquals("updated just now", usageUpdatedLabel(nowMs, nowMs))
+        assertEquals("updated just now", usageUpdatedLabel(nowMs - 59_000L, nowMs))
+        assertEquals("updated 1m ago", usageUpdatedLabel(nowMs - minuteMs, nowMs))
+        assertEquals("updated 5m ago", usageUpdatedLabel(nowMs - 5 * minuteMs, nowMs))
+        assertEquals("updated 59m ago", usageUpdatedLabel(nowMs - 60 * minuteMs + 1, nowMs))
+        assertEquals("updated 1h ago", usageUpdatedLabel(nowMs - hourMs, nowMs))
+        assertEquals("updated 26h ago", usageUpdatedLabel(nowMs - 26 * hourMs, nowMs))
+    }
+
+    @Test
+    fun updatedLabelClampsASkewedFutureStampToJustNow() {
+        // A fetchedAtMs ahead of the local clock (skew) never renders a
+        // negative age — it clamps to the freshest bucket.
+        assertEquals("updated just now", usageUpdatedLabel(nowMs + 5 * minuteMs, nowMs))
     }
 
     // ── Chord-fitted widths ─────────────────────────────────────────────────
