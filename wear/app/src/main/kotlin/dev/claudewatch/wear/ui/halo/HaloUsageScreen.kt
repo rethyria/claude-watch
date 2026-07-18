@@ -22,6 +22,7 @@
 // honest only when they actually do.
 package dev.claudewatch.wear.ui.halo
 
+import android.content.Context
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.StartOffset
@@ -51,13 +52,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -266,10 +267,19 @@ fun HaloUsageScreen(
     modifier: Modifier = Modifier,
     nowMs: () -> Long = System::currentTimeMillis,
 ) {
-    // REMAINING vs USED is screen-local UI state (not wire state — the wire
-    // percent is always USED): rememberSaveable so a process-recreation
-    // keeps the reader's choice, default REMAINING per the design.
-    var usedMode by rememberSaveable { mutableStateOf(false) }
+    // REMAINING vs USED is a PERSISTED reader preference (user-directed,
+    // 2026-07-18): rememberSaveable only survived process recreation, so
+    // every fresh app launch reset the reader's choice back to REMAINING.
+    // Plain SharedPreferences — a single boolean UI pref has no business in
+    // the Keystore-encrypted connection store. Write-through on toggle; the
+    // composable state stays the single source of truth for the frame.
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("halo_ui", Context.MODE_PRIVATE) }
+    var usedMode by remember { mutableStateOf(prefs.getBoolean(USAGE_USED_MODE_PREF, false)) }
+    val toggleMode = {
+        usedMode = !usedMode
+        prefs.edit().putBoolean(USAGE_USED_MODE_PREF, usedMode).apply()
+    }
     // Minute ticker: BOTH label families ("resets in 4h 13m", "as of Xm
     // ago") are computed from NOW, and nothing else recomposes while the
     // page just sits open — without a tick they would silently go stale.
@@ -294,13 +304,13 @@ fun HaloUsageScreen(
             // a distinct empty state would only flash.
             UsageUi.Idle, UsageUi.Loading -> UsageSkeleton(
                 usedMode = usedMode,
-                onToggleMode = { usedMode = !usedMode },
+                onToggleMode = toggleMode,
             )
             is UsageUi.Error -> UsageError(message = usage.message, onRetry = onRetry)
             is UsageUi.Data -> UsageData(
                 data = usage,
                 usedMode = usedMode,
-                onToggleMode = { usedMode = !usedMode },
+                onToggleMode = toggleMode,
                 // Sampled ON the tick (and on fresh data): reading `tick` in
                 // the remember key is the subscription that re-evaluates
                 // nowMs() every ~30s, flowing a new Long down so every
@@ -551,6 +561,9 @@ private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode
 
 /** Skeleton rows shown while loading — mirrors the expected three windows. */
 private const val SKELETON_ROWS = 3
+
+/** SharedPreferences key for the persisted REMAINING/USED reader choice. */
+private const val USAGE_USED_MODE_PREF = "usage_used_mode"
 
 @Composable
 private fun UsageSkeleton(usedMode: Boolean, onToggleMode: () -> Unit) {

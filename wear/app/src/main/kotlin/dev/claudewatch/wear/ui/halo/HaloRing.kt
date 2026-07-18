@@ -66,7 +66,12 @@ fun HaloRing(
             }
             drawArc(
                 color = color,
-                startAngle = -90f + index * slice + RING_GAP_DEGREES / 2f,
+                // Sessions wind ANTICLOCKWISE from 12 o'clock (user-directed,
+                // 2026-07-18): segment i occupies the slice ENDING at
+                // −90 − i·slice, so index order runs counter to Canvas's
+                // clockwise-positive angles while each arc keeps its positive
+                // sweep (the round stroke caps render identically).
+                startAngle = -90f - (index + 1) * slice + RING_GAP_DEGREES / 2f,
                 sweepAngle = sweep,
                 useCenter = false,
                 topLeft = topLeft,

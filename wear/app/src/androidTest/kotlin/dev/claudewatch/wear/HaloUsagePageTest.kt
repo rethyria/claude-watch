@@ -39,6 +39,16 @@ class HaloUsagePageTest {
     @get:Rule
     val compose = createComposeRule()
 
+    // The REMAINING/USED choice persists in SharedPreferences now — reset it
+    // per test, or the toggle test's USED choice leaks into every later test
+    // that asserts the REMAINING default (order-dependent flakiness).
+    @org.junit.Before
+    fun resetPersistedUsageMode() {
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext
+            .getSharedPreferences("halo_ui", android.content.Context.MODE_PRIVATE)
+            .edit().clear().commit()
+    }
+
     private fun fixtureBridge() = BridgeState(
         sessions = mapOf(
             "s-1" to SessionState(
