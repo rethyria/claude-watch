@@ -9,10 +9,15 @@ import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.RemoteInput
 import dev.claudewatch.shared.protocol.PermissionOption
+import dev.claudewatch.wear.net.ConnectionState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
@@ -224,13 +229,31 @@ internal fun approvalActionTitle(behavior: String): String = when (behavior) {
  * depends on an activity reference, and tests can set it directly). The
  * approval collector posts ONLY while this is false: while the UI is
  * visible the in-app card is the approval surface, and a heads-up buzz over
- * the very card the user is reading would be noise. Volatile: the flag is
- * written on the main thread and read from whatever dispatcher hosts the
- * collector.
+ * the very card the user is reading would be noise.
+ *
+ * Issue #59 turned the old `@Volatile var` into a [MutableStateFlow]-backed
+ * property: the collector no longer only READS visibility at post time, it
+ * REACTS to the visible→hidden transition (post-on-background — a prompt
+ * swallowed while the card was on screen buzzes when the user backgrounds
+ * the app and it is still pending). A plain volatile boolean cannot be
+ * observed, so the flow is the source of truth and [uiVisible] is a
+ * get/set facade over it — every existing write site (MainActivity's
+ * observer, the single production writer; tests' direct assignments) keeps
+ * working unchanged, and StateFlow.value carries the same cross-thread
+ * visibility guarantee the @Volatile annotation used to.
  */
 object AppVisibility {
-    @Volatile
-    var uiVisible: Boolean = false
+    private val _visible = MutableStateFlow(false)
+
+    /** The observable truth; collectors subscribe to visible→hidden edges. */
+    val visible: StateFlow<Boolean> = _visible
+
+    /** Facade over [visible] so pre-#59 read/write sites stay source-identical. */
+    var uiVisible: Boolean
+        get() = _visible.value
+        set(value) {
+            _visible.value = value
+        }
 }
 
 /**
@@ -247,6 +270,19 @@ object AppVisibility {
 interface ApprovalNotificationSink {
     fun post(model: ApprovalNotificationModel)
     fun cancel(permissionId: String)
+
+    /**
+     * Tags (permissionIds) of approval notifications currently in the shade —
+     * the SURVIVORS of a process killed without onDestroy (issue #59). A
+     * graceful stop runs [ApprovalNotificationCollector.cancelAllPosted] and
+     * leaves nothing; an LMK/OEM kill runs no teardown at all, so a fresh
+     * collector attaches into a shade that may still hold live-looking
+     * Approve/Deny notifications no in-memory set remembers. The collector
+     * ADOPTS these at attach (see its kdoc); deliberately NOT defaulted, so
+     * every fake sink has to decide what its "shade" contains instead of
+     * silently opting out of the restart contract.
+     */
+    fun activeTags(): Set<String>
 }
 
 /**
@@ -321,6 +357,18 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
     override fun cancel(permissionId: String) {
         manager.cancel(permissionId, APPROVAL_NOTIFICATION_ID)
     }
+
+    /**
+     * The real shade's approval survivors (issue #59): every active
+     * notification posted under [APPROVAL_NOTIFICATION_ID] — their tags ARE
+     * permissionIds by this class's own posting convention. The FGS chip
+     * (id 24) and anything another app posted never match the id filter.
+     */
+    override fun activeTags(): Set<String> =
+        manager.activeNotifications
+            .filter { it.id == APPROVAL_NOTIFICATION_ID }
+            .mapNotNull { it.tag }
+            .toSet()
 
     /**
      * One action per canonical option, answering through the service. Wear
@@ -450,73 +498,312 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
  * MockWebServer-paired ViewModel — CatchUpFlowTest's kdoc explains why tests
  * must not pair the production singleton's persistent store to a throwaway
  * server — while the service attaches the same class to the singleton: one
- * code path, two hosts. The sink interface plus the [uiVisible] lambda are
- * the JVM seams: ApprovalNotificationCollectorTest tables the gating /
- * swallow / bookkeeping branches below against a recording fake, because
- * every instrumented scenario runs backgrounded and would never catch a
- * broken visible-UI branch.
+ * code path, two hosts. The sink interface plus the [visibility] /
+ * connection StateFlows are the JVM seams: ApprovalNotificationCollectorTest
+ * tables the gating / adoption / bookkeeping branches below against a
+ * recording fake, because every instrumented scenario runs backgrounded and
+ * would never catch a broken visible-UI branch. Android-free by
+ * construction — everything here is sink calls plus pure Kotlin flows.
  *
- * Ownership of state: [knownIds] is every id currently accounted for (posted
- * OR deliberately swallowed), [postedIds] only what actually reached the
- * shade — kept separately so [cancelAllPosted] can cancel PRECISELY what
- * this collector posted (a dead service's actions are dead ends, the same
- * zombie-notification reasoning as #24's onDestroy cancel) without touching
- * notifications it never owned.
+ * Ownership of state: [knownIds] is every id currently accounted for (posted,
+ * deliberately withheld while visible, or ADOPTED), [postedIds] what is
+ * believed to be in the shade — kept separately so [cancelAllPosted] can
+ * cancel PRECISELY what this collector owns (a dead service's actions are
+ * dead ends, the same zombie-notification reasoning as #24's onDestroy
+ * cancel) without touching notifications it never owned.
+ *
+ * Restart edges (issue #59), the reason this class stopped being a plain
+ * diff pump:
+ *
+ *  1. ADOPTION. All of the above is in-memory, so a process killed WITHOUT
+ *     onDestroy (LMK, OEM swipe-kill) leaves approval notifications in the
+ *     shade that no future collector remembers: a prompt resolved from the
+ *     desktop while the watch was dead would sit there forever, its Approve
+ *     silently no-oping. At [attach] the collector therefore ADOPTS every
+ *     surviving tag ([ApprovalNotificationSink.activeTags]) into
+ *     [knownIds] + [postedIds] so the ordinary diff owns them again.
+ *  2. THE POST-CONNECTED SETTLE WINDOW. Right after attach the queue is
+ *     EMPTY — the fresh ViewModel's reconnect replay has not landed — and
+ *     the StateFlow delivers that empty value immediately. An undeferred
+ *     diff would cancel every adopted survivor and then RE-POST it when the
+ *     replay re-adds it: setOnlyAlertOnce does not survive a cancel+notify
+ *     cycle, so every still-pending prompt would buzz the wrist again for
+ *     nothing. Departure processing for ADOPTED ids is therefore deferred:
+ *     queue emissions only ever GRADUATE adopted ids (an id seen IN the
+ *     queue is proven pending and becomes an ordinary live id), never
+ *     cancel them, and the final verdict comes from a TIMER — once the
+ *     connection reaches Connected since attach, a bounded settle window
+ *     ([REPLAY_SETTLE_MS]) lets the backlog replay land, then whatever is
+ *     STILL unconfirmed is cancelled in [adjudicateAdopted]. Time-driven,
+ *     not emission-driven, for two reviewed-in-anger reasons: (a) the
+ *     reducer applies each replayed permission-request frame as its own
+ *     state emission, so "the first post-Connected emission" can be a
+ *     PARTIAL pending set — adjudicating wholesale on it cancelled a
+ *     still-pending survivor and re-buzzed it one emission later, the
+ *     exact cycle adoption exists to kill; (b) when the ONLY pending
+ *     prompt was resolved while the watch was dead, the replay changes
+ *     nothing and the distinctUntilChanged'd queue NEVER re-emits — an
+ *     emission-gated cancel would simply never fire and the zombie
+ *     Approve/Deny (issue #59's headline case) would linger forever. A
+ *     still-pending adopted prompt keeps its ORIGINAL notification
+ *     untouched throughout (no cancel, no re-post, no buzz — the replay
+ *     re-confirms it well inside the window); one resolved while the
+ *     process was dead cancels when the window closes. Live (non-adopted)
+ *     ids keep the immediate diff semantics throughout — deferral is
+ *     scoped to exactly the ids whose pending-ness the empty pre-replay
+ *     queue cannot vouch for.
+ *  3. POST-ON-BACKGROUND. A prompt that arrives while the UI is visible is
+ *     still never posted (the in-app card is the surface) — but the
+ *     withholding is no longer permanent: when the UI stops being visible
+ *     and the prompt is STILL queued, it posts then. The old contract
+ *     ("never posted later either") was written for prompts arriving under
+ *     the user's nose, but the reconnect replay delivers pending prompts
+ *     ~1s after every app open — while visible — so catch-up prompts never
+ *     buzzed at all once the user backgrounded the app, exactly the AFK
+ *     case #25 exists for. The card needs a centerpiece tap to even open;
+ *     "the user already has it on screen" was never true for replayed
+ *     arrivals. Uniform rule for replayed and live arrivals: withhold
+ *     while visible, post on the visible→hidden edge if still pending.
  */
 class ApprovalNotificationCollector(
     private val sink: ApprovalNotificationSink,
-    private val uiVisible: () -> Boolean = { AppVisibility.uiVisible },
+    private val visibility: StateFlow<Boolean> = AppVisibility.visible,
+    /**
+     * The post-Connected settle window (edge 2). A constructor parameter
+     * for exactly one reason: the JVM tests pin the Connected→delay→
+     * adjudicate glue deterministically with a zero window (delay(0) never
+     * suspends, so under Unconfined the whole chain runs synchronously in
+     * the connection write), while production and the default-window tests
+     * get a timer that cannot fire mid-test.
+     */
+    private val settleMs: Long = REPLAY_SETTLE_MS,
+    /**
+     * How long a visible→hidden edge must HOLD before post-on-background
+     * fires (edge 3). Activity recreation flaps visibility
+     * true→false→true (the old instance's ON_STOP lands between the new
+     * one's ON_START dispatches), and StateFlow conflation across separate
+     * main-thread dispatches is possible but not guaranteed — an unfiltered
+     * transient false edge would buzz every withheld prompt over the very
+     * card the user is still looking at. collectLatest + this delay means a
+     * flap back to visible CANCELS the pending edge; only a hidden state
+     * that outlives the debounce posts. Constructor parameter for the same
+     * reason as [settleMs]: virtual-time tests pin the cancel-vs-fire glue.
+     */
+    private val visibilityDebounceMs: Long = VISIBILITY_FLAP_DEBOUNCE_MS,
 ) {
 
     private var knownIds: Set<String> = emptySet()
     private val postedIds = mutableSetOf<String>()
 
     /**
-     * Collect [state]'s permission queue in [scope]. The job lives and dies
-     * with the host's scope — a dead service means a dead stream, so no new
-     * prompts can arrive anyway; the host cancels the leftovers explicitly
-     * via [cancelAllPosted].
+     * Adopted survivors whose fate the queue cannot yet vouch for (edge 2
+     * above): members are exempt from departure-cancel until the settle
+     * window closes, and graduate early if any emission re-confirms them
+     * (once seen IN the queue they are ordinary live ids again).
      */
-    fun attach(scope: CoroutineScope, state: StateFlow<BridgeViewModel.UiState>): Job =
-        scope.launch {
-            state.map { it.permissionQueue }.distinctUntilChanged().collect { onQueue(it) }
+    private val adoptedAwaitingReplay = mutableSetOf<String>()
+
+    /**
+     * The queue as of the last emission — what the visible→hidden edge
+     * consults to post still-pending swallowed prompts (edge 3). Held as the
+     * full prompts, not ids: posting needs the content model.
+     */
+    private var lastQueue: List<BridgeViewModel.PendingPermission> = emptyList()
+
+    /** Previous visibility value, for edge detection (constructor snapshot). */
+    private var lastVisible = visibility.value
+
+    /**
+     * Collect [state]'s permission queue in [scope], plus the [connection]
+     * flow that arms the settle-window adjudicator and the [visibility] flow
+     * whose visible→hidden edge triggers post-on-background. The job lives
+     * and dies with the host's scope — a dead service means a dead stream,
+     * so no new prompts can arrive anyway; the host cancels the leftovers
+     * explicitly via [cancelAllPosted]. Adoption runs FIRST, before any
+     * flow's immediately-delivered current value can diff a survivor away.
+     *
+     * The adjudicator (edge 2) launches only when adoption found survivors:
+     * it waits for the first Connected since attach, gives the backlog
+     * replay [settleMs] to land (the bridge replays immediately on stream
+     * open — ~1 s observed on hardware — and every replayed frame graduates
+     * the ids it re-confirms), then cancels whatever no emission vouched
+     * for, against a final read of the CURRENT queue (belt for the timer
+     * racing an in-flight emission's dispatch). Deliberately NOT gated on
+     * any queue emission — see the class kdoc for the two ways an
+     * emission-gated verdict adjudicated wrongly or never.
+     */
+    fun attach(
+        scope: CoroutineScope,
+        state: StateFlow<BridgeViewModel.UiState>,
+        connection: StateFlow<ConnectionState>,
+    ): Job = scope.launch {
+        adopt(sink.activeTags())
+        if (adoptedAwaitingReplay.isNotEmpty()) {
+            launch {
+                connection.first { it == ConnectionState.Connected }
+                delay(settleMs)
+                adjudicateAdopted(state.value.permissionQueue)
+            }
         }
+        launch {
+            // collectLatest is the flap filter (see visibilityDebounceMs):
+            // a hidden edge only reaches onVisibility after HOLDING for the
+            // debounce; a flap back to visible cancels the pending block
+            // mid-delay, so the transient edge never posts anything.
+            visibility.collectLatest { visible ->
+                if (!visible) delay(visibilityDebounceMs)
+                onVisibility(visible)
+            }
+        }
+        state.map { it.permissionQueue }.distinctUntilChanged().collect { onQueue(it) }
+    }
+
+    /**
+     * Take ownership of shade survivors (edge 1). Into BOTH sets: knownIds
+     * so the replay re-adding a survivor is not a "new" prompt (no re-post,
+     * no re-buzz), postedIds so [cancelAllPosted] and departure-cancel treat
+     * it as shade-present — which it literally is.
+     */
+    internal fun adopt(tags: Set<String>) {
+        if (tags.isEmpty()) return
+        knownIds = knownIds + tags
+        postedIds += tags
+        adoptedAwaitingReplay += tags
+    }
+
+    /**
+     * The settle window's verdict (edge 2): every adopted id no queue
+     * emission re-confirmed by the time the window closed was resolved
+     * while this process was dead — cancel it, exactly once. [queue] is the
+     * CURRENT queue at verdict time, a last-chance graduation: an emission
+     * still in dispatch flight when the timer fires must not get its
+     * still-pending survivor cancelled out from under it. Ids the replay
+     * re-confirmed have already graduated per-emission in [onQueue] and are
+     * wholly untouched here — original notification, original postTime, no
+     * second buzz.
+     */
+    internal fun adjudicateAdopted(queue: List<BridgeViewModel.PendingPermission>) {
+        if (adoptedAwaitingReplay.isEmpty()) return
+        adoptedAwaitingReplay.removeAll(queue.mapTo(mutableSetOf()) { it.permissionId })
+        val resolvedWhileDead = adoptedAwaitingReplay.toSet()
+        for (id in resolvedWhileDead) {
+            sink.cancel(id)
+            postedIds -= id
+        }
+        knownIds = knownIds - resolvedWhileDead
+        adoptedAwaitingReplay.clear()
+    }
+
+    /**
+     * Visibility edge (edge 3): on visible→hidden, post every prompt that is
+     * still queued but was withheld while the UI was on screen (known,
+     * never posted, still in [lastQueue]). Everything else is a no-op: the
+     * initial emission and hidden→visible change nothing, a withheld prompt
+     * that already DEPARTED is simply absent from lastQueue, and a
+     * posted-then-departed id is out of postedIds AND lastQueue by the time
+     * the edge fires.
+     */
+    internal fun onVisibility(visible: Boolean) {
+        val wasVisible = lastVisible
+        lastVisible = visible
+        if (!wasVisible || visible) return
+        for (prompt in lastQueue) {
+            val id = prompt.permissionId
+            if (id in knownIds && id !in postedIds) {
+                sink.post(approvalNotificationModel(prompt))
+                postedIds += id
+            }
+        }
+    }
 
     /** One queue emission: cancel departures, post arrivals (unless the UI owns them). */
     fun onQueue(queue: List<BridgeViewModel.PendingPermission>) {
+        lastQueue = queue
+        val currentIds = queue.mapTo(mutableSetOf()) { it.permissionId }
         val diff = diffPermissionNotifications(knownIds, queue)
         // Departures ALWAYS cancel, visible or not — idempotent when the id
-        // was never posted (the swallowed-while-visible case below).
+        // was never posted (the withheld-while-visible case below) — EXCEPT
+        // ids still inside the settle window: an emission that omits an
+        // adopted id proves NOTHING about it (pre-replay the queue is
+        // empty, and mid-replay it is PARTIAL — each replayed frame is its
+        // own emission), so a survivor's "departure" is never acted on
+        // here; [adjudicateAdopted] owns that verdict when the window
+        // closes. Live ids never enter that set, so their cancel stays
+        // immediate even before Connected.
         for (id in diff.toCancelIds) {
+            if (id in adoptedAwaitingReplay) continue
             sink.cancel(id)
             postedIds -= id
         }
         for (prompt in diff.toPost) {
-            if (!uiVisible()) {
+            if (!visibility.value) {
                 sink.post(approvalNotificationModel(prompt))
                 postedIds += prompt.permissionId
             }
             // While the UI is visible the in-app card is the surface: the
-            // prompt is deliberately NOT posted — and because knownIds still
-            // records it, it is never posted LATER either (backgrounding the
-            // app does not retroactively buzz for a card the user already
-            // has open and chose not to answer). Ids are marked known either
-            // way, which is what makes the swallow permanent.
+            // prompt is deliberately NOT posted here. knownIds still records
+            // it, so later emissions never treat it as new — but the
+            // withholding is no longer permanent (#59 edge 3): the
+            // visible→hidden edge in [onVisibility] posts it if it is still
+            // queued then. See the class kdoc for why the old permanent
+            // swallow silently muted every replayed catch-up prompt.
         }
-        knownIds = queue.mapTo(mutableSetOf()) { it.permissionId }
+        // Any adopted id the queue re-confirmed is an ordinary live id from
+        // here on: its pending-ness is proven, so a later departure —
+        // inside the settle window or not — cancels it like any other. This
+        // per-emission graduation is also what keeps the window's eventual
+        // verdict honest against a PARTIAL replay: each replayed frame
+        // graduates the ids it carries, so by the time the timer fires only
+        // genuinely never-re-confirmed survivors are left to cancel.
+        adoptedAwaitingReplay.removeAll(currentIds)
+        // Adopted ids still awaiting judgment stay known past this emission:
+        // dropping them would make the replay's re-add look NEW and re-buzz
+        // the shade's own survivor — the exact cycle the deferral exists to
+        // stop.
+        knownIds = currentIds + adoptedAwaitingReplay
     }
 
     /**
-     * Cancel exactly the notifications THIS collector posted — the host is
-     * going away and every action PendingIntent would restart it just to
-     * answer into whatever state it wakes up with; better no notification
-     * than one whose buttons outlived their truth. knownIds is deliberately
-     * kept: this collector is done, its replacement starts fresh and
-     * re-posts still-pending prompts (the recovery path after a sticky
-     * service restart).
+     * Cancel exactly the notifications THIS collector owns in the shade —
+     * posted by it or ADOPTED by it (#59; an adopted survivor is in
+     * [postedIds] precisely so this graceful-death sweep covers it: after a
+     * clean stop the shade is empty and the NEXT attach adopts nothing).
+     * The host is going away and every action PendingIntent would restart
+     * it just to answer into whatever state it wakes up with; better no
+     * notification than one whose buttons outlived their truth. knownIds is
+     * deliberately kept: this collector is done, its replacement starts
+     * fresh and re-posts still-pending prompts (the recovery path after a
+     * sticky service restart).
      */
     fun cancelAllPosted() {
         for (id in postedIds.toList()) sink.cancel(id)
         postedIds.clear()
+        adoptedAwaitingReplay.clear()
+    }
+
+    companion object {
+        /**
+         * How long after the first Connected the adopted-survivor verdict
+         * waits for the backlog replay to land (edge 2; see [attach]).
+         * Sized like the service's TERMINAL_GRACE_MS and the answer path's
+         * ANSWER_REPLAY_WAIT_MS floor: the bridge replays immediately on
+         * stream open and the frames land ~1 s later on hardware, so 3 s is
+         * comfortably past the whole backlog without stretching into
+         * "stale zombie sat in the shade for ages" territory. Too SHORT
+         * cancels (then re-buzzes) a still-pending survivor whose replay
+         * frame hadn't landed; too LONG just delays removing a notification
+         * whose Approve would harmlessly no-op anyway — so the constant errs
+         * long.
+         */
+        internal const val REPLAY_SETTLE_MS = 3_000L
+
+        /**
+         * How long a hidden edge must hold before post-on-background fires
+         * (edge 3; see [attach]'s collectLatest). An activity-recreation
+         * flap resolves within one main-thread dispatch turn — tens of ms —
+         * so 400 ms filters every flap while staying imperceptible next to
+         * the user's actual wrist-lowering gesture.
+         */
+        internal const val VISIBILITY_FLAP_DEBOUNCE_MS = 400L
     }
 }

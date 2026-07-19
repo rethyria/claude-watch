@@ -367,11 +367,19 @@ hosted by `BridgeSessionService`; end-to-end in
   Reply + the in-app card own those. A MULTI-question prompt gets NO
   actions at all — a wrist notification cannot walk the buffered
   multi-question form; the in-app card owns it.
-- **Foreground gating:** posts only while the app UI is not visible
-  (`AppVisibility`, flipped by MainActivity ON_START/ON_STOP). While
-  visible the in-app card is the surface; a prompt that arrives while
-  visible is never posted later either (the card already has it).
-  Departures always cancel regardless (idempotent).
+- **Foreground gating (post-on-background since #59):** posts only while
+  the app UI is not visible (`AppVisibility`, flipped by MainActivity
+  ON_START/ON_STOP — now a StateFlow the collector OBSERVES, with the old
+  `uiVisible` var kept as a facade). While visible the in-app card is the
+  surface and nothing posts — but the withhold is no longer permanent: a
+  prompt that arrived while visible and is STILL queued when the UI goes
+  away posts on that visible→hidden edge. The old "never posted later
+  either" rule silently muted every replayed catch-up prompt (the
+  reconnect replay lands ~1s after every app open, while visible, and the
+  card needs a centerpiece tap to even open), which gutted the wrist-buzz
+  contract in exactly the AFK scenario. Uniform for replayed and live
+  arrivals. Departures always cancel regardless (idempotent), including
+  while visible.
 - **Cancellation = queue-diff:** the collector diffs `permissionQueue`
   emissions; ids that leave the queue cancel their tag. Answered here,
   answered elsewhere (404), expired, permission-cleared, local dismiss —
@@ -383,6 +391,59 @@ hosted by `BridgeSessionService`; end-to-end in
   after the user's Disconnect resumes the engine just to deliver the
   answer, but returns `START_NOT_STICKY` — a tap never re-mints the sticky
   promise the Disconnect revoked.
+- **Restart edges (#59):** everything above assumed a graceful death; a
+  process killed WITHOUT onDestroy (LMK, OEM swipe-kill) leaves shade
+  survivors no in-memory set remembers. Three fixes, all riding the
+  existing surfaces:
+  - *Adoption:* at attach the collector adopts every active notification
+    with `id == 25` (tags ARE permissionIds) into knownIds+postedIds, so
+    the ordinary diff owns them again — no zombie Approve/Deny lingering
+    forever after a prompt was resolved from the desktop while the watch
+    was dead, and `cancelAllPosted` (graceful death) sweeps adopted
+    survivors too, which is what keeps adoption self-limiting (a clean
+    stop leaves an empty shade; the next attach adopts nothing).
+  - *Post-Connected settle window:* the queue right after attach is
+    pre-replay EMPTY, so departure processing for ADOPTED ids is deferred:
+    queue emissions only ever GRADUATE a survivor (an id seen in the queue
+    is proven pending and becomes an ordinary live id), and the verdict is
+    a TIMER — Connected arms a settle window (`REPLAY_SETTLE_MS`, ~3 s,
+    comfortably past the ~1 s backlog replay), whose close cancels exactly
+    the never-re-confirmed leftovers against the freshest queue. NOT
+    emission-gated, deliberately (second-round review): the reducer emits
+    once per replayed frame, so "the first post-Connected emission" can be
+    a PARTIAL pending set (adjudicating wholesale on it cancelled a
+    still-pending survivor and re-buzzed it one emission later), and when
+    the replay changes nothing — the only pending prompt resolved while
+    the watch was dead, the issue's headline orphan — the
+    distinctUntilChanged'd queue never re-emits and an emission-gated
+    verdict never fires at all. A still-pending survivor keeps its
+    ORIGINAL notification untouched (no cancel+re-post buzz —
+    `setOnlyAlertOnce` does not survive a cancel); one resolved while dead
+    cancels when the window closes, queue emission or not. Live ids keep
+    immediate diff semantics throughout.
+  - *Answer deferral:* a notification tap that itself recreated a dead
+    process runs before the replay repopulates the queue; answering
+    synchronously would be silently dropped by the ViewModel's still-queued
+    guard (which stays intact — it protects the card UI). The SERVICE now
+    defers an answer whose id is not yet queued: bounded wait (~10s,
+    `ANSWER_REPLAY_WAIT_MS`) on `vm.state` for the id to appear, then the
+    same entry point with the same payload; on timeout it does NOTHING
+    (the re-posted notification / in-app card is the retry surface). All
+    three answer kinds (behavior, RemoteInput text, option label) route
+    through it. The tapped notification still cancels instantly either
+    way. A double-delivered tap (racing the instant cancel) is dropped by a
+    time-bounded claim (`claimAnswerDelivery`, 5 s window — long enough to
+    kill any duplicate, short enough that a replay-re-raised prompt's fresh
+    tap answers): without it both deliveries pass the still-queued guard
+    (the first POST is async) and the duplicate's 404 clobbers
+    decisionResult.
+  - *Visibility-flap debounce:* activity recreation flaps the visibility
+    flow true→false→true, and an unfiltered transient hidden edge would
+    buzz every withheld prompt over the very card the user is looking at —
+    the collector's edge handling rides `collectLatest` + a
+    `VISIBILITY_FLAP_DEBOUNCE_MS` (400 ms) hold, so a flap back to visible
+    cancels the pending post-on-background pass mid-delay
+    (virtual-time-tested).
 
 ## Glanceables (#28)
 

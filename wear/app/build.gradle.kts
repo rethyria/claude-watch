@@ -79,6 +79,9 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.okhttp.mockwebserver)
+    // Virtual-time tests for the collector's debounced visibility edge
+    // (#59): the flap filter is a real delay that Unconfined cannot pin.
+    testImplementation(libs.coroutines.test)
     // Real org.json for local unit tests (the mockable android.jar stubs it out).
     testImplementation(libs.org.json)
 
