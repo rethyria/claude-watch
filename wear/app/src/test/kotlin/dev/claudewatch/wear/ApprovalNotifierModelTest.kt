@@ -99,6 +99,29 @@ class ApprovalNotifierModelTest {
             emptyList<PermissionOption>(),
             model.options,
         )
+        // The question's OWN option labels become the RemoteInput choice
+        // chips — live-demo lesson: without them Wear invents ML Smart
+        // Replies ("Good question") that masquerade as agent options.
+        assertEquals(listOf("PostgreSQL"), model.replyChoices)
+    }
+
+    @Test
+    fun aChoicelessSingleQuestionStaysPureFreeText() {
+        val model = approvalNotificationModel(
+            prompt(
+                id = "perm-open",
+                toolName = "AskUserQuestion",
+                summary = "[AskUserQuestion]",
+                options = emptyList(),
+                questions = listOf(AskUserQuestion(question = "What should it be called?")),
+            ),
+        )
+        assertTrue(model.remoteInputQuestion)
+        assertEquals(
+            "no options on the question means no chips on the wrist",
+            emptyList<String>(),
+            model.replyChoices,
+        )
     }
 
     @Test
@@ -121,6 +144,11 @@ class ApprovalNotifierModelTest {
         assertFalse(model.remoteInputQuestion)
         assertEquals(emptyList<PermissionOption>(), model.options)
         assertEquals("2 questions — open to answer", model.text)
+        assertEquals(
+            "multi-question options belong to the in-app card only",
+            emptyList<String>(),
+            model.replyChoices,
+        )
     }
 
     // ------------------------------------------------------------------

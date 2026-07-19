@@ -61,6 +61,13 @@ internal const val MAX_WEAR_NOTIFICATION_ACTIONS = 3
  * walk a multi-question form (buffered positional answers, per-question
  * option lists), the in-app question card owns that flow, so the content
  * tap opening the app is the only affordance.
+ *
+ * [replyChoices] are the single question's own option labels, surfaced as
+ * the RemoteInput's choice chips. Live-demo lesson: without explicit
+ * choices, Wear decorates the Reply action with ML-GENERATED Smart Replies
+ * ("Still waiting", "Good question") that look exactly like agent options —
+ * and a mis-tap sends Google's guess to a blocked session as a real answer.
+ * The agent's labels are the only chips allowed on this surface.
  */
 data class ApprovalNotificationModel(
     val permissionId: String,
@@ -68,6 +75,7 @@ data class ApprovalNotificationModel(
     val text: String,
     val options: List<PermissionOption>,
     val remoteInputQuestion: Boolean,
+    val replyChoices: List<String> = emptyList(),
 )
 
 /** Derive the wrist-rendered content for one queued prompt. Pure. */
@@ -100,6 +108,15 @@ internal fun approvalNotificationModel(
             emptyList()
         },
         remoteInputQuestion = questions.size == 1,
+        // The single question's own option labels ride into the RemoteInput
+        // as choice chips (see the field's doc); a choice-less question
+        // stays pure free text. Multi-question lists keep their options on
+        // the in-app card only, same as [options] above.
+        replyChoices = if (questions.size == 1) {
+            questions.single().options.map { it.label }
+        } else {
+            emptyList()
+        },
     )
 }
 
@@ -306,6 +323,9 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
     private fun replyAction(model: ApprovalNotificationModel): NotificationCompat.Action {
         val remoteInput = RemoteInput.Builder(KEY_QUESTION_ANSWER)
             .setLabel(model.text) // the question itself prompts the input UI
+            // The AGENT's option labels are the choice chips; free text via
+            // keyboard/voice coexists with choices on the reply surface.
+            .apply { if (model.replyChoices.isNotEmpty()) setChoices(model.replyChoices.toTypedArray()) }
             .build()
         val pending = PendingIntent.getService(
             context,
@@ -315,6 +335,11 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
         )
         return NotificationCompat.Action.Builder(0, "Reply", pending)
             .addRemoteInput(remoteInput)
+            // Live-demo lesson (see ApprovalNotificationModel.replyChoices):
+            // Wear's ML Smart Replies ("Good question") rendered as if they
+            // were the agent's options, and a mis-tap answers a blocked
+            // session with Google's guess. Only the agent speaks here.
+            .setAllowGeneratedReplies(false)
             .build()
     }
 
