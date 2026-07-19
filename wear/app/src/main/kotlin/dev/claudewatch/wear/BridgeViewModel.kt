@@ -948,5 +948,20 @@ class BridgeViewModel(
                     escalator = WifiNetworkEscalator(context.applicationContext),
                 ).also { instance = it }
             }
+
+        /**
+         * PEEK at the singleton WITHOUT constructing it (issue #28's
+         * passivity rule). [singleton] constructs on first touch, and
+         * construction is not free: init fires engine.start(), which reads
+         * persisted credentials and OPENS THE STREAM. That is the right
+         * behavior for MainActivity and BridgeSessionService — surfaces the
+         * user deliberately entered — and exactly the wrong behavior for a
+         * glanceable: the tile carousel calls onTileRequest on a SWIPE PAST,
+         * and a swipe is not consent to spin up the network. Glanceables
+         * peek; null means "the app process holds no engine right now" and
+         * renders honestly as disconnected + tap-to-open, never as a freshly
+         * started connection the user didn't ask for.
+         */
+        fun peek(): BridgeViewModel? = instance
     }
 }

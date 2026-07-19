@@ -55,6 +55,18 @@ dependencies {
     // (issue #24), plus androidx.core explicitly for NotificationCompat /
     // ServiceCompat rather than leaning on a transitive version.
     implementation(libs.wear.ongoing)
+    // Glanceables (issue #28): the ProtoLayout Tile (HaloTileService) and the
+    // SHORT_TEXT complication (HaloComplicationService). tiles 1.4 + proto-
+    // layout 1.2 are a matched pair — see the version catalog's warning
+    // before touching either. concurrent-futures is only for
+    // CallbackToFutureAdapter (TileService speaks ListenableFuture and Guava's
+    // Futures.immediateFuture is NOT on the classpath — tiles ships just the
+    // listenablefuture stub artifact).
+    implementation(libs.wear.tiles)
+    implementation(libs.wear.protolayout)
+    implementation(libs.wear.protolayout.material)
+    implementation(libs.watchface.complications.data.source)
+    implementation(libs.concurrent.futures)
     implementation(libs.core.ktx)
     implementation(libs.activity.compose)
     implementation(libs.lifecycle.viewmodel.compose)

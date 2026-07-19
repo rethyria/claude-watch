@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Claude Watch</string>
+    <!-- Glanceables (issue #28): what the tile carousel picker and the
+         watch-face complication editor call our surfaces. -->
+    <string name="tile_label">Claude Watch</string>
+    <string name="complication_label">Claude Watch status</string>
 </resources>

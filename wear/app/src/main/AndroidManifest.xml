@@ -53,5 +53,58 @@
             android:name=".BridgeSessionService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- The Halo Tile (issue #28): session/connection status one swipe
+             from the watch face. exported + BIND_TILE_PROVIDER is the tile
+             contract: only the system UI holds that permission, so exported
+             here does not mean reachable by other apps. The PREVIEW metadata
+             feeds the carousel's "add tile" picker; a real rendered-layout
+             screenshot is impractical to keep truthful from a build (it
+             would drift from the actual layout the moment the layout
+             changes), so the preview is a DERIVED static drawable of the
+             ring glyph over black — honest branding rather than a stale
+             fake render. -->
+        <service
+            android:name=".glance.HaloTileService"
+            android:exported="true"
+            android:label="@string/tile_label"
+            android:icon="@drawable/ic_bridge_chip"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+
+        <!-- The SHORT_TEXT complication data source (issue #28). Same
+             exported-but-system-bind-only contract as the tile.
+             UPDATE_PERIOD_SECONDS = 300: pushes from the
+             BridgeSessionService collector deliver instant honesty on real
+             changes — the 5-minute poll is NOT the update mechanism, it is
+             the staleness BOUND for a process killed without onDestroy (LMK,
+             OEM battery kill, withheld sticky restart): no death-flip push
+             fires there, and a push-only complication would freeze on its
+             last healthy value indefinitely — the exact stale-green class
+             this issue exists to kill. The tile's 60s freshnessInterval is
+             its version of the same net; each poll costs one null-safe
+             peek (onComplicationRequest never constructs the singleton). -->
+        <service
+            android:name=".glance.HaloComplicationService"
+            android:exported="true"
+            android:label="@string/complication_label"
+            android:icon="@drawable/ic_bridge_chip"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data
+                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+                android:value="SHORT_TEXT" />
+            <meta-data
+                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+                android:value="300" />
+        </service>
     </application>
 </manifest>
