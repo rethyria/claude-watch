@@ -55,6 +55,11 @@ dependencies {
     // (issue #24), plus androidx.core explicitly for NotificationCompat /
     // ServiceCompat rather than leaning on a transitive version.
     implementation(libs.wear.ongoing)
+    // On-wrist text entry (pairing form): RemoteInputIntentHelper launches the
+    // Wear system input activity so the committed string comes back as an
+    // activity result — inline Compose text editing does not survive the
+    // watch's IME (see HaloOfflineScreen).
+    implementation(libs.wear.input)
     // Glanceables (issue #28): the ProtoLayout Tile (HaloTileService) and the
     // SHORT_TEXT complication (HaloComplicationService). tiles 1.4 + proto-
     // layout 1.2 are a matched pair — see the version catalog's warning

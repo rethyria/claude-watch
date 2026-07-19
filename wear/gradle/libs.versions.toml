@@ -7,6 +7,11 @@ okhttp = "4.12.0"
 composeBom = "2024.10.01"
 wearCompose = "1.4.0"
 wear = "1.3.0"
+# RemoteInputIntentHelper for on-wrist text entry (pairing form): the Wear
+# system input activity (keyboard/voice) that returns committed text as an
+# activity result — inline Compose BasicTextField cannot reliably drive the
+# watch's IME (Samsung keyboard drops composing glyphs). 1.1.0 is stable.
+wearInput = "1.1.0"
 wearOngoing = "1.0.0"
 # Glanceables (issue #28): tiles 1.4.x is the line built against protolayout
 # 1.2.x — both stable Aug 2024, compiled against SDK 35, and known-good under
@@ -40,6 +45,7 @@ compose-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-mani
 wear-compose-material = { group = "androidx.wear.compose", name = "compose-material", version.ref = "wearCompose" }
 wear-compose-foundation = { group = "androidx.wear.compose", name = "compose-foundation", version.ref = "wearCompose" }
 wear = { group = "androidx.wear", name = "wear", version.ref = "wear" }
+wear-input = { group = "androidx.wear", name = "wear-input", version.ref = "wearInput" }
 wear-ongoing = { group = "androidx.wear", name = "wear-ongoing", version.ref = "wearOngoing" }
 wear-tiles = { group = "androidx.wear.tiles", name = "tiles", version.ref = "wearTiles" }
 wear-protolayout = { group = "androidx.wear.protolayout", name = "protolayout", version.ref = "protolayout" }

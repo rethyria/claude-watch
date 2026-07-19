@@ -9,7 +9,12 @@
 // re-pairing never requires unpair (which wipes credentials) first.
 package dev.claudewatch.wear.ui.halo
 
+import android.app.Activity
+import android.app.RemoteInput
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,7 +25,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -29,14 +33,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material.Chip
 import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.Text
+import androidx.wear.input.RemoteInputIntentHelper
 import dev.claudewatch.wear.BridgeViewModel
 
 @Composable
@@ -83,7 +86,7 @@ fun HaloOfflineScreen(
                 PairField("port", port, "port") { port = it }
                 PairField("code", code, "code") { code = it }
                 Chip(
-                    onClick = { onPair(host, port, code) },
+                    onClick = { onPair(host.trim(), port.trim(), code.trim()) },
                     label = {
                         Text("pair", fontSize = Halo.Type.Caption, color = Halo.Palette.ApproveText)
                     },
@@ -112,20 +115,81 @@ fun HaloOfflineScreen(
     }
 }
 
+/**
+ * One pairing field. NOT an inline Compose text field: on the watch those
+ * cannot reliably drive the system IME — the Samsung keyboard streams input
+ * through the composing region, which the Compose BasicTextField interop
+ * drops on this device (the caret moves but the glyphs never stick), so a
+ * real finger could tap and type and end up with an empty field. Instead the
+ * field is a tappable row that launches the Wear RemoteInput activity — the
+ * platform's own full-screen input surface (keyboard + voice) — which hands
+ * the finished string back as an activity result. No inline editing, no
+ * composing-region interop, so no keyboard can corrupt it mid-type; this is
+ * the input path Wear itself recommends over embedded text fields. The tag
+ * stays on the tappable row so the instrumented pairing leg can still find
+ * it (it drives the value through a test seam, not the real IME — the IME
+ * cannot run headless anyway).
+ */
 @Composable
 private fun PairField(label: String, value: String, tag: String, onChange: (String) -> Unit) {
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            RemoteInput.getResultsFromIntent(result.data)
+                ?.getCharSequence(REMOTE_INPUT_KEY)
+                ?.toString()
+                ?.let { onChange(it.trim()) }
+        }
+    }
     Text(label, fontSize = Halo.Type.Min, color = Halo.Palette.TextFaint)
-    BasicTextField(
-        value = value,
-        onValueChange = onChange,
-        singleLine = true,
-        textStyle = TextStyle(color = Halo.Palette.TextPrimary, fontSize = Halo.Type.Body),
-        cursorBrush = SolidColor(Halo.Palette.TextPrimary),
+    Box(
         modifier = Modifier
             .fillMaxWidth()
             .background(Halo.Palette.Surface, RoundedCornerShape(8.dp))
-            .padding(horizontal = 8.dp, vertical = 6.dp)
+            .clickable {
+                // The instrumented pairing leg cannot drive the Wear
+                // RemoteInput activity (no headless IME) and the field is no
+                // longer an inline node performTextInput can fill, so a test
+                // seam short-circuits the tap to a canned value (see
+                // PairFieldInput). Production leaves the seam null and takes
+                // the real RemoteInput path — the only path a finger takes.
+                val seam = PairFieldInput.override
+                if (seam != null) {
+                    seam(label)?.let { onChange(it.trim()) }
+                    return@clickable
+                }
+                val remoteInput = RemoteInput.Builder(REMOTE_INPUT_KEY)
+                    .setLabel(label)
+                    .build()
+                val intent = RemoteInputIntentHelper.createActionRemoteInputIntent()
+                RemoteInputIntentHelper.putRemoteInputsExtra(intent, listOf(remoteInput))
+                launcher.launch(intent)
+            }
+            .padding(horizontal = 8.dp, vertical = 8.dp)
             .testTag(tag),
-    )
+    ) {
+        Text(
+            text = value.ifEmpty { "tap to enter" },
+            fontSize = Halo.Type.Body,
+            color = if (value.isEmpty()) Halo.Palette.TextFaint else Halo.Palette.TextPrimary,
+        )
+    }
     Spacer(Modifier.height(4.dp))
+}
+
+private const val REMOTE_INPUT_KEY = "pair_field_value"
+
+/**
+ * Test seam for [PairField] (the resolver-seam idiom used by
+ * BridgeSessionService/GlanceStateSource). When [override] is non-null,
+ * tapping a pairing field routes to it — returning the string to fill, or
+ * null to leave the field unchanged (a cancelled input) — instead of
+ * launching the Wear RemoteInput activity, which needs a real IME and does
+ * not exist in the instrumented harness. Production never sets it, so a real
+ * finger always gets the real system input surface.
+ */
+internal object PairFieldInput {
+    @Volatile
+    internal var override: ((label: String) -> String?)? = null
 }
