@@ -23,8 +23,6 @@ import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -367,22 +365,19 @@ private fun HaloAppBody(
 
         // Issue #56: the spawn target picker, over the list that summoned it
         // and UNDER the approval card / offline takeover (a prompt or a
-        // dropped stream outranks choosing a spawn directory). Modal like the
-        // card: consumeAllGestures keeps stray horizontal drags off the
-        // invisible session rows underneath (the picker's own list consumes
-        // vertical drags itself, and its children are hit first).
+        // dropped stream outranks choosing a spawn directory).
         if (spawnPickerOpen) {
-            // Deliberately NO consumeAllGestures() here, unlike the card
-            // overlay below: consuming the down in the Main pass reads to the
-            // picker list's scrollable as "another detector claimed this
-            // gesture", cancelling its drag recognition — which silently
-            // killed the nested-scroll swipe-down cancel for real fingers
-            // (device-bisected). No shield is needed either: the picker's
-            // ScalingLazyColumn is fillMaxSize, so ITS handlers own every hit
-            // on screen and nothing falls through to the session list below;
-            // and this overlay is a root-Box sibling, so no ancestor back
-            // detector can double-handle the pull. The card differs on both
-            // counts (smaller content, gesture detector on the box itself).
+            // NO gesture-swallowing wrapper: consuming the down in the Main
+            // pass reads to the picker list's scrollable as "another detector
+            // claimed this gesture", cancelling its drag recognition — which
+            // silently killed the nested-scroll swipe-down cancel for real
+            // fingers (device-bisected). The offline takeover below carried
+            // the exact same bug for its tap targets — the pair Chip and text
+            // fields — until it too dropped the wrapper. No shield is needed
+            // either: the picker's ScalingLazyColumn is fillMaxSize, so ITS
+            // handlers own every hit on screen and nothing falls through to
+            // the session list below; and this overlay is a root-Box sibling,
+            // so no ancestor back detector can double-handle the pull.
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -602,12 +597,21 @@ private fun HaloAppBody(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Halo.Palette.Background)
-                    // A takeover, not a scrim: swallow every gesture so the
-                    // hidden pager/centerpiece/back detectors can't be driven
-                    // invisibly while offline. The screen's own controls are
-                    // children and are hit first.
-                    .consumeAllGestures(),
+                    .background(Halo.Palette.Background),
+                // NO gesture-swallowing wrapper — the same real-touch trap the
+                // spawn picker above was device-bisected out of. Consuming the
+                // whole down..up stream in the Main pass reads to a CHILD's tap
+                // recognizer as "another detector claimed this gesture", so the
+                // pair Chip and the host/port/code fields never registered a
+                // real finger's tap: only synthetic adb/instrumented taps —
+                // whose instant single-event stream slips through — worked,
+                // which is why every gate stayed green while on-wrist pairing
+                // was impossible (the whole reason this screen exists). No
+                // shield is needed either, for the picker's reasons: this Box
+                // is a root-Box sibling (no ancestor back detector can
+                // double-handle a gesture) and HaloOfflineScreen's Column is
+                // fillMaxSize, so its own controls own every hit — and offline
+                // there are no sessions behind it to drive anyway.
             ) {
                 HaloOfflineScreen(ui = ui, onPair = actions.onPair)
             }
@@ -637,22 +641,6 @@ private fun HaloAppBody(
 private fun BridgeViewModel.UiState.isOffline(): Boolean =
     !paired || status.contains("reconnecting")
 
-/**
- * Modal scrim: a pointer node here removes the sibling layers underneath
- * from the hit path (a bare background does NOT hit-test, so without this
- * every gesture falls through), and consuming keeps ancestors quiet too.
- * Children of the overlay still receive their events first.
- */
-private fun Modifier.consumeAllGestures(): Modifier = pointerInput(Unit) {
-    awaitEachGesture {
-        awaitFirstDown(requireUnconsumed = false).consume()
-        while (true) {
-            val event = awaitPointerEvent()
-            event.changes.forEach { it.consume() }
-            if (event.changes.none { it.pressed }) break
-        }
-    }
-}
 
 // ── Depth layers & motion ───────────────────────────────────────────────────
 

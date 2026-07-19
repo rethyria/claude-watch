@@ -16,8 +16,6 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performScrollToNode
-import androidx.compose.ui.test.performTextClearance
-import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.swipeLeft
@@ -33,9 +31,12 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONObject
+import dev.claudewatch.wear.ui.halo.PairFieldInput
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -100,9 +101,32 @@ class WalkingSkeletonTest {
                 .build(),
         ).execute()
 
-    private fun fill(tag: String, value: String) {
-        compose.onNodeWithTag(tag).performScrollTo().performTextClearance()
-        compose.onNodeWithTag(tag).performTextInput(value)
+    // Arm the pairing-field seam before the UI is touched: each field now
+    // launches the Wear RemoteInput activity (no headless IME in this
+    // harness), so a field tap short-circuits to its canned value instead.
+    @Before
+    fun armPairFieldSeam() {
+        PairFieldInput.override = { label ->
+            when (label) {
+                "host" -> bridgeHost
+                "port" -> bridgePort.toString()
+                "code" -> pairingCode
+                else -> null
+            }
+        }
+    }
+
+    // Process-global seam: clear it so it never leaks into another test class
+    // in the same instrumentation run.
+    @After
+    fun clearPairFieldSeam() {
+        PairFieldInput.override = null
+    }
+
+    // "Filling" a pairing field is now just tapping it: the armed seam
+    // supplies the value the RemoteInput activity would have returned.
+    private fun fill(tag: String) {
+        compose.onNodeWithTag(tag).performScrollTo().performClick()
     }
 
     private fun waitForText(tag: String, substring: String, timeoutMs: Long = 30_000) {
@@ -275,9 +299,9 @@ class WalkingSkeletonTest {
             compose.onNodeWithTag("repairButton").performScrollTo().performClick()
             compose.waitForIdle()
         }
-        fill("host", bridgeHost)
-        fill("port", bridgePort.toString())
-        fill("code", pairingCode)
+        fill("host")
+        fill("port")
+        fill("code")
         compose.onNodeWithTag("pairButton").performScrollTo().performClick()
         // Gate on the app reaching the online home (the stream is open, or
         // connecting with backlog replay to follow), not on a status string:
