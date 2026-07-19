@@ -350,10 +350,16 @@ hosted by `BridgeSessionService`; end-to-end in
   key — keep concurrent prompts' intents from recycling into
   approve-the-wrong-permission. Plain actions are `FLAG_IMMUTABLE`.
 - **RemoteInput rule:** a SINGLE-question AskUserQuestion prompt gets one
-  free-text "Reply" action (`RemoteInput`, `FLAG_MUTABLE` — immutable would
-  strip the results on API 31+); blank/null replies are DROPPED, never sent.
-  A MULTI-question prompt gets NO actions at all — a wrist notification
-  cannot walk the buffered multi-question form; the in-app card owns it.
+  "Reply" action (`RemoteInput`, `FLAG_MUTABLE` — immutable would strip the
+  results on API 31+); blank/null replies are DROPPED, never sent. The
+  question's OWN option labels are the RemoteInput choice chips
+  (`setChoices`), and ML Smart Replies are banned on the action
+  (`setAllowGeneratedReplies(false)`) — live-demo lesson: Wear's generated
+  chips ("Good question") rendered exactly like agent options, and a
+  mis-tap answers a blocked session with Google's guess. Free text via
+  keyboard/voice coexists with the chips. A MULTI-question prompt gets NO
+  actions at all — a wrist notification cannot walk the buffered
+  multi-question form; the in-app card owns it.
 - **Foreground gating:** posts only while the app UI is not visible
   (`AppVisibility`, flipped by MainActivity ON_START/ON_STOP). While
   visible the in-app card is the surface; a prompt that arrives while

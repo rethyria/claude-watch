@@ -345,6 +345,20 @@ class ApprovalNotificationFlowTest {
             .firstOrNull { !it.remoteInputs.isNullOrEmpty() }
             ?: throw AssertionError("single-question prompt has no RemoteInput action")
 
+        // The reply surface speaks the AGENT's language and only that: the
+        // question's own option labels are the choice chips, and Wear's
+        // ML-generated Smart Replies are banned (live-demo lesson: "Good
+        // question" rendered as if the agent offered it, and a mis-tap
+        // answers a blocked session with Google's guess).
+        assertEquals(
+            listOf("Yes please"),
+            reply.remoteInputs!!.single().choices.orEmpty().map { it.toString() },
+        )
+        assertTrue(
+            "generated smart replies must be off on the reply action",
+            !reply.allowGeneratedReplies,
+        )
+
         // Simulate the system UI delivering the typed/dictated reply: the
         // results ride a fill-in intent exactly as RemoteInput specifies —
         // which is also why the action's PendingIntent must be MUTABLE (an
