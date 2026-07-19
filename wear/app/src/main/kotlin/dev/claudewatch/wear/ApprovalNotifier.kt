@@ -68,6 +68,19 @@ internal const val MAX_WEAR_NOTIFICATION_ACTIONS = 3
  * ("Still waiting", "Good question") that look exactly like agent options —
  * and a mis-tap sends Google's guess to a blocked session as a real answer.
  * The agent's labels are the only chips allowed on this surface.
+ *
+ * [optionAnswers] are those same labels AS PLAIN ACTION BUTTONS — the
+ * second live-demo lesson: this Wear image renders RemoteInput choices
+ * NOWHERE (not on the card, whose chip row belongs to the banned
+ * smart-reply machinery, and not on the input screen), so setChoices alone
+ * quietly degraded the wrist to free-text only. Plain actions are the one
+ * surface that renders deterministically (the Approve/Deny buttons prove
+ * it), so the option labels become one-tap answer buttons — but ONLY when
+ * the FULL option set fits under the action cap alongside Reply
+ * (single-select, ≤ [MAX_OPTION_ANSWER_ACTIONS] options). A truncated menu
+ * would misrepresent the agent's question; past the cap (or multiSelect,
+ * whose answer is a joined toggle set no single button expresses) the
+ * wrist keeps free-text Reply and the in-app card owns the full set.
  */
 data class ApprovalNotificationModel(
     val permissionId: String,
@@ -76,7 +89,15 @@ data class ApprovalNotificationModel(
     val options: List<PermissionOption>,
     val remoteInputQuestion: Boolean,
     val replyChoices: List<String> = emptyList(),
+    val optionAnswers: List<String> = emptyList(),
 )
+
+/**
+ * How many option-answer buttons fit next to the free-text Reply under
+ * Wear's 3-action cap. All-or-nothing: see [ApprovalNotificationModel
+ * .optionAnswers].
+ */
+internal const val MAX_OPTION_ANSWER_ACTIONS = MAX_WEAR_NOTIFICATION_ACTIONS - 1
 
 /** Derive the wrist-rendered content for one queued prompt. Pure. */
 internal fun approvalNotificationModel(
@@ -117,6 +138,14 @@ internal fun approvalNotificationModel(
         } else {
             emptyList()
         },
+        // ...and as one-tap action BUTTONS when the whole set fits (see the
+        // field's doc for the all-or-nothing rule and the multiSelect
+        // exclusion).
+        optionAnswers = questions.singleOrNull()
+            ?.takeUnless { it.multiSelect }
+            ?.options?.map { it.label }
+            ?.takeIf { it.isNotEmpty() && it.size <= MAX_OPTION_ANSWER_ACTIONS }
+            ?: emptyList(),
     )
 }
 
@@ -273,6 +302,12 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
             // replaces silently instead of buzzing again.
             .setOnlyAlertOnce(true)
         if (model.remoteInputQuestion) {
+            // Option buttons FIRST (the agent's expected answers, one tap),
+            // free-text Reply last — ≤ 3 total by construction (see
+            // MAX_OPTION_ANSWER_ACTIONS).
+            for (label in model.optionAnswers) {
+                builder.addAction(optionAnswerAction(model.permissionId, label))
+            }
             builder.addAction(replyAction(model))
         } else {
             for (option in model.options) {
@@ -311,6 +346,31 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return NotificationCompat.Action.Builder(0, approvalActionTitle(option.behavior), pending).build()
+    }
+
+    /**
+     * One option label as a one-tap ANSWER button (see
+     * [ApprovalNotificationModel.optionAnswers]): the service's answer path
+     * reads [EXTRA_ANSWER_TEXT] and calls the same answerQuestions entry
+     * point as the free-text reply — one wire shape, two input surfaces.
+     * The "answer:" discriminator prefix keeps these PendingIntents distinct
+     * from behavior actions AND from each other (the label is part of both
+     * the requestCode mix and the data URI, so two options of one prompt
+     * can never collapse into answering with the wrong label).
+     */
+    private fun optionAnswerAction(permissionId: String, label: String): NotificationCompat.Action {
+        val discriminator = "answer:$label"
+        val intent = answerIntent(permissionId, discriminator = discriminator)
+            .putExtra(EXTRA_ANSWER_TEXT, label)
+        val pending = PendingIntent.getService(
+            context,
+            approvalActionRequestCode(permissionId, discriminator),
+            intent,
+            // IMMUTABLE like the behavior actions: the label rides the
+            // intent as-built; nothing needs filling in.
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return NotificationCompat.Action.Builder(0, label, pending).build()
     }
 
     /**
@@ -368,6 +428,14 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
         const val ACTION_ANSWER = "dev.claudewatch.wear.action.ANSWER"
         const val EXTRA_PERMISSION_ID = "dev.claudewatch.wear.extra.PERMISSION_ID"
         const val EXTRA_BEHAVIOR = "dev.claudewatch.wear.extra.BEHAVIOR"
+
+        /**
+         * A pre-composed question answer riding an option-button tap (see
+         * [ApprovalNotificationModel.optionAnswers]) — the service answers
+         * with this text through the same answerQuestions path as a typed
+         * RemoteInput reply.
+         */
+        const val EXTRA_ANSWER_TEXT = "dev.claudewatch.wear.extra.ANSWER_TEXT"
         const val KEY_QUESTION_ANSWER = "dev.claudewatch.wear.remoteinput.QUESTION_ANSWER"
 
         /** Namespaces the reply action's requestCode/URI away from every behavior key. */

@@ -351,13 +351,20 @@ hosted by `BridgeSessionService`; end-to-end in
   approve-the-wrong-permission. Plain actions are `FLAG_IMMUTABLE`.
 - **RemoteInput rule:** a SINGLE-question AskUserQuestion prompt gets one
   "Reply" action (`RemoteInput`, `FLAG_MUTABLE` — immutable would strip the
-  results on API 31+); blank/null replies are DROPPED, never sent. The
-  question's OWN option labels are the RemoteInput choice chips
-  (`setChoices`), and ML Smart Replies are banned on the action
-  (`setAllowGeneratedReplies(false)`) — live-demo lesson: Wear's generated
-  chips ("Good question") rendered exactly like agent options, and a
-  mis-tap answers a blocked session with Google's guess. Free text via
-  keyboard/voice coexists with the chips. A MULTI-question prompt gets NO
+  results on API 31+); blank/null replies are DROPPED, never sent. ML Smart
+  Replies are banned on the action (`setAllowGeneratedReplies(false)`) —
+  live-demo lesson #1: Wear's generated chips ("Good question") rendered
+  exactly like agent options, and a mis-tap answers a blocked session with
+  Google's guess. The question's own labels ride `setChoices` too, but —
+  live-demo lesson #2 — this Wear image renders those chips NOWHERE (the
+  card's chip row belongs to the banned smart-reply machinery), so the
+  labels ALSO become plain one-tap ACTION BUTTONS, the one surface that
+  renders deterministically: single-select questions whose FULL option set
+  fits next to Reply under the 3-action cap (≤ 2 options) get one button
+  per label, answering through the same answerQuestions path as a typed
+  reply (`EXTRA_ANSWER_TEXT`). All-or-nothing: 3+ options or multiSelect
+  render NO buttons (a truncated menu would misrepresent the question) —
+  Reply + the in-app card own those. A MULTI-question prompt gets NO
   actions at all — a wrist notification cannot walk the buffered
   multi-question form; the in-app card owns it.
 - **Foreground gating:** posts only while the app UI is not visible

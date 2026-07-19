@@ -385,6 +385,15 @@ class BridgeSessionService : Service() {
             if (!text.isNullOrEmpty()) vm.answerQuestions(permissionId, listOf(text))
             return
         }
+        // An option BUTTON tap: the label rode the intent as-built
+        // (EXTRA_ANSWER_TEXT), answered through the exact same entry point
+        // as a typed reply — one wire shape, two input surfaces. Never
+        // blank: the labels come from the agent's own option list.
+        val optionAnswer = intent.getStringExtra(ApprovalNotifier.EXTRA_ANSWER_TEXT)
+        if (optionAnswer != null) {
+            vm.answerQuestions(permissionId, listOf(optionAnswer))
+            return
+        }
         val behavior = intent.getStringExtra(ApprovalNotifier.EXTRA_BEHAVIOR) ?: return
         vm.answerPermission(permissionId, behavior)
     }

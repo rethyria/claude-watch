@@ -395,6 +395,55 @@ class ApprovalNotificationFlowTest {
     }
 
     // ------------------------------------------------------------------
+    // Second live-demo lesson: setChoices chips render NOWHERE on this Wear
+    // image, so the option labels double as plain one-tap action BUTTONS —
+    // the only deterministically rendered surface. This leg drives one.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun optionButtonAnswersWithItsOwnLabel() {
+        val question =
+            """{"permissionId":"perm-opt","sessionId":"s-1","tool_name":"AskUserQuestion",""" +
+                """"tool_input":{"questions":[{"question":"Ship now or wait?",""" +
+                """"options":[{"label":"Ship now"},{"label":"Wait for review"}]}]}}"""
+        pair(
+            buildString {
+                append(":connected\n\n")
+                append(frame(1, "session", sessionEvent))
+                append(frame(2, "permission-request", question))
+                append(holdOpenPad())
+            },
+        )
+
+        waitFor("perm-opt notification") { approvalNotification("perm-opt") != null }
+        val posted = approvalNotification("perm-opt")!!
+        val actions = posted.notification.actions.orEmpty()
+        // Both option buttons + the free-text Reply, in that order — the
+        // full 3-action budget, never a truncated option menu.
+        assertEquals(
+            listOf("Ship now", "Wait for review", "Reply"),
+            actions.map { it.title.toString() },
+        )
+
+        // Tap the SECOND option's button: the answer POST must carry THAT
+        // label (a collapsed PendingIntent would answer with the first's).
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        actions.first { it.title.toString() == "Wait for review" }.actionIntent.send()
+
+        val request = takeRequest("option answer POST")
+        assertEquals("/v1/command", request.path)
+        val body = JSONObject(request.body.readUtf8())
+        assertEquals("perm-opt", body.getString("permissionId"))
+        val decision = body.getJSONObject("decision")
+        assertEquals("allow", decision.getString("behavior"))
+        val answers = decision.getJSONArray("answers")
+        assertEquals(1, answers.length())
+        assertEquals("Wait for review", answers.getString(0))
+
+        waitFor("perm-opt cancelled") { approvalNotification("perm-opt") == null }
+    }
+
+    // ------------------------------------------------------------------
     // Acceptance 4's guard rail: a blank or resultless RemoteInput delivery
     // is DROPPED — "never answer with empty text". An accidental empty
     // dictation must not become the agent's answer; before this test

@@ -103,6 +103,48 @@ class ApprovalNotifierModelTest {
         // chips — live-demo lesson: without them Wear invents ML Smart
         // Replies ("Good question") that masquerade as agent options.
         assertEquals(listOf("PostgreSQL"), model.replyChoices)
+        // ...and one-tap action BUTTONS (second live-demo lesson: this Wear
+        // image renders setChoices chips nowhere — plain actions are the
+        // only deterministic surface).
+        assertEquals(listOf("PostgreSQL"), model.optionAnswers)
+    }
+
+    @Test
+    fun optionAnswerButtonsAreAllOrNothing() {
+        fun questionWith(labels: List<String>, multiSelect: Boolean = false) =
+            approvalNotificationModel(
+                prompt(
+                    id = "perm-q",
+                    toolName = "AskUserQuestion",
+                    summary = "[AskUserQuestion]",
+                    options = emptyList(),
+                    questions = listOf(
+                        AskUserQuestion(
+                            question = "Pick one",
+                            options = labels.map { AskUserQuestionOption(it) },
+                            multiSelect = multiSelect,
+                        ),
+                    ),
+                ),
+            )
+        // Two options + Reply = the full 3-action budget: both render.
+        assertEquals(listOf("A", "B"), questionWith(listOf("A", "B")).optionAnswers)
+        // Three options CANNOT all fit next to Reply — a truncated menu
+        // would misrepresent the agent's question, so none render (the
+        // in-app card owns the full set; Reply stays for free text).
+        assertEquals(emptyList<String>(), questionWith(listOf("A", "B", "C")).optionAnswers)
+        // multiSelect answers are a JOINED toggle set — no single button
+        // expresses one, so the wrist keeps Reply + the card.
+        assertEquals(
+            emptyList<String>(),
+            questionWith(listOf("A", "B"), multiSelect = true).optionAnswers,
+        )
+        // The choice chips are unaffected by the button cap: they list every
+        // label wherever the platform renders them.
+        assertEquals(
+            listOf("A", "B", "C"),
+            questionWith(listOf("A", "B", "C")).replyChoices,
+        )
     }
 
     @Test
