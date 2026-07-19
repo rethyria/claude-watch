@@ -14,7 +14,10 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.wear.ongoing.OngoingActivity
 import androidx.wear.ongoing.Status
+import dev.claudewatch.wear.glance.glanceStatus
+import dev.claudewatch.wear.glance.requestGlanceRefresh
 import dev.claudewatch.wear.net.ConnectionState
+import dev.claudewatch.wear.ui.halo.HaloModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -22,6 +25,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 /**
@@ -181,6 +186,34 @@ class BridgeSessionService : Service() {
         approvalNotifier = ApprovalNotifier(this)
         approvalCollector = ApprovalNotificationCollector(approvalNotifier)
         approvalCollector.attach(scope, vm.state)
+
+        // Glanceables (issue #28): a THIRD collector, pushing tile +
+        // complication refreshes on GlanceStatus CHANGES only. The platform
+        // enforces a ~30 s floor between honored tile updates (excess
+        // requests are dropped/deferred, and chronic abusers get throttled
+        // harder), so this must not fire per state emission — the reducer
+        // emits on every SSE frame. distinctUntilChanged on the DERIVED
+        // GlanceStatus keeps us far under the floor: connection transitions
+        // are rare by construction (backoff-paced), and the census
+        // (session/project/waiting counts) only steps on session lifecycle
+        // events, which the reducer has already debounced down from the
+        // output firehose — output frames change the feed, not the census,
+        // so they dedupe to nothing here. The derivation runs on the
+        // RESOLVED vm (the test seam), which in production is the same
+        // singleton peekGlanceStatus reads: push-trigger and rendered truth
+        // can't diverge.
+        scope.launch {
+            combine(vm.connection, vm.state) { conn, ui -> glanceStatus(conn, HaloModel.from(ui)) }
+                .distinctUntilChanged()
+                .collect { requestGlanceRefresh(applicationContext) }
+        }
+        // Service birth is itself glance-relevant news (a sticky restart or a
+        // fresh pairing means the last pushed render predates this process).
+        // The collector's first emission above usually covers it, but that
+        // emission rides a coroutine dispatch — this direct call is the
+        // belt: the platform coalesces the duplicate, and a dropped birth
+        // update is exactly the staleness class this issue exists to kill.
+        requestGlanceRefresh(applicationContext)
     }
 
     /**
@@ -297,6 +330,18 @@ class BridgeSessionService : Service() {
         // Still-pending prompts come back honestly: a restarted service's
         // fresh collector re-announces whatever the queue still holds.
         approvalCollector.cancelAllPosted()
+        // Glanceables (issue #28): ONE final push now that this service —
+        // the thing that kept the stream alive — is dying. Without it the
+        // tile/complication freeze on their last render, which for a healthy
+        // session was GREEN: the exact watchOS staleness bug (complication
+        // green through an outage) this issue exists to kill. The refresh
+        // makes the platform re-request AFTER we're gone; peekGlanceStatus
+        // then reads the terminal connection state (user disconnect /
+        // AuthExpired / BridgeMismatch), or null-peeks in a fresh process —
+        // either way the glanceables SAY disconnected instead of freezing
+        // green. Fired after scope.cancel() above, so no in-flight collector
+        // emission can race a second, staler push behind this one.
+        requestGlanceRefresh(applicationContext)
         super.onDestroy()
     }
 

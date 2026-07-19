@@ -370,3 +370,64 @@ hosted by `BridgeSessionService`; end-to-end in
   after the user's Disconnect resumes the engine just to deliver the
   answer, but returns `START_NOT_STICKY` — a tap never re-mints the sticky
   promise the Disconnect revoked.
+
+## Glanceables (#28)
+
+A ProtoLayout **Tile** (`glance/HaloTileService`) and a **SHORT_TEXT
+complication** (`glance/HaloComplicationService`), both rendering one shared
+pure derivation: `glanceStatus(ConnectionState?, HaloModel?) → GlanceStatus
+(healthy, statusText, detailText, shortText)` in `glance/GlanceModel.kt`,
+plain-JVM-tabled in `GlanceModelTest`.
+
+- **The honesty rule** (the reason the issue exists): status reflects ACTUAL
+  STREAM HEALTH. `healthy` is true for exactly one state — `Connected` —
+  never for paired/credentials-exist. The watchOS complication this replaces
+  derived green from optimistic pairing state and glowed through outages;
+  `GlanceModelTest.reconnectingWhilePairedWithLiveSessionsIsNeverHealthy` is
+  that bug as a permanently failing sabotage trap. Unhealthy accent is Halo
+  **Error red** (the offline screen's headline color), healthy is **Running
+  green** — terracotta stays reserved for "waiting for YOU".
+- **Peek, never start (passivity):** glanceables read state via
+  `BridgeViewModel.peek()` — returns the singleton or NULL without
+  constructing (constructing fires `engine.start()`); a tile-carousel swipe
+  must not spin up the network. Null peek renders as honest
+  "disconnected / tap to open" (`peekGlanceStatus`). The instrumented seam
+  is `GlanceStateSource.resolver` (the #25 viewModelResolver pattern),
+  restored in `@After`.
+- **Census reuse:** the connected headline is the home ring's census
+  wording VERBATIM via the extracted `sessionCensusText`/`haloCensusText`
+  (HaloAllPage.kt) — same fact, same words, and the census comes from
+  `HaloModel.from`, so honest-hidden sessions (#53) and queue orphans are
+  already folded in. Detail line: `N waiting` (the approval card's wording)
+  beats `N projects`.
+- **Push points:** a third collector in `BridgeSessionService.onCreate`
+  derives GlanceStatus from `combine(connection, state)` and calls
+  `requestGlanceRefresh` (tile updater + `requestUpdateAll`) on
+  **distinctUntilChanged CHANGE only** — the platform enforces a ~30 s tile
+  update floor, and status/census changes are rare while output frames
+  dedupe to nothing. Service BIRTH fires one explicit refresh (the last
+  pushed render predates this process) and DEATH fires one final refresh in
+  `onDestroy` — the re-request lands on peekGlanceStatus reading the
+  terminal state, flipping the glanceables to "disconnected" instead of
+  freezing on the last healthy green (the exact watchOS staleness bug).
+  The tile also sets `freshnessIntervalMillis` = 60 s as the passive net
+  for a dead process. The complication declares `UPDATE_PERIOD_SECONDS`
+  300: pushes stay the update mechanism; the 5-minute poll is the staleness
+  BOUND for a process killed WITHOUT `onDestroy` (LMK/OEM kill — no
+  death-flip push fires there, and push-only would freeze the face on the
+  last healthy value indefinitely). Each poll costs one null-safe peek.
+- **Short-form table** (SHORT_TEXT budgets ~7 chars; mapped in the PURE
+  layer as `GlanceStatus.shortText` so tile and complication cannot
+  drift): Connected → `"N sess"` (zero included, `"0 sess"`);
+  Connecting/Reconnecting → `recon`; Stopped & null-peek → `off`; Pairing →
+  `pairing`; PairFailed → `no pair`; AuthExpired & BridgeMismatch →
+  `re-pair` (the FIX fits in 7 chars, "wrong bridge" doesn't); ProtoMismatch
+  → `update`. Long form rides as the complication's content description.
+- **Carousel preview:** `drawable/tile_preview` is a static ring-glyph
+  brand mark (ic_bridge_chip in Running green on AMOLED black), NOT a fake
+  layout screenshot — a hand-made render would silently rot the moment
+  `tileLayout` changes. Instrumented coverage is proto-tree assertions
+  (`HaloTileServiceTest`, `HaloComplicationServiceTest`) instead of the
+  issue's adb/screenshot wording: the carousel isn't automatable on the e2e
+  image, and the layout proto IS what the tile says — honesty is the
+  load-bearing acceptance, rendering protos is the platform's contract.
