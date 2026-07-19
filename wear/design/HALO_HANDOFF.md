@@ -314,3 +314,59 @@ root (TimeText stays visible underneath — it is the ambient clock), the
 infinite animations frozen (`LocalHaloAmbient`; currently the usage
 skeleton's pulse), and testTag `haloAmbient` present ONLY while ambient.
 Wake restores the full screen in place.
+
+## Actionable notifications (#25)
+
+While the app is backgrounded, a permission request arriving over the live
+SSE stream (which the #24 service keeps open) buzzes the wrist as a
+HIGH-importance notification whose actions answer WITHOUT opening the app.
+Implementation in `ApprovalNotifier.kt` (pure content model + queue diff,
+plain-JVM-tested in `ApprovalNotifierModelTest`; the collector's gating /
+swallow / teardown-bookkeeping branches JVM-tested against the
+`ApprovalNotificationSink` seam in `ApprovalNotificationCollectorTest`)
+hosted by `BridgeSessionService`; end-to-end in
+`ApprovalNotificationFlowTest`, including the blank-reply drop.
+
+- **Channel:** `"approvals"`, `IMPORTANCE_HIGH` — the importance IS the buzz
+  (no custom vibration code; the platform and the user's channel settings
+  own the pattern). Category `CATEGORY_REMINDER`: CALL-class urgency would
+  hijack Wear's call surface, RECOMMENDATION is ranked down as passive
+  content; "the agent is blocked on you" is a reminder-class act-now.
+- **Per-permissionId tagging:** `notify(tag = permissionId, id = 25)` /
+  `cancel(tag, 25)` — one notification per prompt, never a mutating
+  singleton; concurrent prompts coexist and resolve independently, and an
+  unchanged id is never re-posted (`setOnlyAlertOnce` as the belt to the
+  diff's braces).
+- **Action wiring:** one action per canonical `PendingPermission.options`
+  entry VERBATIM (behavior-keyed, order kept — #17's rule, never inferred
+  from labels), capped at 3 (Wear's action limit; the in-app card renders
+  any overflow, and the content tap opens it). Wear forbids
+  BroadcastReceiver actions, so every action is `PendingIntent.getService`
+  to `BridgeSessionService` (`ACTION_ANSWER` + id/behavior extras), which
+  answers through the SAME ViewModel entry points as the in-app card —
+  ack-gated, 404-drops, retryable failures keep the prompt queued in-app.
+  PendingIntent identity ignores extras, so distinct requestCodes derived
+  from (permissionId, behavior) — plus a per-pair data URI as the second
+  key — keep concurrent prompts' intents from recycling into
+  approve-the-wrong-permission. Plain actions are `FLAG_IMMUTABLE`.
+- **RemoteInput rule:** a SINGLE-question AskUserQuestion prompt gets one
+  free-text "Reply" action (`RemoteInput`, `FLAG_MUTABLE` — immutable would
+  strip the results on API 31+); blank/null replies are DROPPED, never sent.
+  A MULTI-question prompt gets NO actions at all — a wrist notification
+  cannot walk the buffered multi-question form; the in-app card owns it.
+- **Foreground gating:** posts only while the app UI is not visible
+  (`AppVisibility`, flipped by MainActivity ON_START/ON_STOP). While
+  visible the in-app card is the surface; a prompt that arrives while
+  visible is never posted later either (the card already has it).
+  Departures always cancel regardless (idempotent).
+- **Cancellation = queue-diff:** the collector diffs `permissionQueue`
+  emissions; ids that leave the queue cancel their tag. Answered here,
+  answered elsewhere (404), expired, permission-cleared, local dismiss —
+  all flow through the reducer/ViewModel's queue removal, so the diff is
+  the single cancellation path (no separate cleared listener to drift).
+  Service death cancels everything it posted (dead actions are dead ends —
+  the #24 zombie-notification reasoning); a restarted service's fresh
+  collector re-posts whatever is still pending. An answer tap that lands
+  after the user's Disconnect resumes the engine just to deliver the
+  answer, but returns `START_NOT_STICKY` — a tap never re-mints the sticky
+  promise the Disconnect revoked.
