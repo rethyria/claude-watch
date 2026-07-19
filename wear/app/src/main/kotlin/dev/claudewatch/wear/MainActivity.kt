@@ -68,9 +68,24 @@ class MainActivity : ComponentActivity() {
         // start() is guarded upstream — a live engine no-ops, and without
         // credentials it stays Stopped — so this is free when nothing was
         // disconnected and load-bearing when something was.
+        //
+        // The same observer owns the process-wide visibility flag (issue
+        // #25): while the UI is on screen the in-app card is the approval
+        // surface and the service's collector must not post notifications
+        // over it. The flag flips BEFORE resume() on purpose — prompts the
+        // resume-reconnect replays land with the UI already marked visible,
+        // so opening the app never buzzes for the card it is about to show.
+        // ON_START/ON_STOP (not RESUME/PAUSE): a permission dialog or the
+        // recognizer activity pauses us while our UI is still the surface
+        // underneath, and buzzing during those would be the same noise.
         lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
+                AppVisibility.uiVisible = true
                 BridgeViewModel.singleton(applicationContext).resume()
+            }
+
+            override fun onStop(owner: LifecycleOwner) {
+                AppVisibility.uiVisible = false
             }
         })
         setContent {

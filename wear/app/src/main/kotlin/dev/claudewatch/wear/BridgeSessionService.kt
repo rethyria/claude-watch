@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.app.RemoteInput
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.wear.ongoing.OngoingActivity
@@ -67,6 +68,14 @@ fun serviceStatusText(state: ConnectionState): String = when (state) {
  *  - The notification's Disconnect action is the user's stop affordance:
  *    [BridgeViewModel.disconnect] (stream down, credentials KEPT — reopening
  *    the app resumes and catches up from the persisted cursor) + stopSelf.
+ *
+ * Issue #25 rides this service's lifetime: an [ApprovalNotificationCollector]
+ * watches the ViewModel's permission queue and posts/cancels actionable
+ * approval notifications (see ApprovalNotifier.kt), and the notification
+ * actions land back here as [ApprovalNotifier.ACTION_ANSWER] start commands —
+ * Wear forbids BroadcastReceiver notification actions, and this service is
+ * the one component whose lifetime already tracks the stream the prompts
+ * arrive on.
  */
 class BridgeSessionService : Service() {
 
@@ -89,6 +98,23 @@ class BridgeSessionService : Service() {
     private lateinit var notificationBuilder: NotificationCompat.Builder
     private var ongoingActivity: OngoingActivity? = null
 
+    // The approval-notification surface (issue #25): the notifier renders,
+    // the collector diffs the ViewModel's permission queue into post/cancel
+    // calls. Same class the instrumented test attaches to its own ViewModel
+    // — one code path, two hosts (see ApprovalNotificationCollector's doc).
+    private lateinit var approvalNotifier: ApprovalNotifier
+    private lateinit var approvalCollector: ApprovalNotificationCollector
+
+    // True once a NORMAL (MainActivity / system-sticky) start command has
+    // landed on this instance. An ACTION_ANSWER start returns START_STICKY
+    // only when this is set: a notification-action tap that itself CREATED
+    // the instance must not mint a sticky-restart promise the user never
+    // made (the user's Disconnect revoked it; the tap only asked to answer
+    // one prompt) — while an answer landing on an already-sticky instance
+    // must not DOWNGRADE #24's revive guarantee either, since Android keeps
+    // only the LAST onStartCommand return value.
+    private var stickyStarted = false
+
     override fun onCreate() {
         super.onCreate()
         val channel = NotificationChannel(
@@ -100,7 +126,7 @@ class BridgeSessionService : Service() {
         )
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
 
-        val vm = BridgeViewModel.singleton(applicationContext)
+        val vm = viewModelResolver(applicationContext)
         val initialText = serviceStatusText(vm.connection.value)
         val contentIntent = PendingIntent.getActivity(
             this,
@@ -145,6 +171,16 @@ class BridgeSessionService : Service() {
         )
 
         startWatching(vm)
+
+        // Approval notifications (issue #25), attached AFTER the immediate
+        // startForeground like the state watch: a SECOND collector on the
+        // permission queue, alive exactly as long as this service's scope —
+        // which is the honest lifetime, because a dead service means the
+        // stream that delivers prompts is dead too. Posting/cancelling and
+        // the queue diff live in ApprovalNotificationCollector.
+        approvalNotifier = ApprovalNotifier(this)
+        approvalCollector = ApprovalNotificationCollector(approvalNotifier)
+        approvalCollector.attach(scope, vm.state)
     }
 
     /**
@@ -195,12 +231,30 @@ class BridgeSessionService : Service() {
             // instead of riding the state collector's grace: the user just
             // tapped Disconnect and the chip must go NOW, not in 3 seconds.
             watchJob?.cancel() // no post-stop notify (see watchJob's doc)
-            BridgeViewModel.singleton(applicationContext).disconnect()
+            viewModelResolver(applicationContext).disconnect()
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
-        // EVERY non-disconnect start must re-assert foreground: MainActivity
+        if (intent?.action == ApprovalNotifier.ACTION_ANSWER) {
+            // A notification action's answer (issue #25) — handled BEFORE the
+            // foreground re-assert below, because that re-assert is #24's
+            // contract with startForegroundService callers ONLY: an action's
+            // PendingIntent.getService delivers a PLAIN startService with no
+            // startForeground obligation, and re-asserting here would flip a
+            // tap on a dying service's leftovers into foreground-forever.
+            // (On an instance the tap itself CREATED, onCreate has already
+            // startForeground()d — unavoidable, #24's 5s-deadline invariant —
+            // and the state watch's terminal grace tears that back down
+            // within seconds unless resume() below genuinely revives the
+            // connection, in which case the chip is honest again.)
+            handleApprovalAnswer(intent)
+            // Sticky only when a real sticky start already owns the
+            // instance; see stickyStarted for the both-directions reasoning.
+            return if (stickyStarted) START_STICKY else START_NOT_STICKY
+        }
+        // EVERY non-disconnect, non-answer start must re-assert foreground:
+        // MainActivity
         // fires startForegroundService on each re-entry to RESUMED (its
         // repeatOnLifecycle collector restarts), and the platform demands a
         // startForeground() for EACH of those — on a live instance onCreate
@@ -217,7 +271,8 @@ class BridgeSessionService : Service() {
             notificationBuilder.build(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
         )
-        val vm = BridgeViewModel.singleton(applicationContext)
+        stickyStarted = true
+        val vm = viewModelResolver(applicationContext)
         // Every (re)start — MainActivity's paired trigger AND the system
         // reviving the sticky service after killing the process — resumes the
         // engine. Guarded upstream: a live engine no-ops.
@@ -234,7 +289,59 @@ class BridgeSessionService : Service() {
         // of: a destroyed service must leave no ongoing-flagged notification
         // behind (its Disconnect action would point at nothing).
         getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
+        // Same zombie-notification reasoning for the approval surface (#25):
+        // a dead service's answer actions are dead ends, so every approval
+        // notification THIS instance posted goes with it — precisely those,
+        // via the collector's posted-ids set (scope is already cancelled
+        // above, so no in-flight queue emission can re-post behind this).
+        // Still-pending prompts come back honestly: a restarted service's
+        // fresh collector re-announces whatever the queue still holds.
+        approvalCollector.cancelAllPosted()
         super.onDestroy()
+    }
+
+    /**
+     * A notification action's answer (issue #25). The intent carries the
+     * permissionId plus EITHER a behavior extra (a plain option action) OR
+     * RemoteInput results (the single-question reply); both routes answer
+     * through the SAME ViewModel entry points as the in-app card
+     * ([BridgeViewModel.answerPermission] / [BridgeViewModel.answerQuestions]
+     * — exactly what HaloActions wires), so the ack-gated semantics are
+     * identical: 2xx/404/dead-token drops the prompt from the queue, and the
+     * queue diff cancels the notification; a retryable failure keeps the
+     * prompt queued IN-APP with the error surfaced on the card.
+     */
+    private fun handleApprovalAnswer(intent: Intent) {
+        val permissionId = intent.getStringExtra(ApprovalNotifier.EXTRA_PERMISSION_ID) ?: return
+        // Cancel the tapped notification IMMEDIATELY: the tap deserves an
+        // instant response, and a failed answer must NOT re-raise it — the
+        // in-app card (still queued on failure) is the retry surface; a
+        // notification that bounces back after being answered reads as "it
+        // didn't take" even when the failure is transient.
+        approvalNotifier.cancel(permissionId)
+        val vm = viewModelResolver(applicationContext)
+        // The user may have disconnected between post and tap (a narrow race
+        // — this service's onDestroy cancels posted notifications, but a tap
+        // can already be in flight): resume() first, the same guarded no-op
+        // MainActivity fires on every ON_START, so the answer POST finds a
+        // live engine when the persisted credentials allow one. If the
+        // engine still isn't up when the POST runs, the answer fails
+        // retryably and the prompt simply stays queued in-app — tolerated:
+        // never a silently swallowed decision, the card still renders it.
+        vm.resume()
+        val results = RemoteInput.getResultsFromIntent(intent)
+        if (results != null) {
+            // Blank/null reply -> DROP, never answer with empty text: an
+            // accidental empty dictation must not become the agent's answer.
+            // The prompt stays queued (nothing was sent), and the in-app
+            // question card remains the way to answer it properly.
+            val text = results.getCharSequence(ApprovalNotifier.KEY_QUESTION_ANSWER)
+                ?.toString()?.trim()
+            if (!text.isNullOrEmpty()) vm.answerQuestions(permissionId, listOf(text))
+            return
+        }
+        val behavior = intent.getStringExtra(ApprovalNotifier.EXTRA_BEHAVIOR) ?: return
+        vm.answerPermission(permissionId, behavior)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null // started, never bound
@@ -260,6 +367,20 @@ class BridgeSessionService : Service() {
          * Keystore decrypt land well inside this on real hardware.
          */
         internal const val TERMINAL_GRACE_MS = 3_000L
+
+        /**
+         * How this service finds its ViewModel — the production default is
+         * the process singleton, always. Swappable ONLY as a test seam: the
+         * approval-notification instrumented test must exercise the REAL
+         * action PendingIntents, whose .send() necessarily starts THIS
+         * service (the intent names it — there is no other dispatcher), and
+         * without the seam that start would answer through the singleton,
+         * forcing the test to pair the singleton's PERSISTENT store to a
+         * throwaway MockWebServer — the exact cross-test leak
+         * CatchUpFlowTest's kdoc exists to warn about.
+         */
+        internal var viewModelResolver: (Context) -> BridgeViewModel =
+            { BridgeViewModel.singleton(it) }
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(
