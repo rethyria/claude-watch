@@ -10,12 +10,15 @@ import android.service.notification.StatusBarNotification
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.rule.GrantPermissionRule
+import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.wear.data.AesGcmTokenCipher
 import dev.claudewatch.wear.data.CredentialStore
+import dev.claudewatch.wear.net.ConnectionState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.json.JSONObject
@@ -91,10 +94,13 @@ class ApprovalNotificationFlowTest {
         // .send() starts must answer through THIS test's ViewModel.
         BridgeSessionService.viewModelResolver = { viewModel }
         // The REAL collector — the class the service hosts — on this test's
-        // ViewModel and the real NotificationManager.
+        // ViewModel and the real NotificationManager. The connection flow
+        // rides along (#59): attach adopts shade survivors (none here — the
+        // cancelAll above guarantees an empty shade) and gates their
+        // adjudication on it.
         collectorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         ApprovalNotificationCollector(ApprovalNotifier(context))
-            .attach(collectorScope, viewModel.state)
+            .attach(collectorScope, viewModel.state, viewModel.connection)
     }
 
     @After
@@ -514,6 +520,194 @@ class ApprovalNotificationFlowTest {
         assertTrue(
             "the unanswered prompt must stay queued in-app",
             viewModel.state.value.permissionQueue.any { it.permissionId == "perm-q" },
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #59 — restart edges. The scenarios below simulate a process
+    // kill WITHOUT onDestroy: no cancelAllPosted runs, so the shade keeps
+    // notifications that no fresh in-memory collector remembers.
+    // ------------------------------------------------------------------
+
+    /** A fully-formed prompt for driving collectors (and the notifier) directly. */
+    private fun pending(id: String) = BridgeViewModel.PendingPermission(
+        permissionId = id,
+        sessionId = "s-1",
+        toolName = "Bash",
+        requestSummary = "$ npm test",
+        sessionLabel = "proj",
+        options = listOf(
+            PermissionOption("allow", "Yes"),
+            PermissionOption("deny", "No"),
+        ),
+    )
+
+    // ------------------------------------------------------------------
+    // #59 edge 1: adoption. Collector A posts two prompts and dies WITHOUT
+    // teardown (job cancel = the process-kill stand-in; its posted-ids die
+    // with it). Collector B — same real NotificationManager, fresh memory —
+    // must adopt both survivors, hold fire through the pre-replay window
+    // (empty queue + Reconnecting), and once the post-Connected settle
+    // window (REPLAY_SETTLE_MS) closes, cancel exactly the one no replay
+    // emission re-confirmed. (Second-round review moved the verdict from
+    // "the first post-Connected queue emission" to this timer: the reducer
+    // emits once per replayed frame, so that first emission can be a
+    // PARTIAL pending set — adjudicating on it re-buzzed still-pending
+    // survivors — and an unchanged queue never re-emits at all, which left
+    // the resolved-while-dead orphan lingering forever.) The survivor's
+    // ORIGINAL notification must remain untouched: postTime is stamped by
+    // notify(), so an equal postTime across the whole dance proves no
+    // cancel+re-post cycle (which would also re-buzz — setOnlyAlertOnce
+    // does not survive a cancel).
+    // ------------------------------------------------------------------
+
+    @Test
+    fun processKillSurvivorsAreAdoptedAndAdjudicatedAfterTheSettleWindow() {
+        // Collector A: the pre-kill process. Backgrounded (setUp's flag), so
+        // both prompts post for real.
+        val scopeA = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val stateA = MutableStateFlow(
+            BridgeViewModel.UiState(permissionQueue = listOf(pending("perm-x"), pending("perm-y"))),
+        )
+        val connA = MutableStateFlow<ConnectionState>(ConnectionState.Connected)
+        ApprovalNotificationCollector(ApprovalNotifier(context)).attach(scopeA, stateA, connA)
+        waitFor("perm-x and perm-y posted") {
+            approvalNotification("perm-x") != null && approvalNotification("perm-y") != null
+        }
+        val originalPostTime = approvalNotification("perm-x")!!.postTime
+
+        // The kill: the scope dies, cancelAllPosted NEVER runs (that is the
+        // graceful path a SIGKILL skips) — the shade keeps both.
+        scopeA.cancel()
+
+        val scopeB = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            // Collector B: the restarted process — fresh in-memory sets, an
+            // empty pre-replay queue, a connection still working on it.
+            val stateB = MutableStateFlow(BridgeViewModel.UiState())
+            val connB = MutableStateFlow<ConnectionState>(
+                ConnectionState.Reconnecting(attempt = 1, reason = "process death"),
+            )
+            ApprovalNotificationCollector(ApprovalNotifier(context)).attach(scopeB, stateB, connB)
+
+            // The pre-replay window: the empty queue emission has been
+            // delivered (StateFlow delivers current value at collect), and
+            // it must cancel NOTHING — an undeferred diff here is the
+            // cancel-then-re-buzz bug this issue exists to kill.
+            Thread.sleep(1_000)
+            assertNotNull("perm-x must survive the pre-replay window", approvalNotification("perm-x"))
+            assertNotNull("perm-y must survive the pre-replay window", approvalNotification("perm-y"))
+
+            // Connected arms the settle window; the replay emission landing
+            // inside it graduates perm-x (perm-y was answered from the
+            // desktop while the watch was dead, so no emission ever
+            // re-confirms it). The sleep between the two writes mirrors the
+            // real engine's order — Connected at stream open, replay frames
+            // after — and keeps the emission comfortably inside the window.
+            connB.value = ConnectionState.Connected
+            Thread.sleep(500)
+            stateB.value = BridgeViewModel.UiState(permissionQueue = listOf(pending("perm-x")))
+
+            // The verdict fires REPLAY_SETTLE_MS (~3 s) after Connected —
+            // the waitFor absorbs it.
+            waitFor("perm-y (resolved while dead) cancelled by the window's close") {
+                approvalNotification("perm-y") == null
+            }
+            val survivor = approvalNotification("perm-x")
+            assertNotNull("perm-x must still be posted", survivor)
+            assertEquals(
+                "perm-x's ORIGINAL notification must be untouched — no cancel, no re-post",
+                originalPostTime,
+                survivor!!.postTime,
+            )
+        } finally {
+            scopeB.cancel()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // #59 edge 2: a notification answer racing the reconnect replay. The
+    // tap's PendingIntent fires while the ViewModel's queue does NOT yet
+    // hold the prompt (the fixture holds the replay back behind throttled
+    // pad — the on-wire stand-in for "the tap itself recreated the dead
+    // process and the engine is still catching up"). The service must NOT
+    // answer synchronously into the still-queued guard's silent drop; it
+    // defers until the id appears, then answers with the SAME payload.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun notificationAnswerDefersUntilTheReplayDeliversThePromptThenAnswers() {
+        pair(
+            buildString {
+                append(":connected\n\n")
+                append(frame(1, "session", sessionEvent))
+                // ~4.5 s of held-back replay (512 B / 250 ms throttle): the
+                // window in which the tap lands on an empty queue.
+                append(":pad\n\n".repeat(1_500))
+                append(frame(2, "permission-request", permissionRequest("perm-z", "Bash", "npm test")))
+                append(holdOpenPad())
+            },
+        )
+
+        // The dead process's survivor, posted through the REAL notifier so
+        // its Approve action carries the REAL service-addressed
+        // PendingIntent (there is no other dispatcher).
+        ApprovalNotifier(context).post(approvalNotificationModel(pending("perm-z")))
+        waitFor("perm-z survivor posted") { approvalNotification("perm-z") != null }
+        assertTrue(
+            "premise: the queue must not know perm-z at tap time",
+            viewModel.state.value.permissionQueue.none { it.permissionId == "perm-z" },
+        )
+
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        approveActionOf("perm-z").actionIntent.send()
+
+        // The tap's instant-response contract is deferral-independent: the
+        // tapped notification cancels immediately, answer sent or not.
+        waitFor("perm-z cancelled on tap") { approvalNotification("perm-z") == null }
+
+        // The deferred answer fires once the replay delivers perm-z
+        // (~seconds from now, well inside ANSWER_REPLAY_WAIT_MS) — same
+        // entry point, same payload as a synchronous answer. Pre-#59 this
+        // request never arrived: the still-queued guard swallowed the
+        // decision and the replay re-raised the prompt as "it didn't take".
+        val request = takeRequest("deferred answer POST")
+        assertEquals("/v1/command", request.path)
+        val body = JSONObject(request.body.readUtf8())
+        assertEquals("perm-z", body.getString("permissionId"))
+        assertEquals("allow", body.getJSONObject("decision").getString("behavior"))
+    }
+
+    @Test
+    fun notificationAnswerWhoseReplayNeverDeliversThePromptSendsNothing() {
+        // The prompt resolved (or expired) while the watch was dead: the
+        // replay simply never re-delivers perm-gone. The deferred answer
+        // must time out doing NOTHING — no POST invented for a prompt whose
+        // truth we never re-established; the re-posted notification / the
+        // in-app card is the retry surface if the prompt is in fact alive.
+        pair(
+            buildString {
+                append(":connected\n\n")
+                append(frame(1, "session", sessionEvent))
+                append(holdOpenPad())
+            },
+        )
+
+        ApprovalNotifier(context).post(approvalNotificationModel(pending("perm-gone")))
+        waitFor("perm-gone survivor posted") { approvalNotification("perm-gone") != null }
+
+        approveActionOf("perm-gone").actionIntent.send()
+
+        // Instant cancel still applies (the tap deserves its response even
+        // when the answer cannot be delivered)...
+        waitFor("perm-gone cancelled on tap") { approvalNotification("perm-gone") == null }
+
+        // ...but no request may ever leave the watch. pair() consumed the
+        // fixture's three requests (ping, pair, events), so ANY request in
+        // this bounded window would be the invented answer POST.
+        assertNull(
+            "an answer for a prompt the replay never delivered must never POST",
+            server.takeRequest(5, TimeUnit.SECONDS),
         )
     }
 }

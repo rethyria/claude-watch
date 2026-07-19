@@ -27,7 +27,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * The chip's one line of truth, PURE so plain-JVM tests can table it: the
@@ -48,6 +50,44 @@ fun serviceStatusText(state: ConnectionState): String = when (state) {
     is ConnectionState.AuthExpired -> "auth expired"
     is ConnectionState.BridgeMismatch -> "bridge mismatch"
 }
+
+/**
+ * Whether [permissionId] is currently in the answerable queue — the exact
+ * predicate BridgeViewModel.sendDecision's still-queued guard applies (the
+ * rendered permissionQueue mirrors bridge.pendingPermissions id-for-id), kept
+ * PURE and top-level so the plain-JVM test can table it. The service's answer
+ * path (issue #59) keys its defer-or-answer-now decision on this: answering
+ * while it is false would be silently dropped by that very guard.
+ */
+internal fun isPermissionQueued(state: BridgeViewModel.UiState, permissionId: String): Boolean =
+    state.permissionQueue.any { it.permissionId == permissionId }
+
+/**
+ * Claim one answer delivery for [id], refusing duplicates inside
+ * [windowMs]. A double-tap can race the immediate notification cancel and
+ * deliver the SAME action PendingIntent twice, milliseconds apart — without
+ * this claim both deliveries answer (the first POST is async, so the
+ * still-queued guard passes twice) and the duplicate's 404 clobbers
+ * decisionResult. Time-bounded rather than forever, because the same
+ * permissionId legitimately comes back: a prompt re-raised by the replay
+ * re-posts a notification whose fresh tap — always seconds later, past the
+ * window — must answer. Pure over an injected clock so the JVM test tables
+ * it; the caller owns the map (main-thread confined in the service).
+ */
+internal fun claimAnswerDelivery(
+    claims: MutableMap<String, Long>,
+    id: String,
+    nowMs: Long,
+    windowMs: Long = ANSWER_DUPLICATE_WINDOW_MS,
+): Boolean {
+    val last = claims[id]
+    if (last != null && nowMs - last < windowMs) return false
+    claims[id] = nowMs
+    return true
+}
+
+/** See [claimAnswerDelivery]. Comfortably past any double-tap, well short of a replay re-post cycle. */
+internal const val ANSWER_DUPLICATE_WINDOW_MS = 5_000L
 
 /**
  * The connectedDevice foreground service that gives the bridge connection a
@@ -109,6 +149,10 @@ class BridgeSessionService : Service() {
     // — one code path, two hosts (see ApprovalNotificationCollector's doc).
     private lateinit var approvalNotifier: ApprovalNotifier
     private lateinit var approvalCollector: ApprovalNotificationCollector
+
+    // Answer-delivery claims (main-thread confined, like every onStartCommand
+    // path) — see claimAnswerDelivery for the double-tap race it closes.
+    private val answerClaims = mutableMapOf<String, Long>()
 
     // True once a NORMAL (MainActivity / system-sticky) start command has
     // landed on this instance. An ACTION_ANSWER start returns START_STICKY
@@ -182,10 +226,16 @@ class BridgeSessionService : Service() {
         // permission queue, alive exactly as long as this service's scope —
         // which is the honest lifetime, because a dead service means the
         // stream that delivers prompts is dead too. Posting/cancelling and
-        // the queue diff live in ApprovalNotificationCollector.
+        // the queue diff live in ApprovalNotificationCollector. vm.connection
+        // rides along (issue #59): attach ADOPTS whatever approval
+        // notifications an ungracefully killed predecessor left in the shade,
+        // and the connection flow arms the post-Connected settle window that
+        // adjudicates those survivors once the backlog replay has had time
+        // to land (the initially empty, pre-replay queue is never allowed to
+        // cancel them) — see the collector's kdoc.
         approvalNotifier = ApprovalNotifier(this)
         approvalCollector = ApprovalNotificationCollector(approvalNotifier)
-        approvalCollector.attach(scope, vm.state)
+        approvalCollector.attach(scope, vm.state, vm.connection)
 
         // Glanceables (issue #28): a THIRD collector, pushing tile +
         // complication refreshes on GlanceStatus CHANGES only. The platform
@@ -324,11 +374,16 @@ class BridgeSessionService : Service() {
         getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
         // Same zombie-notification reasoning for the approval surface (#25):
         // a dead service's answer actions are dead ends, so every approval
-        // notification THIS instance posted goes with it — precisely those,
-        // via the collector's posted-ids set (scope is already cancelled
-        // above, so no in-flight queue emission can re-post behind this).
-        // Still-pending prompts come back honestly: a restarted service's
-        // fresh collector re-announces whatever the queue still holds.
+        // notification THIS instance owns goes with it — what it posted PLUS
+        // what it adopted from an ungracefully killed predecessor (#59;
+        // adoption folds survivors into the same posted-ids set precisely so
+        // this sweep covers them), via the collector's bookkeeping (scope is
+        // already cancelled above, so no in-flight queue emission can
+        // re-post behind this). This graceful path is also what makes
+        // adoption self-limiting: after a clean stop the shade is empty and
+        // the next attach adopts nothing. Still-pending prompts come back
+        // honestly: a restarted service's fresh collector re-announces
+        // whatever the queue still holds.
         approvalCollector.cancelAllPosted()
         // Glanceables (issue #28): ONE final push now that this service —
         // the thing that kept the stream alive — is dying. Without it the
@@ -348,16 +403,30 @@ class BridgeSessionService : Service() {
     /**
      * A notification action's answer (issue #25). The intent carries the
      * permissionId plus EITHER a behavior extra (a plain option action) OR
-     * RemoteInput results (the single-question reply); both routes answer
-     * through the SAME ViewModel entry points as the in-app card
+     * RemoteInput results (the single-question reply) OR a pre-composed
+     * option label (EXTRA_ANSWER_TEXT); all routes answer through the SAME
+     * ViewModel entry points as the in-app card
      * ([BridgeViewModel.answerPermission] / [BridgeViewModel.answerQuestions]
      * — exactly what HaloActions wires), so the ack-gated semantics are
      * identical: 2xx/404/dead-token drops the prompt from the queue, and the
      * queue diff cancels the notification; a retryable failure keeps the
      * prompt queued IN-APP with the error surfaced on the card.
+     *
+     * All three answer kinds route through [answerWhenQueued] (issue #59): a
+     * tap whose very delivery CREATED this process runs before the reconnect
+     * replay has repopulated the queue, and answering synchronously into
+     * that emptiness would hit the ViewModel's still-queued guard — the
+     * decision silently dropped, the notification already cancelled, and
+     * the replay re-raising the prompt seconds later as "it didn't take".
      */
     private fun handleApprovalAnswer(intent: Intent) {
         val permissionId = intent.getStringExtra(ApprovalNotifier.EXTRA_PERMISSION_ID) ?: return
+        // One delivery answers; a double-tap's duplicate (see
+        // claimAnswerDelivery) is dropped BEFORE the cancel — which is
+        // idempotent anyway — and before any deferred waiter can be minted.
+        if (!claimAnswerDelivery(answerClaims, permissionId, android.os.SystemClock.elapsedRealtime())) {
+            return
+        }
         // Cancel the tapped notification IMMEDIATELY: the tap deserves an
         // instant response, and a failed answer must NOT re-raise it — the
         // in-app card (still queued on failure) is the retry surface; a
@@ -382,7 +451,9 @@ class BridgeSessionService : Service() {
             // question card remains the way to answer it properly.
             val text = results.getCharSequence(ApprovalNotifier.KEY_QUESTION_ANSWER)
                 ?.toString()?.trim()
-            if (!text.isNullOrEmpty()) vm.answerQuestions(permissionId, listOf(text))
+            if (!text.isNullOrEmpty()) {
+                answerWhenQueued(vm, permissionId) { vm.answerQuestions(permissionId, listOf(text)) }
+            }
             return
         }
         // An option BUTTON tap: the label rode the intent as-built
@@ -391,11 +462,55 @@ class BridgeSessionService : Service() {
         // blank: the labels come from the agent's own option list.
         val optionAnswer = intent.getStringExtra(ApprovalNotifier.EXTRA_ANSWER_TEXT)
         if (optionAnswer != null) {
-            vm.answerQuestions(permissionId, listOf(optionAnswer))
+            answerWhenQueued(vm, permissionId) { vm.answerQuestions(permissionId, listOf(optionAnswer)) }
             return
         }
         val behavior = intent.getStringExtra(ApprovalNotifier.EXTRA_BEHAVIOR) ?: return
-        vm.answerPermission(permissionId, behavior)
+        answerWhenQueued(vm, permissionId) { vm.answerPermission(permissionId, behavior) }
+    }
+
+    /**
+     * Answer now if [permissionId] is queued; otherwise WAIT for the
+     * reconnect replay to deliver it, then answer (issue #59).
+     *
+     * The race this closes: a notification tap on a dead process starts this
+     * service, which resume()s a FRESH engine — and the tap's answer used to
+     * run synchronously, while the queue was still empty. The ViewModel's
+     * still-queued guard (sendDecision's first line) silently returned, the
+     * tapped notification was already cancelled above, and the replay
+     * re-raised the prompt seconds later: a decision the user made, dropped
+     * without a trace, plus a spurious second buzz. The fix is deliberately
+     * IN THE SERVICE, not a weakening of the VM guard — that guard protects
+     * the in-app card from answering prompts that no longer exist, and the
+     * card's state is always replay-current by the time a human can tap it;
+     * only the notification path can outrun the replay.
+     *
+     * An id already queued answers synchronously, exactly the pre-#59
+     * behavior. Otherwise a bounded wait ([ANSWER_REPLAY_WAIT_MS]) collects
+     * vm.state until the id appears, then answers through the SAME closure —
+     * same entry point, same payload as the synchronous path. On timeout it
+     * does NOTHING, deliberately: the prompt either no longer exists
+     * server-side (answered elsewhere / expired while we were dead — nothing
+     * to decide, and POSTing anyway would just 404) or the reconnect itself
+     * is failing (in which case the re-posted notification from the fresh
+     * collector, or the in-app card, is the retry surface the user actually
+     * sees — an answer fired minutes later against a re-raised prompt the
+     * user may have re-judged would be the wrong-decision race, not a fix).
+     * The wait rides the service scope: if the service dies first, the
+     * deferred answer dies with it — an instance that cannot host the POST's
+     * outcome must not fire it.
+     */
+    private fun answerWhenQueued(vm: BridgeViewModel, permissionId: String, answer: () -> Unit) {
+        if (isPermissionQueued(vm.state.value, permissionId)) {
+            answer()
+            return
+        }
+        scope.launch {
+            val replayed = withTimeoutOrNull(ANSWER_REPLAY_WAIT_MS) {
+                vm.state.first { isPermissionQueued(it, permissionId) }
+            }
+            if (replayed != null) answer()
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null // started, never bound
@@ -421,6 +536,16 @@ class BridgeSessionService : Service() {
          * Keystore decrypt land well inside this on real hardware.
          */
         internal const val TERMINAL_GRACE_MS = 3_000L
+
+        /**
+         * How long a notification answer will wait for the reconnect replay
+         * to re-deliver its prompt before concluding it no longer exists
+         * (issue #59; see [answerWhenQueued]). Sized to comfortably cover a
+         * cold process start + credential decrypt + stream open + backlog
+         * replay (~1-3 s observed on hardware) without stretching into
+         * "answer a prompt the user re-judged minutes later" territory.
+         */
+        internal const val ANSWER_REPLAY_WAIT_MS = 10_000L
 
         /**
          * How this service finds its ViewModel — the production default is

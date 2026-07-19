@@ -75,6 +75,11 @@ class MainActivity : ComponentActivity() {
         // over it. The flag flips BEFORE resume() on purpose — prompts the
         // resume-reconnect replays land with the UI already marked visible,
         // so opening the app never buzzes for the card it is about to show.
+        // (The withhold is no longer permanent, though — issue #59: the
+        // ON_STOP flip below is a real signal the collector observes via
+        // AppVisibility.visible, and prompts still pending when the user
+        // backgrounds the app post THEN. This observer stays the single
+        // WRITER of the flag; the collector only reads/reacts.)
         // ON_START/ON_STOP (not RESUME/PAUSE): a permission dialog or the
         // recognizer activity pauses us while our UI is still the surface
         // underneath, and buzzing during those would be the same noise.
