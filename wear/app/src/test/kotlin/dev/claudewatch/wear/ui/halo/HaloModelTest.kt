@@ -147,7 +147,9 @@ class HaloModelTest {
      * had just launched — the exact stretch the watch exists to report on.
      *
      * Sabotage that this catches: delete the `agents.running > 0` branch and
-     * the idled-with-a-fleet row below reverts to IDLE.
+     * the idled-with-a-fleet row reverts to IDLE; drop it BELOW the WORKING
+     * branch (its pre-#67 position) and the working-with-a-fleet row reverts to
+     * RUNNING — the exact green-forever bug #67 fixed.
      */
     @Test
     fun aStoppedSessionWithRunningSubagentsIsDelegatedNotIdleOrRunning() {
@@ -171,11 +173,14 @@ class HaloModelTest {
             Halo.SessionState.IDLE,
             stateOf(SessionActivity.IDLE, running = 0, done = 3),
         )
-        // The main loop itself working outranks delegation: the agent IS
-        // churning, so it reads as running even while subagents run too.
+        // Delegation outranks a working main loop (issue #67): a running
+        // fleet paints blue even if the main loop also reports WORKING, because
+        // in practice a workflow holds the turn open (the Stop that would set
+        // idle never fires), so "WORKING + fleet" IS the delegated case and
+        // would otherwise be stuck green forever. Any subagents → blue.
         assertEquals(
-            "an actively working main loop stays running, fleet or no fleet",
-            Halo.SessionState.RUNNING,
+            "a running fleet outranks a working main loop — delegated, not running",
+            Halo.SessionState.DELEGATED,
             stateOf(SessionActivity.WORKING, running = 3),
         )
     }

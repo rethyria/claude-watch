@@ -98,15 +98,21 @@ data class HaloModel(
                 val state = when {
                     pending != null && pending.questions.isNotEmpty() -> SessionState.WAITING_Q
                     pending != null -> SessionState.WAITING_PERM
-                    s.thinking || s.activity == SessionActivity.WORKING -> SessionState.RUNNING
-                    // The main loop has yielded (Stop) but subagents are still
-                    // running (issue #55's counts): work IS in flight, so grey
-                    // would be a lie — but the agent will not answer you right
-                    // now either, so green would be one too. This is the long
-                    // unattended stretch a workflow occupies, i.e. exactly what
-                    // the watch exists to report; before this it rendered IDLE
-                    // the instant the turn ended, whatever the fleet was doing.
+                    // Subagents in flight (issue #55's counts) outrank RUNNING
+                    // deliberately (issue #67). The original design gated blue
+                    // on the session ALSO being idle — main loop stopped AND
+                    // agents running — but those never coincide: while a
+                    // workflow runs, Claude Code holds the turn open, so the
+                    // Stop that sets idle never fires, and the session stayed
+                    // green the whole time and blue was unreachable. So we drop
+                    // the idle precondition entirely: any running subagents ->
+                    // blue, full stop. The wrist reading it as "delegated" is
+                    // right even when the main loop is briefly foreground-active
+                    // — during a workflow it is idle or mostly-idle, just
+                    // shepherding the fleet. A genuinely actionable prompt
+                    // (WAITING, above) still outranks this; nothing else does.
                     (s.agents?.running ?: 0) > 0 -> SessionState.DELEGATED
+                    s.thinking || s.activity == SessionActivity.WORKING -> SessionState.RUNNING
                     else -> SessionState.IDLE
                 }
                 // A worktree session reports its MAIN repo root (issue #54):
