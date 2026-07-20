@@ -160,7 +160,10 @@ export function handleEvents(req, res) {
   // permissions (permissions.js), and pending Codex synthetic permissions
   // (codex.js). Pending permissions in particular must not rely on the ring
   // buffer: ordinary pty-output can evict a permission-request before a
-  // disconnected watch reconnects.
+  // disconnected watch reconnects. permissions.js leads its block with an
+  // authoritative `permission-sync` id set that RETRACTS prompts the client
+  // still holds but that died while it was offline (issue #63) — the per-
+  // prompt re-sends that follow are additive and cannot do that.
   // Snapshot events consume ids from the same counter as buffered events
   // (pre-increment, matching pushSseEvent) so every id a client observes is
   // strictly increasing — PROTOCOL.md guarantees monotonic ids, and a

@@ -354,4 +354,22 @@ class WireModelContractTest {
     fun permissionClearedWithoutPermissionIdFailsLoudly() {
         assertFailsLoudly("permission-cleared", """{"reason":"hook-aborted"}""")
     }
+
+    @Test
+    fun permissionSyncParsesAnEmptyAuthoritativeSet() {
+        // An empty list is legal and meaningful ("nothing is live") — it must
+        // parse, not fail, so a client actually retracts on it (issue #63).
+        val event = BridgeEventParser.parse("permission-sync", """{"permissionIds":[]}""")
+        assertTrue(event is dev.claudewatch.shared.protocol.PermissionSyncEvent)
+        assertEquals(0, (event as dev.claudewatch.shared.protocol.PermissionSyncEvent).permissionIds.size)
+    }
+
+    @Test
+    fun permissionSyncWithoutPermissionIdsFailsLoudly() {
+        // permissionIds is deliberately NON-defaulted: a MISSING field is a
+        // contract violation and must loud-fail, never be silently mistaken
+        // for the empty "retract everything" set. If it had a default, a
+        // truncated frame would clear the whole wrist.
+        assertFailsLoudly("permission-sync", """{"sessionId":"A"}""")
+    }
 }

@@ -13,7 +13,11 @@ import {
   CODEX_LOG_FILE,
 } from "./config.js";
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
-import { canonicalPermissionOptions, PERMISSION_BEHAVIORS } from "./permissions.js";
+import {
+  canonicalPermissionOptions,
+  PERMISSION_BEHAVIORS,
+  registerPendingPermissionIdSource,
+} from "./permissions.js";
 import {
   sessions,
   attachPtyToSession,
@@ -562,6 +566,13 @@ export function stopCodexMonitor() {
 // When a PTY-backed session ends, clear any synthetic permission tied to it
 // (registered as a callback to avoid a sessions.js → codex.js import cycle).
 registerSessionCleanupHook(clearCodexSyntheticPermissionForSession);
+
+// The authoritative permission-sync frame in permissions.js retracts every id
+// it does NOT list, so synthetic Codex approvals must be in that list or a
+// reconnect would drop a live exec-approval straight off the wrist (issue
+// #63). Registered rather than imported because permissions.js cannot import
+// this module — this one imports it.
+registerPendingPermissionIdSource(() => codexSyntheticPermissions.keys());
 
 // Replay pending synthetic permissions to late-connecting SSE clients (runs
 // after the sessions.js provider — sessions.js evaluates first).

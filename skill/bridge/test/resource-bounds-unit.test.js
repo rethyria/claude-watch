@@ -146,23 +146,95 @@ test("pruneEndedSessions removes ended sessions only after the grace period", as
   }
 });
 
-test("permission timeout auto-denies and clears the stored suggestion body", async () => {
+test("permission expiry returns no decision, announces itself, and clears the stored suggestion body", async () => {
   const { PERMISSION_TIMEOUT_MS } = await import("../config.js");
   assert.equal(PERMISSION_TIMEOUT_MS, 100, "test-only env override must reach config.js");
 
   const { waitForPermission, pendingPermissions, pendingPermissionBodies } =
     await import("../permissions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
 
   // hooks.js stores the suggestions before blocking on waitForPermission.
   pendingPermissionBodies.set("perm-timeout-1", [{ type: "rule", value: "Bash(rm:*)" }]);
 
   const decision = await waitForPermission("perm-timeout-1");
-  assert.equal(decision.behavior, "deny");
-  assert.match(decision.reason, /Timed out/);
+  // NOT a deny: a fabricated deny cancels the dialog the user still has on
+  // screen and writes a `reject` they never chose (issue #63).
+  assert.equal(decision.noDecision, true);
+  assert.equal(decision.behavior, undefined, "expiry must never mint a behavior");
+  assert.equal(decision.reason, "expired");
   assert.equal(pendingPermissions.has("perm-timeout-1"), false);
   assert.equal(
     pendingPermissionBodies.has("perm-timeout-1"),
     false,
-    "timed-out permission must not leave an orphaned suggestion body",
+    "expired permission must not leave an orphaned suggestion body",
+  );
+  // The silent half of #63: the bridge used to drop the permission without
+  // telling anyone, so the watch rendered the card until the app was
+  // force-stopped. Every non-answer exit must announce itself.
+  const cleared = sseBuffer.filter(
+    (e) => e.event === "permission-cleared" && JSON.parse(e.data).permissionId === "perm-timeout-1",
+  );
+  assert.equal(cleared.length, 1, "expiry must push exactly one permission-cleared");
+  assert.equal(JSON.parse(cleared[0].data).reason, "expired");
+});
+
+test("tool correlation records are bounded and never leak an index entry", async () => {
+  // The PreToolUse map added for #63 is fed by EVERY tool call, not just gated
+  // ones — production burns ~9000 of them per 48h — so an unbounded map would
+  // be a slow leak on a long-lived bridge.
+  const {
+    notePreToolUse,
+    claimToolUseId,
+    waitForPermission,
+    resolvePermission,
+    permissionsByToolUseId,
+  } = await import("../permissions.js");
+
+  // Cap: far more distinct fingerprints than PRE_TOOL_USE_MAX (256). The
+  // oldest are dropped, so the earliest call can no longer be claimed while a
+  // recent one still can.
+  for (let i = 0; i < 400; i++) {
+    notePreToolUse({ tool_name: "Bash", tool_input: { command: `cmd-${i}` }, tool_use_id: `tu-${i}` });
+  }
+  assert.equal(
+    claimToolUseId({ tool_name: "Bash", tool_input: { command: "cmd-0" } }),
+    null,
+    "the oldest record must have been evicted by the cap",
+  );
+  assert.equal(
+    claimToolUseId({ tool_name: "Bash", tool_input: { command: "cmd-399" } }),
+    "tu-399",
+    "a recent record must still correlate",
+  );
+  // Consuming: one PreToolUse backs at most one permission, so a second prompt
+  // with the same fingerprint cannot inherit a stale id.
+  assert.equal(
+    claimToolUseId({ tool_name: "Bash", tool_input: { command: "cmd-399" } }),
+    null,
+    "claiming must consume the record",
+  );
+
+  // Key order must not defeat the fingerprint: Claude Code re-serializes hook
+  // bodies between PreToolUse and PermissionRequest.
+  notePreToolUse({ tool_name: "Bash", tool_input: { a: 1, b: 2 }, tool_use_id: "tu-order" });
+  assert.equal(
+    claimToolUseId({ tool_name: "Bash", tool_input: { b: 2, a: 1 } }),
+    "tu-order",
+    "fingerprinting must be independent of JSON key order",
+  );
+
+  // Index leak: a watch-answered permission must release its reverse-index
+  // entry, or a later PostToolUse would chase a dead permissionId forever.
+  notePreToolUse({ tool_name: "Bash", tool_input: { command: "answered" }, tool_use_id: "tu-answered" });
+  const toolUseId = claimToolUseId({ tool_name: "Bash", tool_input: { command: "answered" } });
+  const decision = waitForPermission("perm-indexed", { toolUseId });
+  assert.equal(permissionsByToolUseId.get("tu-answered"), "perm-indexed");
+  resolvePermission("perm-indexed", { behavior: "allow" });
+  await decision;
+  assert.equal(
+    permissionsByToolUseId.has("tu-answered"),
+    false,
+    "answering must release the correlation index entry",
   );
 });

@@ -8,6 +8,7 @@ import dev.claudewatch.shared.protocol.SseFrame
 import dev.claudewatch.shared.state.BridgeEventReducer
 import dev.claudewatch.shared.state.BridgeState
 import dev.claudewatch.shared.state.SessionActivity
+import dev.claudewatch.shared.terminal.TerminalLineType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -573,5 +574,155 @@ class BridgeEventReducerTest {
         val unknown = SseFrame("10", "shiny-new-event", """{"anything":true}""")
         val appliedUnknown = BridgeEventReducer.reduce(appliedNoId.state, unknown, 5_000L) as BridgeEventReducer.Applied
         assertEquals("10", appliedUnknown.state.lastEventId)
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #63: honest clears + authoritative permission-sync
+    // ------------------------------------------------------------------
+
+    // A session with one pending prompt, used by the clear/sync tests below.
+    private fun sessionWithPendingPrompt(permissionId: String): BridgeState = fold(
+        listOf(
+            SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+            SseFrame(
+                "2",
+                "permission-request",
+                """{"permissionId":"$permissionId","tool_name":"Bash","tool_input":{"command":"make deploy"},"sessionId":"A"}""",
+            ),
+        ),
+    )
+
+    @Test
+    fun permissionClearedRemovesExactlyThatPermission() {
+        // Two prompts pending on one session; clearing one must leave the other.
+        val two = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "permission-request", """{"permissionId":"perm-a","tool_name":"Bash","sessionId":"A"}"""),
+                SseFrame("3", "permission-request", """{"permissionId":"perm-b","tool_name":"Bash","sessionId":"A"}"""),
+            ),
+        )
+        assertEquals(listOf("perm-a", "perm-b"), two.pendingPermissions.map { it.permissionId })
+
+        val cleared = fold(
+            listOf(SseFrame("4", "permission-cleared", """{"permissionId":"perm-a","reason":"expired","sessionId":"A"}""")),
+            initial = two,
+        )
+        assertEquals(listOf("perm-b"), cleared.pendingPermissions.map { it.permissionId })
+    }
+
+    @Test
+    fun permissionClearedExpiredDropsThePromptAndAppendsAnHonestNotice() {
+        // The #63 fix: a card that just vanishes reads as an approval the user
+        // believes they gave. An `expired` clear both drops the prompt AND
+        // leaves a line the user can act on.
+        val cleared = fold(
+            listOf(SseFrame("3", "permission-cleared", """{"permissionId":"p-1","reason":"expired","sessionId":"A"}""")),
+            initial = sessionWithPendingPrompt("p-1"),
+        )
+        assertTrue(cleared.pendingPermissions.isEmpty())
+        val lines = cleared.sessions.getValue("A").terminal.items
+        val notice = lines.last()
+        assertEquals(TerminalLineType.SYSTEM, notice.type)
+        assertTrue(
+            "expiry notice must tell the user where to answer, got: ${notice.text}",
+            notice.text.contains("expired") && notice.text.contains("computer"),
+        )
+    }
+
+    @Test
+    fun expiredNoticeDoesNotClaimTheUserFailedToAnswerOrMustStillAnswer() {
+        // #63 review: `expired` is emitted for THREE outcomes the bridge cannot
+        // distinguish — a genuine no-answer, a DENY made in the IDE (no
+        // PostToolUse fires for a tool that never ran, so it falls to the expiry
+        // timer), and an approve-and-long-run whose PostToolUse lands after the
+        // window. Telling a user who already denied that the prompt went
+        // "unanswered", or a user whose approved tool is running to "answer it
+        // on the computer", is a false instruction. The copy must stay
+        // non-committal — the old wording did neither.
+        val cleared = fold(
+            listOf(SseFrame("3", "permission-cleared", """{"permissionId":"p-1","reason":"expired","sessionId":"A"}""")),
+            initial = sessionWithPendingPrompt("p-1"),
+        )
+        val notice = cleared.sessions.getValue("A").terminal.items.last().text.lowercase()
+        assertFalse(
+            "the expired notice must not claim the prompt went unanswered — it may have been denied elsewhere: $notice",
+            notice.contains("unanswered"),
+        )
+        assertFalse(
+            "the expired notice must not instruct the user to answer it — it may already be answered/running: $notice",
+            notice.contains("answer it"),
+        )
+    }
+
+    @Test
+    fun permissionClearedAnsweredElsewhereAppendsItsOwnNotice() {
+        val cleared = fold(
+            listOf(SseFrame("3", "permission-cleared", """{"permissionId":"p-1","reason":"answered-elsewhere","sessionId":"A"}""")),
+            initial = sessionWithPendingPrompt("p-1"),
+        )
+        assertTrue(cleared.pendingPermissions.isEmpty())
+        val notice = cleared.sessions.getValue("A").terminal.items.last()
+        assertEquals(TerminalLineType.SYSTEM, notice.type)
+        assertTrue(
+            "answered-elsewhere notice must say it was answered on the computer, got: ${notice.text}",
+            notice.text.contains("answered on the computer"),
+        )
+    }
+
+    @Test
+    fun permissionClearedWithUnknownReasonDropsThePromptButStaysSilent() {
+        // hook-aborted (the agent withdrew its own request) and any reason we
+        // do not understand must NOT narrate a guess — the drop is the whole
+        // contract, the wording is only a courtesy. TerminalReducerTest depends
+        // on this: corpus frame 8's hook-aborted clear appends nothing.
+        val before = sessionWithPendingPrompt("p-1")
+        val terminalBefore = before.sessions.getValue("A").terminal.items
+        val cleared = fold(
+            listOf(SseFrame("3", "permission-cleared", """{"permissionId":"p-1","reason":"hook-aborted","sessionId":"A"}""")),
+            initial = before,
+        )
+        assertTrue(cleared.pendingPermissions.isEmpty())
+        assertEquals(
+            "an unactionable reason must not append a terminal line",
+            terminalBefore,
+            cleared.sessions.getValue("A").terminal.items,
+        )
+    }
+
+    @Test
+    fun permissionSyncRetractsAbsentPermissionsAndKeepsListedOnes() {
+        // The authoritative connect-time frame: a watch that was offline when a
+        // prompt died holds the card until an app restart, because the
+        // per-prompt re-send is additive and can only ever ADD. This frame is
+        // the whole truth — drop everything it does not list.
+        val two = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "permission-request", """{"permissionId":"still-live","tool_name":"Bash","sessionId":"A"}"""),
+                SseFrame("3", "permission-request", """{"permissionId":"died-offline","tool_name":"Bash","sessionId":"A"}"""),
+            ),
+        )
+        assertEquals(2, two.pendingPermissions.size)
+
+        // Reconnect: the bridge lists only the prompt that is still live.
+        // A connect-time sync frame carries no id, so it is reduced directly
+        // rather than through the id-keyed `fold` clock.
+        val syncFrame = SseFrame(null, "permission-sync", """{"permissionIds":["still-live"]}""")
+        val synced = (BridgeEventReducer.reduce(two, syncFrame, 1_100_000L) as BridgeEventReducer.Applied).state
+        assertEquals(
+            "the sync must drop the prompt that died while we were away, and keep the live one",
+            listOf("still-live"),
+            synced.pendingPermissions.map { it.permissionId },
+        )
+    }
+
+    @Test
+    fun emptyPermissionSyncRetractsEverything() {
+        // An empty list is a legal, meaningful instruction ("nothing is live").
+        val before = sessionWithPendingPrompt("p-1")
+        val syncFrame = SseFrame(null, "permission-sync", """{"permissionIds":[]}""")
+        val synced = (BridgeEventReducer.reduce(before, syncFrame, 1_100_000L) as BridgeEventReducer.Applied).state
+        assertTrue("an empty authoritative set must clear the queue", synced.pendingPermissions.isEmpty())
     }
 }

@@ -36,6 +36,31 @@ export function isLoopbackAddress(addr) {
   return m !== null && m.slice(1).every((octet) => Number(octet) <= 255);
 }
 
+// Deterministic JSON for fingerprinting hook payloads (issue #63). Claude Code
+// re-serializes hook bodies between the PreToolUse and PermissionRequest that
+// describe the same tool call, and JSON key order is not contractual — plain
+// JSON.stringify would hash two identical tool_inputs differently and silently
+// lose the correlation. Object keys are sorted recursively; array order is
+// preserved because it is semantic (argv, questions).
+export function stableStringify(value) {
+  if (value === null || typeof value !== "object") {
+    // JSON.stringify returns undefined for undefined/function/symbol; a
+    // fingerprint must always be a string, and "null" is the same thing
+    // JSON.stringify writes for those inside an array.
+    return JSON.stringify(value) ?? "null";
+  }
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const parts = [];
+  for (const key of Object.keys(value).sort()) {
+    // Mirror JSON.stringify: a key whose value is undefined is absent from
+    // the output entirely, rather than serialized as null. Otherwise
+    // {a: undefined} and {a: null} would fingerprint identically.
+    if (value[key] === undefined) continue;
+    parts.push(`${JSON.stringify(key)}:${stableStringify(value[key])}`);
+  }
+  return `{${parts.join(",")}}`;
+}
+
 // Maximum request body size. Bodies are buffered in memory before JSON.parse
 // on unauthenticated endpoints (/pair, /hooks/*), so without a cap a single
 // multi-GB POST OOMs the bridge before auth even runs. No legitimate client

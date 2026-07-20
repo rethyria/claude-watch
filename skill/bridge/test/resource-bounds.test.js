@@ -58,7 +58,7 @@ test("oversized POST bodies are rejected pre-auth and the bridge survives", { ti
   assert.ok(pair.body.token, "pairing still works after oversized requests");
 });
 
-test("never-answered permission auto-denies after the timeout and leaves nothing pending", { timeout: 60_000 }, async (t) => {
+test("never-answered permission expires with no decision and leaves nothing pending", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t, {
     env: { CLAUDE_WATCH_PERMISSION_TIMEOUT_MS: "1500" },
   });
@@ -88,11 +88,20 @@ test("never-answered permission auto-denies after the timeout and leaves nothing
   const permissionId = promptEvent.parsed.permissionId;
   assert.ok(permissionId, "permission-request carries a permissionId");
 
-  // The blocked hook unblocks on its own with a deny.
+  // The blocked hook unblocks on its own — with NO decision, so Claude Code
+  // leaves its own prompt live instead of recording a refusal (issue #63).
   const hook = await hookResponse;
   assert.equal(hook.status, 200);
-  assert.equal(hook.body.hookSpecificOutput.decision.behavior, "deny");
-  await bridge.waitForOutput(/timed out after 1\.5s, auto-denying/);
+  assert.deepEqual(hook.body, {}, "expiry must return no decision, never a deny");
+  await bridge.waitForOutput(/expired after 1\.5s unanswered/);
+
+  // ...and the watch is told, so the card leaves the wrist. Before #63 the
+  // bridge dropped the permission silently and the prompt stayed rendered
+  // until the app was force-stopped.
+  const cleared = await sse.waitFor(
+    (e) => e.event === "permission-cleared" && e.parsed?.permissionId === permissionId,
+  );
+  assert.equal(cleared.parsed.reason, "expired");
 
   // The pending permission was cleaned up: a late decision finds nothing.
   const late = await request(port, "POST", "/command", {
