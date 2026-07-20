@@ -99,6 +99,14 @@ data class HaloModel(
                     pending != null && pending.questions.isNotEmpty() -> SessionState.WAITING_Q
                     pending != null -> SessionState.WAITING_PERM
                     s.thinking || s.activity == SessionActivity.WORKING -> SessionState.RUNNING
+                    // The main loop has yielded (Stop) but subagents are still
+                    // running (issue #55's counts): work IS in flight, so grey
+                    // would be a lie — but the agent will not answer you right
+                    // now either, so green would be one too. This is the long
+                    // unattended stretch a workflow occupies, i.e. exactly what
+                    // the watch exists to report; before this it rendered IDLE
+                    // the instant the turn ended, whatever the fleet was doing.
+                    (s.agents?.running ?: 0) > 0 -> SessionState.DELEGATED
                     else -> SessionState.IDLE
                 }
                 // A worktree session reports its MAIN repo root (issue #54):

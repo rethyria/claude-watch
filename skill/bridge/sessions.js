@@ -32,8 +32,12 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 //   branch/worktree/repoRoot + gitMetaCache carry the git metadata derived at
 //   the slot's root (issue #54, see the git-metadata section below);
 //   agents/workflowActive/workflowActivatedAt/workflowJournalCache track
-//   subagent workflow activity (issue #55, see the workflow-activity section).
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
+//   subagent workflow activity (issue #55, see the workflow-activity section);
+//   idle carries the TURN-level truth that state cannot (issue #60 — see
+//   the turn-end-idle section below): state stays "running" across a finished
+//   turn, so idle is what tells a connect-time snapshot apart from a session
+//   that is actually producing work.
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -473,6 +477,48 @@ export function refreshGitMetadata(slot) {
   }
 }
 
+// --- Turn-end idle (issue #60) ----------------------------------------------
+// The slot model has exactly two lifecycle states, `running` and `ended`, and
+// that is deliberate: Stop fires at the end of every TURN, and mapping it to
+// "ended" would kill a live session on the watch after its first reply (see
+// endHookSession). So Stop only emits a transient `stop` SSE event and leaves
+// slot.state alone.
+//
+// What that left uncovered showed up on hardware: a session whose last hook
+// was a Stop three hours earlier rendered GREEN on a freshly-paired watch. The
+// connect-time sync re-sent the still-live slot as `running`; the client
+// creates a session it has never seen before as WORKING; and the `stop` that
+// had idled it had long since aged out of the SSE replay ring, so nothing
+// could ever correct it. Green means "it is working" — the exact opposite of
+// the truth, on the one screen whose entire job is at-a-glance honesty.
+//
+// So the slot now carries the turn-level truth alongside the lifecycle one:
+// `idle` is TRUE once the last lifecycle signal was a turn END (Stop /
+// TaskComplete) and FALSE while the session is producing work (tool output,
+// PTY output, a headless prompt run). That signal set is deliberately the SAME
+// one the watch reducer folds into markIdle/markWorking, so the flag is
+// exactly "what a client watching live would have computed" — pre-computed for
+// the clients that were NOT watching. A fresh slot is simply born without the
+// field: absent means working, per the omit-when-false wire doctrine below.
+//
+// Setting it never broadcasts. Live clients already learn a turn end from the
+// `stop`/`task-complete` event and new work from the output events, so an
+// extra `session` push per turn would be pure noise (and per turn is a LOT of
+// pushes). The flag's whole job is to ride the NEXT session event — above all
+// the connect-time snapshot, which is where the bug lived.
+
+/** Mark a slot idle: its last lifecycle signal was a turn end. */
+export function markSessionIdle(sessionId) {
+  const slot = sessions.get(sessionId);
+  if (slot) slot.idle = true;
+}
+
+/** Mark a slot working again: it just produced output. */
+export function markSessionWorking(sessionId) {
+  const slot = sessions.get(sessionId);
+  if (slot) slot.idle = false;
+}
+
 // The additive `title` field rides every session payload once known; absent
 // until derivable (clients must tolerate either, per PROTOCOL.md). The same
 // absent-means-preserve doctrine covers the additive git-metadata fields
@@ -483,9 +529,19 @@ export function refreshGitMetadata(slot) {
 // (running/ended + the connect-time sync), so clients can offer an honest
 // "hide" instead of a kill for a process the bridge does not own. The flag is
 // OMITTED for bridge-owned PTY slots — older clients tolerate that, and
-// clients treat absent as external=false (killable). Kept in lockstep with
-// getSessionsSnapshot.
-function sessionEventPayload(slot, fields) {
+// clients treat absent as external=false (killable). The turn-end `idle` flag
+// (issue #60) follows the exact same present-only-when-true rule, and for the
+// same reason must ride EVERY session event uniformly: it is the connect-time
+// snapshot — an event nobody thinks of as "a state change" — that carries the
+// only honest answer for a session idled before the client existed. Kept in
+// lockstep with getSessionsSnapshot.
+//
+// Exported so the ONE session event pushed from outside this module (the
+// headless-prompt run in commands.js) goes through it too. PROTOCOL.md claims
+// these fields ride EVERY session event; a hand-built payload elsewhere makes
+// that claim true only by luck, and the luck runs out the moment a slot has a
+// title or an `external` tag the hand-built push forgets.
+export function sessionEventPayload(slot, fields) {
   const payload = { ...fields };
   if (slot.title) payload.title = slot.title;
   if (slot.branch) payload.branch = slot.branch;
@@ -493,6 +549,9 @@ function sessionEventPayload(slot, fields) {
   if (slot.repoRoot) payload.repoRoot = slot.repoRoot;
   if (slot.agents) payload.agents = slot.agents;
   if (slot.hookCreated) payload.external = true;
+  // Rides `ended` payloads too — meaningless there (clients prune ended
+  // sessions outright), but uniformity beats a special case nobody reads.
+  if (slot.idle) payload.idle = true;
   return payload;
 }
 
@@ -839,13 +898,19 @@ export function bindPtyProcess(slot, proc) {
     log("warn", `Session ${sessionId} stdin write error: ${err.code || err.message}`);
   });
 
+  // Bytes out of the PTY are the bridge-owned equivalent of the tool-output
+  // hook: work is happening, so a slot idled by an earlier turn is working
+  // again (issue #60). Written under a guard — this is the hottest path in the
+  // bridge and the flag is false almost every time.
   proc.stdout.on("data", (data) => {
     if (!slot.firstOutputSeen) flushReadyWaiters(slot, true);
+    if (slot.idle) slot.idle = false;
     pushSseEvent("pty-output", { text: data.toString() }, sessionId);
   });
 
   proc.stderr.on("data", (data) => {
     if (!slot.firstOutputSeen) flushReadyWaiters(slot, true);
+    if (slot.idle) slot.idle = false;
     pushSseEvent("pty-output", { text: data.toString() }, sessionId);
   });
 
@@ -1019,6 +1084,11 @@ export function getSessionsSnapshot() {
     // bridge does not own; omitted for PTY slots (clients treat absent as
     // external=false). Kept in lockstep with sessionEventPayload's SSE tag.
     ...(s.hookCreated ? { external: true } : {}),
+    // Additive turn-end flag (issue #60): present (=true) when the slot's last
+    // lifecycle signal was a Stop/TaskComplete. Same lockstep obligation — a
+    // REST snapshot that disagreed with the SSE snapshot about whether a
+    // session is working would just relocate the bug.
+    ...(s.idle ? { idle: true } : {}),
   }));
 }
 

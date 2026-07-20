@@ -3,7 +3,14 @@
 import crypto from "node:crypto";
 import { log, jsonResponse, readBody, isLoopbackAddress } from "./util.js";
 import { pushSseEvent, sseClients } from "./transport-sse.js";
-import { resolveHookSession, endHookSession, refreshHookSessionTitle, markWorkflowActivity } from "./sessions.js";
+import {
+  resolveHookSession,
+  endHookSession,
+  refreshHookSessionTitle,
+  markWorkflowActivity,
+  markSessionIdle,
+  markSessionWorking,
+} from "./sessions.js";
 import {
   waitForPermission,
   cancelPermission,
@@ -64,6 +71,10 @@ export async function handleHookToolOutput(req, res) {
 
   const sid = resolveHookSession(body);
   const source = body.source || "claude";
+  // A completed tool use is the canonical "this session is producing work"
+  // signal — the same one the watch reducer folds into markWorking — so it
+  // clears any idle left by an earlier turn's Stop (issue #60).
+  markSessionWorking(sid);
   log("info", `Hook: ${source === "codex" ? "Codex" : "PostToolUse"} received [${source}]${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
   // Workflow launch signal (issue #55): the Workflow tool returns immediately
   // (it runs in the background), so this PostToolUse is the ONLY hook-side
@@ -200,6 +211,10 @@ export async function handleHookStop(req, res) {
   }
 
   const sid = resolveHookSession(body);
+  // The turn ended: the session is idle until it produces work again (issue
+  // #60). Marked BEFORE the refresh below, so that if the refresh does
+  // broadcast, the session event it pushes already tells the truth.
+  markSessionIdle(sid);
   // The turn just finished, so the transcript (and possibly its ai-title)
   // just changed: opportunistic title refresh — a change is broadcast as an
   // idempotent `session` running event before the stop lands.
@@ -241,6 +256,10 @@ export async function handleHookTaskComplete(req, res) {
   }
 
   const sid = resolveHookSession(body);
+  // The other turn-end signal the watch reducer treats as markIdle — the two
+  // must agree, or a TaskComplete-ending session would still snapshot green
+  // (issue #60).
+  markSessionIdle(sid);
   log("info", `Hook: TaskCompleted received${sid ? ` session=${sid}` : ""}`);
   pushSseEvent("task-complete", body, sid);
   return jsonResponse(res, 200, { ok: true });

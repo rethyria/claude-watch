@@ -237,6 +237,11 @@ Authenticated snapshot:
   hook-created (external, PTY-less) session whose process the bridge does not
   own; **omitted** for bridge-owned PTY slots. Clients must treat its absence
   as `external: false` (killable). See the [`session`](#session) event.
+- `sessions[].idle` (boolean, **optional, additive**): `true` when the
+  session's last lifecycle signal was a turn end (`Stop`/`TaskCompleted`);
+  **omitted** while it is producing work, and by bridges predating the field.
+  Unlike every other additive field, absence does NOT mean "preserve" — see
+  the [`session`](#session) event for the one-direction consumption rule.
 - `sessions[].branch` / `sessions[].worktree` / `sessions[].repoRoot`
   (**optional, additive**): git metadata of the session's project root —
   branch name (detached HEAD → 7-char short sha); `worktree: true` plus the
@@ -477,6 +482,33 @@ its absence as `external: false`: a PTY session is killable (`kill` command),
 whereas an external session has no bridge-owned process to stop, so a client
 should offer an honest "hide from view" instead of a kill. Additive: this
 does not bump the protocol version and older clients ignore it.
+
+**`idle`** (boolean, **optional, additive** — issue #60): PRESENT (`true`)
+when the bridge's **last lifecycle signal** for the session was a turn **end**
+— a `Stop` or `TaskCompleted` hook. **OMITTED** when the bridge considers the
+session to be producing work (tool output, PTY output, a dictated prompt run),
+and also, necessarily, by any bridge predating this field. Carried uniformly on
+EVERY session event of the slot (`running`/`ended`, the metadata refresh, and
+the connect-time sync) and mirrored on `sessions[].idle` in `/v1/status`.
+
+Absence therefore means **"working, or an older bridge"** — never "preserve
+what you knew". This field is the one exception to the absent-means-preserve
+doctrine that governs `title`/`external`/`branch`, because unlike those it is a
+*dynamic* state that flips both ways. Clients MUST therefore consume it in one
+direction only: a present `true` may mark the session idle (both when first
+learning of it and on a later re-send), while its **absence must never wake a
+session up**. The asymmetry matters — the connect-time re-send arrives on every
+reconnect, so treating it as a wake signal would restart elapsed clocks
+routinely, whereas treating a present `true` as an idle signal only freezes a
+span that had in fact already stopped. Live `stop`/`task-complete`/output
+events remain the authority for every other transition.
+
+The field exists because `state` cannot express it: `Stop` fires per turn and
+must NOT end a session, so an idle session stays `state: "running"` forever.
+Before this flag, a client seeing such a session for the first time had to
+guess WORKING — and the `stop` that had idled it hours earlier was long gone
+from the SSE replay ring, so nothing ever corrected the guess. Additive: no
+protocol-version bump, and older clients ignore it.
 
 A `kill` on an external session is therefore best-effort and non-authoritative:
 the bridge marks the slot `ended`, but if the still-alive process emits another

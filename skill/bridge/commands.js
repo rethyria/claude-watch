@@ -38,6 +38,8 @@ import {
   findMostRecentActiveSession,
   findMostRecentRunningSession,
   getSessionsSnapshot,
+  markSessionIdle,
+  sessionEventPayload,
   waitForFirstPtyOutput,
   writeToSessionStdin,
 } from "./sessions.js";
@@ -202,7 +204,26 @@ function runHeadlessPrompt(res, targetSession, command) {
   log("info", `Running ${targetSession.agent} prompt in ${targetSession.cwd}: "${promptText.slice(0, 80)}"`);
 
   targetSession.state = "running";
-  pushSseEvent("session", { state: "running", agent: targetSession.agent, cwd: targetSession.cwd, folderName: targetSession.folderName }, targetSessionId);
+  // A dictated prompt starts real work on a slot that was very likely idle
+  // (that is why the user is dictating at it): clear the turn-end flag now, so
+  // a watch reconnecting mid-run sees it green rather than grey (issue #60).
+  // The agent's own output will keep it cleared.
+  targetSession.idle = false;
+  // Built through sessionEventPayload like every other session push: this used
+  // to be the one hand-rolled payload in the bridge, which silently dropped
+  // `title`/`external`/`branch` (and would have dropped `idle`) from an event
+  // clients treat as an ordinary idempotent refresh. Uniformity by
+  // construction, not by the accident of a nearby assignment.
+  pushSseEvent(
+    "session",
+    sessionEventPayload(targetSession, {
+      state: "running",
+      agent: targetSession.agent,
+      cwd: targetSession.cwd,
+      folderName: targetSession.folderName,
+    }),
+    targetSessionId,
+  );
 
   const proc = childSpawn(bin, args, {
     cwd: targetSession.cwd,
@@ -220,11 +241,24 @@ function runHeadlessPrompt(res, targetSession, command) {
       pushSseEvent("pty-output", { text }, targetSessionId);
     }
   });
+  // A finished headless run is a turn END, and it is the ONLY turn-end signal
+  // this slot will ever get for it: we spawn the RAW agent binary here, not the
+  // codex-watch wrapper, so nothing POSTs /hooks/stop on our behalf (and a
+  // `claude -p --continue` that reports a fresh session_id gets its hooks
+  // attributed to a different slot entirely). Without this the idle=false set
+  // above is permanent, and one dictated prompt pins the session "working"
+  // forever — re-creating issue #60's green-when-idle symptom on the very slot
+  // the flag was added to keep honest. Setting it never broadcasts; it rides
+  // the next session event, snapshots included (see sessions.js).
   proc.on("close", (exitCode) => {
     log("info", `Prompt process exited (code ${exitCode}) for session ${targetSessionId}`);
+    markSessionIdle(targetSessionId);
   });
   proc.on("error", (err) => {
+    // Spawn/exec failure: no output, no hooks, no run — the slot is doing even
+    // less than idle, and must not be left claiming otherwise.
     log("error", `Prompt process error for session ${targetSessionId}: ${err.message}`);
+    markSessionIdle(targetSessionId);
   });
 
   return jsonResponse(res, 200, { ok: true, sessionId: targetSessionId, agent: targetSession.agent, prompt: true });

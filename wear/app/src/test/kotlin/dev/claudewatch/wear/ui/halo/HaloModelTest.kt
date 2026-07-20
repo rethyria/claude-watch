@@ -1,6 +1,8 @@
 package dev.claudewatch.wear.ui.halo
 
 import dev.claudewatch.shared.protocol.AgentsActivity
+import dev.claudewatch.shared.protocol.SseFrame
+import dev.claudewatch.shared.state.BridgeEventReducer
 import dev.claudewatch.shared.state.BridgeState
 import dev.claudewatch.shared.state.SessionActivity
 import dev.claudewatch.shared.state.SessionState
@@ -96,6 +98,113 @@ class HaloModelTest {
         )
         assertTrue("a hidden session leaves the derived model entirely", hiddenModel.sessions.isEmpty())
         assertEquals(0, hiddenModel.projectCount)
+    }
+
+    /**
+     * Issue #60, end to end through the layer that actually shows the colour.
+     * The live bug was reported as "green", not as "activity == WORKING": a
+     * session idled before the watch connected arrived in the connect-time
+     * snapshot, the reducer created it WORKING, and Halo painted it RUNNING.
+     * Drive a real snapshot frame through the reducer and assert the DOT, so
+     * a regression anywhere along that path is caught where it was seen.
+     */
+    @Test
+    fun aSnapshotSessionFlaggedIdleRendersIdleNotRunning() {
+        fun modelFor(payload: String): HaloModel {
+            val applied = BridgeEventReducer.reduce(
+                BridgeState(),
+                SseFrame(null, "session", payload),
+                1_000L,
+            ) as BridgeEventReducer.Applied
+            return HaloModel.from(UiState(bridge = applied.state))
+        }
+
+        val idled = modelFor(
+            """{"state":"running","agent":"claude","cwd":"/home/dev/claypot","folderName":"claypot","external":true,"idle":true,"sessionId":"A"}""",
+        )
+        assertEquals(
+            "a session the bridge reports idle must not render as running",
+            Halo.SessionState.IDLE,
+            idled.sessions.single().state,
+        )
+
+        // The flagless snapshot (working session, or an older bridge) keeps
+        // rendering RUNNING — the deliberate default, so genuinely-live
+        // sessions never go grey on a reconnect.
+        val working = modelFor(
+            """{"state":"running","agent":"claude","cwd":"/home/dev/claypot","folderName":"claypot","external":true,"sessionId":"A"}""",
+        )
+        assertEquals(Halo.SessionState.RUNNING, working.sessions.single().state)
+    }
+
+    /**
+     * The #60 follow-up: "the turn ended" and "nothing is happening" are NOT
+     * the same claim. A session that yields its turn while a workflow's
+     * subagents keep running is neither RUNNING (it will not answer you) nor
+     * IDLE (work is in flight) — it is DELEGATED, its own colour. Before
+     * this, the state derivation ignored `agents` entirely, so every session
+     * went grey the instant its main loop stopped, however large the fleet it
+     * had just launched — the exact stretch the watch exists to report on.
+     *
+     * Sabotage that this catches: delete the `agents.running > 0` branch and
+     * the idled-with-a-fleet row below reverts to IDLE.
+     */
+    @Test
+    fun aStoppedSessionWithRunningSubagentsIsDelegatedNotIdleOrRunning() {
+        fun stateOf(activity: SessionActivity, running: Int, done: Int = 0): Halo.SessionState =
+            HaloModel.from(
+                uiState(
+                    session("s-1", agents = AgentsActivity(running = running, done = done))
+                        .copy(activity = activity),
+                ),
+            ).sessions.single().state
+
+        // Main loop stopped, fleet still running → the new blue state.
+        assertEquals(
+            "a yielded turn with subagents in flight is delegated, not idle",
+            Halo.SessionState.DELEGATED,
+            stateOf(SessionActivity.IDLE, running = 3),
+        )
+        // The fleet finishes: nothing is left in flight → genuinely idle.
+        assertEquals(
+            "agents at zero means the session really is idle",
+            Halo.SessionState.IDLE,
+            stateOf(SessionActivity.IDLE, running = 0, done = 3),
+        )
+        // The main loop itself working outranks delegation: the agent IS
+        // churning, so it reads as running even while subagents run too.
+        assertEquals(
+            "an actively working main loop stays running, fleet or no fleet",
+            Halo.SessionState.RUNNING,
+            stateOf(SessionActivity.WORKING, running = 3),
+        )
+    }
+
+    /** A pending prompt outranks delegation: needing you is the top signal. */
+    @Test
+    fun aPendingPromptOutranksDelegation() {
+        val model = HaloModel.from(
+            uiState(
+                session("s-1", agents = AgentsActivity(running = 2))
+                    .copy(activity = SessionActivity.IDLE),
+            ).copy(
+                permissionQueue = listOf(
+                    PendingPermission(
+                        permissionId = "p-1",
+                        sessionId = "s-1",
+                        toolName = "Bash",
+                        requestSummary = "rm -rf ./build",
+                        sessionLabel = "proj",
+                        options = emptyList(),
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            "a prompt waiting on the user must not be masked by subagent activity",
+            Halo.SessionState.WAITING_PERM,
+            model.sessions.single().state,
+        )
     }
 
     /** Issue #54: a worktree session groups under basename(repoRoot), so it

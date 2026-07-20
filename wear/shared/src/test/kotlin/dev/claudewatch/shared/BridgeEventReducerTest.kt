@@ -360,6 +360,152 @@ class BridgeEventReducerTest {
         assertNull(quiet.sessions.getValue("B").agents)
     }
 
+    // ------------------------------------------------------------------
+    // Issue #60: the turn-end `idle` flag, consumed at FIRST SIGHT only
+    // ------------------------------------------------------------------
+
+    @Test
+    fun aNewlySeenSessionCarryingIdleStartsIdleNotWorking() {
+        // The live bug: a session whose last hook was a `Stop` HOURS before
+        // this client existed. Its `stop` is long gone from the SSE replay
+        // ring, so the connect-time snapshot's flag is the only truth on
+        // offer — and before #60 we ignored it and rendered green.
+        // A connect-time sync frame carries no id, so it is reduced directly
+        // rather than through the id-keyed `fold` clock.
+        val snapshot = SseFrame(
+            null,
+            "session",
+            """{"state":"running","agent":"claude","cwd":"/home/dev/claypot","folderName":"claypot","external":true,"idle":true,"sessionId":"A"}""",
+        )
+        val state = (BridgeEventReducer.reduce(BridgeState(), snapshot, 1_001_000L) as BridgeEventReducer.Applied).state
+
+        val a = state.sessions.getValue("A")
+        assertEquals(SessionActivity.IDLE, a.activity)
+        // No running span, and nothing frozen either: this client never saw
+        // the span that ended, so it has no honest duration to show.
+        assertNull(a.activeSinceMs)
+        assertNull(a.frozenElapsedMs)
+        assertNull("an idle first sight must show no elapsed clock at all", a.elapsedMs(9_999_999L))
+        // Metadata still lands as usual.
+        assertEquals("claypot", a.folderName)
+        assertTrue(a.external)
+    }
+
+    @Test
+    fun aNewlySeenSessionWithoutTheIdleFlagStaysWorking() {
+        // Absence means "working, or an OLDER bridge" — never "idle". Our
+        // bridge emits the flag on every session event now, so defaulting
+        // absent to IDLE would paint every genuinely-live session on an older
+        // bridge grey on every reconnect: the same bug in the other colour.
+        val snapshot = SseFrame(null, "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}""")
+        val state = (BridgeEventReducer.reduce(BridgeState(), snapshot, 1_001_000L) as BridgeEventReducer.Applied).state
+        val a = state.sessions.getValue("A")
+        assertEquals(SessionActivity.WORKING, a.activity)
+        assertEquals(1_001_000L, a.activeSinceMs)
+    }
+
+    @Test
+    fun aReconnectSnapshotCarryingIdleIdlesAKnownSessionAndFreezesItsSpan() {
+        // The OTHER half of the live bug, and the half the issue title actually
+        // names ("on reconnect"). The watch keeps its BridgeState across SSE
+        // drops, so a session it already tracks is not covered by first-sight
+        // handling at all: if the turn ended during the drop and that `stop`
+        // then aged out of the replay ring, nothing else will ever correct the
+        // WORKING it is still holding. Green, indefinitely — issue #60 verbatim.
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "pty-output", """{"text":"working...\r\n","sessionId":"A"}"""),
+            ),
+        )
+        val before = state.sessions.getValue("A")
+        assertEquals(SessionActivity.WORKING, before.activity)
+        // The span opened at first sight (frame 1); output on an already-working
+        // session does not restart it.
+        assertEquals(1_001_000L, before.activeSinceMs)
+
+        // Reconnect: the connect-time sync re-sends the slot, now flagged idle.
+        val resent = SseFrame(
+            null,
+            "session",
+            """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","idle":true,"sessionId":"A"}""",
+        )
+        val after = (BridgeEventReducer.reduce(state, resent, 1_005_000L) as BridgeEventReducer.Applied).state
+        val a = after.sessions.getValue("A")
+        assertEquals("a flagged resend must idle a known session too", SessionActivity.IDLE, a.activity)
+        // Frozen, NOT restarted: the span that really ran is what we show.
+        assertNull(a.activeSinceMs)
+        assertEquals(4_000L, a.frozenElapsedMs) // t(resend) - activeSince
+
+        // Idempotent: the NEXT reconnect re-sends the same flag, and must not
+        // re-freeze the span from a later `now` (that would inflate a duration
+        // by however long the watch has been reconnecting).
+        val again = (BridgeEventReducer.reduce(after, resent, 9_000_000L) as BridgeEventReducer.Applied).state
+        assertEquals(4_000L, again.sessions.getValue("A").frozenElapsedMs)
+    }
+
+    @Test
+    fun aFlaglessResendNeverWakesOrRestartsAKnownSession() {
+        // The direction that must stay inert, which is what keeps the latch
+        // above from becoming its own bug: the bridge re-sends `running` for
+        // every live slot on EVERY connect, so if ABSENCE were treated as
+        // "working" a routine reconnect would restart the elapsed clock of a
+        // session that has been sitting idle for hours — and would do it again
+        // on every reconnect after that.
+        val idle = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "pty-output", """{"text":"working...\r\n","sessionId":"A"}"""),
+                SseFrame("3", "stop", """{"sessionId":"A"}"""),
+            ),
+        )
+        val before = idle.sessions.getValue("A")
+        assertEquals(SessionActivity.IDLE, before.activity)
+        assertEquals(2_000L, before.frozenElapsedMs) // t(3) - the span opened at t(1)
+
+        val flagless = SseFrame(null, "session", """{"state":"running","agent":"claude","folderName":"a","sessionId":"A"}""")
+        val after = (BridgeEventReducer.reduce(idle, flagless, 6_000_000L) as BridgeEventReducer.Applied).state
+        val a = after.sessions.getValue("A")
+        assertEquals("absence must never wake a session", SessionActivity.IDLE, a.activity)
+        assertNull(a.activeSinceMs)
+        assertEquals("the frozen span must survive a reconnect", 2_000L, a.frozenElapsedMs)
+
+        // A WORKING session is equally untouched by a flagless resend: no
+        // fresh span, no restarted clock.
+        val working = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/b","folderName":"b","sessionId":"B"}"""),
+                SseFrame("2", "pty-output", """{"text":"busy\r\n","sessionId":"B"}"""),
+            ),
+        )
+        val resent = SseFrame(null, "session", """{"state":"running","agent":"claude","folderName":"b","sessionId":"B"}""")
+        val stillWorking = (BridgeEventReducer.reduce(working, resent, 7_000_000L) as BridgeEventReducer.Applied).state
+        val b = stillWorking.sessions.getValue("B")
+        assertEquals(SessionActivity.WORKING, b.activity)
+        assertEquals("the elapsed clock must not restart", 1_001_000L, b.activeSinceMs)
+    }
+
+    @Test
+    fun liveStopAndOutputStillOverrideAFirstSightIdle() {
+        // A session that first appears idle is not stuck there: the ordinary
+        // markWorking path takes over the moment it produces anything.
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","idle":true,"sessionId":"A"}"""),
+                SseFrame("2", "pty-output", """{"text":"new turn\r\n","sessionId":"A"}"""),
+            ),
+        )
+        val working = state.sessions.getValue("A")
+        assertEquals(SessionActivity.WORKING, working.activity)
+        assertEquals(1_002_000L, working.activeSinceMs) // fresh span from the output
+
+        // ...and back to idle on the next turn end, freezing that real span.
+        val after = fold(listOf(SseFrame("3", "stop", """{"sessionId":"A"}""")), state)
+        val a = after.sessions.getValue("A")
+        assertEquals(SessionActivity.IDLE, a.activity)
+        assertEquals(1_000L, a.frozenElapsedMs) // t3 - t2
+    }
+
     @Test
     fun resentRunningStillRefreshesSessionMetadata() {
         val state = fold(

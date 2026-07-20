@@ -30,6 +30,12 @@ object Halo {
         // Semantic session/state colors.
         val WaitingForYou = Color(0xFFD97757) // terracotta — perm & question
         val Running = Color(0xFF6CB289)
+        // The agent yielded its turn but SUBAGENTS are still running: work is
+        // in flight, yet nothing will answer you right now — a third reading
+        // that green (I am working) and grey (nothing is happening) both got
+        // wrong. Luminance-matched to Running (8.1:1 vs 8.2:1 on black) so the
+        // ring reads as a peer state, not an alarm.
+        val Delegated = Color(0xFF6BA8D8)
         val Idle = Color(0xFF3A3C42)
         val Error = Color(0xFFE5484D) // error / offline
 
@@ -82,12 +88,20 @@ object Halo {
     }
 
     /** Per-session state that colors a ring segment and a row dot. */
-    enum class SessionState { WAITING_PERM, WAITING_Q, RUNNING, IDLE, ERROR }
+    /**
+     * [DELEGATED] is the main loop having yielded while its subagents keep
+     * running (issue #60 follow-up): distinct from [RUNNING] (the agent
+     * itself is churning) and from [IDLE] (nothing at all is happening),
+     * because from the wrist those are three different answers to "should I
+     * expect something to change?".
+     */
+    enum class SessionState { WAITING_PERM, WAITING_Q, RUNNING, DELEGATED, IDLE, ERROR }
 
     /** Ring/dot color for a session state (interactive, not ambient). */
     fun colorFor(state: SessionState): Color = when (state) {
         SessionState.WAITING_PERM, SessionState.WAITING_Q -> Palette.WaitingForYou
         SessionState.RUNNING -> Palette.Running
+        SessionState.DELEGATED -> Palette.Delegated
         SessionState.IDLE -> Palette.Idle
         SessionState.ERROR -> Palette.Error
     }

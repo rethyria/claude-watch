@@ -191,6 +191,36 @@ class WireModelContractTest {
     }
 
     @Test
+    fun idleFlagParsesWhenPresentAndIsNullWhenOmitted() {
+        // Issue #60: a session whose last lifecycle signal was a turn end
+        // carries the additive flag.
+        val idled = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-1","idle":true}""",
+        ) as SessionEvent
+        assertEquals(true, idled.idle)
+
+        // Working sessions (and every bridge predating the field) omit it
+        // entirely — present-only-when-true, like `external`/`worktree`. Null
+        // is what the reducer reads as "working", so the distinction between
+        // absent and false must survive parsing.
+        val working = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-2"}""",
+        ) as SessionEvent
+        assertNull(working.idle)
+
+        // It rides `ended` payloads too (uniform emission) without upsetting
+        // the end-of-life extras.
+        val ended = BridgeEventParser.parse(
+            "session",
+            """{"state":"ended","sessionId":"s-3","reason":"session-end","external":true,"idle":true}""",
+        ) as SessionEvent
+        assertEquals(true, ended.idle)
+        assertEquals("session-end", ended.reason)
+    }
+
+    @Test
     fun gitMetadataParsesWhenPresentAndIsNullWhenOmitted() {
         // Issue #54: a worktree session carries all three additive fields.
         val worktree = BridgeEventParser.parse(
