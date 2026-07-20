@@ -47,8 +47,13 @@ previous build). All px at a 450×450 reference; use dp proportionally.
 ## Screens
 
 ### 1. All view (home, page 0)
-Ring: one 205px-radius arc segment **per session** (all sessions), stroke 9,
-round caps, colored by state; equal segments with small gaps. Center: time (88
+Ring: one arc segment **per session** (all sessions), stroke 9, round caps,
+colored by state; equal segments with small gaps. The ring is placed by its
+OUTER edge, 6px in from the display edge (≈3dp — what first-party Wear edge
+chrome hugs to), so the rim line does not move when the ambient stroke thins
+to 4. (Superseded the original bare "205px radius", which left ~7.8dp of dead
+rim and collided with the page dots at 3+ pages; the ~56px safe inset above is
+a text rule and never governed the ring.) Center: time (88
 light) + subtitle "3 projects · 5 sessions" (22, `#8D8B84`). Bottom: page dots
 (y≈414). Tap center → opens the first waiting item directly. No top `TimeText`
 on pages showing the centerpiece time; inner screens show top `TimeText` (20,

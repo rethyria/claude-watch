@@ -62,7 +62,17 @@ object Halo {
 
     // ── Geometry ────────────────────────────────────────────────────────────
     object Geo {
-        val RingRadiusFraction = 205f / 225f // arc radius / display radius
+        // The ring is positioned by its OUTER STROKE EDGE, not its centerline:
+        // the interactive and ambient strokes differ (9 vs 4), and a shared
+        // centerline would leave the thinner ambient ring sitting visibly
+        // further in — the rim line must land in the same place in both modes.
+        // 6px at the 450 ref ≈ 3dp, matching what first-party Wear edge chrome
+        // hugs to (M3 PaddingDefaults.edgePadding is 2.dp, EdgeButton 3.dp).
+        // The handoff's original 205px radius was a bare number with no stated
+        // rationale, and left ~7.8dp of bare rim; the ~56px safe inset below is
+        // explicitly a TEXT rule ("never let text reach the curve"), which the
+        // ring — decorative, non-interactive, wordless — was never subject to.
+        const val RingEdgeGap = 6f           // px at 450 ref, edge → outer stroke
         const val RingStroke = 9f            // px at 450 ref (scaled at draw time)
         const val RingStrokeAmbient = 4f
         val SafeInset = 28.dp                // ~56px circular safe-area inset

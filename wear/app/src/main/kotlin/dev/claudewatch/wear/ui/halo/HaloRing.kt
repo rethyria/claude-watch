@@ -40,7 +40,12 @@ fun HaloRing(
         val minDim = size.minDimension
         val scale = minDim / HALO_REF_PX
         val strokePx = (if (ambient) Halo.Geo.RingStrokeAmbient else Halo.Geo.RingStroke) * scale
-        val radius = Halo.Geo.RingRadiusFraction * (minDim / 2f)
+        // Derived from the OUTER edge inward (see Geo.RingEdgeGap): the arc is
+        // stroked centered on `radius`, so half the stroke has to come back off
+        // to leave the gap the token actually names. Doing it this way keeps
+        // the rim line fixed across the interactive/ambient stroke change and
+        // makes clipping arithmetically impossible at any display size.
+        val radius = (minDim / 2f) - (Halo.Geo.RingEdgeGap * scale) - strokePx / 2f
 
         if (states.isEmpty()) {
             // No sessions: a faint full circle keeps the layout readable
