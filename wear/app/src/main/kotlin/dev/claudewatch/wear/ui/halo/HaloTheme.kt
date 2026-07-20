@@ -89,11 +89,14 @@ object Halo {
 
     /** Per-session state that colors a ring segment and a row dot. */
     /**
-     * [DELEGATED] is the main loop having yielded while its subagents keep
-     * running (issue #60 follow-up): distinct from [RUNNING] (the agent
-     * itself is churning) and from [IDLE] (nothing at all is happening),
-     * because from the wrist those are three different answers to "should I
-     * expect something to change?".
+     * [DELEGATED] means subagents are in flight (issue #60, refined by #67):
+     * distinct from [IDLE] (nothing is happening) and, deliberately, ranked
+     * ABOVE [RUNNING] — while a workflow runs the main loop is idle or
+     * mostly-idle shepherding the fleet, and it never reports a clean stop
+     * (Claude Code holds the turn open), so keying blue on "any subagents
+     * running" is what makes it reachable at all. From the wrist these are
+     * different answers to "should I expect something to change, and will it
+     * answer ME?".
      */
     enum class SessionState { WAITING_PERM, WAITING_Q, RUNNING, DELEGATED, IDLE, ERROR }
 
