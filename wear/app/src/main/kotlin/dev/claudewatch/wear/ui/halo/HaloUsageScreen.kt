@@ -480,7 +480,12 @@ private fun UsageData(
                     Text(
                         text = "no usage windows reported",
                         fontSize = 11.sp, // 22px
-                        color = Halo.Palette.TextFaint,
+                        // TextSecondary, not TextFaint (2026-07-20): when this
+                        // renders it is the ENTIRE screen. A faint token only
+                        // means something inside a hierarchy — here there is
+                        // nothing for it to be subordinate TO, so it was just
+                        // sub-AA (3.39:1) for no gain.
+                        color = Halo.Palette.TextSecondary,
                         textAlign = TextAlign.Center,
                     )
                 }
@@ -583,7 +588,15 @@ private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode
                 Text(
                     text = usageDisplayName(limit.kind, limit.label),
                     fontSize = 11.sp, // 22px window name
-                    color = Halo.Palette.TextSecondary,
+                    // TextPrimary (2026-07-20, user-directed): the window name
+                    // is the HEADING that labels the row's data, so it takes
+                    // the heading tone. This restores the tonal ramp the reset
+                    // promotion above flattened — name (11sp primary) > reset
+                    // (9.5sp secondary) — and matches the truncation priority
+                    // the row already encodes below ("the name is primary
+                    // data"). Against the percent it stays distinct by size
+                    // and weight (15sp Medium) rather than by luminance.
+                    color = Halo.Palette.TextPrimary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.alignByBaseline(),
@@ -615,7 +628,18 @@ private fun UsageRow(limit: UsageLimit, widthPx: Int, compact: Boolean, usedMode
                         Text(
                             text = resets,
                             fontSize = 9.5.sp, // 19px reset time
-                            color = Halo.Palette.TextFaint,
+                            // TextSecondary, not TextFaint (2026-07-20): this
+                            // is the row's only LIVE sub-datum — the whole
+                            // degradation ladder above exists to keep the
+                            // number readable, and painting it at TextFaint's
+                            // 3.39:1 on black undid that at the last step
+                            // (below the 4.5:1 AA floor; #8D8B84 is 6.16:1).
+                            // Faint is the EYEBROW's token — a section label —
+                            // and the reset time is content, not a heading. It
+                            // still reads subordinate to the window name via
+                            // size (9.5sp vs 11sp), which is where that
+                            // distinction belongs.
+                            color = Halo.Palette.TextSecondary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
