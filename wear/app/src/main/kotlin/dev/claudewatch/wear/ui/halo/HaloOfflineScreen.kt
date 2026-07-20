@@ -27,6 +27,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,6 +48,7 @@ fun HaloOfflineScreen(
     ui: BridgeViewModel.UiState,
     onPair: (host: String, port: String, code: String) -> Unit,
     modifier: Modifier = Modifier,
+    onDiscoverForPairing: () -> Unit = {},
 ) {
     var host by remember { mutableStateOf("10.0.2.2") }
     var port by remember { mutableStateOf("7860") }
@@ -55,6 +57,16 @@ fun HaloOfflineScreen(
     // the form stays behind a chip so it doesn't shout over "reconnecting".
     var formOpen by remember { mutableStateOf(false) }
     val showForm = !ui.paired || formOpen
+
+    // Issue #23 zero-typing: kick an NSD scan on entry, then seed the host/port
+    // fields the moment a bridge is found. The fields keep their manual
+    // defaults as a fallback (emulator/no-bridge never lands a discovery), and
+    // seeding is one-shot per discovered value — a later manual edit is never
+    // clobbered because the LaunchedEffect only re-fires when the discovered
+    // value itself changes, not on every recomposition.
+    LaunchedEffect(Unit) { onDiscoverForPairing() }
+    LaunchedEffect(ui.discoveredHost) { ui.discoveredHost?.let { host = it } }
+    LaunchedEffect(ui.discoveredPort) { ui.discoveredPort?.let { port = it.toString() } }
 
     Box(modifier = modifier.fillMaxSize()) {
         HaloRing(states = emptyList(), drained = true)

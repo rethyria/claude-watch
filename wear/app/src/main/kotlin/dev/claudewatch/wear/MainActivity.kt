@@ -216,6 +216,7 @@ fun WatchApp(
         ambient = ambient,
         actions = HaloActions(
             onPair = viewModel::pair,
+            onDiscoverForPairing = viewModel::discoverForPairing,
             onUnpair = viewModel::unpair,
             onSendCommand = viewModel::sendCommand,
             onCommandDraftChange = viewModel::updateCommandDraft,

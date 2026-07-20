@@ -12,9 +12,11 @@ import dev.claudewatch.shared.terminal.ToolOutputFormatter
 import dev.claudewatch.wear.data.CredentialStore
 import dev.claudewatch.wear.net.BackoffPolicy
 import dev.claudewatch.wear.net.BridgeClient
+import dev.claudewatch.wear.net.BridgeDiscovery
 import dev.claudewatch.wear.net.ConnectionEngine
 import dev.claudewatch.wear.net.ConnectionState
 import dev.claudewatch.wear.net.NetworkEscalator
+import dev.claudewatch.wear.net.NsdBridgeDiscovery
 import dev.claudewatch.wear.net.WifiNetworkEscalator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +51,7 @@ class BridgeViewModel(
     clientFactory: (String, Int) -> BridgeClient = { hostIp, port -> BridgeClient(hostIp, port) },
     backoff: BackoffPolicy = BackoffPolicy(),
     escalator: NetworkEscalator = NetworkEscalator.NOOP,
+    discovery: BridgeDiscovery = BridgeDiscovery.NOOP,
 ) {
 
     /**
@@ -190,6 +193,14 @@ class BridgeViewModel(
         val hiddenSessions: Set<String> = emptySet(),
         /** The usage page's fetch-on-open state (issue #57); see [UsageUi]. */
         val usage: UsageUi = UsageUi.Idle,
+        /**
+         * Issue #23 zero-typing: host+port an NSD scan found on the LAN, used
+         * to pre-fill the pairing form so the user types only the code. Null
+         * until a scan lands (emulator/no-bridge leaves them null and the form
+         * keeps its manual defaults).
+         */
+        val discoveredHost: String? = null,
+        val discoveredPort: Int? = null,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -209,7 +220,8 @@ class BridgeViewModel(
     // JVM unit tests don't have) — which is also why process scoping was a
     // natural move: nothing here ever depended on an activity's lifecycle.
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val engine = ConnectionEngine(store, engineScope, clientFactory, backoff, escalator = escalator)
+    private val engine =
+        ConnectionEngine(store, engineScope, clientFactory, backoff, escalator = escalator, discovery = discovery)
 
     /**
      * The engine's raw connection state, exposed for [BridgeSessionService]:
@@ -260,6 +272,21 @@ class BridgeViewModel(
             if (sessionId != null) {
                 _state.update { it.copy(sessionId = sessionId) }
             }
+        }
+    }
+
+    /**
+     * Issue #23 zero-typing: fire an NSD scan when the unpaired/offline screen
+     * shows, publishing any found endpoint so the pairing form pre-fills
+     * host+port and the user enters only the code. NOOP/no-bridge leaves the
+     * fields null and the form's manual defaults stand. Safe to call on every
+     * offline-screen entry: the scan is single-flighted (see [BridgeDiscovery])
+     * and best-effort.
+     */
+    fun discoverForPairing() {
+        engineScope.launch {
+            val found = engine.discoverForPairing() ?: return@launch
+            _state.update { it.copy(discoveredHost = found.hostIp, discoveredPort = found.port) }
         }
     }
 
@@ -953,6 +980,9 @@ class BridgeViewModel(
                 instance ?: BridgeViewModel(
                     CredentialStore.singleton(context),
                     escalator = WifiNetworkEscalator(context.applicationContext),
+                    // Issue #23: real mDNS/NSD discovery for zero-typing pairing
+                    // and the DHCP self-heal, over the actual Wi-Fi transport.
+                    discovery = NsdBridgeDiscovery(context.applicationContext),
                 ).also { instance = it }
             }
 

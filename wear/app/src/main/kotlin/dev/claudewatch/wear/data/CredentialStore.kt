@@ -80,6 +80,22 @@ class CredentialStore(
     }
 
     /**
+     * The paired bridge relocated to a new HOST+port after a DHCP lease change
+     * (issue #23 NSD self-heal matched its pinned bridgeId at the new address).
+     * Rewrites hostIp AND port; token, bridgeId and the replay cursor all
+     * survive because it is the SAME bridge — a full replay here would drop
+     * every event pushed while it was stranded. A no-op when unpaired.
+     * [savePort] cannot express a host change, which is exactly the DHCP gap
+     * this closes.
+     */
+    suspend fun saveEndpoint(hostIp: String, port: Int) {
+        dataStore.updateData { current ->
+            val credentials = current.credentials ?: return@updateData current
+            current.copy(credentials = credentials.copy(hostIp = hostIp, port = port))
+        }
+    }
+
+    /**
      * Advances the replay cursor. A no-op once credentials are cleared so a
      * late in-flight event from a torn-down stream cannot resurrect state
      * after unpair.

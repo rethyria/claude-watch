@@ -70,6 +70,14 @@ import kotlin.math.roundToInt
 /** Everything Halo can ask the ViewModel to do (mirror of the VM's actions). */
 data class HaloActions(
     val onPair: (host: String, port: String, code: String) -> Unit = { _, _, _ -> },
+    /**
+     * Issue #23 zero-typing: the offline/unpaired screen appeared — fire an
+     * NSD scan so a found bridge's host+port pre-fill the pairing form. Fired
+     * on every offline-screen entry; the scan is single-flighted and
+     * best-effort, so a no-op default and NOOP discovery leave manual entry
+     * fully intact.
+     */
+    val onDiscoverForPairing: () -> Unit = {},
     val onUnpair: () -> Unit = {},
     /** Send [text] to [toSession] (null = the VM's default session). */
     val onSendCommand: (text: String, toSession: String?) -> Unit = { _, _ -> },
@@ -613,7 +621,11 @@ private fun HaloAppBody(
                 // fillMaxSize, so its own controls own every hit — and offline
                 // there are no sessions behind it to drive anyway.
             ) {
-                HaloOfflineScreen(ui = ui, onPair = actions.onPair)
+                HaloOfflineScreen(
+                    ui = ui,
+                    onPair = actions.onPair,
+                    onDiscoverForPairing = actions.onDiscoverForPairing,
+                )
             }
         }
 
