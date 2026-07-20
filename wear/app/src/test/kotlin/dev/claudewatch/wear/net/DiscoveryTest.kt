@@ -1,6 +1,7 @@
 package dev.claudewatch.wear.net
 
 import dev.claudewatch.wear.data.AesGcmTokenCipher
+import dev.claudewatch.wear.data.BridgeCredentials
 import dev.claudewatch.wear.data.CredentialStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -100,6 +101,8 @@ class DiscoveryTest {
     private fun newEngine(
         probePorts: List<Int> = emptyList(),
         escalator: NetworkEscalator = NetworkEscalator.NOOP,
+        discovery: BridgeDiscovery = BridgeDiscovery.NOOP,
+        rediscoverAfterAttempts: Int = ConnectionEngine.DEFAULT_REDISCOVER_AFTER_ATTEMPTS,
         clientFactory: (String, Int) -> BridgeClient = { hostIp, port -> BridgeClient(hostIp, port) },
     ) = ConnectionEngine(
         store = store,
@@ -107,6 +110,8 @@ class DiscoveryTest {
         clientFactory = clientFactory,
         backoff = BackoffPolicy(baseMs = 40, maxMs = 200, random = Random(11)),
         escalator = escalator,
+        discovery = discovery,
+        rediscoverAfterAttempts = rediscoverAfterAttempts,
         probePorts = probePorts,
     ).also { engine = it }
 
@@ -446,5 +451,306 @@ class DiscoveryTest {
         assertEquals(server.port, credentials.port)
         assertEquals("tok-1", credentials.token)
         assertEquals("bridgeId is pinned at pair time", "b-1", credentials.bridgeId)
+    }
+
+    // -- DHCP self-heal via NSD re-discovery (issue #23) ----------------------
+    //
+    // These exercise the ENGINE side of the self-heal against a recording
+    // BridgeDiscovery fake: the threshold gate, the pinned-bridgeId filter, the
+    // foreign-bridge refusal, the legacy-null bail, and the transparent
+    // host+port persistence that preserves the replay cursor. The framework
+    // glue behind NsdBridgeDiscovery (real multicast/bind) is a separate HITL
+    // issue and is unit-tested for its resource discipline in
+    // NsdBridgeDiscoveryTest; it CANNOT be exercised here (emulator NAT drops
+    // LAN multicast).
+
+    /** Records every scan (its bridgeId filter) and returns a fixed [result]. */
+    private class RecordingDiscovery(
+        private val result: BridgeDiscovery.Discovered?,
+    ) : BridgeDiscovery {
+        val filters = CopyOnWriteArrayList<String?>()
+        val calls = AtomicInteger(0)
+        override suspend fun discover(bridgeId: String?, timeoutMs: Long): BridgeDiscovery.Discovered? {
+            calls.incrementAndGet()
+            filters.add(bridgeId)
+            return result
+        }
+    }
+
+    @Test
+    fun selfHealFollowsDhcpMoveResumesAndPersists() {
+        // The bridge originally lives on `server`. A DHCP lease change hands it
+        // a new IP; it is now reachable only at `relocated`'s address, which the
+        // scan returns for the pinned bridgeId.
+        val relocated = newServer()
+        relocated.enqueue(pingResponse()) // reconnect preflight after relocation
+        relocated.enqueue(sseHeld("id: 6\nevent: tool-output\ndata: {\"n\":2}\n\n"))
+
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        server.enqueue(sseHeld("id: 5\nevent: tool-output\ndata: {\"n\":1}\n\n", pads = 2))
+
+        val discovery = RecordingDiscovery(
+            BridgeDiscovery.Discovered("127.0.0.1", relocated.port, "b-1"),
+        )
+        val engine = newEngine(discovery = discovery, rediscoverAfterAttempts = 2)
+        val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
+        scope.launch {
+            engine.events.collect {
+                it.id?.let { id -> engine.ackApplied(id) }
+                events.add(it)
+            }
+        }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { events.any { it.id == "5" } }
+
+        // DHCP move: the stored ip goes dark (host up, bridge gone → refused).
+        // After `rediscoverAfterAttempts` failed reconnects the scan fires and
+        // the engine follows the bridge to its new port.
+        server.shutdown()
+
+        awaitCondition { events.any { it.id == "6" } }
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+
+        // The scan was filtered by the pinned bridgeId — never a blind relocation.
+        assertTrue("a scan must have run", discovery.filters.isNotEmpty())
+        assertTrue("scan filtered by pinned bridgeId", discovery.filters.all { it == "b-1" })
+
+        // The relocated bridge was pinged (preflight) then trusted with the
+        // token AND the replay cursor: resume from the last acked id, no full
+        // replay.
+        takeRequest(from = relocated).let { assertEquals("/v1/ping", it.path) }
+        takeRequest(from = relocated).let {
+            assertEquals("/v1/events", it.path)
+            assertEquals("Bearer tok-1", it.getHeader("Authorization"))
+            // Resume from the last acked id, NOT a full replay ("0"). NOTE:
+            // this header is sourced from the engine's IN-MEMORY cursor, which
+            // self-heal never touches — so it proves the resume happens, but it
+            // is INVARIANT to saveEndpoint vs saveCredentials and thus cannot
+            // prove the PERSISTED cursor survived (a full-replay regression
+            // observable only on a cold restart). That proof lives in
+            // selfHealPersistsEndpointWithoutResettingTheReplayCursor below,
+            // which reads store.read().lastEventId directly.
+            assertEquals("5", it.getHeader("Last-Event-ID"))
+        }
+
+        // The new HOST+port is persisted via saveEndpoint — token, bridgeId and
+        // the replay cursor all survive (same bridge at a new address).
+        awaitCondition { runBlocking { store.read().credentials }?.port == relocated.port }
+        val creds = runBlocking { store.read().credentials }!!
+        assertEquals("127.0.0.1", creds.hostIp)
+        assertEquals(relocated.port, creds.port)
+        assertEquals("tok-1", creds.token)
+        assertEquals("b-1", creds.bridgeId)
+    }
+
+    @Test
+    fun selfHealPersistsEndpointWithoutResettingTheReplayCursor() {
+        // The A1 gap: selfHealFollowsDhcpMoveResumesAndPersists proves the
+        // resume cursor only via the reconnect's Last-Event-ID header, which is
+        // sourced from the engine's IN-MEMORY lastEventId — invariant to whether
+        // the self-heal persists via saveEndpoint (cursor preserved) or
+        // saveCredentials (cursor reset to full-replay "0"). It also cannot read
+        // the PERSISTED cursor at the end, because the relocated stream's event
+        // "6" re-acks and re-advances it, masking any transient reset.
+        //
+        // This test closes that gap: the relocated stream delivers NO id-bearing
+        // event, so nothing re-acks after the move. The ONLY thing that could
+        // have touched store.lastEventId is the self-heal persist itself, and we
+        // read it directly — the assertion the header-only proof cannot make.
+        val relocated = newServer()
+        relocated.enqueue(pingResponse())            // reconnect preflight after relocation
+        relocated.enqueue(sseHeld(":connected\n\n")) // held open, NO id-bearing event → no re-ack
+
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        server.enqueue(sseHeld("id: 5\nevent: tool-output\ndata: {\"n\":1}\n\n", pads = 2))
+
+        val discovery = RecordingDiscovery(
+            BridgeDiscovery.Discovered("127.0.0.1", relocated.port, "b-1"),
+        )
+        val engine = newEngine(discovery = discovery, rediscoverAfterAttempts = 2)
+        val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
+        scope.launch {
+            engine.events.collect {
+                it.id?.let { id -> engine.ackApplied(id) }
+                events.add(it)
+            }
+        }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { events.any { it.id == "5" } }
+        // Precondition: event 5 was applied+acked, so the PERSISTED cursor is "5".
+        awaitCondition { runBlocking { store.read().lastEventId } == "5" }
+
+        // DHCP move: stored ip goes dark, self-heal scans, follows to relocated,
+        // reconnects. saveEndpoint here preserves the persisted cursor;
+        // saveCredentials would reset it to "0".
+        server.shutdown()
+        awaitCondition { runBlocking { store.read().credentials }?.port == relocated.port }
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+
+        // Nothing re-acked after the move (the relocated stream carried no id),
+        // so this is the value the self-heal persist left behind. It MUST still
+        // be "5": a full-replay reset ("0") would drop every event pushed while
+        // the watch was stranded on the next cold start.
+        assertEquals(
+            "self-heal must persist host+port WITHOUT resetting the persisted replay cursor",
+            "5",
+            runBlocking { store.read().lastEventId },
+        )
+    }
+
+    @Test
+    fun selfHealDoesNotFireBeforeThreshold() {
+        // Count preflight pings and record the ping count at the FIRST scan: a
+        // transient blip (fewer than `rediscoverAfterAttempts` failures) must
+        // never trigger the heavyweight multicast scan.
+        val pathBroken = AtomicBoolean(false)
+        val pingCount = AtomicInteger(0)
+        val firstScanAtPingCount = AtomicInteger(-1)
+        val threshold = 3
+        val discovery = object : BridgeDiscovery {
+            val calls = AtomicInteger(0)
+            override suspend fun discover(bridgeId: String?, timeoutMs: Long): BridgeDiscovery.Discovered? {
+                if (calls.getAndIncrement() == 0) firstScanAtPingCount.set(pingCount.get())
+                return null
+            }
+        }
+        val engine = newEngine(
+            discovery = discovery,
+            rediscoverAfterAttempts = threshold,
+            clientFactory = { hostIp, port ->
+                object : BridgeClient(hostIp, port) {
+                    override fun ping(): ApiResult {
+                        if (pathBroken.get()) {
+                            pingCount.incrementAndGet()
+                            throw SocketTimeoutException("simulated broken path")
+                        }
+                        return super.ping()
+                    }
+                }
+            },
+        )
+
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        server.enqueue(sseHeld(":connected\n\n", pads = 2))
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+
+        // Break the path; the held stream ends shortly and every reconnect
+        // preflight now fails. Wait for the first scan, then check how many
+        // failures preceded it.
+        pathBroken.set(true)
+        awaitCondition { discovery.calls.get() > 0 }
+
+        assertTrue(
+            "self-heal fired too early: only ${firstScanAtPingCount.get()} failed pings before the first scan",
+            firstScanAtPingCount.get() >= threshold - 1,
+        )
+    }
+
+    @Test
+    fun selfHealScanIsFilteredByPinnedBridgeId() {
+        val discovery = RecordingDiscovery(result = null) // finds nothing
+        val engine = newEngine(discovery = discovery, rediscoverAfterAttempts = 1)
+
+        server.enqueue(pingResponse(bridgeId = "b-1"))
+        server.enqueue(pairResponse())
+        server.enqueue(sseHeld(":connected\n\n", pads = 2))
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+
+        server.shutdown() // DHCP move: stored ip dark, self-heal starts scanning
+        awaitCondition { discovery.calls.get() > 0 }
+
+        // Every scan carries the pinned bridgeId as its filter — never a blind
+        // "any bridge" scan that could latch onto a stranger.
+        assertTrue("a scan must have run", discovery.filters.isNotEmpty())
+        assertTrue("scan must filter by pinned bridgeId", discovery.filters.all { it == "b-1" })
+    }
+
+    @Test
+    fun selfHealRejectsForeignBridgeIdAndStaysPut() {
+        // The scan returns an endpoint whose bridgeId does NOT match the pin (a
+        // stranger squatting mDNS, or a stale advertisement of another bridge).
+        val stranger = newServer() // must never be contacted by the engine
+        val discovery = RecordingDiscovery(
+            BridgeDiscovery.Discovered("127.0.0.1", stranger.port, "b-EVIL"),
+        )
+        val engine = newEngine(discovery = discovery, rediscoverAfterAttempts = 2)
+
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        server.enqueue(sseHeld(":connected\n\n", pads = 2))
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        val originalPort = server.port
+
+        server.shutdown() // DHCP move: self-heal fires but the foreign id is refused
+        awaitCondition { discovery.calls.get() > 0 }
+        Thread.sleep(500) // give any (wrongful) relocation a chance to persist
+
+        // The stored endpoint is UNCHANGED: never relocated to the stranger,
+        // and the stranger was never contacted (no token leaked, no stream).
+        val creds = runBlocking { store.read().credentials }!!
+        assertEquals("127.0.0.1", creds.hostIp)
+        assertEquals(originalPort, creds.port)
+        assertEquals("tok-1", creds.token)
+        assertEquals("the stranger must never be contacted", 0, stranger.requestCount)
+    }
+
+    @Test
+    fun selfHealSkippedForLegacyPairingWithoutBridgeId() {
+        // A legacy pairing persisted no bridgeId. Cold-start restores it with a
+        // null pin; the self-heal must never relocate a pairing it cannot
+        // verify, even at the most eager threshold.
+        runBlocking {
+            store.saveCredentials(
+                BridgeCredentials("tok-legacy", "127.0.0.1", server.port, bridgeId = null),
+            )
+        }
+        val pathBroken = AtomicBoolean(false)
+        val discovery = RecordingDiscovery(
+            BridgeDiscovery.Discovered("127.0.0.1", 7999, "b-anything"),
+        )
+        val engine = newEngine(
+            discovery = discovery,
+            rediscoverAfterAttempts = 1,
+            clientFactory = { hostIp, port ->
+                object : BridgeClient(hostIp, port) {
+                    override fun ping(): ApiResult {
+                        if (pathBroken.get()) throw SocketTimeoutException("simulated broken path")
+                        return super.ping()
+                    }
+                }
+            },
+        )
+
+        server.enqueue(pingResponse()) // cold-start preflight (pin null → any bridge accepted)
+        server.enqueue(sseHeld(":connected\n\n", pads = 2))
+
+        engine.start()
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+
+        pathBroken.set(true)
+        awaitCondition {
+            engine.state.value is ConnectionState.Reconnecting ||
+                engine.state.value is ConnectionState.Connecting
+        }
+        // Several reconnect cycles at 40-200ms backoff. With threshold=1 a
+        // PINNED bridge would have scanned many times by now — a legacy one
+        // (null pin) must never scan at all.
+        Thread.sleep(1_000)
+        assertEquals(
+            "legacy pairing (null bridgeId) must never self-heal",
+            0,
+            discovery.calls.get(),
+        )
     }
 }

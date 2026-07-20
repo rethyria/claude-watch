@@ -144,6 +144,15 @@ class ConnectionEngine(
     private val minProto: Int = MIN_PROTO_VERSION,
     private val io: CoroutineDispatcher = Dispatchers.IO,
     private val escalator: NetworkEscalator = NetworkEscalator.NOOP,
+    // Issue #23: mDNS/NSD re-discovery for the DHCP self-heal. NOOP on the
+    // emulator/JVM (multicast can't be exercised there); the production
+    // NsdBridgeDiscovery is wired in the ViewModel singleton.
+    private val discovery: BridgeDiscovery = BridgeDiscovery.NOOP,
+    // Consecutive failed reconnects before a self-heal scan fires — below this a
+    // DHCP move is indistinguishable from a transient blip, and NSD (multicast +
+    // a process-global Wi-Fi bind) is far too heavy to run on every blip.
+    private val rediscoverAfterAttempts: Int = DEFAULT_REDISCOVER_AFTER_ATTEMPTS,
+    private val discoveryTimeoutMs: Long = BridgeDiscovery.DEFAULT_TIMEOUT_MS,
     private val probePorts: List<Int> = DEFAULT_PROBE_PORTS,
 ) {
 
@@ -357,6 +366,17 @@ class ConnectionEngine(
             connect(verifyIdentity = false)
             body
         }
+
+    /**
+     * Issue #23 zero-typing: discover ANY bridge on the LAN (null bridgeId
+     * filter — there is no pinned identity yet at pairing time) so the pairing
+     * form can pre-fill host+port and the user enters only the code. Returns
+     * null on the emulator/JVM ([BridgeDiscovery.NOOP]) or when no bridge
+     * answers, in which case the form keeps its manual defaults. Best-effort:
+     * any discovery failure degrades to manual entry, never an error.
+     */
+    suspend fun discoverForPairing(): BridgeDiscovery.Discovered? =
+        withContext(io) { runCatching { discovery.discover(null, discoveryTimeoutMs) }.getOrNull() }
 
     /**
      * Records a failed pair attempt WITHOUT touching the engine: whatever was
@@ -671,6 +691,87 @@ class ConnectionEngine(
         return null
     }
 
+    /**
+     * Issue #23 self-heal. A DHCP lease change hands the bridge a NEW IP; the
+     * stored ip then times out (unassigned) or is squatted by a machine that
+     * refuses/decoys — every reconnect fails and [attempt] climbs. Once it has
+     * climbed to [rediscoverAfterAttempts] (PERSISTENT failure, not a blip),
+     * re-run mDNS discovery FILTERED BY THE PINNED bridgeId and transparently
+     * follow the bridge to its new address.
+     *
+     * Complementary to the escalator, never a fight with it: the escalator
+     * fixes the TRANSPORT (holds Wi-Fi up so the LAN is reachable at all — it
+     * ran synchronously at schedule time, before this call); discovery fixes
+     * the ADDRESS. This runs INSIDE the single-flight reconnect job, just before
+     * connect(), so a scan never overlaps itself or a live stream.
+     *
+     * Never relocates without a pinned identity to match ([pinnedBridgeId] null
+     * for a legacy pairing bails — same invariant probeForRelocatedBridge holds
+     * for port moves), and the discovered bridgeId is re-checked against the pin
+     * before anything is applied. connect() below is still the authoritative
+     * gate: its preflight /v1/pings the new address and verifies the bridgeId
+     * BEFORE the token is ever offered, so a fooled discovery cannot leak a
+     * token to a stranger.
+     */
+    private suspend fun maybeSelfHeal(myEpoch: Int) {
+        val pinned = synchronized(lock) {
+            // Still our reconnect, still paired, and the failure is persistent.
+            if (stopped || epoch != myEpoch) return
+            if (attempt < rediscoverAfterAttempts) return
+            pinnedBridgeId ?: return // legacy pairing: never relocate blind
+        }
+        // Heavy, cancellable, self-releasing (see BridgeDiscovery). Runs OUTSIDE
+        // the lock — it blocks on multicast for up to discoveryTimeoutMs.
+        val found = try {
+            discovery.discover(pinned, discoveryTimeoutMs)
+        } catch (_: Exception) {
+            null // discovery is best-effort; fall through to the normal backoff
+        } ?: return
+        // Defense in depth: the seam already filters by bridgeId, but re-verify
+        // before mutating engine state — never follow a stranger.
+        if (found.bridgeId != pinned) return
+        val newClient = try {
+            clientFactory(found.hostIp, found.port)
+        } catch (_: IllegalArgumentException) {
+            return // resolved a non-RFC1918 address: ignore it
+        }
+        val applied = synchronized(lock) {
+            // A stop()/pair()/401 that raced the scan wins: discard the result.
+            if (stopped || epoch != myEpoch) return
+            if (pairedHost == found.hostIp && pairedPort == found.port) {
+                false // discovery pointed us back at the SAME address: nothing to move
+            } else {
+                client = newClient
+                pairedHost = found.hostIp
+                pairedPort = found.port
+                true
+            }
+        }
+        if (applied) persistSelfHealedEndpoint(found.hostIp, found.port)
+        // connect() runs next (same reconnect job) and its preflight verifies
+        // the pinned bridgeId at the NEW address before offering the token.
+    }
+
+    /**
+     * Persist a DHCP self-heal relocation. Mirrors [persistRelocatedPort]'s
+     * launch/mutex/liveness discipline, but writes host AND port via the new
+     * [CredentialStore.saveEndpoint] — NOT saveCredentials, which would reset
+     * the replay cursor. It is the SAME bridge at a new address, so the cursor
+     * MUST survive: a full replay here would drop every event pushed while the
+     * watch was stranded.
+     */
+    private fun persistSelfHealedEndpoint(hostIp: String, port: Int) {
+        scope.launch {
+            persistMutex.withLock {
+                // Only persist while the relocation is still the engine's live view.
+                val current = synchronized(lock) {
+                    !stopped && pairedHost == hostIp && pairedPort == port
+                }
+                if (current) store.saveEndpoint(hostIp, port)
+            }
+        }
+    }
+
     /** Refused = the host answered with a reset: something is THERE, the bridge is not. */
     private fun isConnectionRefused(e: Exception): Boolean {
         var cause: Throwable? = e
@@ -759,6 +860,13 @@ class ConnectionEngine(
             val delayMs = backoff.delayMsFor(nextAttempt)
             reconnectJob = scope.launch {
                 delay(delayMs)
+                // Issue #23: after a PERSISTENT stored-ip failure, re-discover
+                // the pinned bridge by mDNS and follow a DHCP move BEFORE the
+                // next connect(). escalate() already ran synchronously above
+                // (before this delay), so the Wi-Fi radio the multicast scan
+                // needs is already up — the required escalate-precedes-discovery
+                // ordering. Gated + guarded inside maybeSelfHeal.
+                maybeSelfHeal(myEpoch)
                 connect()
             }
             _state.value = ConnectionState.Reconnecting(nextAttempt, reason)
@@ -821,6 +929,15 @@ class ConnectionEngine(
          * an explanation instead of tolerating undefined behavior later.
          */
         const val MIN_PROTO_VERSION = 3
+
+        /**
+         * Consecutive failed reconnects before an NSD self-heal scan fires
+         * (issue #23). Below this floor a DHCP move is indistinguishable from a
+         * transient blip, and a full multicast scan + process Wi-Fi bind is far
+         * too heavy to run on every blip. On a hit, onOpen resets attempt to 0,
+         * ending the scan loop.
+         */
+        const val DEFAULT_REDISCOVER_AFTER_ATTEMPTS = 3
 
         /**
          * The bridge walks 7860..7869 at startup (7860 is Gradio's default,
