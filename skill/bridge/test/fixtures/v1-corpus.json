@@ -643,6 +643,7 @@
         "folderName": "fixture-project",
         "reason": "session-end",
         "external": true,
+        "idle": true,
         "sessionId": "<session-1>"
       }
     }
@@ -675,6 +676,7 @@
         "folderName": "fixture-project",
         "reason": "session-end",
         "external": true,
+        "idle": true,
         "sessionId": "<session-1>"
       }
     }

@@ -91,6 +91,33 @@ data class SessionEvent(
      */
     val external: Boolean? = null,
     /**
+     * Additive optional turn-end flag (issue #60). PRESENT (=true) means the
+     * bridge's LAST lifecycle signal for this session was a turn END — a
+     * `Stop` or `TaskCompleted` hook. OMITTED (null) means the bridge either
+     * considers the session to be producing work, or predates the field.
+     *
+     * CONSUMED IN ONE DIRECTION ONLY. Every other additive field here follows
+     * preserve-on-absence (absent = "keep what you knew"); this one is a
+     * DYNAMIC state that flips both ways, so it must never be merged by that
+     * rule. Instead: a PRESENT `true` may idle the session — at first sight,
+     * and as a latch on a re-send for a session already known — while its
+     * ABSENCE changes nothing, ever, and never wakes a session up.
+     *
+     * The asymmetry is deliberate. The bridge re-sends `running` for every live
+     * slot on EVERY connect; letting that WAKE a session would restart its
+     * elapsed clock on each routine reconnect (and absence also means "an
+     * older bridge", which knows nothing at all). Letting it IDLE one can only
+     * freeze a span, which is exactly the transition a missed `stop` would have
+     * made. Live `stop`/`task-complete`/output events remain the authority for
+     * every other transition.
+     *
+     * Its reason to exist is the turn that ended while the client was not
+     * listening — before it ever connected, or during one of the SSE drops the
+     * watch lives with. Either way that `stop` has aged out of the replay ring,
+     * and a `session` event is the only place the truth can still arrive.
+     */
+    val idle: Boolean? = null,
+    /**
      * Additive git metadata (issue #54): the branch of the session's project
      * root ("main", "issue-53-fix"; detached HEAD → the 7-char short sha).
      * Absent when the root is not a git checkout or HEAD is unreadable —

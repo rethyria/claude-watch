@@ -307,6 +307,7 @@ private fun statusLabel(state: SessionState): String = when (state) {
     SessionState.WAITING_PERM -> "waiting for permission"
     SessionState.WAITING_Q -> "has a question"
     SessionState.RUNNING -> "running"
+    SessionState.DELEGATED -> "subagents running"
     SessionState.IDLE -> "idle"
     SessionState.ERROR -> "error"
 }

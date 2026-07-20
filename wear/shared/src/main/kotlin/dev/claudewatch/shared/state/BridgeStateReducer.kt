@@ -278,6 +278,8 @@ object BridgeEventReducer {
                 // The one live re-emission of `running` for an existing slot
                 // (headless prompt run) is immediately followed by pty-output,
                 // which markWorking turns into a fresh WORKING span anyway.
+                // The `idle` flag (issue #60) is the ONE exception, and only in
+                // the IDLE direction — see the latch below.
                 val session = existing?.copy(
                     agent = event.agent ?: existing.agent,
                     cwd = event.cwd ?: existing.cwd,
@@ -306,7 +308,33 @@ object BridgeEventReducer {
                     worktree = if (event.branch != null) event.worktree ?: false else existing.worktree,
                     repoRoot = if (event.branch != null) event.repoRoot else existing.repoRoot,
                     agents = event.agents ?: existing.agents,
-                ) ?: SessionState(
+                )?.let { known ->
+                    // ONE-WAY IDLE LATCH (issue #60). `idle: true` is honoured
+                    // for a session we already track; its ABSENCE is not —
+                    // absence never wakes anything up.
+                    //
+                    // The asymmetry is the whole point. The reported bug is a
+                    // session idled while we were not listening, and that does
+                    // NOT only happen before first sight: the watch drops SSE
+                    // constantly and keeps its BridgeState across reconnects,
+                    // so a `stop` that fired during the gap and then aged out
+                    // of the replay ring is lost just as completely for a
+                    // session we already know. First-sight-only scoping would
+                    // leave that session green forever — issue #60's exact
+                    // symptom, on the path its title actually names.
+                    //
+                    // Honouring it in only this direction is what keeps the
+                    // cure from becoming the disease: applying `true` can only
+                    // FREEZE a span (idempotently — an already-IDLE session is
+                    // untouched, so routine reconnects never re-freeze), which
+                    // is precisely the transition the missed `stop` would have
+                    // made. It is a WAKE that would be dangerous, because it
+                    // restarts the elapsed clock on every reconnect — so
+                    // absence stays preserve-on-absence, exactly as it was, and
+                    // live `stop`/output events remain the authority for
+                    // everything else.
+                    if (event.idle == true) idled(known, nowMs) else known
+                } ?: SessionState(
                     sessionId = id,
                     agent = event.agent,
                     cwd = event.cwd,
@@ -317,8 +345,29 @@ object BridgeEventReducer {
                     worktree = event.worktree ?: false,
                     repoRoot = event.repoRoot,
                     agents = event.agents,
-                    activity = SessionActivity.WORKING,
-                    activeSinceMs = nowMs,
+                    // FIRST SIGHT: the case `idle` was added for (issue #60). A
+                    // session whose turn ended before this client connected has
+                    // no `stop` left in the replay ring to correct a guess, so
+                    // the bridge's flag is the only truth on offer — without it,
+                    // a session idle for three hours rendered green on a
+                    // freshly-paired watch. (The latch above covers the same
+                    // loss for a session we already know.)
+                    //
+                    // ABSENCE keeps WORKING deliberately. Our bridge now emits
+                    // the flag on every session event, so an absent flag means
+                    // an OLDER bridge — and defaulting those to IDLE would
+                    // paint every genuinely-live session grey on every
+                    // reconnect: the same bug wearing the opposite colour.
+                    // Guessing WORKING is also the self-correcting guess when
+                    // it is wrong (a live session's next output or stop event
+                    // is already on its way); guessing IDLE is not.
+                    activity = if (event.idle == true) SessionActivity.IDLE else SessionActivity.WORKING,
+                    // Elapsed fields stay coherent with that activity: an idle
+                    // session has no running span (and nothing frozen either —
+                    // this client never observed the span that ended, so it
+                    // has no honest duration to show), a working one starts
+                    // its span now, exactly as before.
+                    activeSinceMs = if (event.idle == true) null else nowMs,
                     frozenElapsedMs = null,
                 )
                 state.copy(sessions = state.sessions + (id to session))
@@ -329,16 +378,35 @@ object BridgeEventReducer {
                 state.copy(sessions = state.sessions - requireNotNull(event.sessionId))
         }
 
-    private fun markIdle(state: BridgeState, sessionId: String?, nowMs: Long): BridgeState {
-        val session = sessionId?.let { state.sessions[it] } ?: return state
-        if (session.activity == SessionActivity.IDLE) return state
-        return state.copy(
-            sessions = state.sessions + (session.sessionId to session.copy(
+    /**
+     * The IDLE transition itself: stop the running span and freeze whatever it
+     * had accumulated. Idempotent — an already-idle session is returned
+     * unchanged (identity), so a repeated signal can never re-freeze a span
+     * that already stopped.
+     *
+     * Extracted so the two ways a session can go idle — a live `stop`/
+     * `task-complete` event via [markIdle], and the bridge's `idle: true` flag
+     * on a `session` resend (issue #60) — are the SAME transition by
+     * construction. Two hand-written copies would drift, and the drift would
+     * show up as a wrong duration on the one screen that exists to be glanced
+     * at.
+     */
+    private fun idled(session: SessionState, nowMs: Long): SessionState =
+        if (session.activity == SessionActivity.IDLE) {
+            session
+        } else {
+            session.copy(
                 activity = SessionActivity.IDLE,
                 activeSinceMs = null,
                 frozenElapsedMs = session.activeSinceMs?.let { nowMs - it },
-            )),
-        )
+            )
+        }
+
+    private fun markIdle(state: BridgeState, sessionId: String?, nowMs: Long): BridgeState {
+        val session = sessionId?.let { state.sessions[it] } ?: return state
+        val next = idled(session, nowMs)
+        if (next === session) return state
+        return state.copy(sessions = state.sessions + (session.sessionId to next))
     }
 
     private fun markWorking(state: BridgeState, sessionId: String?, nowMs: Long): BridgeState {

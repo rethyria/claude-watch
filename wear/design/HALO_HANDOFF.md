@@ -151,8 +151,31 @@ lists/feeds. Live feed streams; keep visible tail (~6 lines), bottom-anchored.
 - "Projects" are derived from `SessionState.folderName` (fallback: cwd basename);
   the bridge has no project entity. See `HaloModel.from`.
 - Session `state` is derived: a queued permission → waiting-perm; a queued
-  AskUserQuestion → waiting-q; else `activity==WORKING`/thinking → running; else
-  idle. Per-session `error` is not modeled yet (offline is connection-level).
+  AskUserQuestion → waiting-q; else `activity==WORKING`/thinking → running;
+  else `agents.running > 0` → **delegated**; else idle. Per-session `error` is
+  not modeled yet (offline is connection-level).
+- **Delegated (blue, `#6BA8D8`)** is the main loop having yielded while its
+  workflow subagents keep running. "The turn ended" and "nothing is happening"
+  are different claims, and this is where they diverge: green would promise an
+  agent that will answer you, grey would deny work that is genuinely in
+  flight — so the long unattended stretch a workflow occupies gets its own
+  reading. It sits BELOW running (a churning main loop outranks its fleet) and
+  below both waiting states (needing you always wins), and it clears the
+  moment the agent count reaches zero. The colour is luminance-matched to
+  Running (8.1:1 vs 8.2:1 on black) so the ring reads as a peer state rather
+  than an alarm. Note this fixes the LIVE path too, not just reconnect: before
+  it, `agents` was ignored by the derivation entirely, so a session went grey
+  the instant its turn ended however large the fleet it had just launched.
+- **Idle is now a first-class bridge-side state** (issue #60): session events
+  carry an optional `idle: true` once the session's last lifecycle signal was a
+  turn end. The watch trusts it in ONE direction — a present `true` may grey a
+  session out (on first sight, and as a latch on any later re-send), but its
+  absence never turns one green again. That covers both halves of the live bug:
+  a session idled before we connected, and one idled during an SSE drop, whose
+  `stop` is gone from the replay ring either way. Waking on absence is what we
+  must not do — the bridge re-sends `running` on every connect, so it would
+  restart elapsed clocks constantly. Absent still means running for an older
+  bridge, exactly as before.
 - The feed is `SessionState.terminal` (RingBuffer<TerminalLine>).
 - Edge states (error-outranks-waiting ring, 8-session ring scaling, approval
   queue "1/3" peek, revocable always-allow manager) are in Concepts.dc.html §2b.
