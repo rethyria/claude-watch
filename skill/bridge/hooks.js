@@ -16,6 +16,9 @@ import {
   cancelPermission,
   pendingPermissionBodies,
   defaultPermissionOptions,
+  notePreToolUse,
+  claimToolUseId,
+  expirePermissionForToolUse,
 } from "./permissions.js";
 
 // Assemble the updatedInput.answers map for an AskUserQuestion decision.
@@ -71,11 +74,36 @@ export async function handleHookToolOutput(req, res) {
 
   const sid = resolveHookSession(body);
   const source = body.source || "claude";
+  const hookEvent = typeof body.hook_event_name === "string" ? body.hook_event_name : null;
   // A completed tool use is the canonical "this session is producing work"
   // signal — the same one the watch reducer folds into markWorking — so it
-  // clears any idle left by an earlier turn's Stop (issue #60).
+  // clears any idle left by an earlier turn's Stop (issue #60). Both PreToolUse
+  // and PostToolUse feed this (and the tool-output push below); neither is
+  // gated on hook_event_name, because #60's idle logic depends on both.
   markSessionWorking(sid);
-  log("info", `Hook: ${source === "codex" ? "Codex" : "PostToolUse"} received [${source}]${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
+  // PreToolUse and PostToolUse both POST here (setup-hooks.sh), and this line
+  // used to hardcode "PostToolUse" for both. That is precisely why the
+  // pre-permission signal was invisible across an entire production log
+  // review — naming the real event is what makes the #63 correlation
+  // auditable in bridge.log.
+  log("info", `Hook: ${source === "codex" ? "Codex" : (hookEvent ?? "PostToolUse")} received [${source}]${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
+
+  // #63 correlation, gated STRICTLY on an exact hook_event_name match. Do NOT
+  // infer PostToolUse from the presence of tool_response: this endpoint also
+  // serves Codex and a shell-curl fallback, and a misclassified body would
+  // clear a LIVE prompt off the wrist. The field is present on every real
+  // Claude Code hook body, so strictness is free.
+  if (hookEvent === "PreToolUse") {
+    // The only tool-scoped hook that carries tool_use_id AND fires before the
+    // permission flow. Claude Code awaits it, so this record is always in
+    // before PermissionRequest arrives (5-17ms in all 5 production samples).
+    notePreToolUse(body);
+  } else if (hookEvent === "PostToolUse" && body.tool_use_id) {
+    const cleared = expirePermissionForToolUse(body.tool_use_id);
+    if (cleared) {
+      log("info", `Hook: PostToolUse for ${body.tool_use_id} proves permission ${cleared} was answered elsewhere — clearing the watch prompt`);
+    }
+  }
   // Workflow launch signal (issue #55): the Workflow tool returns immediately
   // (it runs in the background), so this PostToolUse is the ONLY hook-side
   // moment the bridge learns a workflow started — arm the journal scan now;
@@ -114,7 +142,13 @@ export async function handleHookPermission(req, res) {
   }
 
   const permissionId = crypto.randomUUID();
-  log("info", `Hook: PermissionRequest received (id: ${permissionId})${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
+  // PermissionRequest is the one tool-scoped hook Claude Code sends WITHOUT a
+  // tool_use_id, so it is claimed from the PreToolUse that fired microseconds
+  // earlier. The "(uncorrelated)" marker is the production health metric for
+  // the whole answered-elsewhere feature: if every line says it, the
+  // correlation is inert and only the expiry below is doing any work.
+  const toolUseId = claimToolUseId(body);
+  log("info", `Hook: PermissionRequest received (id: ${permissionId})${toolUseId ? ` tool_use=${toolUseId}` : " (uncorrelated)"}${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
 
   if (body.permission_suggestions) {
     pendingPermissionBodies.set(permissionId, body.permission_suggestions);
@@ -139,19 +173,24 @@ export async function handleHookPermission(req, res) {
   const decisionPromise = waitForPermission(permissionId, {
     sessionId: sid,
     payload: eventPayload,
+    toolUseId,
   });
 
   // Claude Code can abort this blocking request before a decision arrives
-  // (user answered in the terminal, pressed Esc, or the hook-side timeout
-  // fired). Without cleanup the pending entry survives as a zombie prompt on
-  // the watch whose eventual answer goes into a dead socket. 'close' with an
-  // unfinished response means the client went away: cancel the pending entry
-  // and tell clients to dismiss the prompt.
+  // (its own hook-side timeout, or the process dying). Without cleanup the
+  // pending entry survives as a zombie prompt on the watch whose eventual
+  // answer goes into a dead socket. 'close' with an unfinished response means
+  // the client went away: cancel the pending entry, which tells clients to
+  // dismiss the prompt (the permission-cleared push lives in voidPermission,
+  // so every non-answer exit announces itself the same way).
+  //
+  // This does NOT cover answering in the IDE/terminal, despite what it used to
+  // claim: Claude Code leaves this socket open and discards our late reply, so
+  // this handler fired ZERO times in 48h of production logs (issue #63).
   res.on("close", () => {
     if (res.writableEnded) return; // normal completion, nothing to clean up
     if (cancelPermission(permissionId)) {
       log("warn", `Hook: PermissionRequest ${permissionId} aborted by Claude Code, clearing pending prompt`);
-      pushSseEvent("permission-cleared", { permissionId, reason: "hook-aborted" }, sid);
     }
   });
 
@@ -161,6 +200,14 @@ export async function handleHookPermission(req, res) {
 
   // Canceled means the hook request is gone — there is no socket to answer.
   if (decision.canceled || res.writableEnded || res.destroyed) return;
+
+  // No decision is not a decision. See voidPermission() in permissions.js for
+  // why this must not be a deny: a fabricated deny cancels the dialog the user
+  // still has on screen. Same shape as the zero-clients fast path above.
+  if (decision.noDecision) {
+    log("info", `Hook: PermissionRequest ${permissionId} answered with no-decision (${decision.reason}) — the agent's own prompt keeps the answer`);
+    return jsonResponse(res, 200, {});
+  }
 
   log("info", `Hook: PermissionRequest resolved (id: ${permissionId}): ${decision.behavior}`);
 
@@ -302,6 +349,16 @@ export async function handleHookError(req, res) {
 
   const sid = resolveHookSession(body);
   log("info", `Hook: Error received${sid ? ` session=${sid}` : ""}`, body.error || "");
+  // A tool that ran and FAILED was still allowed, so PostToolUseFailure is
+  // just as good a proof of an answered-elsewhere prompt as PostToolUse
+  // (issue #63) — including `is_interrupt: true`, which still means it ran.
+  // StopFailure carries no tool_use_id and no-ops here.
+  if (body.hook_event_name === "PostToolUseFailure" && body.tool_use_id) {
+    const cleared = expirePermissionForToolUse(body.tool_use_id);
+    if (cleared) {
+      log("info", `Hook: PostToolUseFailure for ${body.tool_use_id} proves permission ${cleared} was answered elsewhere — clearing the watch prompt`);
+    }
+  }
   pushSseEvent("error", body, sid);
   return jsonResponse(res, 200, { ok: true });
 }

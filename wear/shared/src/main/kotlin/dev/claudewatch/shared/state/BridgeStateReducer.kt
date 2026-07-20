@@ -20,6 +20,7 @@ import dev.claudewatch.shared.protocol.ErrorEvent
 import dev.claudewatch.shared.protocol.NotificationEvent
 import dev.claudewatch.shared.protocol.PermissionClearedEvent
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
+import dev.claudewatch.shared.protocol.PermissionSyncEvent
 import dev.claudewatch.shared.protocol.PtyOutputEvent
 import dev.claudewatch.shared.protocol.SessionEvent
 import dev.claudewatch.shared.protocol.SessionRunState
@@ -118,11 +119,12 @@ data class BridgeState(
 
     /**
      * Drop a pending permission the client has learned is gone. The bridge
-     * pushes `permission-cleared` only for hook aborts and Codex clears — NOT
-     * for prompts resolved from another paired device via /v1/command, and
-     * NOT for server-side timeouts. So the client must call this both for a
-     * prompt it answered itself (2xx) and for one the bridge reports as no
-     * longer existing (404), or the entry lives in state forever.
+     * pushes `permission-cleared` for every non-answer exit — hook aborts,
+     * Codex clears, expiry, and prompts proven answered on the computer
+     * (issue #63) — but NOT for prompts resolved from another paired device
+     * via /v1/command. So the client must still call this both for a prompt it
+     * answered itself (2xx) and for one the bridge reports as no longer
+     * existing (404), or the entry lives in state forever.
      */
     fun resolvePermission(permissionId: String): BridgeState =
         copy(pendingPermissions = pendingPermissions.filterNot { it.permissionId == permissionId })
@@ -230,7 +232,25 @@ object BridgeEventReducer {
             pendingPermissions = state.pendingPermissions
                 .filterNot { it.permissionId == event.permissionId } + event,
         )
-        is PermissionClearedEvent -> state.resolvePermission(event.permissionId)
+        // A card that just vanishes reads as a glitch — or worse, as an
+        // approval the user believes they gave. When the bridge tells us WHY,
+        // and the reason is one the user can act on, leave a terminal line so
+        // the disappearance is explained (issue #63).
+        is PermissionClearedEvent -> appendTerminal(
+            state.resolvePermission(event.permissionId),
+            event.sessionId,
+            listOfNotNull(clearedNoticeLine(event.reason)),
+            clearThinking = false, // a cleared prompt says nothing about output
+        )
+        // Authoritative retraction (issue #63): keep only the prompts the
+        // bridge still lists. Never additive — payloads arrive as
+        // permission-request — so this can only ever DROP, which is exactly
+        // what the additive per-prompt re-send could not do for a client that
+        // was offline when a prompt died.
+        is PermissionSyncEvent -> {
+            val live = event.permissionIds.toSet()
+            state.copy(pendingPermissions = state.pendingPermissions.filter { it.permissionId in live })
+        }
         // A session-addressed bridge error surfaces in that terminal; global
         // errors stay in the event log only.
         is ErrorEvent -> appendTerminal(
@@ -240,6 +260,37 @@ object BridgeEventReducer {
             clearThinking = true,
         )
         is NotificationEvent, is UnknownEvent -> state
+    }
+
+    /**
+     * What a cleared prompt is allowed to SAY. Only reasons the user can act
+     * on get a line; `hook-aborted` (the agent withdrew its own request) and
+     * any future reason we do not understand stay SILENT rather than narrate a
+     * guess (issue #63). A null sessionId means the notice has nowhere to land
+     * — appendTerminal drops it — but the prompt is still removed regardless.
+     *
+     * `expired` is DELIBERATELY non-committal. The bridge emits it for three
+     * real outcomes it cannot tell apart: a genuine no-answer, a DENY made in
+     * the IDE (Claude Code fires no PostToolUse for a tool it never ran, so the
+     * deny reaches the bridge as nothing and falls to the expiry timer), and an
+     * approve-and-long-run whose PostToolUse lands after the window closed. The
+     * old copy — "expired unanswered: answer it on the computer" — was a false
+     * instruction in two of those three: the user who already denied it did
+     * answer, and the approved tool is running, not waiting. "Check the
+     * computer" is true in all three (the still-open dialog, the resolved deny,
+     * or the running tool all live there) and never claims the user failed to
+     * act (#63 review).
+     */
+    private fun clearedNoticeLine(reason: String?): TerminalLine? = when (reason) {
+        "expired" -> TerminalLine(
+            "— approval expired — check the computer —",
+            TerminalLineType.SYSTEM,
+        )
+        "answered-elsewhere" -> TerminalLine(
+            "— approval answered on the computer —",
+            TerminalLineType.SYSTEM,
+        )
+        else -> null
     }
 
     /**
@@ -432,6 +483,8 @@ object BridgeEventReducer {
         is PermissionRequestEvent -> "permission-request ${event.toolName ?: "?"} (${event.permissionId})"
         is PermissionClearedEvent ->
             "permission-cleared ${event.permissionId}${event.reason?.let { " ($it)" } ?: ""}"
+        is PermissionSyncEvent ->
+            "permission-sync ${event.permissionIds.size} live"
         is StopEvent -> "stop${event.sessionId?.let { " $it" } ?: ""}"
         is TaskCompleteEvent -> "task-complete${event.sessionId?.let { " $it" } ?: ""}"
         is NotificationEvent -> "notification ${event.notificationType ?: ""}".trimEnd()

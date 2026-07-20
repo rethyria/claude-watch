@@ -385,12 +385,19 @@ than the buffer are gone — clients needing full state should reconcile with
 
 **Connect-time snapshot.** On every connect the bridge also writes
 authoritative current state: a `session` (`state: "running"`) event per
-running session and a re-sent `permission-request` per pending prompt (so a
-prompt evicted from the ring buffer can never be lost). A fresh client (no
+running session, one `permission-sync` carrying the authoritative set of live
+prompt ids, and a re-sent `permission-request` per pending prompt (so a prompt
+evicted from the ring buffer can never be lost). A fresh client (no
 `Last-Event-ID`) additionally receives up to the last 50 buffered
 `pty-output`/`tool-output` events as terminal backlog. Consequence: clients
 MUST handle duplicate delivery — deduplicate permissions by `permissionId`
-and treat `session` events as idempotent state, not transitions.
+and treat `session` events as idempotent state, not transitions. The
+`permission-sync` frame is emitted BEFORE the per-prompt re-sends, and it
+RETRACTS: drop every pending prompt whose id it omits (the re-sends then carry
+the payloads for everything it kept). This exists because the per-prompt
+re-send is additive and cannot tell a client to drop a prompt that DIED while
+it was offline — its `permission-cleared` long since evicted from the ring
+buffer (issue #63).
 
 **Connection care.** Stalled clients (> 1 MiB unflushed) are destroyed and
 expected to reconnect with replay; TCP keepalive probes run every 30 s.
@@ -437,9 +444,35 @@ An agent wants approval (blocking). Claude Code shape:
   `permissionId`.
 
 ### `permission-cleared`
-The prompt identified by `permissionId` is void (agent aborted the request,
-answered in the terminal, or the approval resolved elsewhere) — dismiss it.
-`{ "permissionId": "<uuid>", "reason": "hook-aborted" | "resolved" | "...", "sessionId": ... }`
+The prompt identified by `permissionId` is void — dismiss it.
+`{ "permissionId": "<uuid>", "reason": "hook-aborted" | "answered-elsewhere" | "expired" | "resolved" | "...", "sessionId": ... }`
+
+`reason` is an OPEN set; an unrecognised value must never fail the frame (the
+drop is the contract, the wording is a courtesy). Known values:
+
+- `hook-aborted` — the agent withdrew the request; nothing to say.
+- `answered-elsewhere` — a `PostToolUse`/`PostToolUseFailure` for this prompt's
+  `tool_use_id` proved the tool ran, so it was approved on the computer.
+- `expired` — the bridge's window closed without a decision reaching it. The
+  bridge returned NO DECISION: nothing was allowed and nothing was denied here.
+  This one reason covers three outcomes the bridge cannot tell apart — a genuine
+  no-answer (the agent's own prompt is still live on the computer), a DENY made
+  in the IDE (Claude Code fires no `PostToolUse` for a tool it never ran, so the
+  deny never reaches the bridge), and an approve-and-long-run whose `PostToolUse`
+  lands after the window. A client MUST NOT tell the user the prompt went
+  "unanswered" or must still be answered; whatever the outcome, it lives on the
+  computer, which is all a client can honestly say.
+- `resolved` — a Codex synthetic approval was answered.
+
+The bridge never fabricates a decision. A `deny` in a bridge log or a hook
+response is always a decision a human made.
+
+### `permission-sync`
+The authoritative set of live prompt ids, emitted on every connect (see
+Connect-time snapshot). RETRACTION ONLY — drop every pending prompt whose id
+is absent; never create one (payloads arrive as `permission-request`). An
+empty list is legal and meaningful ("nothing is live").
+`{ "permissionIds": [ "<uuid>", ... ], "sessionId": ... }`
 
 ### `session`
 Lifecycle of agent sessions. Variants:

@@ -313,9 +313,14 @@ async function startServer() {
       try { bonjourInstance.destroy(); } catch { /* ignore */ }
     }
 
+    // No-decision, not deny: a shutdown deny is just as fabricated as the
+    // expiry one was, and Claude Code acts on it — cancelling the dialog the
+    // user still has on screen and writing a `reject` they never chose
+    // (issue #63). Leave the decision to the agent's own prompt. No
+    // permission-cleared push here: the SSE clients are going away with us.
     for (const [id, pending] of pendingPermissions) {
       clearTimeout(pending.timer);
-      pending.resolve({ behavior: "deny", reason: "Server shutting down" });
+      pending.resolve({ noDecision: true, reason: "shutting-down" });
     }
     pendingPermissions.clear();
 

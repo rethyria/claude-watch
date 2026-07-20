@@ -288,7 +288,12 @@ data class PermissionRequestEvent(
 private fun JsonObject.stringOrNull(key: String): String? =
     (this[key] as? JsonPrimitive)?.contentOrNull
 
-/** `permission-cleared` — dismiss a pending prompt (hook aborted, Codex resolved it, ...). */
+/**
+ * `permission-cleared` — dismiss a pending prompt. [reason] is an OPEN set
+ * (`hook-aborted`, `answered-elsewhere`, `expired`, Codex clears, ...): an
+ * unrecognised value must never fail the frame, because the drop is the
+ * contract and the wording is only a courtesy.
+ */
 @Serializable
 data class PermissionClearedEvent(
     val permissionId: String,
@@ -299,6 +304,26 @@ data class PermissionClearedEvent(
         require(permissionId.isNotEmpty()) { "permission-cleared must carry a permissionId" }
     }
 }
+
+/**
+ * `permission-sync` — the bridge's AUTHORITATIVE set of live prompt ids, sent
+ * on every connect. RETRACTION ONLY: drop every pending prompt absent from it,
+ * never create one (payloads arrive as `permission-request` immediately
+ * after). Exists because the connect-time re-send is additive and could not
+ * retract a prompt that died while this client was offline — its
+ * `permission-cleared` having long since been evicted from the bridge's ring
+ * buffer — which left the card on the wrist until the app was force-stopped
+ * (issue #63).
+ *
+ * [permissionIds] is deliberately NOT defaulted: an EMPTY list is a legal and
+ * meaningful instruction ("retract everything"), so a missing field must
+ * loud-fail as a contract violation rather than be silently mistaken for it.
+ */
+@Serializable
+data class PermissionSyncEvent(
+    val permissionIds: List<String>,
+    override val sessionId: String? = null,
+) : BridgeEvent
 
 /** `stop` — the Stop hook fired: the agent finished a turn (NOT the session's end). */
 @Serializable
@@ -359,6 +384,7 @@ object BridgeEventParser {
         "tool-output" -> json.decodeFromString<ToolOutputEvent>(data)
         "permission-request" -> json.decodeFromString<PermissionRequestEvent>(data)
         "permission-cleared" -> json.decodeFromString<PermissionClearedEvent>(data)
+        "permission-sync" -> json.decodeFromString<PermissionSyncEvent>(data)
         "stop" -> json.decodeFromString<StopEvent>(data)
         "task-complete" -> json.decodeFromString<TaskCompleteEvent>(data)
         "notification" -> json.decodeFromString<NotificationEvent>(data)

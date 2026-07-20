@@ -186,3 +186,43 @@ test("the decision endpoint routes behavior-based answers through to Codex synth
     codexSyntheticPermissions.clear();
   }
 });
+
+test("the authoritative permission-sync frame lists Codex synthetic approvals too", async () => {
+  // The retraction frame added for #63 drops every prompt whose id it does not
+  // list. Codex's synthetic exec-approvals live in their OWN map in codex.js
+  // (permissions.js cannot import it — the dependency runs the other way), so
+  // they are contributed through registerPendingPermissionIdSource. Forgetting
+  // that registration would nuke a LIVE exec-approval off the wrist on every
+  // reconnect, which is worse than the bug this frame fixes.
+  const { codexSyntheticPermissions } = await import("../codex.js");
+  const { pendingPermissionsSync, pendingPermissions } = await import("../permissions.js");
+
+  try {
+    codexSyntheticPermissions.set("codex-live-perm", {
+      sessionId: "codex-unit",
+      optionCount: 2,
+      payload: { permissionId: "codex-live-perm", source: "codex", tool_name: "ExecApproval" },
+    });
+    pendingPermissions.set("claude-live-perm", {
+      resolve: () => {},
+      timer: setTimeout(() => {}, 60_000),
+      sessionId: "claude-unit",
+      payload: null,
+      toolUseId: null,
+    });
+
+    const frames = [...pendingPermissionsSync()];
+    const sync = frames.find((f) => f.event === "permission-sync");
+    assert.ok(sync, "connect-time sync must emit an authoritative permission-sync frame");
+    const ids = JSON.parse(sync.data).permissionIds;
+    assert.ok(ids.includes("claude-live-perm"), "hook permissions must be listed");
+    assert.ok(ids.includes("codex-live-perm"), "Codex synthetic approvals must be listed");
+    // Retraction-only: the frame must come first, so the per-prompt re-sends
+    // that follow can restore payloads for everything it retained.
+    assert.equal(frames[0].event, "permission-sync", "the authoritative frame must precede the re-sends");
+  } finally {
+    for (const pending of pendingPermissions.values()) clearTimeout(pending.timer);
+    pendingPermissions.clear();
+    codexSyntheticPermissions.clear();
+  }
+});

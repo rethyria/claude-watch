@@ -111,8 +111,8 @@ test("aborted hook request: pending entry removed, permission-cleared emitted, l
   assert.equal(status.body.pendingPermissions, 0, "aborted permission must not stay pending");
 });
 
-test("bridge auto-deny lands before the hook-side timeout window", { timeout: 60_000 }, async (t) => {
-  // Shrink only the HOOK-side window; the bridge must derive its own auto-deny
+test("bridge no-decision lands before the hook-side timeout window", { timeout: 60_000 }, async (t) => {
+  // Shrink only the HOOK-side window; the bridge must derive its own expiry
   // to fire deterministically before it (previously both were exactly 600s
   // and expiry raced).
   const hookWindowMs = 4000;
@@ -139,16 +139,18 @@ test("bridge auto-deny lands before the hook-side timeout window", { timeout: 60
   }, AbortSignal.timeout(hookWindowMs));
   const elapsed = Date.now() - startedAt;
 
-  // The bridge answered (deny) BEFORE the hook-side window elapsed — the
-  // fetch above would have thrown TimeoutError otherwise.
+  // The bridge answered BEFORE the hook-side window elapsed — the fetch above
+  // would have thrown TimeoutError otherwise. The answer is NO DECISION, not
+  // a deny: the bridge never fabricates a refusal the user did not choose
+  // (issue #63), so the agent's own prompt keeps the answer.
   assert.equal(hookRes.status, 200);
   const hookBody = await hookRes.json();
-  assert.equal(hookBody.hookSpecificOutput.decision.behavior, "deny");
+  assert.deepEqual(hookBody, {}, "expiry must return no decision, never a deny");
   assert.ok(
     elapsed < hookWindowMs,
-    `auto-deny must land inside the hook window (${hookWindowMs}ms), took ${elapsed}ms`,
+    `expiry must land inside the hook window (${hookWindowMs}ms), took ${elapsed}ms`,
   );
-  await bridge.waitForOutput(/timed out after .*s, auto-denying/);
+  await bridge.waitForOutput(/expired after .*s unanswered/);
 });
 
 test("client connecting after ring-buffer eviction still receives pending permissions", { timeout: 60_000 }, async (t) => {

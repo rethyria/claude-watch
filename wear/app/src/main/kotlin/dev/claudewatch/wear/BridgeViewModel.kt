@@ -129,10 +129,14 @@ class BridgeViewModel(
         val sessionId: String? = null,
         /**
          * Approval queue, newest-first. The FRONT is the rendered card. Newest
-         * first because the bridge pushes no permission-cleared for prompts
-         * resolved from another device or timed out server-side: a stale entry
-         * must never shadow a live prompt that arrived after it (answering the
-         * stale one 404s, which drops it and reveals the next).
+         * first because the bridge pushes no permission-cleared for a prompt
+         * resolved from ANOTHER paired device (its own device drops it locally
+         * on the 2xx): a stale entry must never shadow a live prompt that
+         * arrived after it (answering the stale one 404s, which drops it and
+         * reveals the next). Server-side expiry now DOES broadcast
+         * permission-cleared (issue #63), so that path self-heals — but the
+         * ack-to-advance machinery is still the only cover for the
+         * other-device case.
          */
         val permissionQueue: List<PendingPermission> = emptyList(),
         /** permissionId of the answer POST currently in flight, if any. */
@@ -668,15 +672,16 @@ class BridgeViewModel(
      * (the watchOS race that approved the wrong permission). Dismissal is
      * ack-gated: the prompt leaves the queue only on an authoritative outcome
      *  - 2xx: we resolved it ourselves;
-     *  - 404: gone (resolved elsewhere or timed out server-side — keeping it
-     *    would wedge a zombie prompt forever, since the bridge pushes no
-     *    permission-cleared for either);
+     *  - 404: gone (resolved from another paired device — keeping it would
+     *    wedge a zombie prompt forever, since that path pushes no
+     *    permission-cleared; server-side expiry does now broadcast one, but
+     *    racing our own answer against it can still 404 first);
      *  - 401/403: this device's token is dead (bridge restarted, device
-     *    revoked). No retry with this token can ever succeed and the new
-     *    bridge pushes no permission-cleared, so keeping the card would wedge
-     *    the whole app — pairing page included — behind an unanswerable
+     *    revoked). No retry with this token can ever succeed and this device
+     *    can no longer receive a permission-cleared, so keeping the card would
+     *    wedge the whole app — pairing page included — behind an unanswerable
      *    sheet. The card is dropped WITHOUT deciding anything (the bridge's
-     *    own timeout owns the real outcome) and a re-pair error is surfaced.
+     *    own expiry owns the real outcome) and a re-pair error is surfaced.
      * Any retryable failure (transport, 5xx) keeps the prompt queued and
      * surfaces the error — never a silent inversion of an approval into a
      * 10-minute auto-deny — and bumps [UiState.decisionFailureCount], which
@@ -735,13 +740,15 @@ class BridgeViewModel(
                 }
                 _state.update { ui ->
                     // The bridge pushes no permission-cleared when a prompt is
-                    // resolved via /v1/command from another paired device, or
-                    // when it times out server-side — only hook-abort and
-                    // Codex clears broadcast. So both outcomes here mean the
-                    // prompt is gone and must be dropped locally:
+                    // resolved via /v1/command from another paired device (that
+                    // device drops it locally on the 2xx). Expiry and
+                    // answered-elsewhere DO broadcast now (issue #63), but our
+                    // own answer can still race ahead of that SSE frame. So
+                    // both outcomes here mean the prompt is gone and must be
+                    // dropped locally:
                     //  - ok: we resolved it ourselves.
                     //  - 404: the bridge says it no longer exists (answered
-                    //    elsewhere or timed out). Keeping it would wedge a
+                    //    elsewhere or expired). Keeping it would wedge a
                     //    zombie prompt in state forever.
                     val gone = result.ok || result.status == 404
                     // Dead token (bridge restarted / device revoked): also
