@@ -39,6 +39,7 @@ import {
   handleHookError,
   handleHookNotification,
 } from "./hooks.js";
+import { handleAdminDevices, handleAdminRevoke } from "./admin.js";
 
 // ---------------------------------------------------------------------------
 // Process-level guards
@@ -95,6 +96,10 @@ const routes = {
   "GET /status": handleStatus,
   "GET /usage": handleUsage,
   "GET /ping": handlePing,
+  // Operator device admin (issue #72): loopback-only, not part of the /v1
+  // client protocol. See admin.js / PROTOCOL.md "Admin surface".
+  "GET /admin/devices": handleAdminDevices,
+  "POST /admin/devices/revoke": handleAdminRevoke,
 };
 
 // ---------------------------------------------------------------------------
@@ -342,6 +347,10 @@ async function startServer() {
   if (CLAUDE_BIN) agents.push("Claude");
   if (CODEX_BIN) agents.push("Codex");
   log("info", `Bridge ready. Available agents: ${agents.join(", ") || "none"}. Sessions spawn on demand.`);
+  // Operator discoverability (issue #72): the device-admin surface is loopback
+  // only and unadvertised otherwise. Additive log line — safe for the banner
+  // scrapers (helpers.js keys only off Pairing/Port lines).
+  log("info", "Admin (loopback only): GET /admin/devices lists paired devices; POST /admin/devices/revoke {id|all:true} disconnects them.");
 
   // Get LAN IP
   const interfaces = os.networkInterfaces();
@@ -370,6 +379,10 @@ async function startServer() {
   console.log(`║  IP Address:    ${lanIP.padEnd(20)}║`);
   console.log(`║  Port:          ${String(boundPort).padEnd(20)}║`);
   console.log(`║  Agents:        ${agentLine.padEnd(20)}║`);
+  // Additive banner row (issue #72): the three scraped lines above (Pairing
+  // Code / Pairing: locked / Port) stay byte-identical — this row is new and
+  // matches none of the helpers' regexes.
+  console.log(`║  Devices:       ${String(storedCredentials).padEnd(20)}║`);
   console.log("╚═══════════════════════════════════════╝");
   console.log("");
 

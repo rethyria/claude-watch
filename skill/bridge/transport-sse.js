@@ -8,7 +8,7 @@ import {
   SSE_SYNC_TERMINAL_BACKLOG,
   SSE_TCP_KEEPALIVE_MS,
 } from "./config.js";
-import { requireAuth } from "./credentials.js";
+import { requireAuth, presentedTokenHash } from "./credentials.js";
 
 // SSE event ids must be monotonic ACROSS bridge restarts, not merely within
 // one process: per-device tokens survive a restart (credentials.json), and
@@ -99,6 +99,42 @@ export function formatSseMessage(entry) {
   return msg;
 }
 
+// Drop every live SSE connection whose device hash is in `hashes` (full 64-hex
+// strings). Called on a TARGETED revoke (admin.js) so the revoked device's
+// OPEN stream ends at once instead of surviving until its next authed request
+// (auth only runs at /events connect — an already-open stream is never
+// re-authed). Each connection carries the device hash it authed with, tagged
+// at connect time below. Deleting from the Set mid-iteration is safe (Set
+// iteration tolerates removal of the current/other entries); res.end() closes
+// the response and the socket-close path (heartbeat write failure + the req
+// 'close' handler) does the remaining bookkeeping. Returns how many dropped.
+export function dropSseClientsForHashes(hashes) {
+  const wanted = hashes instanceof Set ? hashes : new Set(hashes);
+  let dropped = 0;
+  for (const res of sseClients) {
+    if (res._deviceHash && wanted.has(res._deviceHash)) {
+      sseClients.delete(res);
+      try { res.end(); } catch { /* already gone */ }
+      dropped++;
+    }
+  }
+  return dropped;
+}
+
+// Drop EVERY live SSE connection. Called on revoke-all: no token survives, so
+// every open stream now belongs to a revoked device — the whole set goes,
+// including any connection that predates hash tagging. Same idiom as graceful
+// shutdown (server.js). Returns how many dropped.
+export function dropAllSseClients() {
+  let dropped = 0;
+  for (const res of sseClients) {
+    try { res.end(); } catch { /* already gone */ }
+    dropped++;
+  }
+  sseClients.clear();
+  return dropped;
+}
+
 export function handleEvents(req, res) {
   if (req.method !== "GET") {
     return jsonResponse(res, 405, { error: "Method not allowed" });
@@ -106,6 +142,13 @@ export function handleEvents(req, res) {
   if (!requireAuth(req)) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
+
+  // Tag this connection with the device hash it authenticated with, so a
+  // targeted revoke (admin.js) can drop THIS device's live stream immediately
+  // rather than waiting for its next authed request. requireAuth just passed,
+  // so presentedTokenHash equals the matching stored credential's hash. The
+  // tag is internal only — never logged, never sent to any client.
+  res._deviceHash = presentedTokenHash(req);
 
   // TCP keepalive: a peer that vanishes without FIN/RST (network loss, watch
   // out of range) otherwise looks connected for ~15 minutes while events
