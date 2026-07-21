@@ -11,6 +11,10 @@
 
 https://github.com/user-attachments/assets/5f478c28-2086-4696-9d76-e43dda853201
 
+> ### ⌚ On **Wear OS / Android**? This README covers the original **Apple Watch (iOS)** build.
+> For the Wear OS watch app, follow **[wear/INSTALL.md](wear/INSTALL.md)** instead. Both use the
+> same Node.js bridge described below — only the watch app differs.
+
 ---
 
 ```
