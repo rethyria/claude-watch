@@ -43,6 +43,21 @@ interface BridgeDiscovery {
     data class Discovered(val hostIp: String, val port: Int, val bridgeId: String)
 
     /**
+     * A bridge found on the LAN, for the Discover-pairing LIST. Carries the
+     * [machineName] the row renders (from the advertisement's TXT), plus the
+     * endpoint the code-less pair POSTs to. Unlike [Discovered] a list row is
+     * NOT pre-confirmed by ping (see [discoverAll]) — the pair-time preflight
+     * re-proves liveness — so a row is only ever built from a TXT-advertised
+     * bridgeId, never a decoy with no identity.
+     */
+    data class DiscoveredBridge(
+        val machineName: String,
+        val hostIp: String,
+        val port: Int,
+        val bridgeId: String,
+    )
+
+    /**
      * Run one discovery scan. [bridgeId] filters to a specific bridge (the
      * self-heal case — never relocate to a stranger) or is null to accept the
      * first bridge that answers (the zero-typing pairing case). Returns null on
@@ -51,6 +66,17 @@ interface BridgeDiscovery {
      * scan — multicast is slow, so this is a hard ceiling, not a hint.
      */
     suspend fun discover(bridgeId: String?, timeoutMs: Long): Discovered?
+
+    /**
+     * Discover ALL bridges on the LAN for the Discover-pairing list — no
+     * bridgeId filter (there is no pinned identity yet at pairing time). Shares
+     * the SAME lock/bind/browse lifecycle AND the same single-flight guard as
+     * [discover], so a pairing-list scan can never race a self-heal over the
+     * process-global Wi-Fi bind. Empty on timeout/no-answer/[NOOP]. Rows are
+     * deduped by bridgeId and are NOT confirmed by ping here (the user then
+     * taps one, and the code-less pair's preflight is the real liveness gate).
+     */
+    suspend fun discoverAll(timeoutMs: Long): List<DiscoveredBridge>
 
     companion object {
         /**
@@ -63,6 +89,7 @@ interface BridgeDiscovery {
         /** For contexts with no platform network stack (JVM unit tests, emulator). */
         val NOOP: BridgeDiscovery = object : BridgeDiscovery {
             override suspend fun discover(bridgeId: String?, timeoutMs: Long): Discovered? = null
+            override suspend fun discoverAll(timeoutMs: Long): List<DiscoveredBridge> = emptyList()
         }
     }
 }
@@ -103,8 +130,19 @@ class NsdBridgeDiscovery internal constructor(
         confirm = { hostIp, port -> withContext(Dispatchers.IO) { pingBridgeId(hostIp, port) } },
     )
 
-    /** A resolved NSD service: its endpoint plus the TXT `bridgeId` (null if TXT unread). */
-    internal data class Candidate(val hostIp: String, val port: Int, val bridgeId: String?)
+    /**
+     * A resolved NSD service: its endpoint plus the TXT `bridgeId` (null if TXT
+     * unread) and TXT `machineName` (the human label the Discover list renders;
+     * null if unread — [discoverAll] falls back to the host then). [machineName]
+     * is additive with a default so [discover]'s 3-arg confirm-by-ping path and
+     * the `cand(host, port, bridgeId)` test helper are untouched.
+     */
+    internal data class Candidate(
+        val hostIp: String,
+        val port: Int,
+        val bridgeId: String?,
+        val machineName: String? = null,
+    )
 
     /**
      * The three framework surfaces discovery touches, each as a [Closeable] so
@@ -139,8 +177,24 @@ class NsdBridgeDiscovery internal constructor(
     // time, but discoverForPairing could race it — this is the belt-and-braces.
     private val inFlight = AtomicBoolean(false)
 
-    override suspend fun discover(bridgeId: String?, timeoutMs: Long): BridgeDiscovery.Discovered? {
-        if (!inFlight.compareAndSet(false, true)) return null
+    /**
+     * The single-flight guard + the FULL resource lifecycle, in ONE reviewable
+     * place shared by [discover] and [discoverAll] (issue #23 criterion 3, the
+     * #1 review target — kept in one place so the release-on-every-path
+     * discipline is proved once, not twice): lock → bind → browse acquired in
+     * order, released in reverse via runCatching on EVERY path (success, no
+     * match, timeout, throw, cancellation). A concurrent scan (a self-heal
+     * [discover] vs a pairing-list [discoverAll]) loses the compareAndSet and
+     * returns [empty] WITHOUT touching the process-global Wi-Fi bind — the first
+     * to finish would otherwise `bindProcessToNetwork(null)` and unbind the
+     * whole process (the live SSE stream included) out from under the second.
+     */
+    private suspend fun <T> withScan(
+        timeoutMs: Long,
+        empty: T,
+        block: suspend (List<Candidate>) -> T,
+    ): T {
+        if (!inFlight.compareAndSet(false, true)) return empty
         try {
             // Holders declared BEFORE the try so a partial acquisition (e.g.
             // bindWifiProcess throws after the lock is held) still releases only
@@ -152,23 +206,7 @@ class NsdBridgeDiscovery internal constructor(
                 lock = platform.acquireMulticastLock()
                 bind = platform.bindWifiProcess(timeoutMs)
                 browse = platform.startBrowse()
-                for (candidate in browse.awaitCandidates(timeoutMs)) {
-                    // Cheap TXT pre-filter: skip an obviously-foreign bridge with
-                    // no network round-trip. A candidate with no readable TXT
-                    // bridgeId falls through to confirm, which pings for its real
-                    // identity rather than treating absence as a match.
-                    if (bridgeId != null && candidate.bridgeId != null && candidate.bridgeId != bridgeId) {
-                        continue
-                    }
-                    // Authoritative gate: it must answer /v1/ping like a bridge
-                    // right now (rejects a decoy or a stale advertisement).
-                    val confirmedId = confirm(candidate.hostIp, candidate.port) ?: continue
-                    // Defense in depth over the TXT pre-filter: never relocate to
-                    // a stranger even if a candidate's TXT lied or was empty.
-                    if (bridgeId != null && confirmedId != bridgeId) continue
-                    return BridgeDiscovery.Discovered(candidate.hostIp, candidate.port, confirmedId)
-                }
-                return null
+                return block(browse.awaitCandidates(timeoutMs))
             } finally {
                 // Criterion 3: release EVERYTHING on EVERY path — success, no
                 // match, timeout, exception, cancellation. Reverse acquire order,
@@ -183,6 +221,51 @@ class NsdBridgeDiscovery internal constructor(
             inFlight.set(false)
         }
     }
+
+    override suspend fun discover(bridgeId: String?, timeoutMs: Long): BridgeDiscovery.Discovered? =
+        withScan(timeoutMs, empty = null) { candidates ->
+            for (candidate in candidates) {
+                // Cheap TXT pre-filter: skip an obviously-foreign bridge with no
+                // network round-trip. A candidate with no readable TXT bridgeId
+                // falls through to confirm, which pings for its real identity
+                // rather than treating absence as a match.
+                if (bridgeId != null && candidate.bridgeId != null && candidate.bridgeId != bridgeId) {
+                    continue
+                }
+                // Authoritative gate: it must answer /v1/ping like a bridge right
+                // now (rejects a decoy or a stale advertisement).
+                val confirmedId = confirm(candidate.hostIp, candidate.port) ?: continue
+                // Defense in depth over the TXT pre-filter: never relocate to a
+                // stranger even if a candidate's TXT lied or was empty.
+                if (bridgeId != null && confirmedId != bridgeId) continue
+                return@withScan BridgeDiscovery.Discovered(candidate.hostIp, candidate.port, confirmedId)
+            }
+            null
+        }
+
+    override suspend fun discoverAll(timeoutMs: Long): List<BridgeDiscovery.DiscoveredBridge> =
+        withScan(timeoutMs, empty = emptyList()) { candidates ->
+            // DELIBERATELY not confirmed by ping per candidate: the pair-time
+            // preflight (ConnectionEngine.doPair pings + shape-gates + proto-gates
+            // BEFORE the code-less POST) re-proves liveness, so a decoy row fails
+            // on tap, never with a token. Confirming N candidates serially through
+            // the pre-API-34 one-at-a-time resolve queue would also make the list
+            // slow. A row needs a bridgeId for its key and dedupe, so a candidate
+            // with no TXT identity is dropped from the list (it is unpairable
+            // blind anyway); machineName falls back to the host if the TXT lacked
+            // it, so a row is never label-less.
+            candidates
+                .filter { it.bridgeId != null }
+                .distinctBy { it.bridgeId }
+                .map {
+                    BridgeDiscovery.DiscoveredBridge(
+                        machineName = it.machineName ?: it.hostIp,
+                        hostIp = it.hostIp,
+                        port = it.port,
+                        bridgeId = it.bridgeId!!,
+                    )
+                }
+        }
 
     /**
      * Real framework glue — HITL-only, never constructed in a unit test (the
@@ -290,7 +373,11 @@ class NsdBridgeDiscovery internal constructor(
             override fun onServiceResolved(info: NsdServiceInfo) {
                 val host = info.host?.hostAddress
                 val id = info.attributes?.get("bridgeId")?.toString(Charsets.UTF_8)
-                if (host != null) candidates.trySend(Candidate(host, info.port, id))
+                // machineName rides the same TXT record (config.js bonjourTxtRecord)
+                // and is the human label the Discover list renders; discover()
+                // (self-heal) ignores it, discoverAll() (pairing list) uses it.
+                val name = info.attributes?.get("machineName")?.toString(Charsets.UTF_8)
+                if (host != null) candidates.trySend(Candidate(host, info.port, id, name))
                 synchronized(lock) { resolving = false }
                 pump()
             }

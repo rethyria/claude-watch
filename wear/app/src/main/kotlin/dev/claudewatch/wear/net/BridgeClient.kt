@@ -104,6 +104,22 @@ open class BridgeClient(
         )
 
     /**
+     * POST /v1/pair WITHOUT a code — the Discover pairing path (issue #23
+     * follow-up). The operator-opened pairing window on the bridge is the sole
+     * gate; a closed window 403s exactly as a code-bearing pair does. The
+     * `code` key is genuinely OMITTED, not an empty string: an empty `code`
+     * would still be no code to the bridge, so this is a distinct call rather
+     * than [pair] with `""`. Still declares [PROTO_VERSION] — the /v1
+     * min-version gate fires for code-less pairs too (426 if missing/too old).
+     */
+    fun pairByDiscovery(deviceName: String): ApiResult =
+        postJson(
+            "/v1/pair",
+            token = null,
+            JSONObject().put("deviceName", deviceName).put("proto", PROTO_VERSION),
+        )
+
+    /**
      * POST /v1/command — session-id-scoped text command. The explicit session
      * id is mandatory at this rung: the no-session-id path 500s against
      * PTY-less sessions until the spawn-reliability fix lands.

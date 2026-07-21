@@ -78,6 +78,13 @@ data class HaloActions(
      * fully intact.
      */
     val onDiscoverForPairing: () -> Unit = {},
+    /**
+     * Issue #23 follow-up — the Discover LIST scan: the user opened the Discover
+     * pane. Fires an all-bridges NSD scan; results land in [UiState.discover].
+     */
+    val onDiscoverBridges: () -> Unit = {},
+    /** Code-less pair with a bridge tapped in the Discover list (no code entered). */
+    val onPairByDiscovery: (dev.claudewatch.wear.net.BridgeDiscovery.DiscoveredBridge) -> Unit = {},
     val onUnpair: () -> Unit = {},
     /** Send [text] to [toSession] (null = the VM's default session). */
     val onSendCommand: (text: String, toSession: String?) -> Unit = { _, _ -> },
@@ -633,6 +640,8 @@ private fun HaloAppBody(
                     ui = ui,
                     onPair = actions.onPair,
                     onDiscoverForPairing = actions.onDiscoverForPairing,
+                    onDiscoverBridges = actions.onDiscoverBridges,
+                    onPairByDiscovery = actions.onPairByDiscovery,
                 )
             }
         }

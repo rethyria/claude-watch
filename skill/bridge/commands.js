@@ -67,17 +67,28 @@ export async function handlePair(req, res) {
   recordRateLimitAttempt(remoteIp);
 
   const { code, deviceName } = body;
-  if (!code || typeof code !== "string") {
-    return jsonResponse(res, 400, { error: "Missing 'code' field" });
-  }
 
   // Which surface this pair request arrived on. Legacy /pair is frozen; the
   // /v1 divergences below (min-version gate, proto in the response, no
   // top-level sessionId alias) apply only to /v1/pair. Classified from the
   // router-parsed pathname (server.js), NOT the raw req.url string: an
   // absolute-form request target would otherwise route as /v1 but classify
-  // as legacy, bypassing the min-version gate.
+  // as legacy, bypassing the min-version gate. Moved ABOVE the code check so
+  // the code-optional relaxation below can be scoped to /v1 only.
   const surface = req.pathname === "/v1/pair" ? "v1" : "legacy";
+
+  // `code` is REQUIRED on the frozen legacy /pair, OPTIONAL on /v1/pair. The
+  // /v1 Discover-pairing path (issue #23 follow-up) sends no code at all:
+  // there the operator-opened pairing window (isPairingOpen, checked below)
+  // plus the per-IP rate limit and the single-use lock on success are the
+  // whole gate — no code is ever entered. Legacy stays frozen: legacy-corpus
+  // "pair missing code" replays `POST /pair {}` -> 400 IN SEQUENCE, and a
+  // code-less legacy success would call lockPairing() and cascade-403 the
+  // following legacy fixtures. So the relaxation is guarded on surface==="v1".
+  const hasCode = typeof code === "string" && code.length > 0;
+  if (surface === "legacy" && !hasCode) {
+    return jsonResponse(res, 400, { error: "Missing 'code' field" });
+  }
 
   // /v1 min-version gate (PROTOCOL.md "Versioning"): the request must declare
   // the client's protocol version, and it must meet the bridge's minimum.
@@ -123,7 +134,12 @@ export async function handlePair(req, res) {
     return jsonResponse(res, 401, { error: "Pairing code expired. A new code has been generated." });
   }
 
-  if (!matchesPairingCode(code)) {
+  // Only a supplied code is matched. A code-less /v1 Discover pair skips this
+  // check — its gate is the open window verified above (the expiry/relock
+  // gate still ran, so a reopened-and-expired window has already 403'd here).
+  // A code-BEARING pair (Manual path, or any legacy pair) still fails a wrong
+  // code exactly as before.
+  if (hasCode && !matchesPairingCode(code)) {
     return jsonResponse(res, 401, { error: "Invalid pairing code" });
   }
 

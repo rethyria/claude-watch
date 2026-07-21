@@ -16,6 +16,7 @@ import okhttp3.mockwebserver.RecordedRequest
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -464,16 +465,24 @@ class DiscoveryTest {
     // NsdBridgeDiscoveryTest; it CANNOT be exercised here (emulator NAT drops
     // LAN multicast).
 
-    /** Records every scan (its bridgeId filter) and returns a fixed [result]. */
+    /** Records every scan (its bridgeId filter) and returns a fixed [result].
+     *  [all] is the canned discoverAll list for the Discover-pairing tests. */
     private class RecordingDiscovery(
         private val result: BridgeDiscovery.Discovered?,
+        private val all: List<BridgeDiscovery.DiscoveredBridge> = emptyList(),
     ) : BridgeDiscovery {
         val filters = CopyOnWriteArrayList<String?>()
         val calls = AtomicInteger(0)
+        val allCalls = AtomicInteger(0)
         override suspend fun discover(bridgeId: String?, timeoutMs: Long): BridgeDiscovery.Discovered? {
             calls.incrementAndGet()
             filters.add(bridgeId)
             return result
+        }
+
+        override suspend fun discoverAll(timeoutMs: Long): List<BridgeDiscovery.DiscoveredBridge> {
+            allCalls.incrementAndGet()
+            return all
         }
     }
 
@@ -617,6 +626,9 @@ class DiscoveryTest {
                 if (calls.getAndIncrement() == 0) firstScanAtPingCount.set(pingCount.get())
                 return null
             }
+
+            override suspend fun discoverAll(timeoutMs: Long): List<BridgeDiscovery.DiscoveredBridge> =
+                emptyList()
         }
         val engine = newEngine(
             discovery = discovery,
@@ -752,5 +764,70 @@ class DiscoveryTest {
             0,
             discovery.calls.get(),
         )
+    }
+
+    // -- Discover-pairing LIST + code-less pair (issue #23 follow-up) ----------
+    //
+    // The engine's discoverAllForPairing() wrapper and the code-less
+    // pairByDiscovery() path, against MockWebServer. The NSD framework glue is
+    // still HITL (emulator NAT drops multicast); the recording BridgeDiscovery
+    // fake stands in for the scan exactly as the self-heal tests above use it.
+
+    @Test
+    fun discoverAllForPairingReturnsTheScannedBridges() {
+        val bridges = listOf(
+            BridgeDiscovery.DiscoveredBridge("Mac-Studio", "127.0.0.1", 7860, "b-1"),
+            BridgeDiscovery.DiscoveredBridge("Deck", "10.0.0.9", 7861, "b-2"),
+        )
+        val engine = newEngine(discovery = RecordingDiscovery(result = null, all = bridges))
+        val found = runBlocking { engine.discoverAllForPairing() }
+        assertEquals("the wrapper returns the scan's bridges verbatim", bridges, found)
+    }
+
+    @Test
+    fun pairByDiscoverySendsNoCodeAndConnectsOnSuccess() {
+        server.enqueue(pingResponse())      // doPair preflight
+        server.enqueue(pairResponse())      // code-less /v1/pair -> token
+        server.enqueue(sseHeld(":connected\n\n"))
+
+        val engine = newEngine()
+        val outcome = runBlocking { engine.pairByDiscovery("127.0.0.1", server.port, "wear-test") }
+        assertTrue(
+            "a successful code-less pair yields Success",
+            outcome is ConnectionEngine.PairOutcome.Success,
+        )
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+
+        assertEquals("/v1/ping", takeRequest().path)
+        val pairRequest = takeRequest()
+        assertEquals("/v1/pair", pairRequest.path)
+        val body = JSONObject(pairRequest.body.readUtf8())
+        // The whole point of the Discover path: the code key is genuinely OMITTED
+        // (an empty-string code would still hit the bridge's code check).
+        assertFalse("a code-less pair must OMIT the code key", body.has("code"))
+        assertEquals("the proto gate still applies to a code-less pair", 3, body.getInt("proto"))
+        assertEquals("wear-test", body.getString("deviceName"))
+    }
+
+    @Test
+    fun pairByDiscoveryClosedWindowMapsToWindowClosed() {
+        server.enqueue(pingResponse()) // doPair preflight succeeds...
+        server.enqueue(
+            MockResponse().setResponseCode(403).setBody(
+                """{"error":"Already paired. Re-pairing requires explicit authorization on the bridge."}""",
+            ),
+        )
+
+        val engine = newEngine()
+        val outcome = runBlocking { engine.pairByDiscovery("127.0.0.1", server.port, "wear-test") }
+        // A 403 lockout is the bridge's closed pairing window: the UI turns THIS
+        // into the honest "open pairing (SIGUSR1)" hint, so it must be its own
+        // outcome, never folded into a generic Failed.
+        assertTrue(
+            "a 403 lockout must map to WindowClosed, not a generic failure: $outcome",
+            outcome is ConnectionEngine.PairOutcome.WindowClosed,
+        )
+        // The pairing was NOT committed — nothing persisted, credentials clean.
+        assertNull(runBlocking { store.read().credentials })
     }
 }

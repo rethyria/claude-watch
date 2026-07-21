@@ -3,7 +3,9 @@ package dev.claudewatch.wear
 import dev.claudewatch.shared.terminal.TerminalLineType
 import dev.claudewatch.wear.data.AesGcmTokenCipher
 import dev.claudewatch.wear.data.CredentialStore
+import dev.claudewatch.wear.net.BridgeDiscovery
 import dev.claudewatch.wear.ui.halo.HaloModel
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -27,6 +29,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.KeyGenerator
 
 /**
@@ -48,6 +51,7 @@ class BridgeViewModelTest {
 
     private lateinit var server: MockWebServer
     private lateinit var storeScope: CoroutineScope
+    private lateinit var store: CredentialStore
     private lateinit var viewModel: BridgeViewModel
 
     private val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
@@ -57,12 +61,42 @@ class BridgeViewModelTest {
         server = MockWebServer()
         server.start()
         storeScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-        val store = CredentialStore(
+        store = CredentialStore(
             { File(tmp.root, "conn.bin") },
             AesGcmTokenCipher { key },
             storeScope,
         )
         viewModel = BridgeViewModel(store)
+    }
+
+    /** A BridgeDiscovery whose discoverAll returns a canned list (the Discover
+     *  LIST scan); discover() is unused here, so it yields nothing. */
+    private fun fakeDiscovery(all: List<BridgeDiscovery.DiscoveredBridge>) = object : BridgeDiscovery {
+        override suspend fun discover(bridgeId: String?, timeoutMs: Long): BridgeDiscovery.Discovered? = null
+        override suspend fun discoverAll(timeoutMs: Long): List<BridgeDiscovery.DiscoveredBridge> = all
+    }
+
+    /**
+     * A BridgeDiscovery that models NsdBridgeDiscovery's process-global
+     * single-flight: the FIRST discoverAll blocks on [gate] then returns [all];
+     * any OVERLAPPING discoverAll loses the compareAndSet and returns emptyList
+     * immediately (the lost-race empty the re-entrancy guard keeps off screen).
+     */
+    private class SingleFlightDiscovery(
+        private val all: List<BridgeDiscovery.DiscoveredBridge>,
+    ) : BridgeDiscovery {
+        val gate = CompletableDeferred<Unit>()
+        private val inFlight = AtomicBoolean(false)
+        override suspend fun discover(bridgeId: String?, timeoutMs: Long): BridgeDiscovery.Discovered? = null
+        override suspend fun discoverAll(timeoutMs: Long): List<BridgeDiscovery.DiscoveredBridge> {
+            if (!inFlight.compareAndSet(false, true)) return emptyList()
+            try {
+                gate.await()
+                return all
+            } finally {
+                inFlight.set(false)
+            }
+        }
     }
 
     @After
@@ -1946,5 +1980,174 @@ class BridgeViewModelTest {
             "the hidden session stays filtered out of the derived model after a resync",
             HaloModel.from(afterResync).sessions.any { it.id == "s-ext" },
         )
+    }
+
+    // -- Discover-pairing LIST + code-less pair (issue #23 follow-up) ----------
+
+    /**
+     * The Discover scan publishes the found bridges into [DiscoverUi.Found]
+     * (a transient [DiscoverUi.Scanning] before it is acceptable). The engine's
+     * discoverAll is the injected fake; the VM only orchestrates the state.
+     */
+    @Test
+    fun discoverBridgesForPairingPublishesTheFoundList() {
+        val bridges = listOf(
+            BridgeDiscovery.DiscoveredBridge("Mac-Studio", "127.0.0.1", server.port, "b-1"),
+            BridgeDiscovery.DiscoveredBridge("Deck", "10.0.0.9", 7861, "b-2"),
+        )
+        viewModel = BridgeViewModel(store, discovery = fakeDiscovery(bridges))
+
+        viewModel.discoverBridgesForPairing()
+        val state = awaitUi { it.discover is BridgeViewModel.DiscoverUi.Found }
+        assertEquals(bridges, (state.discover as BridgeViewModel.DiscoverUi.Found).bridges)
+    }
+
+    /** An empty scan lands [DiscoverUi.Empty] — the honest "no bridges found"
+     *  state, never an error. */
+    @Test
+    fun discoverBridgesForPairingLandsEmptyWhenNothingFound() {
+        viewModel = BridgeViewModel(store, discovery = fakeDiscovery(emptyList()))
+
+        viewModel.discoverBridgesForPairing()
+        awaitUi { it.discover is BridgeViewModel.DiscoverUi.Empty }
+    }
+
+    /**
+     * Tapping a discovered bridge pairs code-less: the /v1/pair POST carries NO
+     * `code` (just proto + deviceName), the stream opens, and the panel returns
+     * to Idle (the offline screen dismisses on paired).
+     */
+    @Test
+    fun pairByDiscoverySendsNoCodeAndConnects() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(16, 250, TimeUnit.MILLISECONDS)
+                .setBody(":connected\n\n" + ":pad\n\n".repeat(400)),
+        )
+
+        val bridge = BridgeDiscovery.DiscoveredBridge("Mac-Studio", "127.0.0.1", server.port, "b-1")
+        viewModel = BridgeViewModel(store, discovery = fakeDiscovery(listOf(bridge)))
+
+        viewModel.pairByDiscovery(bridge)
+        awaitStatus { it == "paired, stream open" }
+
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
+        val pairRequest = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no /v1/pair request")
+        assertEquals("/v1/pair", pairRequest.path)
+        val body = JSONObject(pairRequest.body.readUtf8())
+        assertFalse("a code-less Discover pair must OMIT the code key", body.has("code"))
+        assertEquals(3, body.getInt("proto"))
+        assertEquals("wear-client", body.getString("deviceName"))
+
+        // On success the panel is back to Idle (paired flipped through the
+        // engine collector; the offline screen dismisses on that).
+        awaitUi { it.discover is BridgeViewModel.DiscoverUi.Idle }
+    }
+
+    /**
+     * A closed pairing window (403 lockout) on the tapped bridge becomes a
+     * [DiscoverUi.PairError] whose message names SIGUSR1 — the honest "reopen
+     * pairing on the computer" hint, never a generic failure. Nothing is wiped.
+     */
+    @Test
+    fun pairByDiscoveryClosedWindowShowsSigusr1Hint() {
+        enqueuePing() // the doPair preflight succeeds...
+        server.enqueue(
+            MockResponse().setResponseCode(403).setBody(
+                """{"error":"Already paired. Re-pairing requires explicit authorization on the bridge."}""",
+            ),
+        )
+
+        val bridge = BridgeDiscovery.DiscoveredBridge("Mac-Studio", "127.0.0.1", server.port, "b-9")
+        viewModel = BridgeViewModel(store, discovery = fakeDiscovery(listOf(bridge)))
+
+        viewModel.pairByDiscovery(bridge)
+        val state = awaitUi { it.discover is BridgeViewModel.DiscoverUi.PairError }
+        val error = state.discover as BridgeViewModel.DiscoverUi.PairError
+        assertEquals("the error is attributed to the tapped bridge", "b-9", error.bridgeId)
+        assertTrue(
+            "a closed window must name SIGUSR1 so the operator knows how to reopen: ${error.message}",
+            error.message.contains("SIGUSR1"),
+        )
+    }
+
+    /**
+     * Regression (Discover re-trigger false-Empty): re-triggering the scan
+     * while "scanning…" is on screen — the scan-again chip, an impatient
+     * double-tap — must NOT flip the panel to a false [DiscoverUi.Empty]. On a
+     * real device the second, overlapping scan loses NsdBridgeDiscovery's
+     * process-global Wi-Fi single-flight and returns an immediate empty list;
+     * unguarded, that empty clobbers the live Scanning state while the first
+     * scan (which WILL find bridges) is still running. The VM's re-entrancy
+     * guard drops the re-trigger, so the panel stays Scanning until the real
+     * result lands — proved here with a discovery that blocks the first scan and
+     * lost-races every overlapping one (the emulator NOOP can't exhibit it: its
+     * every scan is Empty, so the false Empty is indistinguishable there).
+     */
+    @Test
+    fun discoverReTriggerWhileScanningKeepsScanningNotFalseEmpty() {
+        val bridges = listOf(
+            BridgeDiscovery.DiscoveredBridge("Mac-Studio", "127.0.0.1", server.port, "b-1"),
+        )
+        val discovery = SingleFlightDiscovery(bridges)
+        viewModel = BridgeViewModel(store, discovery = discovery)
+
+        viewModel.discoverBridgesForPairing() // scan 1: Scanning, blocks on the gate
+        awaitUi { it.discover is BridgeViewModel.DiscoverUi.Scanning }
+        viewModel.discoverBridgesForPairing() // re-trigger while still scanning
+
+        // Give a buggy overlapping scan (no guard) time to land its lost-race
+        // empty before asserting the panel did NOT flip to a false Empty.
+        Thread.sleep(500)
+        assertTrue(
+            "a re-trigger while scanning must not flip to a false Empty; discover was " +
+                "${viewModel.state.value.discover}",
+            viewModel.state.value.discover is BridgeViewModel.DiscoverUi.Scanning,
+        )
+
+        discovery.gate.complete(Unit) // let scan 1 finish
+        val done = awaitUi { it.discover is BridgeViewModel.DiscoverUi.Found }
+        assertEquals(bridges, (done.discover as BridgeViewModel.DiscoverUi.Found).bridges)
+    }
+
+    /**
+     * Regression (Success-path panel reset from a NON-Idle state): a code-less
+     * pair that succeeds AFTER the found list is on screen must return the panel
+     * to [DiscoverUi.Idle]. The sibling [pairByDiscoverySendsNoCodeAndConnects]
+     * never leaves Idle (it only calls pairByDiscovery), so its trailing
+     * Idle assertion cannot catch a dropped reset; this one drives the panel to
+     * [DiscoverUi.Found] first, so the reset actually has a non-Idle state to
+     * clear — deleting the Success branch's reset leaves it stuck on Found here.
+     */
+    @Test
+    fun pairByDiscoveryResetsPanelFromFoundToIdleOnSuccess() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(16, 250, TimeUnit.MILLISECONDS)
+                .setBody(":connected\n\n" + ":pad\n\n".repeat(400)),
+        )
+
+        val bridge = BridgeDiscovery.DiscoveredBridge("Mac-Studio", "127.0.0.1", server.port, "b-1")
+        viewModel = BridgeViewModel(store, discovery = fakeDiscovery(listOf(bridge)))
+
+        // Drive the panel to a NON-Idle state first (the found list) so the
+        // success-path reset has something to clear.
+        viewModel.discoverBridgesForPairing()
+        awaitUi { it.discover is BridgeViewModel.DiscoverUi.Found }
+
+        viewModel.pairByDiscovery(bridge)
+        awaitStatus { it == "paired, stream open" }
+        awaitUi { it.discover is BridgeViewModel.DiscoverUi.Idle }
     }
 }

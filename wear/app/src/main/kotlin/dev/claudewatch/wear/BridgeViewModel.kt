@@ -124,6 +124,27 @@ class BridgeViewModel(
         data class Error(val message: String) : UsageUi
     }
 
+    /**
+     * The Discover-pairing panel's state (issue #23 follow-up). Independent of
+     * the single-endpoint zero-typing pre-fill ([UiState.discoveredHost]/
+     * [UiState.discoveredPort], which still feeds the Manual form): this is the
+     * code-less LIST path — scan, present the found bridges, tap one to pair
+     * with no code. A successful pair flips [paired] via the engine collector
+     * (the offline screen then dismisses), so Success returns here to [Idle].
+     */
+    sealed interface DiscoverUi {
+        /** Not scanning; the Choose/Manual panes render. */
+        data object Idle : DiscoverUi
+        /** A scan is in flight. */
+        data object Scanning : DiscoverUi
+        /** The scan found bridges (non-empty). */
+        data class Found(val bridges: List<BridgeDiscovery.DiscoveredBridge>) : DiscoverUi
+        /** The scan completed with nothing found. */
+        data object Empty : DiscoverUi
+        /** A tapped bridge failed to pair; [message] explains (SIGUSR1 for a closed window). */
+        data class PairError(val bridgeId: String, val message: String) : DiscoverUi
+    }
+
     data class UiState(
         val status: String = "unpaired",
         val paired: Boolean = false,
@@ -201,6 +222,13 @@ class BridgeViewModel(
          */
         val discoveredHost: String? = null,
         val discoveredPort: Int? = null,
+        /**
+         * Issue #23 follow-up: the Discover-pairing LIST panel's state (scan →
+         * list → tap-to-pair-code-less). Idle unless the user is on the Discover
+         * pane. Separate from [discoveredHost]/[discoveredPort] (the Manual-form
+         * pre-fill), which are untouched by this flow.
+         */
+        val discover: DiscoverUi = DiscoverUi.Idle,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -258,20 +286,28 @@ class BridgeViewModel(
                 return@launch
             }
             val body = engine.pair(host, port, code.trim(), deviceName = "wear-client") ?: return@launch
-            // Seed the session id from the pair snapshot when one is running.
-            var sessionId: String? = null
-            val sessions = body.optJSONArray("sessions")
-            if (sessions != null) {
-                for (i in 0 until sessions.length()) {
-                    val session = sessions.optJSONObject(i) ?: continue
-                    if (session.optString("state") == "running") {
-                        sessionId = session.optString("id").takeUnless { it.isEmpty() }
-                    }
+            seedSessionFromSnapshot(body)
+        }
+    }
+
+    /**
+     * Seed [UiState.sessionId] from a pair-response snapshot's running session,
+     * shared by the Manual [pair] and the Discover [pairByDiscovery] paths (both
+     * receive the same `{token, bridgeId, sessions}` body from /v1/pair).
+     */
+    private fun seedSessionFromSnapshot(body: JSONObject) {
+        var sessionId: String? = null
+        val sessions = body.optJSONArray("sessions")
+        if (sessions != null) {
+            for (i in 0 until sessions.length()) {
+                val session = sessions.optJSONObject(i) ?: continue
+                if (session.optString("state") == "running") {
+                    sessionId = session.optString("id").takeUnless { it.isEmpty() }
                 }
             }
-            if (sessionId != null) {
-                _state.update { it.copy(sessionId = sessionId) }
-            }
+        }
+        if (sessionId != null) {
+            _state.update { it.copy(sessionId = sessionId) }
         }
     }
 
@@ -287,6 +323,71 @@ class BridgeViewModel(
         engineScope.launch {
             val found = engine.discoverForPairing() ?: return@launch
             _state.update { it.copy(discoveredHost = found.hostIp, discoveredPort = found.port) }
+        }
+    }
+
+    /**
+     * Issue #23 follow-up — the Discover LIST scan: flip to [DiscoverUi.Scanning],
+     * run one all-bridges NSD scan, then publish [DiscoverUi.Found] (non-empty)
+     * or [DiscoverUi.Empty]. Best-effort (the engine degrades a failed scan to an
+     * empty list), so this never surfaces an error — an empty list is the honest
+     * "no bridges found" state the screen renders. NOOP/emulator yields Empty.
+     */
+    fun discoverBridgesForPairing() {
+        // Re-entrancy guard: a scan we already launched is on screen as
+        // "scanning…". Re-triggering it — the scan-again chip, an impatient
+        // double-tap — must NOT launch a second, overlapping scan. On a real
+        // device NsdBridgeDiscovery single-flights the process-global Wi-Fi
+        // bind, so the second concurrent discoverAll loses the compareAndSet
+        // and returns an EMPTY list immediately; unguarded, that empty would
+        // clobber the live Scanning state with a false "no bridges found" while
+        // the first scan (which WILL find bridges) is still in flight. Re-scan
+        // is allowed only once the in-flight scan has landed (Found/Empty/
+        // PairError). NOOP/emulator never races (every scan is Empty there), so
+        // this is HITL-observable only — but the guard makes the state machine
+        // correct regardless of platform, which is the JVM-testable contract.
+        if (_state.value.discover is DiscoverUi.Scanning) return
+        _state.update { it.copy(discover = DiscoverUi.Scanning) }
+        engineScope.launch {
+            val found = engine.discoverAllForPairing()
+            _state.update {
+                it.copy(discover = if (found.isEmpty()) DiscoverUi.Empty else DiscoverUi.Found(found))
+            }
+        }
+    }
+
+    /**
+     * Code-less pair with a bridge tapped in the Discover list. On success the
+     * engine flips [paired] through the state collector (the offline screen
+     * dismisses) and the panel returns to [DiscoverUi.Idle]. A closed pairing
+     * window (the bridge's 403 lockout) becomes a [DiscoverUi.PairError] naming
+     * SIGUSR1 — the operator must reopen pairing on the computer; any other
+     * failure is a generic retryable PairError. Nothing is wiped on failure.
+     */
+    fun pairByDiscovery(bridge: BridgeDiscovery.DiscoveredBridge) {
+        engineScope.launch {
+            when (val outcome = engine.pairByDiscovery(bridge.hostIp, bridge.port, deviceName = "wear-client")) {
+                is ConnectionEngine.PairOutcome.Success -> {
+                    seedSessionFromSnapshot(outcome.snapshot)
+                    _state.update { it.copy(discover = DiscoverUi.Idle) }
+                }
+                ConnectionEngine.PairOutcome.WindowClosed -> _state.update {
+                    it.copy(
+                        discover = DiscoverUi.PairError(
+                            bridge.bridgeId,
+                            "Pairing is closed on that bridge. Open it on the computer (SIGUSR1), then tap again.",
+                        ),
+                    )
+                }
+                is ConnectionEngine.PairOutcome.Failed -> _state.update {
+                    it.copy(
+                        discover = DiscoverUi.PairError(
+                            bridge.bridgeId,
+                            "Couldn't pair: ${outcome.message}. Tap to retry.",
+                        ),
+                    )
+                }
+            }
         }
     }
 

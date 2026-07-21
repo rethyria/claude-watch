@@ -217,6 +217,8 @@ fun WatchApp(
         actions = HaloActions(
             onPair = viewModel::pair,
             onDiscoverForPairing = viewModel::discoverForPairing,
+            onDiscoverBridges = viewModel::discoverBridgesForPairing,
+            onPairByDiscovery = viewModel::pairByDiscovery,
             onUnpair = viewModel::unpair,
             onSendCommand = viewModel::sendCommand,
             onCommandDraftChange = viewModel::updateCommandDraft,
