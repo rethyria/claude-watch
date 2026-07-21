@@ -598,20 +598,35 @@ export function refreshHookSessionTitle(sessionId, body) {
 // signal (hooks.js calls markWorkflowActivity) — it flips the slot
 // workflow-active and runs the first scan immediately so the indicator does
 // not wait out a poll interval. A module-level poll then re-scans ONLY active
-// slots every WORKFLOW_POLL_MS; when a scan finds zero running agents AFTER
-// the workflow was actually observed (a running agent on some scan, or a
-// journal written since the launch signal — the signal races the runner's
-// first journal write, so an early scan can see nothing live) the explicit
-// {running: 0, done: N} completion state is broadcast once and the slot goes
-// workflow-inactive (the poll's cheap boolean gate makes idle ticks free). A
-// bridge restarted mid-workflow never sees the launch signal and shows no
-// indicator — accepted, documented in PROTOCOL.md.
+// slots every WORKFLOW_POLL_MS (the poll's cheap boolean gate makes idle
+// ticks free). A bridge restarted mid-workflow never sees the launch signal
+// and shows no indicator — accepted, documented in PROTOCOL.md.
 //
-// Staleness: a journal whose mtime is older than WORKFLOW_STALE_MS counts as
-// dead regardless of its started/result balance — a killed workflow never
-// writes its result lines, and without this it would pin the indicator
-// forever. `done` aggregates only live (non-stale) journals, so a long
-// session's completed workflow history cannot inflate the count.
+// Completion vs. between-phases: a multi-phase workflow legitimately reads
+// zero running in the gap between phases (phase N's agents all finished,
+// phase N+1 not spawned yet), and the journal is then indistinguishable from
+// a genuinely finished workflow — the only difference is future growth. So a
+// zero-running scan is NOT completion while the workflow tree is still fresh;
+// the indicator holds and the poll stays armed (issue #70, flaw 1). The
+// explicit {running: 0} completion state is broadcast once — clearing the
+// indicator and going workflow-inactive — only when the whole tree has gone
+// quiet for the staleness window (below). The cost is the indicator lingering
+// up to WORKFLOW_STALE_MS after the final agent finishes; the alternative
+// (clearing on a transient inter-phase zero) drops it mid-workflow, which is
+// the bug this guards against. A zero only counts at all once the workflow was
+// actually OBSERVED since arming (a running agent seen, or a write since the
+// launch signal — the signal races the runner's first journal write, so an
+// early scan can see nothing live).
+//
+// Staleness / liveness: a workflow dir counts as dead once its newest write is
+// older than WORKFLOW_STALE_MS. That newest write is taken across BOTH
+// journal.jsonl AND the sibling agent-<id>.jsonl transcripts: journal.jsonl
+// only gains a line when an agent starts or finishes, so a phase with one
+// long-running agent would otherwise look dead for minutes while that agent's
+// transcript is actively written (issue #70, flaw 2). A killed workflow stops
+// writing everything, so it still goes stale and clears the indicator instead
+// of pinning it forever. `done` aggregates only live (non-stale) dirs, so a
+// long session's completed workflow history cannot inflate the count.
 
 // A real journal is a few KB. Reading only a prefix of an oversized one could
 // see a `started` whose `result` sits beyond the cap — a phantom running
@@ -651,14 +666,33 @@ function countWorkflowJournal(journalPath, size) {
   return { running, done };
 }
 
-// Enumerate the slot's wf_* journal dirs and aggregate {running, done} over
-// the live (non-stale) ones, plus latestMtimeMs — the newest journal mtime
-// seen (0 when there are none), which lets the caller tell "a journal was
-// written since the launch signal" apart from "only leftovers from an earlier
-// workflow". Returns null when there is no journal tree to observe (no
-// transcript, no workflows dir yet). Per-journal results are cached
-// stat-gated on (mtime, size) — an unchanged journal costs one stat.
+// Newest mtime among a workflow dir's agent-<id>.jsonl transcripts (0 if
+// none). Liveness fallback for when journal.jsonl itself already looks stale:
+// journal.jsonl only gains a line on an agent start/finish, so a long-running
+// single-agent phase keeps only its transcript warm (issue #70, flaw 2). The
+// readdir cost is paid only on that quiet path, never on the common one.
 // Never throws.
+function newestAgentTranscriptMtimeMs(wfDir) {
+  let names;
+  try { names = fs.readdirSync(wfDir); } catch { return 0; }
+  let newest = 0;
+  for (const name of names) {
+    if (!name.startsWith("agent-") || !name.endsWith(".jsonl")) continue;
+    let stat;
+    try { stat = fs.statSync(path.join(wfDir, name)); } catch { continue; }
+    if (stat.isFile() && stat.mtimeMs > newest) newest = stat.mtimeMs;
+  }
+  return newest;
+}
+
+// Enumerate the slot's wf_* journal dirs and aggregate {running, done} over
+// the live (non-stale) ones, plus latestMtimeMs — the newest write seen across
+// all dirs (0 when there are none), which lets the caller tell "written since
+// the launch signal" apart from "only leftovers from an earlier workflow" and
+// "the tree is still live" apart from "gone quiet". Returns null when there is
+// no journal tree to observe (no transcript, no workflows dir yet). Per-journal
+// counts are cached stat-gated on (mtime, size) — an unchanged journal costs
+// one stat. Never throws.
 function scanWorkflowActivity(slot, now) {
   const transcriptPath = slot.transcriptPath;
   if (typeof transcriptPath !== "string" || !transcriptPath.endsWith(".jsonl")) return null;
@@ -673,13 +707,23 @@ function scanWorkflowActivity(slot, now) {
   let unreadableLive = false;
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith("wf_")) continue;
-    const journalPath = path.join(wfRoot, entry.name, "journal.jsonl");
+    const wfDir = path.join(wfRoot, entry.name);
+    const journalPath = path.join(wfDir, "journal.jsonl");
     let stat;
     try { stat = fs.statSync(journalPath); } catch { continue; }
     if (!stat.isFile()) continue; // never open a non-regular file (see readFileBounded)
     seen.add(journalPath);
-    if (stat.mtimeMs > latestMtimeMs) latestMtimeMs = stat.mtimeMs;
-    if (now - stat.mtimeMs > WORKFLOW_STALE_MS) continue; // dead workflow dir
+    // Liveness is the newest write anywhere in the dir. Only when journal.jsonl
+    // itself already looks stale do we pay to stat the agent transcripts — a
+    // long-running single-agent phase keeps only its transcript warm while the
+    // journal sits untouched for minutes (issue #70, flaw 2).
+    let dirMtimeMs = stat.mtimeMs;
+    if (now - dirMtimeMs > WORKFLOW_STALE_MS) {
+      const agentMtimeMs = newestAgentTranscriptMtimeMs(wfDir);
+      if (agentMtimeMs > dirMtimeMs) dirMtimeMs = agentMtimeMs;
+    }
+    if (dirMtimeMs > latestMtimeMs) latestMtimeMs = dirMtimeMs;
+    if (now - dirMtimeMs > WORKFLOW_STALE_MS) continue; // dead workflow dir
     let counts = cache.get(journalPath);
     if (!counts || counts.mtimeMs !== stat.mtimeMs || counts.size !== stat.size) {
       // A LIVE journal the scan cannot read — outgrown the cap (see the cap
@@ -716,26 +760,33 @@ function scanWorkflowActivity(slot, now) {
 
 // Scan one active slot; on a change to {running, done}, update slot.agents (a
 // REPLACED object, never mutated in place — broadcast payloads hold a
-// reference) and push the idempotent running `session` event. Completion
-// (running === 0) additionally flips the slot workflow-inactive so the poll
-// goes quiet — the explicit present-but-zero state was broadcast, and only a
-// fresh Workflow hook re-arms scanning.
+// reference) and push the idempotent running `session` event. A zero-running
+// scan clears the indicator and flips the slot workflow-inactive ONLY once the
+// tree has gone stale (a fresh zero is the between-phases gap — see the
+// completion note above, issue #70); after that only a fresh Workflow hook
+// re-arms scanning.
 function scanAndAnnounceWorkflowActivity(slot, now) {
   const counts = scanWorkflowActivity(slot, now);
   if (counts && counts.running > 0) slot.workflowSawRunning = true;
-  // A zero-running scan is a COMPLETION only if this arming actually observed
-  // its workflow: a running agent on some scan since the launch signal, or a
-  // journal written since it. Otherwise the launch signal beat the runner's
+  // Remember the peak completed-agent count from a live scan. Completion fires
+  // only once the tree is stale, and a stale dir is excluded from aggregation
+  // (its `done` re-reads as 0) — so without this the completion broadcast would
+  // report done: 0 instead of the true total. Reset per arming (below).
+  if (counts && counts.done > (slot.workflowDone ?? 0)) slot.workflowDone = counts.done;
+  // A zero-running scan may count as anything only if this arming actually
+  // observed its workflow: a running agent on some scan since the launch
+  // signal, or a write since it. Otherwise the launch signal beat the runner's
   // first journal write (the workflows dir holding nothing, or only stale
-  // leftovers from an earlier workflow) — that is "observed nothing live",
-  // not "observed completion", and must be treated exactly like an absent
-  // journal tree below rather than broadcast as a spurious {running: 0}.
+  // leftovers from an earlier workflow) — that is "observed nothing live", not
+  // "observed completion", and must be treated exactly like an absent journal
+  // tree below rather than broadcast as a spurious {running: 0}. (running > 0
+  // implies observed, so this equivalently gates the whole scan.)
   const observed = counts !== null && (
     slot.workflowSawRunning === true ||
     (slot.workflowActivatedAt !== undefined && counts.latestMtimeMs >= slot.workflowActivatedAt)
   );
-  if (!counts || (counts.running === 0 && !observed)) {
-    // Nothing observable (journal tree absent, or nothing live since the
+  if (!counts || !observed) {
+    // Nothing observable yet (journal tree absent, or nothing live since the
     // launch signal). Stay armed for the next poll, but give up after the
     // staleness window so a Workflow hook whose journals never materialize
     // cannot pin the poll on forever.
@@ -748,10 +799,19 @@ function scanAndAnnounceWorkflowActivity(slot, now) {
   // is indeterminate, not completion: keep the last broadcast state and stay
   // armed. The journal going stale — or readable again — resolves it.
   if (counts.running === 0 && counts.unreadableLive) return;
+  // Zero running while the workflow tree is still fresh is the gap BETWEEN
+  // phases, not completion — the journal cannot tell the two apart (see the
+  // completion note above). Hold the last broadcast state and stay armed; only
+  // a tree quiet for the whole staleness window is a real completion. (now -
+  // latestMtimeMs naturally treats latestMtimeMs === 0 as long-stale.)
+  if (counts.running === 0 && now - counts.latestMtimeMs <= WORKFLOW_STALE_MS) return;
   if (counts.running === 0) slot.workflowActive = false;
+  // Report the peak done — equal to counts.done mid-run, but preserved across
+  // the completion broadcast where the now-stale dir aggregates to 0.
+  const done = Math.max(counts.done, slot.workflowDone ?? 0);
   const prev = slot.agents;
-  if (prev && prev.running === counts.running && prev.done === counts.done) return;
-  slot.agents = { running: counts.running, done: counts.done };
+  if (prev && prev.running === counts.running && prev.done === done) return;
+  slot.agents = { running: counts.running, done };
   if (slot.state !== "running") return;
   pushSseEvent(
     "session",
@@ -771,6 +831,9 @@ export function markWorkflowActivity(sessionId) {
   // Each arming must observe ITS workflow before a zero-running scan may
   // count as completion (see scanAndAnnounceWorkflowActivity).
   slot.workflowSawRunning = false;
+  // Peak done is per-workflow: a fresh arming (a new Workflow call, hence a new
+  // journal) must not inherit the previous workflow's completed count.
+  slot.workflowDone = 0;
   anyWorkflowActive = true;
   scanAndAnnounceWorkflowActivity(slot, Date.now());
 }

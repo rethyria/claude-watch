@@ -83,7 +83,7 @@ test("the launch signal scans immediately: 3 started / 1 result → {running: 2,
   }
 });
 
-test("completion is the explicit {running: 0} broadcast, after which the poll is quiet until re-armed", async () => {
+test("a fresh running=0 is the inter-phase gap (held); the explicit zero lands only once the tree goes stale, then quiet until re-armed", async () => {
   const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
@@ -94,11 +94,26 @@ test("completion is the explicit {running: 0} broadcast, after which the poll is
     markWorkflowActivity(id);
     assert.deepEqual(sessions.get(id).agents, { running: 1, done: 1 });
 
-    // The last agent finishes: the poll must broadcast the EXPLICIT zero.
+    // The last agent of the phase finishes: the journal reads running=0, but it
+    // was JUST written — that is the between-phases gap, not completion. The
+    // indicator must HOLD (no premature zero broadcast) and stay armed.
     fs.appendFileSync(journalPath, JSON.stringify(result("k2")) + "\n");
-    const before = sseBuffer.length;
+    let before = sseBuffer.length;
     pollWorkflowActivity(Date.now());
-    assert.deepEqual(sessions.get(id).agents, { running: 0, done: 2 });
+    assert.deepEqual(sessions.get(id).agents, { running: 1, done: 1 }, "held — a fresh running=0 is not completion");
+    assert.equal(sessions.get(id).workflowActive, true, "stays armed for a possible next phase");
+    assert.equal(lastSessionEvent(sseBuffer.slice(before), id), null, "no premature {running: 0} broadcast");
+
+    // The workflow truly ended: nothing more is written and the tree goes
+    // stale. NOW the explicit zero lands and the poll goes quiet.
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    // The completion payload still carries the TRUE done count (2), even though
+    // the now-stale journal aggregates to done:0 — the peak done is preserved.
+    assert.deepEqual(sessions.get(id).agents, { running: 0, done: 2 }, "stale tree → explicit zero, true done preserved");
+    assert.equal(sessions.get(id).workflowActive, false, "the poll went quiet");
     const cleared = lastSessionEvent(sseBuffer.slice(before), id);
     assert.ok(cleared, "the completion state was broadcast");
     assert.deepEqual(cleared.agents, { running: 0, done: 2 });
@@ -107,11 +122,78 @@ test("completion is the explicit {running: 0} broadcast, after which the poll is
     // poll (only a fresh Workflow hook re-arms the scan).
     fs.appendFileSync(journalPath, JSON.stringify(started("k9")) + "\n");
     pollWorkflowActivity(Date.now());
-    assert.deepEqual(sessions.get(id).agents, { running: 0, done: 2 }, "the poll went quiet for the slot");
+    assert.equal(sessions.get(id).agents.running, 0, "the poll went quiet for the slot");
 
     // Re-arm: the launch signal sees the new agent.
     markWorkflowActivity(id);
-    assert.deepEqual(sessions.get(id).agents, { running: 1, done: 2 });
+    assert.equal(sessions.get(id).agents.running, 1, "re-arm: the launch signal sees the new agent");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("multi-phase: a poll landing in the inter-phase running=0 gap holds blue, and phase 2's agents surface (issue #70 flaw 1)", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // Phase 1: two agents running.
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("multiphase", "cc-wf-multi",
+    [started("p1a"), started("p1b")]);
+  const id = resolveHookSession({ session_id: "cc-wf-multi", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    markWorkflowActivity(id);
+    assert.deepEqual(sessions.get(id).agents, { running: 2, done: 0 }, "phase 1 running");
+
+    // Phase 1 finishes; phase 2 not spawned yet → the journal reads running=0,
+    // freshly written. A poll lands right in this gap. Before #70 this disarmed
+    // the scan and dropped blue to green for the rest of the workflow.
+    fs.appendFileSync(journalPath, [result("p1a"), result("p1b")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    pollWorkflowActivity(Date.now());
+    assert.equal(sessions.get(id).workflowActive, true, "still armed through the inter-phase gap");
+    assert.equal(sessions.get(id).agents.running, 2, "blue held (last state kept) — not cleared to green");
+
+    // Phase 2 spawns its agents: the scan must still be running and surface them.
+    fs.appendFileSync(journalPath, [started("p2a"), started("p2b"), started("p2c")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(sessions.get(id).agents, { running: 3, done: 2 }, "phase 2 agents visible");
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(event, "phase 2 running state broadcast");
+    assert.equal(event.agents.running, 3);
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("a phase with one long-running agent stays live via its agent-*.jsonl transcript after journal.jsonl goes stale (issue #70 flaw 2)", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+
+  // One agent started, none finished — the journal gains no further line until
+  // that agent completes.
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("longagent", "cc-wf-long",
+    [started("only")]);
+  const wfDir = path.dirname(journalPath);
+  const id = resolveHookSession({ session_id: "cc-wf-long", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    markWorkflowActivity(id);
+    assert.deepEqual(sessions.get(id).agents, { running: 1, done: 0 }, "the single agent is running");
+
+    // journal.jsonl goes stale (no start/result line for longer than the
+    // window) while the agent is very much alive, writing its transcript.
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    const agentTranscript = path.join(wfDir, "agent-only.jsonl");
+    fs.writeFileSync(agentTranscript, JSON.stringify({ type: "assistant" }) + "\n"); // just written — the liveness signal
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(sessions.get(id).agents, { running: 1, done: 0 }, "still blue — the fresh transcript kept it live");
+    assert.equal(sessions.get(id).workflowActive, true, "still armed");
+
+    // The agent finally dies: its transcript stops too, so the whole dir goes
+    // stale and the indicator clears.
+    fs.utimesSync(agentTranscript, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.equal(sessions.get(id).agents.running, 0, "everything stale → cleared");
+    assert.equal(sessions.get(id).workflowActive, false, "poll went quiet");
   } finally {
     sessions.delete(id);
   }

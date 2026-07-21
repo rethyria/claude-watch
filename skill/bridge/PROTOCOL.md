@@ -591,9 +591,15 @@ and then watches the session's workflow journals on a slow poll; `running`
 counts agents started without a result, `done` counts completed agents of
 currently-live workflows. Completion is signaled by the **explicit**
 `{"running": 0, "done": n}` broadcast — absence, as everywhere, means
-preserve, so omission can never clear the indicator. Stale journals (no write
-for ~5 min, e.g. a killed workflow) are treated as dead so the indicator
-cannot stick. A bridge restarted mid-workflow misses the launch hook and
+preserve, so omission can never clear the indicator. A **transient** `running:
+0` in the gap between the phases of a multi-phase workflow is held, not
+broadcast — it is indistinguishable from real completion in the journal, so
+the indicator clears only once the whole workflow tree has gone quiet for
+~5 min (issue #70). "Quiet" is the newest write across a workflow's
+`journal.jsonl` **and** its agents' transcripts — `journal.jsonl` alone only
+moves on an agent start/finish, so a long single-agent phase would look dead
+mid-run. This same staleness retires a killed workflow's stuck indicator. A
+bridge restarted mid-workflow misses the launch hook and
 shows no indicator — accepted. Clients should render an indicator only while
 `running > 0`, and must not offer any control affordance (a workflow cannot
 be stopped from a client).
