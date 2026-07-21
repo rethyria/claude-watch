@@ -332,7 +332,14 @@ private fun DiscoveredBridgeList(
     onSelect: (BridgeDiscovery.DiscoveredBridge) -> Unit,
     onBack: () -> Unit,
 ) {
-    val listState = rememberScalingLazyListState(initialCenterItemIndex = 0)
+    // Center the FIRST BRIDGE ROW (index 1), not the header (index 0), on entry.
+    // Item 0 is the "select a bridge" caption; centering it (the HaloSpawnPicker
+    // default) pushes the first real, tappable row into the lower half of the
+    // round screen, so the user has to scroll UP to reach it. Found always
+    // carries ≥1 bridge (BridgeViewModel: empty → DiscoverUi.Empty), so index 1
+    // always exists; autoCentering stays on item 0 so the header can still be
+    // pulled to center and the top padding is unchanged.
+    val listState = rememberScalingLazyListState(initialCenterItemIndex = 1)
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
