@@ -599,8 +599,13 @@ the indicator clears only once the whole workflow tree has gone quiet for
 `journal.jsonl` **and** its agents' transcripts — `journal.jsonl` alone only
 moves on an agent start/finish, so a long single-agent phase would look dead
 mid-run. This same staleness retires a killed workflow's stuck indicator. A
-bridge restarted mid-workflow misses the launch hook and
-shows no indicator — accepted. Clients should render an indicator only while
+bridge restarted mid-workflow loses its in-memory arming, but re-derives
+`agents` from the on-disk journal when the surviving session re-registers —
+re-arming a still-live workflow, or broadcasting the explicit zero for one that
+finished during the downtime — so a re-registering session's stale blue is
+corrected rather than stranded (issue #68); a session that fires no further hook
+after the restart is left to the authoritative sync (#66). Clients should render
+an indicator only while
 `running > 0`, and must not offer any control affordance (a workflow cannot
 be stopped from a client).
 
