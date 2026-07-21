@@ -214,7 +214,9 @@ test("a launch signal that sees only a stale journal stays armed — the new wor
   try {
     markWorkflowActivity(id);
     const slot = sessions.get(id);
-    assert.equal(slot.agents, undefined, "observed nothing live — no spurious {running: 0, done: 0} completion");
+    // Registration reconciled the stale leftover to the explicit zero (issue
+    // #68); the launch signal then adds no spurious completion of its own.
+    assert.deepEqual(slot.agents, { running: 0, done: 0 }, "stale leftover reconciled to zero at registration, not a launch-race completion");
     assert.equal(slot.workflowActive, true, "stays armed for the new workflow's journal to appear");
 
     // The new workflow's journal materializes a beat later: the poll must
@@ -248,7 +250,9 @@ test("only stale journals and nothing ever materializing: give up quietly after 
     assert.equal(slot.workflowActive, true, "stays armed at first");
     pollWorkflowActivity(Date.now() + STALE_MS + 1_000);
     assert.equal(slot.workflowActive, false, "gave up after the stale window");
-    assert.equal(slot.agents, undefined, "never broadcast a phantom agents state");
+    // Registration reconciled the stale journal to the explicit zero (issue
+    // #68); the give-up path never adds a phantom running count on top.
+    assert.deepEqual(slot.agents, { running: 0, done: 0 }, "stale journal at registration reconciled to zero, no phantom running count");
   } finally {
     sessions.delete(id);
   }
@@ -368,4 +372,171 @@ test("a Workflow tool-output hook arms the scan and the session event carries ag
 
   const event = await sse.waitFor((e) => e.event === "session" && e.parsed?.agents?.running === 1);
   assert.deepEqual(event.parsed.agents, { running: 1, done: 1 });
+});
+
+// Issue #68: a bridge restart loses the in-memory workflow arming. The surviving
+// Claude session re-registers (its hookSessionId binding gone) via
+// resolveHookSession -> createExternalSession, where reconcileWorkflowActivity
+// must re-derive the indicator from the on-disk journal — no fresh Workflow hook,
+// no markWorkflowActivity.
+test("restart mid-workflow: re-registration re-arms the scanner from a live journal and re-seeds the count (issue #68)", async () => {
+  const { sessions, resolveHookSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // A live workflow journal already on disk, as after a mid-run restart.
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-live", "cc-wf-restart-live",
+    [started("k1"), started("k2"), started("k3"), result("k1")]); // running=2, done=1, fresh
+  const before = sseBuffer.length;
+  // The first post-restart hook re-registers the session. NO Workflow hook.
+  const id = resolveHookSession({ session_id: "cc-wf-restart-live", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    assert.deepEqual(sessions.get(id).agents, { running: 2, done: 1 }, "re-seeded the running count on registration");
+    assert.equal(sessions.get(id).workflowActive, true, "re-armed the scanner without a Workflow hook");
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(event, "the registration running event carried the reconciled agents");
+    assert.deepEqual(event.agents, { running: 2, done: 1 });
+
+    // The scanner now tracks to completion like any armed workflow: the last two
+    // finish (fresh zero, held per #70), then the tree goes stale and clears.
+    fs.appendFileSync(journalPath, [result("k2"), result("k3")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    pollWorkflowActivity(Date.now());
+    assert.equal(sessions.get(id).agents.running, 2, "held through the fresh inter-phase zero");
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.equal(sessions.get(id).agents.running, 0, "tracked to completion and cleared to green");
+    assert.equal(sessions.get(id).workflowActive, false, "poll went quiet");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("restart after the workflow finished during the downtime: registration broadcasts the explicit zero to clear a stale blue (issue #68)", async () => {
+  const { sessions, resolveHookSession } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // A workflow that was in flight but whose journal is now stale (it finished or
+  // died while the bridge was down).
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-stale", "cc-wf-restart-stale",
+    [started("k1")]);
+  const old = new Date(Date.now() - 2 * STALE_MS);
+  fs.utimesSync(journalPath, old, old);
+  const before = sseBuffer.length;
+  const id = resolveHookSession({ session_id: "cc-wf-restart-stale", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    // The client may be latched on a stale running>0; the bridge must broadcast
+    // the explicit zero so preserve-on-absence is overwritten. Nothing is live,
+    // so the scanner is not armed.
+    assert.deepEqual(sessions.get(id).agents, { running: 0, done: 0 }, "reconciled to the explicit zero");
+    assert.notEqual(sessions.get(id).workflowActive, true, "nothing live to track — not armed");
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(event, "the registration event carried the clearing zero");
+    assert.deepEqual(event.agents, { running: 0, done: 0 });
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("registration of a session that never ran a workflow adds no agents field (reconcile is silent)", async () => {
+  const { sessions, resolveHookSession } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // A transcript with no workflows dir at all.
+  const dir = path.join(fixturesRoot, "restart-none");
+  fs.mkdirSync(dir, { recursive: true });
+  const transcriptPath = path.join(dir, "cc-wf-restart-none.jsonl");
+  fs.writeFileSync(transcriptPath, "");
+  const before = sseBuffer.length;
+  const id = resolveHookSession({ session_id: "cc-wf-restart-none", cwd: dir, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    assert.equal(sessions.get(id).agents, undefined, "no workflow tree → no agents field");
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(event, "a running event was still broadcast");
+    assert.ok(!Object.hasOwn(event, "agents"), "no agents field on the wire");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("restart during an inter-phase gap (live tree reading running=0) does NOT clear blue — it arms and lets the poll resolve (issue #68 x #70)", async () => {
+  const { sessions, resolveHookSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // Phase 1 finished, phase 2 not yet spawned: the journal reads running=0 but
+  // was just written (fresh) — indistinguishable from real completion. Clearing
+  // here would drop a still-live workflow's blue to green (the #70 bug).
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-gap", "cc-wf-restart-gap",
+    [started("p1a"), started("p1b"), result("p1a"), result("p1b")]); // running=0, done=2, fresh
+  const before = sseBuffer.length;
+  const id = resolveHookSession({ session_id: "cc-wf-restart-gap", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    assert.equal(sessions.get(id).agents, undefined, "no false clear on a fresh inter-phase zero — agents left absent");
+    assert.equal(sessions.get(id).workflowActive, true, "armed to track the live workflow");
+    const regEvent = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(!regEvent || !Object.hasOwn(regEvent, "agents"), "no agents field broadcast at registration");
+
+    // Phase 2 spawns: the armed poll surfaces blue (the client's preserve-on-
+    // absence held its blue in the meantime).
+    fs.appendFileSync(journalPath, [started("p2a"), started("p2b")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(sessions.get(id).agents, { running: 2, done: 2 }, "phase 2 surfaced by the armed poll");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("restart onto an oversized (unreadable) live journal does NOT false-clear the indicator (issue #68 x unreadableLive)", async () => {
+  const { sessions, resolveHookSession } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // A live workflow (running=2) whose journal has outgrown the read cap: the
+  // scan cannot read it and, on a fresh post-restart slot with an empty cache,
+  // reports running=0 with unreadableLive=true and a fresh mtime. Reconcile must
+  // NOT mistake "could not read" for "completed" and clear to green.
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-big", "cc-wf-restart-big",
+    [started("k1"), started("k2")]);
+  fs.appendFileSync(journalPath, "x".repeat(1024 * 1024 + 1) + "\n"); // outgrows the cap, fresh mtime
+  const before = sseBuffer.length;
+  const id = resolveHookSession({ session_id: "cc-wf-restart-big", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    assert.equal(sessions.get(id).agents, undefined, "no false clear on an unreadable live journal — agents left absent");
+    assert.equal(sessions.get(id).workflowActive, true, "armed; the poll resolves it once readable or stale");
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(!event || !Object.hasOwn(event, "agents"), "no agents field broadcast at registration");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("restart onto a just-finished workflow with a still-fresh journal holds, then clears once the tree goes stale (issue #68)", async () => {
+  const { sessions, resolveHookSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // The workflow finished during the downtime, but its journal is still fresh at
+  // re-registration (running=0). Reconcile cannot tell this from a between-phases
+  // gap, so it holds (no immediate clear) and — because it arms as observed —
+  // lets the poll broadcast the completion zero once the tree goes quiet, exactly
+  // like a normal completion (#70). Without arming-as-observed the poll would
+  // give up silently and strand the client's stale blue.
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-fresh-done", "cc-wf-restart-fresh-done",
+    [started("k1"), result("k1")]); // running=0, done=1, fresh
+  const id = resolveHookSession({ session_id: "cc-wf-restart-fresh-done", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    assert.equal(sessions.get(id).agents, undefined, "held — a fresh running=0 is not an immediate clear");
+    assert.equal(sessions.get(id).workflowActive, true, "armed, observed by construction");
+
+    // It stays quiet: the journal goes stale → the poll broadcasts the explicit
+    // zero (with the true done preserved) to clear the client.
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    const before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(sessions.get(id).agents, { running: 0, done: 1 }, "cleared to the explicit zero once stale, done preserved");
+    assert.equal(sessions.get(id).workflowActive, false, "poll went quiet");
+    const cleared = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(cleared, "the completion zero was broadcast to clear the client");
+    assert.equal(cleared.agents.running, 0);
+  } finally {
+    sessions.delete(id);
+  }
 });

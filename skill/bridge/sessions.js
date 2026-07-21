@@ -599,8 +599,13 @@ export function refreshHookSessionTitle(sessionId, body) {
 // workflow-active and runs the first scan immediately so the indicator does
 // not wait out a poll interval. A module-level poll then re-scans ONLY active
 // slots every WORKFLOW_POLL_MS (the poll's cheap boolean gate makes idle
-// ticks free). A bridge restarted mid-workflow never sees the launch signal
-// and shows no indicator — accepted, documented in PROTOCOL.md.
+// ticks free). A bridge restarted mid-workflow loses the in-memory arming and
+// never sees a fresh launch signal; reconcileWorkflowActivity re-derives the
+// indicator from the on-disk journal when the surviving session re-registers,
+// so a re-registering session's stale blue is corrected rather than stranded
+// (issue #68). A session that fires no further hook after the restart (it went
+// idle, or its next hook is SessionEnd) is not re-derived — that residual gap
+// belongs to the authoritative session sync (#66).
 //
 // Completion vs. between-phases: a multi-phase workflow legitimately reads
 // zero running in the gap between phases (phase N's agents all finished,
@@ -836,6 +841,60 @@ export function markWorkflowActivity(sessionId) {
   slot.workflowDone = 0;
   anyWorkflowActive = true;
   scanAndAnnounceWorkflowActivity(slot, Date.now());
+}
+
+// Issue #68: workflow arming lives only in memory, so a workflow in flight when
+// the bridge restarts never re-arms — the scan never runs, the completion
+// {running: 0} is never computed, and a client's preserve-on-absence `agents`
+// value stays stuck blue forever. A session that outlives a bridge restart loses
+// its hookSessionId binding and re-registers through createExternalSession, so
+// that is where we reconcile: read the workflow journal tree from disk and set
+// the slot's authoritative `agents`, which the imminent running broadcast (and
+// the connect-time sync, which reuses sessionEventPayload) then carry to the
+// reconnecting client, overwriting whatever it latched before the restart.
+//   - LIVE journal (a workflow still in flight): re-arm the scanner so the poll
+//     tracks it to completion exactly as a fresh launch would, and seed the
+//     current running count.
+//   - STALE journal (the workflow finished or died during the downtime): set the
+//     explicit zero so the client's stale blue clears. Nothing live to track, so
+//     do not arm.
+//   - no journal tree: no workflow ran — leave `agents` absent, adding no noise
+//     to the far commoner ordinary-session registration.
+// A fresh Workflow hook that already armed this slot takes precedence (guarded).
+function reconcileWorkflowActivity(slot, now = Date.now()) {
+  if (slot.workflowActive) return;
+  const counts = scanWorkflowActivity(slot, now);
+  if (!counts) return;
+  if (now - counts.latestMtimeMs <= WORKFLOW_STALE_MS) {
+    // A workflow is in flight — re-arm so the poll tracks it to completion.
+    // Unlike markWorkflowActivity (which races the runner's first journal
+    // write), reconcile arms only AFTER scanning a live journal tree, so its
+    // workflow is observed by construction: mark it seen so that once the tree
+    // goes stale the poll broadcasts the completion zero (clearing the client)
+    // rather than giving up silently on an "observed nothing live" slot — which
+    // would strand a client that finished-during-downtime on a fresh journal.
+    slot.workflowActive = true;
+    slot.workflowActivatedAt = now;
+    slot.workflowSawRunning = true;
+    slot.workflowDone = counts.done;
+    anyWorkflowActive = true;
+    // Publish only an UNAMBIGUOUS count. running > 0 re-seeds a truthful blue.
+    // running === 0 on a live tree is indeterminate — the between-phases gap
+    // (#70) or a live journal the scan could not read (oversized / racing I/O,
+    // counts.unreadableLive) — exactly the states scanAndAnnounceWorkflowActivity
+    // refuses to broadcast. Leaving `agents` absent lets the client's
+    // preserve-on-absence hold its current value while the armed poll resolves
+    // it (running > 0 once the next phase writes, or the explicit zero once the
+    // tree goes stale); broadcasting a {running: 0} here would wrongly clear a
+    // still-live workflow's blue to green.
+    if (counts.running > 0) slot.agents = { running: counts.running, done: counts.done };
+    return;
+  }
+  // Stale tree: the workflow finished or died during the downtime (running and
+  // done are both 0 — every dir is stale and skipped from the aggregate).
+  // Broadcast the explicit zero so a client latched on a pre-restart blue
+  // clears. Nothing live to track, so do not arm.
+  slot.agents = { running: 0, done: 0 };
 }
 
 // Poll tick (exported so tests can drive it with an injectable `now` instead
@@ -1255,6 +1314,11 @@ function createExternalSession({ source, cwd, hookSessionId, transcriptPath }) {
     // Session creation is one of the opportunistic refresh points: derive the
     // title now so the initial "running" event already carries it.
     refreshSessionTitle(slot, transcriptPath);
+    // A session re-registering after a bridge restart may have a workflow in
+    // flight (or just-finished) on disk; reconcile the indicator the client may
+    // still be holding, so the initial running broadcast below carries the
+    // truth instead of leaving a stale blue latched (issue #68).
+    reconcileWorkflowActivity(slot);
   }
   // Same moment for git metadata (the slot just got its bound root).
   refreshGitMetadata(slot);
