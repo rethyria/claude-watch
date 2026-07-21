@@ -85,6 +85,16 @@ object Halo {
         val CardRadius = 17.dp               // cards/wells 16–18px
         val RowRadius = 13.dp                // session rows 26px
         val TouchMin = 48.dp
+        // Top-anchored lists (session list, spawn picker, discover list) start
+        // their scrollable content this far below the top edge, in place of
+        // ScalingLazyColumn's default autoCentering — which reserves ~half a
+        // screen above item 0 so it can reach center and, as a side effect,
+        // buries the first rows in the lower half of the round face. Tuned on a
+        // round 454px watch so the caption clears the bezel and the first two
+        // rows are both on screen at rest. The bottom inset lets the final row
+        // scroll fully clear of the curve. One knob for all three lists.
+        val ListTopInset = 40.dp
+        val ListBottomInset = 48.dp
     }
 
     /** Per-session state that colors a ring segment and a row dot. */

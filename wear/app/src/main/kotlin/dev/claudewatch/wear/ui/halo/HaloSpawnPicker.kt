@@ -4,12 +4,11 @@
 // over the list, offering one entry per KNOWN project (spawn root derived in
 // HaloModel: repoRoot beats cwd, a worktree offers its MAIN checkout) plus an
 // explicit "no project" home entry (the "~" sentinel = the bridge user's
-// home). Selection spawns and closes; swipe-down cancels without spawning.
-// The cancel gesture is rebuilt from nested-scroll leftovers exactly like
-// HaloSessionList's swipe-down-back: the picker's scrollable consumes every
-// vertical drag, so a plain pointer detector underneath would never fire —
-// and the caller must disable the API 31+ stretch-overscroll around this
-// composable or the stretch eats every delta after the first overpull frame.
+// home). Selection spawns and closes; a pull-down from the resting top bound
+// cancels without spawning (rememberAtTopBackConnection) — it fires only when
+// the picker was already at the top as the gesture began, so scrolling up to
+// the top never spills into a cancel. The caller must disable the API 31+
+// stretch-overscroll around this composable or the stretch eats the pull.
 package dev.claudewatch.wear.ui.halo
 
 import androidx.compose.foundation.background
@@ -24,31 +23,20 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
-import androidx.wear.compose.foundation.lazy.AutoCenteringParams
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
 import androidx.wear.compose.foundation.rotary.rotaryScrollable
 import androidx.wear.compose.material.Text
-
-/** Cancel-swipe threshold ≈60px at the 450 reference, matching HaloApp's. */
-private val CANCEL_SWIPE_THRESHOLD = 30.dp
 
 @Composable
 fun HaloSpawnPicker(
@@ -57,61 +45,31 @@ fun HaloSpawnPicker(
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // Center the FIRST TAPPABLE ROW (index 1), not the "new session in…" header
-    // (index 0), on entry — same round-screen fix as DiscoveredBridgeList.
-    // Centering the caption pushes the first real row into the lower half, so the
-    // user has to scroll UP to reach it. Index 1 is always a real row: the first
-    // spawn target, or the always-present "no project" home row when there are no
-    // projects. autoCentering stays on item 0 so the header can still reach center.
-    val listState = rememberScalingLazyListState(initialCenterItemIndex = 1)
+    // Top-anchor the list so the first AND second rows are both on screen at once
+    // — same round-screen fix as DiscoveredBridgeList. ScalingLazyColumn's default
+    // autoCentering reserves ~half a screen above item 0 so it can reach center,
+    // which pushed the tappable rows into the lower half. Dropping autoCentering
+    // (null, below) with an explicit top inset lets the "new session in…" caption
+    // sit near the top and the first pick row directly beneath it.
+    val listState = rememberScalingLazyListState(initialCenterItemIndex = 0)
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
-    // Swipe-down-cancel from the drags the picker's list rejects — the same
-    // top-of-list pull-past-threshold contract as HaloSessionList's back.
-    val currentOnCancel by rememberUpdatedState(onCancel)
-    val cancelThresholdPx = with(LocalDensity.current) { CANCEL_SWIPE_THRESHOLD.toPx() }
-    val cancelConnection = remember(listState, cancelThresholdPx) {
-        object : NestedScrollConnection {
-            // Unconsumed pull-down so far; any real scroll or upward motion
-            // resets it, so only a continuous top-of-list pull counts.
-            private var pulled = 0f
-            private var fired = false
-
-            override fun onPostScroll(
-                consumed: Offset,
-                available: Offset,
-                source: NestedScrollSource,
-            ): Offset {
-                if (source != NestedScrollSource.UserInput) return Offset.Zero
-                if (available.y > 0f && !listState.canScrollBackward) {
-                    pulled += available.y
-                    if (!fired && pulled > cancelThresholdPx) {
-                        fired = true
-                        currentOnCancel()
-                    }
-                } else if (consumed.y != 0f || available.y < 0f) {
-                    pulled = 0f
-                }
-                return Offset.Zero
-            }
-
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                pulled = 0f
-                fired = false
-                return Velocity.Zero
-            }
-        }
-    }
-
     ScalingLazyColumn(
         state = listState,
-        autoCentering = AutoCenteringParams(itemIndex = 0),
+        autoCentering = null,
         verticalArrangement = Arrangement.spacedBy(5.dp),
-        contentPadding = PaddingValues(horizontal = Halo.Geo.SafeInset),
+        contentPadding = PaddingValues(
+            start = Halo.Geo.SafeInset,
+            end = Halo.Geo.SafeInset,
+            top = Halo.Geo.ListTopInset,
+            bottom = Halo.Geo.ListBottomInset,
+        ),
         modifier = modifier
             .fillMaxSize()
-            .nestedScroll(cancelConnection)
+            // Cancel = a pull-down from the resting top bound; fires only if the
+            // picker was already at the top when the gesture began (HaloGestures).
+            .nestedScroll(rememberAtTopBackConnection(listState, onCancel))
             // rotaryScrollable installs the focus target itself; the
             // LaunchedEffect above claims it so the bezel works on entry.
             .rotaryScrollable(

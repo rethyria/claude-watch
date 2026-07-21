@@ -44,23 +44,16 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
-import androidx.wear.compose.foundation.lazy.AutoCenteringParams
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
@@ -316,14 +309,15 @@ private fun DiscoverStatusPane(
 }
 
 /** Cancel-swipe threshold ≈60px at the 450 reference, matching HaloSpawnPicker. */
-private val LIST_BACK_SWIPE_THRESHOLD = 30.dp
-
 /**
  * The discovered bridges, one TouchMin row each (machineName + host:port).
  * Full-screen ScalingLazyColumn — the HaloSpawnPicker idiom: rotary bezel
- * scroll, AutoCentering, and the API 31+ stretch-overscroll disabled (else the
- * stretch eats the pull-past-threshold "back" gesture). NO consuming
- * pointerInput anywhere (the device-bisected real-touch trap — HaloApp.kt).
+ * scroll, top-anchored content (autoCentering off — see listState), and the API
+ * 31+ stretch-overscroll disabled (else the stretch eats the pull-from-the-top
+ * back). Back is a pull-down from the resting top bound (rememberAtTopBack-
+ * Connection): only fires if the list was at the top as the gesture began. NO
+ * consuming pointerInput anywhere (the device-bisected real-touch trap —
+ * HaloApp.kt).
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -332,62 +326,34 @@ private fun DiscoveredBridgeList(
     onSelect: (BridgeDiscovery.DiscoveredBridge) -> Unit,
     onBack: () -> Unit,
 ) {
-    // Center the FIRST BRIDGE ROW (index 1), not the header (index 0), on entry.
-    // Item 0 is the "select a bridge" caption; centering it (the HaloSpawnPicker
-    // default) pushes the first real, tappable row into the lower half of the
-    // round screen, so the user has to scroll UP to reach it. Found always
-    // carries ≥1 bridge (BridgeViewModel: empty → DiscoverUi.Empty), so index 1
-    // always exists; autoCentering stays on item 0 so the header can still be
-    // pulled to center and the top padding is unchanged.
-    val listState = rememberScalingLazyListState(initialCenterItemIndex = 1)
+    // Top-anchor the list so the first AND second rows are both on screen at
+    // once. ScalingLazyColumn's default autoCentering reserves ~half a screen of
+    // padding above item 0 so it can be scrolled to center — that reservation is
+    // exactly what pushed the bridge rows into the lower half (whether item 0 or
+    // item 1 was the initial center). Dropping autoCentering (null, below) and
+    // giving an explicit top inset instead lets the "select a bridge" caption sit
+    // near the top with the first tappable row directly beneath it.
+    val listState = rememberScalingLazyListState(initialCenterItemIndex = 0)
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
-
-    // Swipe-down-back from the drags the list rejects at its top — the same
-    // pull-past-threshold contract HaloSpawnPicker's cancel uses.
-    val currentOnBack by rememberUpdatedState(onBack)
-    val backThresholdPx = with(LocalDensity.current) { LIST_BACK_SWIPE_THRESHOLD.toPx() }
-    val backConnection = remember(listState, backThresholdPx) {
-        object : NestedScrollConnection {
-            private var pulled = 0f
-            private var fired = false
-
-            override fun onPostScroll(
-                consumed: Offset,
-                available: Offset,
-                source: NestedScrollSource,
-            ): Offset {
-                if (source != NestedScrollSource.UserInput) return Offset.Zero
-                if (available.y > 0f && !listState.canScrollBackward) {
-                    pulled += available.y
-                    if (!fired && pulled > backThresholdPx) {
-                        fired = true
-                        currentOnBack()
-                    }
-                } else if (consumed.y != 0f || available.y < 0f) {
-                    pulled = 0f
-                }
-                return Offset.Zero
-            }
-
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                pulled = 0f
-                fired = false
-                return Velocity.Zero
-            }
-        }
-    }
 
     CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
         ScalingLazyColumn(
             state = listState,
-            autoCentering = AutoCenteringParams(itemIndex = 0),
+            autoCentering = null,
             verticalArrangement = Arrangement.spacedBy(5.dp),
-            contentPadding = PaddingValues(horizontal = Halo.Geo.SafeInset),
+            contentPadding = PaddingValues(
+                start = Halo.Geo.SafeInset,
+                end = Halo.Geo.SafeInset,
+                top = Halo.Geo.ListTopInset,
+                bottom = Halo.Geo.ListBottomInset,
+            ),
             modifier = Modifier
                 .fillMaxSize()
                 .background(Halo.Palette.Background)
-                .nestedScroll(backConnection)
+                // Back = a pull-down from the resting top bound; fires only if the
+                // list was already at the top when the gesture began (HaloGestures).
+                .nestedScroll(rememberAtTopBackConnection(listState, onBack))
                 .rotaryScrollable(
                     behavior = RotaryScrollableDefaults.behavior(listState),
                     focusRequester = focusRequester,
