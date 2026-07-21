@@ -6,10 +6,14 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
- * The pure HaloNav state machine around the USAGE page (issue #57): usage
- * lives at page [USAGE_PAGE] (-1), LEFT of home, and is deliberately
- * depth-less — no drill-down, no centerpiece jump — while All keeps page 0 so
- * jumpHome and every existing depth path land exactly where they always did.
+ * The pure HaloNav state machine around the USAGE and SETTINGS pages (issue
+ * #57): usage lives at page [USAGE_PAGE] (-1) and settings at [SETTINGS_PAGE]
+ * (-2), both LEFT of home and deliberately depth-less — no drill-down, no
+ * centerpiece jump — while All keeps page 0 so jumpHome and every existing
+ * depth path land exactly where they always did. The settings tests exercise
+ * the SAME guards as usage: both are `< 0`, so the machine folds them into the
+ * no-depth/All behavior for free (narrowing a guard to `== USAGE_PAGE` breaks
+ * the settings cases by name).
  */
 class HaloNavTest {
 
@@ -86,5 +90,45 @@ class HaloNavTest {
     fun backAtTheTopOfTheUsagePageStaysPut() {
         val onUsage = HaloNavState(page = USAGE_PAGE)
         assertEquals(onUsage, onUsage.back())
+    }
+
+    // ── Settings page (page = SETTINGS_PAGE, -2): the same depth-less guards ──
+    // (scopeForPage(-2) == All is covered transitively by the drill/openFirst
+    // no-op cases below; it needs no standalone test — the `<= 0` guard plus the
+    // getOrNull fallback make it un-crashable by construction, like the
+    // pre-existing usage sibling.)
+
+    @Test
+    fun drillToListFromTheSettingsPageIsANoOp() {
+        // Settings is a flat glance surface with no depth below it: the
+        // pager-level swipe-up gesture still fires, but the state machine
+        // refuses the jump (page < 0), never a surprise All list.
+        val onSettings = HaloNavState(page = SETTINGS_PAGE)
+        assertEquals(onSettings, onSettings.drillToList(model()))
+    }
+
+    @Test
+    fun openFirstWaitingFromTheSettingsPageIsANoOp() {
+        // The queue HAS a waiting item, but settings renders no centerpiece —
+        // the machine must not hide a depth jump behind a page with no tap
+        // target.
+        val onSettings = HaloNavState(page = SETTINGS_PAGE)
+        assertEquals(onSettings, onSettings.openFirstWaiting(model()))
+    }
+
+    @Test
+    fun jumpHomeLandsOnAllFromTheSettingsPage() {
+        // jumpHome's target is untouched by the settings page: All at page 0.
+        val home = HaloNavState(page = SETTINGS_PAGE).jumpHome()
+        assertEquals(HaloNavState(), home)
+        assertEquals(0, home.page)
+        assertEquals(HaloDepth.PAGE, home.depth)
+        assertNull(home.sessionId)
+    }
+
+    @Test
+    fun backAtTheTopOfTheSettingsPageStaysPut() {
+        val onSettings = HaloNavState(page = SETTINGS_PAGE)
+        assertEquals(onSettings, onSettings.back())
     }
 }

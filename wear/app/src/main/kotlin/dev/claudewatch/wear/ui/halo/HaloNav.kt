@@ -1,9 +1,9 @@
-// Halo's navigation state machine: horizontal = pages (usage left of home,
-// All, then one per project), vertical = depth (page → list → session feed),
-// plus the approval/question card as an overlay flag. Pure Kotlin over
+// Halo's navigation state machine: horizontal = pages (settings and usage left
+// of home, All, then one per project), vertical = depth (page → list → session
+// feed), plus the approval/question card as an overlay flag. Pure Kotlin over
 // HaloModel — no Compose, no I/O — so every transition is unit-testable,
 // including the edge cases (no waiting items, a project vanishing under the
-// user, the depth-less usage page).
+// user, the depth-less settings/usage pages).
 package dev.claudewatch.wear.ui.halo
 
 /**
@@ -15,6 +15,17 @@ package dev.claudewatch.wear.ui.halo
  */
 const val USAGE_PAGE = -1
 
+/**
+ * The settings page's [HaloNavState.page] value — LEFT of the usage page, so
+ * MORE negative still. Same NEGATIVE design as [USAGE_PAGE]: it sits below page
+ * 0, so All stays home, jumpHome is untouched, and `projects[page - 1]` never
+ * shifts. Because it is `< 0` (and `<= 0`), the depth guards
+ * ([drillToList]/[openFirstWaiting]/[scopeForPage]) fold it into the same
+ * no-depth/All behavior as usage for free — settings is likewise a flat glance
+ * surface with no drill-down, no centerpiece, no card summons.
+ */
+const val SETTINGS_PAGE = -2
+
 /** Vertical position in the IA. Cards are an overlay, not a depth. */
 enum class HaloDepth { PAGE, LIST, SESSION }
 
@@ -25,7 +36,7 @@ sealed interface ListScope {
 }
 
 data class HaloNavState(
-    /** Pager index: [USAGE_PAGE] = usage, 0 = All, 1..n = model.projects[page - 1]. */
+    /** Pager index: [SETTINGS_PAGE] = settings, [USAGE_PAGE] = usage, 0 = All, 1..n = model.projects[page - 1]. */
     val page: Int = 0,
     val depth: HaloDepth = HaloDepth.PAGE,
     val listScope: ListScope = ListScope.All,
@@ -47,10 +58,10 @@ data class HaloNavState(
 )
 
 /**
- * The list scope a given pager page drills into. `<= 0` folds the usage page
- * ([USAGE_PAGE]) into All: the usage page never drills itself (see
- * [drillToList]), but any hand-built or stale state asking must get a scope
- * that exists rather than an index crash.
+ * The list scope a given pager page drills into. `<= 0` folds the settings
+ * ([SETTINGS_PAGE]) and usage ([USAGE_PAGE]) pages into All: neither ever
+ * drills itself (see [drillToList]), but any hand-built or stale state asking
+ * must get a scope that exists rather than an index crash.
  */
 fun scopeForPage(page: Int, model: HaloModel): ListScope =
     if (page <= 0) ListScope.All
@@ -58,8 +69,9 @@ fun scopeForPage(page: Int, model: HaloModel): ListScope =
 
 /**
  * Swipe up on a page: into the All list or the current project's list. The
- * usage page has no depth below it (issue #57) — a drill from there is a
- * NO-OP, never a surprise jump into the All list.
+ * settings and usage pages have no depth below them (issue #57) — both are
+ * `< 0`, so a drill from either is a NO-OP, never a surprise jump into the All
+ * list.
  */
 fun HaloNavState.drillToList(model: HaloModel): HaloNavState {
     if (page < 0) return this
@@ -95,9 +107,10 @@ fun HaloNavState.jumpHome(): HaloNavState = HaloNavState()
  * Tap the centerpiece: open the first waiting item scoped to the current page
  * (page 0 = global queue order, a project page = that project's first waiting
  * session). The card opens OVER the session's feed so dismissing it lands
- * somewhere meaningful. No waiting items → no-op. The usage page renders no
- * centerpiece (issue #57), so this is a no-op from there too — the state
- * machine must not hide a depth jump behind a page that offers no tap target.
+ * somewhere meaningful. No waiting items → no-op. The settings and usage pages
+ * render no centerpiece (issue #57), so this is a no-op from either too (both
+ * `< 0`) — the state machine must not hide a depth jump behind a page that
+ * offers no tap target.
  */
 fun HaloNavState.openFirstWaiting(model: HaloModel): HaloNavState {
     if (page < 0) return this

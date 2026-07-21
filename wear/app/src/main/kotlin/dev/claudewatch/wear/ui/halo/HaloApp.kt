@@ -1,5 +1,5 @@
-// The Halo root: horizontal pager (usage left of home, All, one page per
-// project) with tappable dots, vertical swipes for depth, 300ms directional
+// The Halo root: horizontal pager (settings and usage left of home, All, one
+// page per project) with tappable dots, vertical swipes for depth, 300ms directional
 // slide+fade between depths, a decorative (non-tappable) TimeText on inner
 // screens, and the approval/question card as a top overlay chained off the
 // waiting queue.
@@ -302,6 +302,10 @@ private fun HaloAppBody(
                     model = model,
                     page = nav.page,
                     usage = ui.usage,
+                    // The connection status feeds the settings page's honest
+                    // "you are paired" line above its Unpair (the only
+                    // connection descriptor on the UiState).
+                    status = ui.status,
                     onPageChange = { nav = nav.copy(page = it) },
                     onDrill = {
                         lastSwipeAtMs = SystemClock.uptimeMillis()
@@ -314,6 +318,10 @@ private fun HaloAppBody(
                     },
                     onUsageOpen = actions.onUsageOpen,
                     onUsageRefresh = actions.onUsageRefresh,
+                    // Finally consumed: onUnpair has been declared + VM-wired
+                    // since issue #23 but never rendered — the settings page's
+                    // confirm-gated Unpair is its first invocation.
+                    onUnpair = actions.onUnpair,
                 )
                 is Layer.SessionList -> InnerScreen(
                     onBack = { nav = nav.back() },
@@ -707,34 +715,37 @@ private fun PagerLayer(
     model: HaloModel,
     page: Int,
     usage: BridgeViewModel.UsageUi,
+    status: String,
     onPageChange: (Int) -> Unit,
     onDrill: () -> Unit,
     onTapCenter: () -> Unit,
     onUsageOpen: () -> Unit,
     onUsageRefresh: () -> Unit,
+    onUnpair: () -> Unit,
 ) {
-    // Pager slot 0 is the USAGE page (issue #57), so pagerIndex = nav.page + 1:
-    // All keeps nav.page 0 (slot 1, the initial page) and every existing
-    // depth/nav path — jumpHome included — still lands on All untouched.
-    val pageCount = 2 + model.projects.size
+    // Pager slot 0 is SETTINGS, slot 1 is USAGE (issue #57), so pagerIndex =
+    // nav.page + 2: All keeps nav.page 0 (now slot 2, the initial page), usage
+    // keeps nav.page -1 (slot 1) and settings is nav.page -2 (slot 0), so every
+    // existing depth/nav path — jumpHome included — still lands on All untouched.
+    val pageCount = 3 + model.projects.size
     // The remembered PagerState outlives this composition's model; the lambda
     // must read the CURRENT one or the page count freezes at first render.
     val currentModel by rememberUpdatedState(model)
     val pagerState = rememberPagerState(
-        initialPage = (page + 1).coerceIn(0, pageCount - 1),
-        pageCount = { 2 + currentModel.projects.size },
+        initialPage = (page + 2).coerceIn(0, pageCount - 1),
+        pageCount = { 3 + currentModel.projects.size },
     )
     val scope = rememberCoroutineScope()
     val usageOpen by rememberUpdatedState(onUsageOpen)
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }.collect { pagerIndex ->
-            onPageChange(pagerIndex - 1)
-            // Fetch-on-open (issue #57): EVERY landing on the usage page —
-            // swipe, dot tap, re-entry after a depth round trip — re-fetches.
-            // No client cache by design; this snapshotFlow IS the "page
-            // became current" seam. (The sit-and-watch case is the separate
-            // auto-poll loop below.)
-            if (pagerIndex == 0) usageOpen()
+            onPageChange(pagerIndex - 2)
+            // Fetch-on-open (issue #57): EVERY landing on the usage page (now
+            // slot 1, one right of settings) — swipe, dot tap, re-entry after a
+            // depth round trip — re-fetches. No client cache by design; this
+            // snapshotFlow IS the "page became current" seam. (The
+            // sit-and-watch case is the separate auto-poll loop below.)
+            if (pagerIndex == 1) usageOpen()
         }
     }
     // On-page auto-poll (2026-07-18, user-directed): sitting on the usage
@@ -754,7 +765,7 @@ private fun PagerLayer(
     // budget, and the silent-refresh rule makes the swap invisible.
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(pagerState, lifecycleOwner) {
-        snapshotFlow { pagerState.currentPage == 0 }.collectLatest { onUsagePage ->
+        snapshotFlow { pagerState.currentPage == 1 }.collectLatest { onUsagePage ->
             if (onUsagePage) {
                 lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                     while (true) {
@@ -772,7 +783,8 @@ private fun PagerLayer(
             .fillMaxSize()
             // Swipe up drills into the list under the current page. Vertical
             // only — the pager owns horizontal. Threshold per the handoff.
-            // On the usage page the drill lands in HaloNav's no-op (#57).
+            // On the settings/usage pages the drill lands in HaloNav's no-op
+            // (#57): both are flat, depth-less glance surfaces.
             .pointerInput(Unit) {
                 val threshold = size.height * SWIPE_THRESHOLD_FRACTION
                 var total = 0f
@@ -784,18 +796,21 @@ private fun PagerLayer(
     ) {
         HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { index ->
             when {
-                // No centerpiece and no drill-down on the usage page: bars
-                // only, retry re-fires the same fetch the entry did; the
+                // Slot 0: the settings page — a flat, depth-less surface (like
+                // usage) carrying the confirm-gated destructive Unpair.
+                index == 0 -> HaloSettingsScreen(onUnpair = onUnpair, status = status)
+                // Slot 1: the usage page. No centerpiece and no drill-down:
+                // bars only, retry re-fires the same fetch the entry did; the
                 // freshness label's tap is the forced-refresh seam.
-                index == 0 -> HaloUsageScreen(
+                index == 1 -> HaloUsageScreen(
                     usage = usage,
                     onRetry = usageOpen,
                     onRefresh = onUsageRefresh,
                 )
-                index == 1 -> HaloAllPage(model = model, onTapCenter = onTapCenter)
+                index == 2 -> HaloAllPage(model = model, onTapCenter = onTapCenter)
                 else -> {
                     // The pager can briefly ask for a page past a shrunken model.
-                    val project = model.projects.getOrNull(index - 2) ?: return@HorizontalPager
+                    val project = model.projects.getOrNull(index - 3) ?: return@HorizontalPager
                     HaloProjectPage(project = project, onTapCenter = onTapCenter)
                 }
             }
@@ -812,10 +827,10 @@ private fun PagerLayer(
 /**
  * Bottom-center page dots (handoff: current 11px cream, others 8px grey,
  * tappable). Tap targets are deliberately larger than the dots; a full 48dp
- * per dot would overflow the curve with 4+ pages. The LEADING dot is the
- * usage page's (issue #57): an outlined ring instead of a fill — visually
- * distinct and faint, so the session pages' dots keep reading as the row's
- * "real" content.
+ * per dot would overflow the curve with 4+ pages. The TWO LEADING dots are the
+ * non-session pages (issue #57): slot 0 is settings, slot 1 is usage, both
+ * drawn as an outlined ring instead of a fill — visually distinct and faint, so
+ * the home/project pages' dots keep reading as the row's "real" content.
  */
 @Composable
 private fun PageDots(
@@ -835,8 +850,10 @@ private fun PageDots(
             ) {
                 val isCurrent = index == current
                 val color = if (isCurrent) Halo.Palette.DotCurrent else Halo.Palette.DotOther
-                if (index == 0) {
-                    // The usage dot: same footprint, ring not fill.
+                if (index <= 1) {
+                    // The settings (slot 0) and usage (slot 1) dots: same
+                    // footprint, ring not fill — the flat glance pages read as
+                    // a distinct pair leading the session dots.
                     Box(
                         modifier = Modifier
                             .size(if (isCurrent) 5.5.dp else 4.dp)
