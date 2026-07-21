@@ -147,6 +147,98 @@ export function issueToken({ deviceName, surface } = {}) {
   return token;
 }
 
+// --- Operator device admin (issue #72): list + revoke paired devices on the
+// RUNNING bridge. The server holds the token set in memory and rewrites the
+// store on change, so revocation has to happen in-process — a separate CLI
+// editing credentials.json would race the running bridge, which overwrites the
+// file on the next pair/revoke. These three are reached only through the
+// loopback-gated /admin surface (admin.js), never by a watch client.
+
+// Sanitized listing for the operator. `id` is a SHORT hash PREFIX — the first
+// 12 hex of the SHA-256 hash — enough to disambiguate a handful of devices and
+// to target a revoke, but NEVER the token and NEVER the full 64-hex hash (the
+// full hash stays off the wire entirely; the prefix leaks strictly less, and
+// the plaintext token is not even derivable from the full hash). The raw
+// `hash` is deliberately absent from the returned object.
+export function listDevices() {
+  ensureStoreLoaded();
+  return tokens.map((entry) => ({
+    id: entry.hash.slice(0, 12),
+    deviceName: entry.deviceName ?? null,
+    createdAt: entry.createdAt ?? null,
+    surface: entry.surface ?? null,
+  }));
+}
+
+// Revoke exactly one device by hash-prefix. Returns a tagged result the admin
+// handler maps to a status code:
+//   {error:"invalid-id"}     → 400
+//   {notFound:true}          → 404
+//   {ambiguous:true,count}   → 400, NOTHING removed (never guess which device)
+//   {revoked, removedHash}   → 200 (removedHash is INTERNAL — the SSE-drop key;
+//                                   never serialized, never logged)
+export function revokeDevice(id) {
+  ensureStoreLoaded();
+  // Reject empty/short/non-hex up front. hash.startsWith("") is true for EVERY
+  // entry, so an unvalidated empty id would match-all and — with exactly one
+  // paired device — silently revoke the only one. listDevices emits 12 hex;
+  // accept >= 6 for operator convenience, lowercase hex only.
+  if (typeof id !== "string" || !/^[0-9a-f]{6,64}$/.test(id)) {
+    return { error: "invalid-id" };
+  }
+  const matches = tokens.filter((entry) => entry.hash.startsWith(id));
+  if (matches.length === 0) return { notFound: true };
+  if (matches.length > 1) return { ambiguous: true, count: matches.length };
+  const [victim] = matches;
+  // Persist BEFORE committing the in-memory swap (mirrors issueToken): a disk
+  // failure throws here and leaves the token still authenticating, staying
+  // consistent with what is actually on disk.
+  const nextTokens = tokens.filter((entry) => entry !== victim);
+  persistStore(nextTokens);
+  tokens = nextTokens;
+  // Zero devices left means nothing can authenticate — say so on /status
+  // instead of lying "connected" (the pairing latch is untouched — see below).
+  if (tokens.length === 0) bridgeState = "idle";
+  return { revoked: victim.deviceName || id, removedHash: victim.hash };
+}
+
+// Revoke every device — the graceful in-process equivalent of emptying the
+// store. Persists `{version:1, tokens:[]}` and clears the in-memory set, so
+// every prior token stops authenticating immediately. Returns the removed
+// count plus the removed hashes (INTERNAL — the SSE-drop keys).
+//
+// Deliberately does NOT touch the pairing lockout latch: revoke-all is not a
+// reopen, so the operator still SIGUSR1s (or restarts --allow-pairing) to pair
+// a new device. RESTART HAZARD, documented here and in ARCHITECTURE.md: a
+// well-formed but EMPTY store is treated as CORRUPT by ensureStoreLoaded (an
+// empty token list must never silently reopen pairing), so a bridge restarted
+// after revoke-all comes up LOCKED and logs a SECURITY "empty token list" line
+// — fail-closed-correct, but the "unreadable/invalid" wording overreads for a
+// cleanly-emptied store. Re-pairing is the normal locked-store recovery
+// (SIGUSR1 / --allow-pairing). This keeps the minimal blast radius: the frozen
+// empty-store-is-corrupt invariant (pairing-refinements.test.js) is untouched.
+export function revokeAllDevices() {
+  ensureStoreLoaded();
+  const removed = tokens.map((entry) => entry.hash);
+  persistStore([]);
+  tokens = [];
+  bridgeState = "idle";
+  return { revoked: removed.length, removed };
+}
+
+// The SHA-256 hash (64-hex) of the request's Bearer token, or null when no
+// Bearer is present. Used ONLY to tag an authenticated SSE connection with its
+// device hash (transport-sse.js) so a targeted revoke can drop that device's
+// live stream immediately. A full hash is exactly what the admin surface must
+// keep off the wire, so this value is internal only — never serialized, never
+// logged. Callers must gate on requireAuth first: after auth passes, the value
+// returned here equals the matching stored credential's hash.
+export function presentedTokenHash(req) {
+  const auth = req.headers["authorization"];
+  if (!auth || !auth.startsWith("Bearer ")) return null;
+  return sha256Hex(auth.slice(7));
+}
+
 export function requireAuth(req) {
   ensureStoreLoaded();
   const auth = req.headers["authorization"];

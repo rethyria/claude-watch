@@ -671,6 +671,37 @@ with no decision when zero SSE clients are connected). Permission state is
 shared across surfaces: a `/v1/command` decision resolves a hook received on
 either surface.
 
+## Admin surface (server-local, operator)
+
+`GET /admin/devices` and `POST /admin/devices/revoke` are **operator tooling on
+the running bridge**, not part of this versioned client protocol — a watch
+client never calls them, and `PROTOCOL_VERSION` does not gate them. They are
+**loopback-only** (same operator-on-machine trust as the hook surface: no
+bearer token; a non-loopback source gets `403 {"error": "Admin endpoints are
+only accepted from localhost"}`), because the running bridge owns the token set
+in memory and rewrites `credentials.json` on every change — a separate CLI
+editing the file would race it. Documented here so the operator surface is
+discoverable, but it carries no protocol-version or legacy-freeze guarantees and
+may change without a version bump.
+
+- `GET /admin/devices` → `200 {"devices":[{"id","deviceName","createdAt","surface"}]}`.
+  `id` is the **first 12 hex of the credential's SHA-256 hash** — a prefix that
+  disambiguates and targets a revoke while keeping the token *and* the full hash
+  off the wire. Never a token, never the full 64-hex hash.
+- `POST /admin/devices/revoke {"id":"<hex prefix>"}` → `200 {"ok":true,"revoked":"<deviceName|id>"}`
+  removes the device whose hash starts with `id`, persists the store, and
+  immediately stops that token authenticating (and drops its live SSE stream).
+  Refusals remove nothing: ambiguous prefix (≥2 matches) → `400`; unknown prefix
+  → `404`; missing/short/non-hex `id` → `400`. The `revoked` value is the device
+  name or the short id — never a token or hash.
+- `POST /admin/devices/revoke {"all":true}` → `200 {"ok":true,"revoked":<count>}`
+  empties the store and force-drops every live SSE stream. It does **not** reopen
+  pairing (the operator still `SIGUSR1`s); the emptied store fails closed to
+  LOCKED on the next restart (see ARCHITECTURE.md).
+
+Reachable under `/v1/` too (the prefix fallback), harmlessly and still
+loopback-gated — but the canonical paths are unprefixed.
+
 ## Legacy surface (frozen)
 
 For existing iOS/watchOS clients; **never changes**. Differences from `/v1`:
