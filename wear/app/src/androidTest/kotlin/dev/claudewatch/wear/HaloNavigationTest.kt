@@ -36,6 +36,12 @@ import org.junit.runner.RunWith
  * ANSI-stripped lines), the thinking indicator renders from per-session
  * state, and a killed session's feed backs out instead of ghosting. Pure UI
  * test — no bridge, no network.
+ *
+ * Page order (issue #57): settings (slot 0) | usage (slot 1) | home/All (slot
+ * 2, the landing page) | one page per project. The session-drill tests below
+ * navigate RELATIVELY from the initial home page, so the settings/usage
+ * insertion to the far LEFT leaves them untouched; the added test reaches the
+ * new leftmost settings page and pins its confirm-gated Unpair.
  */
 @RunWith(AndroidJUnit4::class)
 class HaloNavigationTest {
@@ -211,6 +217,36 @@ class HaloNavigationTest {
         compose.waitForIdle()
         compose.onNodeWithText("hello!").assertIsDisplayed()
         assertEquals(0, compose.onAllNodes(hasTestTag("haloThinking")).fetchSemanticsNodes().size)
+    }
+
+    @Test
+    fun settingsIsTheLeftmostPageAndConfirmedUnpairFires() {
+        val bridge = fold(fixtureFrames())
+        var unpairs = 0
+        compose.setContent {
+            HaloApp(ui = ui(bridge), actions = HaloActions(onUnpair = { unpairs++ }))
+        }
+        // Home is the landing page (slot 2): the census in the merged centerpiece.
+        compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
+
+        // Two pages right: home → usage → settings, the new leftmost slot.
+        repeat(2) {
+            compose.onNodeWithTag("haloRoot").performTouchInput {
+                down(center)
+                repeat(10) { moveBy(Offset(width / 12f, 0f), delayMillis = 16L) }
+                up()
+            }
+            compose.waitForIdle()
+        }
+        compose.onNodeWithTag("haloSettings").assertIsDisplayed()
+
+        // Confirm-gated Unpair: one tap only ARMS (no wipe), the second fires.
+        compose.onNodeWithTag("haloSettingsUnpair").performClick()
+        compose.waitForIdle()
+        assertEquals("a lone tap never unpairs", 0, unpairs)
+        compose.onNodeWithTag("haloSettingsUnpair").performClick()
+        compose.waitForIdle()
+        assertEquals("confirm-then-tap fires onUnpair once", 1, unpairs)
     }
 
     @Test
