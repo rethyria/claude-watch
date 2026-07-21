@@ -11,8 +11,9 @@
 // surface"). The /v1 prefix fallback makes /v1/admin/... resolve here too;
 // harmless, still loopback-gated.
 import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
-import { listDevices, revokeDevice, revokeAllDevices } from "./credentials.js";
+import { listDevices, revokeDevice, revokeAllDevices, reopenPairing } from "./credentials.js";
 import { dropSseClientsForHashes, dropAllSseClients } from "./transport-sse.js";
+import { PAIRING_CODE_TTL_MS } from "./config.js";
 
 // Admin endpoints expose and mutate the credential store, so they carry the
 // same operator-on-machine trust as /hooks/*: reject any non-loopback source
@@ -26,6 +27,23 @@ function requireLoopback(req, res) {
   log("warn", `Admin request rejected: non-loopback source ${addr || "unknown"}`);
   jsonResponse(res, 403, { error: "Admin endpoints are only accepted from localhost" });
   return false;
+}
+
+// POST /admin/pairing/open → open the single-use pairing window (issue #72
+// follow-up). This is the operator-facing "initialise pairing" control: it does
+// exactly what SIGUSR1 does (reopenPairing), but as a loopback curl instead of
+// a signal to a pid you have to hunt for. The code-less Discover path needs
+// ONLY the open window — it ignores the code — but the fresh code is returned
+// for the Manual path (and so the operator sees it without grepping the log; a
+// pairing code on a loopback-only surface is operator-privileged, not a leak).
+// The window stays single-use: the next successful pair (code-less or
+// code-bearing) relocks it, so opening it does not weaken the security model.
+export function handleAdminPairingOpen(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
+  const code = reopenPairing();
+  log("info", "Admin: pairing window opened (single-use) via POST /admin/pairing/open");
+  return jsonResponse(res, 200, { ok: true, code, expiresInMs: PAIRING_CODE_TTL_MS });
 }
 
 // GET /admin/devices → { devices: [{ id, deviceName, createdAt, surface }] }.

@@ -39,7 +39,7 @@ import {
   handleHookError,
   handleHookNotification,
 } from "./hooks.js";
-import { handleAdminDevices, handleAdminRevoke } from "./admin.js";
+import { handleAdminDevices, handleAdminRevoke, handleAdminPairingOpen } from "./admin.js";
 
 // ---------------------------------------------------------------------------
 // Process-level guards
@@ -100,6 +100,7 @@ const routes = {
   // client protocol. See admin.js / PROTOCOL.md "Admin surface".
   "GET /admin/devices": handleAdminDevices,
   "POST /admin/devices/revoke": handleAdminRevoke,
+  "POST /admin/pairing/open": handleAdminPairingOpen,
 };
 
 // ---------------------------------------------------------------------------
@@ -350,7 +351,7 @@ async function startServer() {
   // Operator discoverability (issue #72): the device-admin surface is loopback
   // only and unadvertised otherwise. Additive log line — safe for the banner
   // scrapers (helpers.js keys only off Pairing/Port lines).
-  log("info", "Admin (loopback only): GET /admin/devices lists paired devices; POST /admin/devices/revoke {id|all:true} disconnects them.");
+  log("info", "Admin (loopback only): POST /admin/pairing/open initialises pairing; GET /admin/devices lists paired devices; POST /admin/devices/revoke {id|all:true} disconnects them.");
 
   // Get LAN IP
   const interfaces = os.networkInterfaces();
