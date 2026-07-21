@@ -2,11 +2,11 @@
 // wrapping title and status subtitle; the all-sessions variant groups rows
 // under project dividers. A horizontal swipe on a row swaps it for a quick-
 // action strip (mode/compact/handover are design stubs; close kills the
-// session). Scrolls via rotary. The list's scrollable consumes every vertical
-// drag — InnerScreen's underlying back detector never fires here — so
-// swipe-down-back is reimplemented via nested scroll: a pull past the
-// threshold while the list is already at the top steps back. px values are at
-// the 450 reference (≈ px/2 in dp, matching HaloTheme).
+// session). Scrolls via rotary and touch. Back is a pull-down from the resting
+// top bound (rememberAtTopBackConnection): it fires only when the list was
+// already at the top as the gesture began, so scrolling up to the top never
+// spills into a back. px values are at the 450 reference (≈ px/2 in dp,
+// matching HaloTheme).
 package dev.claudewatch.wear.ui.halo
 
 import android.os.SystemClock
@@ -42,26 +42,19 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.wear.compose.foundation.lazy.AutoCenteringParams
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
@@ -74,9 +67,6 @@ private val ROW_SWIPE_THRESHOLD = 20.dp
 
 /** A row swipe suppresses the synthetic tap that can follow it. */
 private const val TAP_GUARD_MS = 300L
-
-/** Back-swipe threshold ≈60px at the 450 reference, matching HaloApp's. */
-private val BACK_SWIPE_THRESHOLD = 30.dp
 
 /** Action-strip reveal: 250ms / 46px slide (handoff "Interactions & Motion"). */
 private const val REVEAL_MS = 250
@@ -136,54 +126,24 @@ fun HaloSessionList(
     // that stole it closes — see the rotaryActive param doc.
     LaunchedEffect(rotaryActive) { if (rotaryActive) focusRequester.requestFocus() }
 
-    // Swipe-down-back, rebuilt from the drags the list rejects: the list's
-    // scrollable consumes every vertical drag (even at its edge the leftover
-    // goes to nested-scroll parents, never back to pointer input), so the
-    // screen-level detector under this list is unreachable. Rotary bypasses
-    // nested scroll, so bezel scrolling can't trigger this.
-    val currentOnBack by rememberUpdatedState(onBack)
-    val backThresholdPx = with(LocalDensity.current) { BACK_SWIPE_THRESHOLD.toPx() }
-    val backConnection = remember(listState, backThresholdPx) {
-        object : NestedScrollConnection {
-            // Unconsumed pull-down so far; any real scroll or upward motion
-            // resets it, so only a continuous top-of-list pull counts.
-            private var pulled = 0f
-            private var fired = false
-
-            override fun onPostScroll(
-                consumed: Offset,
-                available: Offset,
-                source: NestedScrollSource,
-            ): Offset {
-                if (source != NestedScrollSource.UserInput) return Offset.Zero
-                if (available.y > 0f && !listState.canScrollBackward) {
-                    pulled += available.y
-                    if (!fired && pulled > backThresholdPx) {
-                        fired = true
-                        currentOnBack()
-                    }
-                } else if (consumed.y != 0f || available.y < 0f) {
-                    pulled = 0f
-                }
-                return Offset.Zero
-            }
-
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                pulled = 0f
-                fired = false
-                return Velocity.Zero
-            }
-        }
-    }
-
     ScalingLazyColumn(
         state = listState,
-        autoCentering = AutoCenteringParams(itemIndex = 0),
+        // Top-anchored (autoCentering off): the "all sessions" caption sits near
+        // the top with the first session rows directly beneath it, rather than
+        // autoCentering burying them in the lower half of the round face.
+        autoCentering = null,
         verticalArrangement = Arrangement.spacedBy(5.dp),
-        contentPadding = PaddingValues(horizontal = Halo.Geo.SafeInset),
+        contentPadding = PaddingValues(
+            start = Halo.Geo.SafeInset,
+            end = Halo.Geo.SafeInset,
+            top = Halo.Geo.ListTopInset,
+            bottom = Halo.Geo.ListBottomInset,
+        ),
         modifier = modifier
             .fillMaxSize()
-            .nestedScroll(backConnection)
+            // Back = a pull-down from the resting top bound; fires only if the
+            // list was already at the top when the gesture began (HaloGestures).
+            .nestedScroll(rememberAtTopBackConnection(listState, onBack))
             // rotaryScrollable installs the focus target itself; the
             // LaunchedEffect above claims it so the bezel works on entry.
             .rotaryScrollable(
