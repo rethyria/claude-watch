@@ -368,3 +368,48 @@ test("revoke with a JSON `null` body → clean 400, not 500", { timeout: 60_000 
   // Nothing was revoked — the lone device is untouched.
   assert.equal((await request(port, "GET", "/admin/devices")).body.devices.length, 1);
 });
+
+test("POST /admin/pairing/open reopens the single-use window — a code-less pair then succeeds", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const { port } = bridge;
+
+  // Pair once with the startup code — this locks the single-use window.
+  const first = await request(port, "POST", "/v1/pair", { body: { code: bridge.pairingCode, proto: 3, deviceName: "first" } });
+  assert.equal(first.status, 200);
+
+  // Locked: a code-less Discover pair is refused (the operator hasn't opened it).
+  const lockedAttempt = await request(port, "POST", "/v1/pair", { body: { proto: 3, deviceName: "discover" } });
+  assert.equal(lockedAttempt.status, 403);
+
+  // The "initialise pairing" control reopens the window and hands back the
+  // fresh Manual-path code + TTL (so the operator need not grep the log).
+  const opened = await request(port, "POST", "/admin/pairing/open");
+  assert.equal(opened.status, 200);
+  assert.equal(opened.body.ok, true);
+  assert.match(opened.body.code, /^\d{6}$/, "a fresh 6-digit code is returned");
+  assert.ok(opened.body.expiresInMs > 0, "the code TTL is reported");
+
+  // Now the code-less Discover pair succeeds against the reopened window.
+  const discoverPair = await request(port, "POST", "/v1/pair", { body: { proto: 3, deviceName: "discover" } });
+  assert.equal(discoverPair.status, 200, "a code-less pair succeeds after /admin/pairing/open");
+  assert.ok(discoverPair.body.token);
+
+  // Single-use: that success relocked the window; a second code-less pair 403s.
+  const relocked = await request(port, "POST", "/v1/pair", { body: { proto: 3, deviceName: "discover-2" } });
+  assert.equal(relocked.status, 403, "the window is single-use — reopening does not weaken that");
+});
+
+test("POST /admin/pairing/open is loopback-only", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const lanIP = lanIPv4();
+  if (!lanIP) {
+    t.diagnostic("no non-internal IPv4 interface; skipping the LAN-source rejection");
+    return;
+  }
+  const res = await fetch(`http://${lanIP}:${bridge.port}/admin/pairing/open`, {
+    method: "POST",
+    headers: { Host: "localhost" },
+    signal: AbortSignal.timeout(10_000),
+  });
+  assert.equal(res.status, 403, "non-loopback POST /admin/pairing/open must be rejected");
+});

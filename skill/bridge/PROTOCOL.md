@@ -673,9 +673,10 @@ either surface.
 
 ## Admin surface (server-local, operator)
 
-`GET /admin/devices` and `POST /admin/devices/revoke` are **operator tooling on
-the running bridge**, not part of this versioned client protocol — a watch
-client never calls them, and `PROTOCOL_VERSION` does not gate them. They are
+`POST /admin/pairing/open`, `GET /admin/devices` and `POST /admin/devices/revoke`
+are **operator tooling on the running bridge**, not part of this versioned client
+protocol — a watch client never calls them, and `PROTOCOL_VERSION` does not gate
+them. They are
 **loopback-only** (same operator-on-machine trust as the hook surface: no
 bearer token; a non-loopback source gets `403 {"error": "Admin endpoints are
 only accepted from localhost"}`), because the running bridge owns the token set
@@ -684,6 +685,13 @@ editing the file would race it. Documented here so the operator surface is
 discoverable, but it carries no protocol-version or legacy-freeze guarantees and
 may change without a version bump.
 
+- `POST /admin/pairing/open` → `200 {"ok":true,"code":"<6 digits>","expiresInMs":<ttl>}`
+  opens the single-use pairing window — the "initialise pairing" control, doing
+  exactly what `SIGUSR1` does but as a loopback call instead of a signal. The
+  code-less **Discover** pair needs only the open window and ignores `code`; the
+  code is returned for the **Manual** path (and so the operator need not grep the
+  log — a pairing code on a loopback-only surface is operator-privileged). The
+  window stays single-use: the next successful pair relocks it.
 - `GET /admin/devices` → `200 {"devices":[{"id","deviceName","createdAt","surface"}]}`.
   `id` is the **first 12 hex of the credential's SHA-256 hash** — a prefix that
   disambiguates and targets a revoke while keeping the token *and* the full hash
