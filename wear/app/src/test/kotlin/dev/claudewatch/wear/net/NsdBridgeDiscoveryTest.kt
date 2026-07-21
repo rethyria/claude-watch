@@ -33,8 +33,8 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 class NsdBridgeDiscoveryTest {
 
-    private fun cand(host: String, port: Int, bridgeId: String?) =
-        NsdBridgeDiscovery.Candidate(host, port, bridgeId)
+    private fun cand(host: String, port: Int, bridgeId: String?, machineName: String? = null) =
+        NsdBridgeDiscovery.Candidate(host, port, bridgeId, machineName)
 
     /**
      * Records acquire/release order in [events] and serves canned candidates.
@@ -257,6 +257,139 @@ class NsdBridgeDiscoveryTest {
         // The rejected scan acquired NOTHING: each process-global resource was
         // taken exactly once (by the first scan only). A broken guard would show
         // a second acquire of any of them.
+        assertEquals("exactly one process Wi-Fi bind", 1, platform.events.count { it == "bind.acquire" })
+        assertEquals("exactly one multicast lock", 1, platform.events.count { it == "lock.acquire" })
+        assertEquals("exactly one browse", 1, platform.events.count { it == "browse.start" })
+
+        first.cancelAndJoin()
+        scope.coroutineContext[Job]!!.cancelAndJoin()
+    }
+
+    // == discoverAll (the Discover-pairing LIST, issue #23 follow-up) =========
+    // Same resource discipline as discover(): the multicast lock, the process
+    // Wi-Fi bind and the browse are released on EVERY path, through the SAME
+    // withScan skeleton and the SAME inFlight guard. These prove the shared
+    // machinery holds for the list variant too — and that a list scan can never
+    // race a self-heal discover() over the process-global bind.
+
+    // -- L1: happy path returns ALL bridges and releases in reverse order -----
+
+    @Test
+    fun discoverAllReturnsEveryBridgeAndReleasesInReverseOrder() = runBlocking {
+        val platform = RecordingPlatform(
+            candidates = listOf(
+                cand("10.0.0.5", 7860, "b-1", "Mac-Studio"),
+                cand("10.0.0.6", 7861, "b-2", "Deck"),
+            ),
+        )
+        // discoverAll does NOT confirm-by-ping (the pair-time preflight is the
+        // real gate), so an empty confirm table must not suppress any row.
+        val discovery = NsdBridgeDiscovery(platform, RecordingConfirm(emptyMap()).fn)
+
+        val found = discovery.discoverAll(1_000)
+
+        assertEquals(
+            listOf(
+                BridgeDiscovery.DiscoveredBridge("Mac-Studio", "10.0.0.5", 7860, "b-1"),
+                BridgeDiscovery.DiscoveredBridge("Deck", "10.0.0.6", 7861, "b-2"),
+            ),
+            found,
+        )
+        assertEquals(
+            listOf(
+                "lock.acquire", "bind.acquire", "browse.start",
+                "browse.close", "bind.release", "lock.release",
+            ),
+            platform.events.toList(),
+        )
+    }
+
+    // -- L2: no candidates -> empty list, everything still released -----------
+
+    @Test
+    fun discoverAllReturnsEmptyAndReleasesWhenNothingResolves() = runBlocking {
+        val platform = RecordingPlatform(candidates = emptyList())
+        val discovery = NsdBridgeDiscovery(platform, RecordingConfirm(emptyMap()).fn)
+
+        val found = discovery.discoverAll(1_000)
+
+        assertTrue("no bridges -> empty list", found.isEmpty())
+        assertTrue("browse closed", platform.events.contains("browse.close"))
+        assertTrue("bind released", platform.events.contains("bind.release"))
+        assertTrue("lock released", platform.events.contains("lock.release"))
+    }
+
+    // -- L3: browse throwing still releases lock + bind + browse --------------
+
+    @Test
+    fun discoverAllReleasesEverythingWhenBrowseThrows() = runBlocking {
+        val platform = RecordingPlatform(browseThrows = true)
+        val discovery = NsdBridgeDiscovery(platform, RecordingConfirm(emptyMap()).fn)
+
+        val outcome = runCatching { discovery.discoverAll(1_000) }
+        assertTrue("browse failure propagates", outcome.isFailure)
+
+        assertTrue("browse closed", platform.events.contains("browse.close"))
+        assertTrue("bind released", platform.events.contains("bind.release"))
+        assertTrue("lock released", platform.events.contains("lock.release"))
+    }
+
+    // -- L4: dedupe by bridgeId; a candidate with no TXT identity is dropped ---
+
+    @Test
+    fun discoverAllDedupesByBridgeIdAndDropsIdentityLessCandidates() = runBlocking {
+        val platform = RecordingPlatform(
+            candidates = listOf(
+                cand("10.0.0.5", 7860, "b-1", "Mac-Studio"),
+                cand("10.0.0.5", 7860, "b-1", "Mac-Studio"), // same bridge re-resolved
+                cand("10.0.0.9", 7862, null, "No-TXT"),      // no identity -> unpairable, dropped
+            ),
+        )
+        val discovery = NsdBridgeDiscovery(platform, RecordingConfirm(emptyMap()).fn)
+
+        val found = discovery.discoverAll(1_000)
+
+        assertEquals("one row per bridgeId, identity-less dropped", 1, found.size)
+        assertEquals("b-1", found.first().bridgeId)
+        assertEquals("Mac-Studio", found.first().machineName)
+    }
+
+    // -- L5: a bridge whose TXT lacked machineName falls back to the host -----
+
+    @Test
+    fun discoverAllFallsBackToHostWhenMachineNameMissing() = runBlocking {
+        val platform = RecordingPlatform(candidates = listOf(cand("10.0.0.5", 7860, "b-1", null)))
+        val discovery = NsdBridgeDiscovery(platform, RecordingConfirm(emptyMap()).fn)
+
+        val found = discovery.discoverAll(1_000)
+
+        assertEquals("a row is never label-less", "10.0.0.5", found.single().machineName)
+    }
+
+    // -- L6: shared single-flight — a discoverAll loses to an in-flight
+    //        discover() without a second process bind ------------------------
+
+    @Test
+    fun discoverAllSharesTheInFlightGuardWithDiscover() = runBlocking {
+        // A discover() self-heal held inside the browse owns the guard; a
+        // concurrent pairing-list discoverAll must bail with emptyList and take
+        // NO second Wi-Fi bind — the exact process-strand hazard the guard
+        // prevents (the first scan's close() would unbind the whole process out
+        // from under the second).
+        val platform = RecordingPlatform(
+            candidates = listOf(cand("10.0.0.5", 7860, "b-1", "Mac-Studio")),
+            awaitDelayMs = 10_000, // hold discover() inside the browse
+        )
+        val discovery =
+            NsdBridgeDiscovery(platform, RecordingConfirm(mapOf("10.0.0.5:7860" to "b-1")).fn)
+
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        val first = scope.launch { discovery.discover("b-1", 10_000) }
+        while (!platform.events.contains("browse.start")) Thread.sleep(10)
+
+        val second = withTimeoutOrNull(2_000) { discovery.discoverAll(10_000) }
+        assertTrue("a concurrent discoverAll must be rejected with emptyList", second?.isEmpty() == true)
+
         assertEquals("exactly one process Wi-Fi bind", 1, platform.events.count { it == "bind.acquire" })
         assertEquals("exactly one multicast lock", 1, platform.events.count { it == "lock.acquire" })
         assertEquals("exactly one browse", 1, platform.events.count { it == "browse.start" })

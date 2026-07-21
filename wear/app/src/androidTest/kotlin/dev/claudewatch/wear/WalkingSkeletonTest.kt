@@ -286,18 +286,28 @@ class WalkingSkeletonTest {
     @Test
     fun pairStreamApproveQuestionSpawnKill() {
         // --- Pair via manual IP:port + code entry -------------------------
-        // The credential store outlives reinstalls, so a previous run can
-        // leave the app PAIRED (to a long-gone bridge): the offline screen
-        // then folds the form behind the "re-pair watch" chip. Open it —
-        // re-pairing goes through the exact same manual-entry path.
-        // waitUntil, not waitForIdle: on a cold-booted emulator the activity
-        // can still be inflating when the rule returns, and the first fill()
-        // raced it into a missing-'host'-node failure once — wait for the
-        // offline screen's first interactive node before touching anything.
-        compose.waitUntil(30_000) { tagExists("host") || tagExists("repairButton") }
+        // The offline screen now fronts two paths with a Choose pane (issue #23
+        // follow-up): "Manual" (host/port/code) and "Discover" (code-less list).
+        // The manual host/port/code form lives behind the "Manual" chip, so the
+        // pair leg taps through to it. The credential store also outlives
+        // reinstalls, so a previous run can leave the app PAIRED (to a long-gone
+        // bridge): then the "re-pair watch" chip fronts the Choose pane instead.
+        // waitUntil, not waitForIdle: on a cold-booted emulator the activity can
+        // still be inflating when the rule returns, and the first fill() raced
+        // it into a missing-'host'-node failure once — wait for the offline
+        // screen's first interactive node before touching anything.
+        compose.waitUntil(30_000) {
+            tagExists("host") || tagExists("repairButton") || tagExists("manualButton")
+        }
+        // Paired-but-offline: reveal the Choose pane first.
         if (tagExists("repairButton")) {
             compose.onNodeWithTag("repairButton").performScrollTo().performClick()
-            compose.waitForIdle()
+            compose.waitUntil(5_000) { tagExists("manualButton") || tagExists("host") }
+        }
+        // Choose pane: open the Manual form.
+        if (tagExists("manualButton")) {
+            compose.onNodeWithTag("manualButton").performScrollTo().performClick()
+            compose.waitUntil(5_000) { tagExists("host") }
         }
         fill("host")
         fill("port")

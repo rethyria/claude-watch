@@ -256,116 +256,182 @@ class ConnectionEngine(
      * so start() refused to resume) until process restart, with the valid
      * credentials still sitting in the store.
      */
-    suspend fun pair(hostIp: String, port: Int, code: String, deviceName: String): JSONObject? =
-        withContext(io) {
-            val myPairGeneration = synchronized(lock) {
-                _state.value = ConnectionState.Pairing
-                pairGeneration
-            }
-            val candidate = try {
-                clientFactory(hostIp, port)
-            } catch (e: IllegalArgumentException) {
-                failPair(myPairGeneration, ConnectionState.PairFailed(e.message ?: "invalid bridge address"))
-                return@withContext null
-            }
+    /**
+     * The outcome of a pair attempt, typed so the Discover path can honestly
+     * distinguish a closed pairing window (the operator must reopen it on the
+     * bridge — SIGUSR1) from any other failure. The Manual path collapses every
+     * non-[Success] to null (see [pair]) so its observable contract is
+     * unchanged; only [pairByDiscovery] reads the distinction.
+     */
+    sealed interface PairOutcome {
+        /** Paired: [snapshot] is the pair response body (sessions, bridgeId...). */
+        data class Success(val snapshot: JSONObject) : PairOutcome
 
-            // Discovery gates, in order: reachability, then response SHAPE (a
-            // decoy HTTP server on the bridge's port — Gradio also defaults
-            // to 7860 — must never be pair-able), then the proto min-version
-            // gate with an explanation instead of undefined behavior later.
-            val pingResult = try {
-                candidate.ping()
-            } catch (e: Exception) {
-                failPair(myPairGeneration, ConnectionState.PairFailed("bridge unreachable: ${e.message}"))
-                return@withContext null
-            }
-            val ping = BridgePing.from(pingResult)
-            if (ping == null) {
-                failPair(
-                    myPairGeneration,
-                    ConnectionState.PairFailed(
-                        "no bridge at $hostIp:$port — the service there does not " +
-                            "answer /v1/ping like a bridge (HTTP ${pingResult.status})",
-                    ),
-                )
-                return@withContext null
-            }
-            if (ping.proto < minProto) {
-                failPair(
-                    myPairGeneration,
-                    ConnectionState.ProtoMismatch(
-                        bridgeProto = ping.proto.toString(),
-                        minProto = minProto,
-                    ),
-                )
-                return@withContext null
-            }
+        /** The bridge refused with 403 — its pairing window is closed/locked. */
+        data object WindowClosed : PairOutcome
 
-            val result = try {
-                candidate.pair(code, deviceName)
-            } catch (e: Exception) {
-                failPair(myPairGeneration, ConnectionState.PairFailed("pair error: ${e.message}"))
-                return@withContext null
-            }
-            val body = result.body
-            val newToken = body?.optString("token").takeUnless { it.isNullOrEmpty() }
-            if (!result.ok || body == null || newToken == null) {
-                val error = body?.optString("error") ?: ""
-                failPair(myPairGeneration, ConnectionState.PairFailed("${result.status} $error".trim()))
-                return@withContext null
-            }
+        /** Anything else (unreachable, decoy, proto too old, wrong code, superseded). */
+        data class Failed(val message: String) : PairOutcome
+    }
 
-            // Commit + persist under the persistence mutex: the generation
-            // check decides whether this pairing is still current, and the
-            // same critical section writes the store, so a stop()/unpair that
-            // raced the /v1/pair roundtrip can never end up with this
-            // pairing's token persisted at rest (its clear() is serialized
-            // either fully before the check — which then fails — or fully
-            // after our save).
-            // Pin the bridge's identity at pair time: every future reconnect
-            // verifies it, so a different bridge later squatting this address
-            // is refused instead of silently trusted (the wrong-Mac bug).
-            val bridgeId = body.optString("bridgeId").takeUnless { it.isEmpty() } ?: ping.bridgeId
-            val committed = persistMutex.withLock {
-                val current = synchronized(lock) {
-                    // A stop() or a second pair() raced this one: don't commit.
-                    if (pairGeneration != myPairGeneration) return@synchronized false
-                    pairGeneration += 1
-                    // Only now — with the new pairing accepted — does the
-                    // previous engine die.
-                    teardownLocked()
-                    client = candidate
-                    token = newToken
-                    pairedHost = hostIp
-                    pairedPort = port
-                    pinnedBridgeId = bridgeId
-                    stopped = false
-                    attempt = 0
-                    // Fresh pairing: request a full ring-buffer replay so events
-                    // pushed between pair success and the stream registering are
-                    // never lost (see BridgeViewModelTest for the war story).
-                    lastEventId = PersistedConnection.FULL_REPLAY_EVENT_ID
-                    true
-                }
-                if (current) {
-                    store.saveCredentials(
-                        BridgeCredentials(
-                            token = newToken,
-                            hostIp = hostIp,
-                            port = port,
-                            bridgeId = bridgeId,
-                        ),
-                    )
-                }
-                current
-            }
-            if (!committed) return@withContext null
-            // The identity preflight is skipped for the connect right after a
-            // successful pair: the very bridge that just answered /v1/ping
-            // and issued this token IS the pinned identity.
-            connect(verifyIdentity = false)
-            body
+    /**
+     * Pair with a bridge: proto min-version gate first, then the code exchange
+     * ([code] non-null, the Manual path) OR a code-less Discover pair
+     * ([code] null, [BridgeClient.pairByDiscovery]), then persist + connect.
+     * On any failure state explains why and NOTHING is retried or wiped (a
+     * rejected pairing is not a reason to erase a previous pairing's
+     * credentials, which stay in the store untouched).
+     *
+     * A LIVE engine keeps running until the new pairing has actually
+     * succeeded: teardown happens only inside the commit critical section.
+     * The bridge locks pairing after its first success, so a Pair tap while
+     * connected is always rejected — tearing the stream down up front turned
+     * that rejection into a dead engine (stopped, yet not in Stopped state,
+     * so start() refused to resume) until process restart, with the valid
+     * credentials still sitting in the store.
+     */
+    private suspend fun doPair(
+        hostIp: String,
+        port: Int,
+        code: String?,
+        deviceName: String,
+    ): PairOutcome = withContext(io) {
+        val myPairGeneration = synchronized(lock) {
+            _state.value = ConnectionState.Pairing
+            pairGeneration
         }
+        val candidate = try {
+            clientFactory(hostIp, port)
+        } catch (e: IllegalArgumentException) {
+            val msg = e.message ?: "invalid bridge address"
+            failPair(myPairGeneration, ConnectionState.PairFailed(msg))
+            return@withContext PairOutcome.Failed(msg)
+        }
+
+        // Discovery gates, in order: reachability, then response SHAPE (a
+        // decoy HTTP server on the bridge's port — Gradio also defaults
+        // to 7860 — must never be pair-able), then the proto min-version
+        // gate with an explanation instead of undefined behavior later.
+        val pingResult = try {
+            candidate.ping()
+        } catch (e: Exception) {
+            val msg = "bridge unreachable: ${e.message}"
+            failPair(myPairGeneration, ConnectionState.PairFailed(msg))
+            return@withContext PairOutcome.Failed(msg)
+        }
+        val ping = BridgePing.from(pingResult)
+        if (ping == null) {
+            val msg = "no bridge at $hostIp:$port — the service there does not " +
+                "answer /v1/ping like a bridge (HTTP ${pingResult.status})"
+            failPair(myPairGeneration, ConnectionState.PairFailed(msg))
+            return@withContext PairOutcome.Failed(msg)
+        }
+        if (ping.proto < minProto) {
+            failPair(
+                myPairGeneration,
+                ConnectionState.ProtoMismatch(
+                    bridgeProto = ping.proto.toString(),
+                    minProto = minProto,
+                ),
+            )
+            return@withContext PairOutcome.Failed(
+                "bridge speaks proto ${ping.proto}, need >= $minProto",
+            )
+        }
+
+        val result = try {
+            // Manual path sends the code; Discover path sends none (the open
+            // window is the bridge's gate). Same round-trip otherwise.
+            if (code != null) candidate.pair(code, deviceName)
+            else candidate.pairByDiscovery(deviceName)
+        } catch (e: Exception) {
+            val msg = "pair error: ${e.message}"
+            failPair(myPairGeneration, ConnectionState.PairFailed(msg))
+            return@withContext PairOutcome.Failed(msg)
+        }
+        val body = result.body
+        val newToken = body?.optString("token").takeUnless { it.isNullOrEmpty() }
+        if (!result.ok || body == null || newToken == null) {
+            val error = body?.optString("error") ?: ""
+            failPair(myPairGeneration, ConnectionState.PairFailed("${result.status} $error".trim()))
+            // A 403 is the bridge's closed-window lockout: the Discover UI turns
+            // this into the honest "open pairing on the bridge (SIGUSR1)" hint,
+            // distinct from an unreachable/decoy/wrong-code Failed.
+            return@withContext if (result.status == 403) PairOutcome.WindowClosed
+            else PairOutcome.Failed("${result.status} $error".trim())
+        }
+
+        // Commit + persist under the persistence mutex: the generation
+        // check decides whether this pairing is still current, and the
+        // same critical section writes the store, so a stop()/unpair that
+        // raced the /v1/pair roundtrip can never end up with this
+        // pairing's token persisted at rest (its clear() is serialized
+        // either fully before the check — which then fails — or fully
+        // after our save).
+        // Pin the bridge's identity at pair time: every future reconnect
+        // verifies it, so a different bridge later squatting this address
+        // is refused instead of silently trusted (the wrong-Mac bug).
+        val bridgeId = body.optString("bridgeId").takeUnless { it.isEmpty() } ?: ping.bridgeId
+        val committed = persistMutex.withLock {
+            val current = synchronized(lock) {
+                // A stop() or a second pair() raced this one: don't commit.
+                if (pairGeneration != myPairGeneration) return@synchronized false
+                pairGeneration += 1
+                // Only now — with the new pairing accepted — does the
+                // previous engine die.
+                teardownLocked()
+                client = candidate
+                token = newToken
+                pairedHost = hostIp
+                pairedPort = port
+                pinnedBridgeId = bridgeId
+                stopped = false
+                attempt = 0
+                // Fresh pairing: request a full ring-buffer replay so events
+                // pushed between pair success and the stream registering are
+                // never lost (see BridgeViewModelTest for the war story).
+                lastEventId = PersistedConnection.FULL_REPLAY_EVENT_ID
+                true
+            }
+            if (current) {
+                store.saveCredentials(
+                    BridgeCredentials(
+                        token = newToken,
+                        hostIp = hostIp,
+                        port = port,
+                        bridgeId = bridgeId,
+                    ),
+                )
+            }
+            current
+        }
+        if (!committed) return@withContext PairOutcome.Failed("superseded")
+        // The identity preflight is skipped for the connect right after a
+        // successful pair: the very bridge that just answered /v1/ping
+        // and issued this token IS the pinned identity.
+        connect(verifyIdentity = false)
+        PairOutcome.Success(body)
+    }
+
+    /**
+     * Manual pairing (host/port/code). Returns the pair response body on
+     * success, null on any failure — the exact contract every existing caller
+     * and test depends on. See [doPair] for the shared machinery.
+     */
+    suspend fun pair(hostIp: String, port: Int, code: String, deviceName: String): JSONObject? =
+        when (val outcome = doPair(hostIp, port, code, deviceName)) {
+            is PairOutcome.Success -> outcome.snapshot
+            else -> null
+        }
+
+    /**
+     * Code-less Discover pairing: pair with a bridge chosen from the discovered
+     * list, sending NO code (the bridge's open window is the gate). Returns the
+     * typed [PairOutcome] so the UI can surface the closed-window case honestly
+     * (reopen with SIGUSR1) instead of a generic failure.
+     */
+    suspend fun pairByDiscovery(hostIp: String, port: Int, deviceName: String): PairOutcome =
+        doPair(hostIp, port, code = null, deviceName)
 
     /**
      * Issue #23 zero-typing: discover ANY bridge on the LAN (null bridgeId
@@ -377,6 +443,15 @@ class ConnectionEngine(
      */
     suspend fun discoverForPairing(): BridgeDiscovery.Discovered? =
         withContext(io) { runCatching { discovery.discover(null, discoveryTimeoutMs) }.getOrNull() }
+
+    /**
+     * Discover ALL bridges on the LAN for the Discover-pairing LIST. Mirrors
+     * [discoverForPairing]'s best-effort discipline: degrades to an empty list
+     * on the emulator/JVM ([BridgeDiscovery.NOOP]) or any scan failure, never
+     * throws. The user picks a row and [pairByDiscovery] does the real gate.
+     */
+    suspend fun discoverAllForPairing(): List<BridgeDiscovery.DiscoveredBridge> =
+        withContext(io) { runCatching { discovery.discoverAll(discoveryTimeoutMs) }.getOrNull() ?: emptyList() }
 
     /**
      * Records a failed pair attempt WITHOUT touching the engine: whatever was

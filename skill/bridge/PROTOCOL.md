@@ -135,9 +135,21 @@ Request:
 { "code": "123456", "proto": 3, "deviceName": "pixel-watch-2" }
 ```
 
-`code` (string, required); `proto` (integer, required on `/v1` — see
-[Versioning](#versioning)); `deviceName` (string, optional, truncated to 200
-chars, stored for operator bookkeeping).
+`code` (string) — **optional on `/v1/pair`**: omit it for the code-less
+Discover pairing path (issue #23 follow-up), where the operator-opened pairing
+window is the sole gate; still **required on the frozen legacy `/pair`**.
+`proto` (integer, required on `/v1` — see [Versioning](#versioning), and still
+required for a code-less pair); `deviceName` (string, optional, truncated to
+200 chars, stored for operator bookkeeping).
+
+**Code-less (Discover) pairing.** A `/v1/pair` with no `code` is admitted when
+the pairing window is open (`isPairingOpen`), is rate-limited and
+min-proto-gated identically to a code-bearing pair, and engages the same
+single-use lock on success. When the window is closed it `403`s exactly like a
+code-bearing pair — a code-less pair is impossible against a locked window.
+This is an additive relaxation (it only drops a required field for clients that
+opt in), so the protocol version stays `3` and any client that keeps sending
+`{code, proto}` behaves identically.
 
 Success (`200`):
 
@@ -161,7 +173,7 @@ Errors:
 
 | Status | Body `error` | Meaning |
 |---|---|---|
-| `400` | `Missing 'code' field` | no/invalid `code` |
+| `400` | `Missing 'code' field` | no/invalid `code` — **legacy `/pair` only**; on `/v1/pair` a missing code is not a `400` (it proceeds to the proto/window gates) |
 | `400` | `Invalid JSON` | unparseable body |
 | `401` | `Invalid pairing code` | wrong code (window still open) |
 | `401` | `Pairing code expired. A new code has been generated.` | startup window expired; fresh code is in the bridge console |
