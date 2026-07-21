@@ -57,7 +57,13 @@ fun HaloSpawnPicker(
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val listState = rememberScalingLazyListState(initialCenterItemIndex = 0)
+    // Center the FIRST TAPPABLE ROW (index 1), not the "new session in…" header
+    // (index 0), on entry — same round-screen fix as DiscoveredBridgeList.
+    // Centering the caption pushes the first real row into the lower half, so the
+    // user has to scroll UP to reach it. Index 1 is always a real row: the first
+    // spawn target, or the always-present "no project" home row when there are no
+    // projects. autoCentering stays on item 0 so the header can still reach center.
+    val listState = rememberScalingLazyListState(initialCenterItemIndex = 1)
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
