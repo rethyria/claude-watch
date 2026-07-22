@@ -54,6 +54,15 @@ import {
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
+import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  createBridgeChannel,
+  teeClientToBridge,
+  type BridgeChannel,
+} from "../bridge-channel.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -138,6 +147,7 @@ function wrapQuery(generator: AsyncGenerator<any>) {
  *  Session field is added in one place rather than every inline literal. */
 function mockSessionState(overrides: Record<string, any> = {}) {
   return {
+    sessionId: "test-session",
     cancelled: false,
     cwd: "/test",
     sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
@@ -3763,6 +3773,7 @@ describe("session/close", () => {
     function* empty() {}
     const gen = Object.assign(empty(), { interrupt: vi.fn(), close: vi.fn() });
     agent.sessions[sessionId] = {
+      sessionId,
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
@@ -3861,6 +3872,7 @@ describe("session/delete", () => {
     function* empty() {}
     const gen = Object.assign(empty(), { interrupt: vi.fn(), close: vi.fn() });
     agent.sessions[sessionId] = {
+      sessionId,
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
@@ -3967,6 +3979,7 @@ describe("getOrCreateSession param change detection", () => {
       supportedCommands: vi.fn().mockResolvedValue([]),
     });
     agent.sessions[sessionId] = {
+      sessionId,
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
@@ -6794,6 +6807,7 @@ describe("post-error recovery", () => {
     }
     const gen = Object.assign(messageGenerator(), { interrupt, close });
     agent.sessions["test-session"] = {
+      sessionId: "test-session",
       query: gen as any,
       input,
       cancelled: false,
@@ -9705,6 +9719,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
 
     const gen = Object.assign(messageGenerator(), { interrupt, close });
     agent.sessions["test-session"] = {
+      sessionId: "test-session",
       query: gen as any,
       input,
       cancelled: false,
@@ -10976,6 +10991,7 @@ describe("agent selection config option", () => {
         applyFlagSettings,
       });
       agent.sessions[sessionId] = {
+        sessionId,
         query: gen as any,
         input: new Pushable(),
         cancelled: false,
@@ -11143,5 +11159,197 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
   it("refuses an unknown session", async () => {
     const agent = makeAgent();
     await expect(agent.injectUserPrompt("nope", "hi", "watch")).rejects.toThrow(/not found/i);
+  });
+});
+
+describe("teeClientToBridge (claude-watch, S3 #77 output tap)", () => {
+  function makeInner() {
+    const calls: string[] = [];
+    const inner = {
+      sessionUpdate: vi.fn(async () => {}),
+      requestPermission: vi.fn(async () => ({ outcome: { outcome: "cancelled" } })),
+      readTextFile: vi.fn(async () => ({ content: "x" })),
+      writeTextFile: vi.fn(async () => ({})),
+      unstable_createElicitation: vi.fn(async () => ({})),
+      unstable_completeElicitation: vi.fn(async () => {}),
+      extNotification: vi.fn(async () => {}),
+    } as unknown as AcpClient;
+    return { inner, calls };
+  }
+
+  function makeSpyBridge() {
+    return {
+      registerSession: vi.fn(),
+      deregisterSession: vi.fn(),
+      forwardSessionUpdate: vi.fn(),
+      forwardPermissionRequest: vi.fn(),
+      onInject: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+    } as unknown as BridgeChannel & Record<string, ReturnType<typeof vi.fn>>;
+  }
+
+  it("mirrors sessionUpdate to the bridge AND passes it through to the inner client", async () => {
+    const { inner } = makeInner();
+    const bridge = makeSpyBridge();
+    const client = teeClientToBridge(inner, bridge);
+    const notification = { sessionId: "s1", update: { sessionUpdate: "agent_message_chunk" } } as any;
+
+    await client.sessionUpdate(notification);
+
+    expect(bridge.forwardSessionUpdate).toHaveBeenCalledWith(notification);
+    expect(inner.sessionUpdate).toHaveBeenCalledWith(notification);
+  });
+
+  it("mirrors the requestPermission RPC (which sendUpdate misses) and returns the inner answer", async () => {
+    const { inner } = makeInner();
+    const bridge = makeSpyBridge();
+    const client = teeClientToBridge(inner, bridge);
+    const req = { sessionId: "s1", toolCall: {}, options: [] } as any;
+
+    const res = await client.requestPermission(req);
+
+    expect(bridge.forwardPermissionRequest).toHaveBeenCalledWith(req);
+    expect(inner.requestPermission).toHaveBeenCalledWith(req, undefined);
+    // The tap must never change the answer Zed gave.
+    expect(res).toEqual({ outcome: { outcome: "cancelled" } });
+  });
+
+  it("does NOT mirror non-tapped methods (fs, elicitation) — they pass straight through", async () => {
+    const { inner } = makeInner();
+    const bridge = makeSpyBridge();
+    const client = teeClientToBridge(inner, bridge);
+
+    await client.readTextFile({ sessionId: "s1", path: "/x" } as any);
+    await client.writeTextFile({ sessionId: "s1", path: "/x", content: "y" } as any);
+
+    expect(inner.readTextFile).toHaveBeenCalled();
+    expect(inner.writeTextFile).toHaveBeenCalled();
+    expect(bridge.forwardSessionUpdate).not.toHaveBeenCalled();
+    expect(bridge.forwardPermissionRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe("createBridgeChannel (claude-watch, S3 #77 activation gate)", () => {
+  it("returns null unless launched by claude-watch (CLAUDE_WATCH_ACP=1)", () => {
+    const prev = process.env.CLAUDE_WATCH_ACP;
+    try {
+      delete process.env.CLAUDE_WATCH_ACP;
+      expect(createBridgeChannel({ log() {}, error() {} })).toBeNull();
+      process.env.CLAUDE_WATCH_ACP = "0";
+      expect(createBridgeChannel({ log() {}, error() {} })).toBeNull();
+      process.env.CLAUDE_WATCH_ACP = "1";
+      const ch = createBridgeChannel({ log() {}, error() {} });
+      expect(ch).not.toBeNull();
+      ch?.stop();
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_WATCH_ACP;
+      else process.env.CLAUDE_WATCH_ACP = prev;
+    }
+  });
+});
+
+describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
+  // Spin a throwaway bridge stand-in on loopback and point the channel's
+  // port-file lookup at it, so the real fetch/SSE code path is exercised — not
+  // a mock of it. The fork must talk to whatever port the file names.
+  function startFakeBridge() {
+    const registers: any[] = [];
+    const deregisters: any[] = [];
+    const updates: any[] = [];
+    let inboxRes: http.ServerResponse | null = null;
+
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (req.method === "GET" && url.pathname === "/acp/inbox") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(":connected\n\n");
+        inboxRes = res;
+        return;
+      }
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const body = raw ? JSON.parse(raw) : {};
+        if (url.pathname === "/acp/register") registers.push(body);
+        else if (url.pathname === "/acp/deregister") deregisters.push(body);
+        else if (url.pathname === "/acp/update") updates.push(body);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+      });
+    });
+
+    return new Promise<{
+      port: number;
+      registers: any[];
+      deregisters: any[];
+      updates: any[];
+      pushInject: (data: unknown) => void;
+      close: () => void;
+    }>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const port = (server.address() as import("node:net").AddressInfo).port;
+        resolve({
+          port,
+          registers,
+          deregisters,
+          updates,
+          pushInject: (data) => inboxRes?.write(`event: inject\ndata: ${JSON.stringify(data)}\n\n`),
+          close: () => {
+            try { inboxRes?.end(); } catch { /* ignore */ }
+            server.close();
+          },
+        });
+      });
+    });
+  }
+
+  async function waitFor(predicate: () => boolean, timeoutMs = 3000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error("timed out waiting for condition");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  it("POSTs register, delivers an inbox inject to the handler, and POSTs deregister", async () => {
+    const bridge = await startFakeBridge();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-chan-"));
+    fs.writeFileSync(path.join(dir, "port"), `${bridge.port}\n`);
+    const prevAcp = process.env.CLAUDE_WATCH_ACP;
+    const prevDir = process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+    process.env.CLAUDE_WATCH_ACP = "1";
+    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = dir;
+
+    const channel = createBridgeChannel({ log() {}, error() {} })!;
+    const injected: Array<[string, string, string]> = [];
+    channel.onInject((sessionId, text, source) => injected.push([sessionId, text, source]));
+
+    try {
+      channel.start();
+
+      channel.registerSession({ sessionId: "acp-1", sdkSessionId: "acp-1", cwd: "/proj" });
+      await waitFor(() => bridge.registers.length === 1);
+      expect(bridge.registers[0]).toMatchObject({ sessionId: "acp-1", sdkSessionId: "acp-1", cwd: "/proj" });
+      expect(typeof bridge.registers[0].connection).toBe("string");
+
+      // The inbox must be connected before a pushed inject can arrive.
+      await waitFor(() => injected.length === 0 && bridge.registers.length === 1);
+      bridge.pushInject({ sessionId: "acp-1", text: "run the tests", source: "watch" });
+      await waitFor(() => injected.length === 1);
+      expect(injected[0]).toEqual(["acp-1", "run the tests", "watch"]);
+
+      channel.deregisterSession("acp-1", "query-closed");
+      await waitFor(() => bridge.deregisters.length === 1);
+      expect(bridge.deregisters[0]).toMatchObject({ sessionId: "acp-1", reason: "query-closed" });
+    } finally {
+      channel.stop();
+      bridge.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (prevAcp === undefined) delete process.env.CLAUDE_WATCH_ACP;
+      else process.env.CLAUDE_WATCH_ACP = prevAcp;
+      if (prevDir === undefined) delete process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+      else process.env.CLAUDE_WATCH_CREDENTIALS_DIR = prevDir;
+    }
   });
 });

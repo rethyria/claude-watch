@@ -122,6 +122,8 @@ import {
   toolUpdateFromToolResult,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+// claude-watch: the fork <-> bridge loopback channel (S3 #77).
+import { BridgeChannel, createBridgeChannel, teeClientToBridge } from "./bridge-channel.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -353,6 +355,11 @@ type Turn = {
 };
 
 type Session = {
+  /** claude-watch: the ACP session id (the key under which this record lives in
+   *  `this.sessions`), stored on the record so teardown paths that only receive
+   *  the Session object (e.g. `closeQueryStream`) can deregister it from the
+   *  watch bridge. */
+  sessionId: string;
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
@@ -1279,10 +1286,18 @@ export class ClaudeAcpAgent {
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
 
-  constructor(client: AcpClient, logger?: Logger) {
+  /** claude-watch: the loopback channel to the watch bridge, or undefined when
+   *  this fork was not launched by claude-watch. Used to register/deregister
+   *  each ACP session so the watch can see and dictate at it. The client tap
+   *  (sessionUpdate + requestPermission mirroring) is wired separately, on the
+   *  {@link client} handed to this constructor. All calls are best-effort. */
+  bridge?: BridgeChannel;
+
+  constructor(client: AcpClient, logger?: Logger, bridge?: BridgeChannel) {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
+    this.bridge = bridge;
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -4075,6 +4090,11 @@ export class ClaudeAcpAgent {
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
+    // claude-watch: this is the one chokepoint every teardown flows through —
+    // the consumer's own done/error path, a spontaneous SDK stream end (the
+    // husk case), closeSession/deleteSession, and dispose() (Zed quit) all call
+    // it. Guarded by `queryClosed` above, so the bridge is told exactly once.
+    this.bridge?.deregisterSession(session.sessionId, "query-closed");
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
@@ -5607,6 +5627,7 @@ export class ClaudeAcpAgent {
         : immediateContextWindow(providerCacheKey, models.currentModelId, allowlistedModelInfo);
 
     this.sessions[sessionId] = {
+      sessionId,
       query: q,
       input: input,
       cancelled: false,
@@ -5639,6 +5660,16 @@ export class ClaudeAcpAgent {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
+
+    // claude-watch: announce the live session to the bridge so the watch can see
+    // and dictate at it. The SDK's session_id equals this ACP sessionId — the
+    // fork sets `options.sessionId = sessionId` (and resume/load reuse the same
+    // id), and the consumer forwards `message.session_id` back to the client
+    // verbatim — so a single id correlates this ACP slot with the settings.json
+    // hook events the SDK also fires, letting the bridge bind them to ONE slot
+    // instead of minting a hook-twin. Best-effort; never blocks session
+    // creation. Covers new/fork/resume/load uniformly (all route through here).
+    this.bridge?.registerSession({ sessionId, sdkSessionId: sessionId, cwd: params.cwd });
 
     return {
       sessionId,
@@ -7456,7 +7487,28 @@ export function runAcp() {
     )
     .connect(stream);
 
-  agent = new ClaudeAcpAgent(new ClientConnection(connection.client));
+  // claude-watch: when launched by claude-watch (CLAUDE_WATCH_ACP=1) wire the
+  // bridge channel — tee the client (so sessionUpdate + the requestPermission
+  // RPC are mirrored to the watch), register/deregister sessions, and route
+  // dictation from the inbox into the live session via injectUserPrompt.
+  // `null` when unset, so every other user of the fork behaves exactly as
+  // upstream. The `agent` reference the inject handler closes over is assigned
+  // synchronously below, before `bridge.start()` opens the inbox.
+  const bridge = createBridgeChannel(console);
+  const baseClient = new ClientConnection(connection.client);
+  agent = new ClaudeAcpAgent(
+    bridge ? teeClientToBridge(baseClient, bridge) : baseClient,
+    undefined,
+    bridge ?? undefined,
+  );
+  if (bridge) {
+    bridge.onInject((sessionId, text, source) => {
+      agent.injectUserPrompt(sessionId, text, source).catch((err) => {
+        console.error(`claude-watch: injectUserPrompt failed for ${sessionId}: ${String(err)}`);
+      });
+    });
+    bridge.start();
+  }
   return { connection, agent };
 }
 

@@ -28,6 +28,13 @@ import { sseClients, handleEvents } from "./transport-sse.js";
 import { sessions } from "./sessions.js";
 import { pendingPermissions } from "./permissions.js";
 import { startCodexMonitor, stopCodexMonitor } from "./codex.js";
+import {
+  handleAcpRegister,
+  handleAcpUpdate,
+  handleAcpDeregister,
+  handleAcpInbox,
+  closeAllAcpInboxes,
+} from "./acp.js";
 import { handlePair, handleCommand, handleStatus, handlePing } from "./commands.js";
 import { handleUsage } from "./usage.js";
 import {
@@ -96,6 +103,15 @@ const routes = {
   "GET /status": handleStatus,
   "GET /usage": handleUsage,
   "GET /ping": handlePing,
+  // ACP loopback channel (issue #77): the forked claude-agent-acp launched by
+  // Zed registers/updates/deregisters its sessions and holds the inbox SSE the
+  // bridge pushes watch dictation down. Loopback-only (guarded in acp.js), not
+  // part of the /v1 client protocol — the /v1 prefix fallback maps /v1/acp/*
+  // here too; harmless, still loopback-gated.
+  "POST /acp/register": handleAcpRegister,
+  "POST /acp/update": handleAcpUpdate,
+  "POST /acp/deregister": handleAcpDeregister,
+  "GET /acp/inbox": handleAcpInbox,
   // Operator device admin (issue #72): loopback-only, not part of the /v1
   // client protocol. See admin.js / PROTOCOL.md "Admin surface".
   "GET /admin/devices": handleAdminDevices,
@@ -311,6 +327,7 @@ async function startServer() {
     }
     sessions.clear();
     stopCodexMonitor();
+    closeAllAcpInboxes();
 
     if (bonjourService) {
       try { bonjourInstance.unpublishAll(); } catch { /* ignore */ }

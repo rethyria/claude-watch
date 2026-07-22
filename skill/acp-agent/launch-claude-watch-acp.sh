@@ -21,4 +21,10 @@ if [ -z "$NODE" ] || [ ! -x "$NODE" ]; then
 fi
 [ -x "$NODE" ] || { echo "claude-watch-acp: no usable node found (set CLAUDE_WATCH_NODE)" >&2; exit 127; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Opt this adapter into the claude-watch bridge loopback channel (S3 #77): the
+# adapter registers each ACP session with the bridge and receives watch
+# dictation. Unset, the fork behaves exactly like upstream claude-agent-acp.
+export CLAUDE_WATCH_ACP=1
+
 exec "$NODE" "$HERE/dist/index.js" "$@"

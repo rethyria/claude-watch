@@ -1,0 +1,296 @@
+// claude-watch: the fork <-> bridge loopback channel (S3 #77).
+//
+// This whole file is a claude-watch addition — it is NOT upstream
+// `claude-agent-acp` code, so re-pulling the fork from upstream only reconciles
+// the handful of marked injection points in acp-agent.ts / index.ts, never this
+// module.
+//
+// Direction of travel:
+//   fork -> bridge   register / update / deregister  (plain fire-and-forget POSTs)
+//   bridge -> fork   dictation `inject`              (a long-lived SSE the fork holds)
+//
+// The uplink is stateless POSTs; the downlink is one persistent SSE "inbox" the
+// fork opens to the bridge. That connection's liveness IS this fork process's
+// liveness: when the fork dies (even on SIGKILL, where the graceful
+// `deregister` never runs) the inbox socket closes and the bridge ends every
+// ACP slot bound to it — so a Zed quit strands no zombie slot.
+//
+// Everything here is strictly best-effort. The bridge being down, slow, or
+// absent must NEVER change how the ACP session behaves for the Zed user: every
+// call swallows its own errors and the SSE reader reconnects on its own.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import type { AcpClient, Logger } from "./acp-agent.js";
+import type {
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+  SessionNotification,
+  ReadTextFileRequest,
+  ReadTextFileResponse,
+  WriteTextFileRequest,
+  WriteTextFileResponse,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  CompleteElicitationNotification,
+} from "@agentclientprotocol/sdk";
+
+/** Delivered by the bridge down the inbox SSE when the watch dictates. */
+export type InjectHandler = (sessionId: string, text: string, source: string) => void;
+
+/** The seam the agent (and its client tee) talk to. A test supplies a fake;
+ *  production uses {@link HttpBridgeChannel}. Every method is best-effort and
+ *  MUST NOT throw into agent code. */
+export interface BridgeChannel {
+  /** Register a live ACP session so the watch can see and dictate at it. The
+   *  SDK session_id equals the ACP session id (the fork passes
+   *  `options.sessionId = sessionId`), so one id correlates the ACP slot with
+   *  the settings.json hook events the SDK also fires — the bridge binds them
+   *  to a single slot. */
+  registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string }): void;
+  /** The ACP session ended (query closed / closeSession / dispose). */
+  deregisterSession(sessionId: string, reason: string): void;
+  /** Mirror of a client `sessionUpdate` (prose, tool calls, mode, plan, …). */
+  forwardSessionUpdate(params: SessionNotification): void;
+  /** Mirror of a client `requestPermission` RPC (missed by `sendUpdate`). */
+  forwardPermissionRequest(params: RequestPermissionRequest): void;
+  /** Register the handler the inbox calls when the watch dictates. */
+  onInject(handler: InjectHandler): void;
+  /** Open the inbox SSE and begin its reconnect loop. */
+  start(): void;
+  /** Stop the inbox loop and release the connection. */
+  stop(): void;
+}
+
+function credentialsDir(): string {
+  return process.env.CLAUDE_WATCH_CREDENTIALS_DIR || path.join(os.homedir(), ".claude-watch");
+}
+
+/** The bridge publishes its ACTUAL bound port here on startup (it walks a port
+ *  range because 7860 is often taken), so we must read it rather than assume a
+ *  port. Re-read on every (re)connect: a bridge restart can land on a new port. */
+function readBridgePort(): number | null {
+  try {
+    const raw = fs.readFileSync(path.join(credentialsDir(), "port"), "utf8").trim();
+    const port = Number.parseInt(raw, 10);
+    return Number.isInteger(port) && port > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+const INBOX_MIN_BACKOFF_MS = 500;
+const INBOX_MAX_BACKOFF_MS = 10_000;
+
+export class HttpBridgeChannel implements BridgeChannel {
+  /** Stable id for this fork process across all its POSTs and its inbox SSE, so
+   *  the bridge knows which sessions belong to which fork (and which inbox to
+   *  push a dictation down). */
+  private readonly connectionId = randomUUID();
+  private injectHandler: InjectHandler | null = null;
+  private stopped = false;
+  private abort: AbortController | null = null;
+
+  constructor(private readonly logger: Logger) {}
+
+  onInject(handler: InjectHandler): void {
+    this.injectHandler = handler;
+  }
+
+  registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string }): void {
+    void this.post("/acp/register", {
+      connection: this.connectionId,
+      sessionId: info.sessionId,
+      sdkSessionId: info.sdkSessionId,
+      cwd: info.cwd,
+    });
+  }
+
+  deregisterSession(sessionId: string, reason: string): void {
+    void this.post("/acp/deregister", {
+      connection: this.connectionId,
+      sessionId,
+      reason,
+    });
+  }
+
+  forwardSessionUpdate(params: SessionNotification): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "session_update",
+      payload: params,
+    });
+  }
+
+  forwardPermissionRequest(params: RequestPermissionRequest): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "permission",
+      payload: params,
+    });
+  }
+
+  start(): void {
+    if (this.stopped) return;
+    void this.runInbox();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    try {
+      this.abort?.abort();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** Fire-and-forget POST to the bridge on loopback. Never rejects into caller
+   *  code: a missing port (bridge not up) or a network error is swallowed. */
+  private async post(route: string, body: Record<string, unknown>): Promise<void> {
+    const port = readBridgePort();
+    if (port === null) return;
+    try {
+      await fetch(`http://127.0.0.1:${port}${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      this.logger.error(`claude-watch: bridge POST ${route} failed: ${String(err)}`);
+    }
+  }
+
+  /** Hold the inbox SSE open, reconnecting with capped backoff until stopped. */
+  private async runInbox(): Promise<void> {
+    let backoff = INBOX_MIN_BACKOFF_MS;
+    while (!this.stopped) {
+      const port = readBridgePort();
+      if (port === null) {
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, INBOX_MAX_BACKOFF_MS);
+        continue;
+      }
+      this.abort = new AbortController();
+      try {
+        const resp = await fetch(
+          `http://127.0.0.1:${port}/acp/inbox?connection=${this.connectionId}`,
+          {
+            headers: { accept: "text/event-stream" },
+            signal: this.abort.signal,
+          },
+        );
+        if (!resp.ok || !resp.body) {
+          throw new Error(`inbox status ${resp.status}`);
+        }
+        // Connected: reset backoff and drain frames until the stream ends.
+        backoff = INBOX_MIN_BACKOFF_MS;
+        await this.drainInbox(resp.body);
+      } catch (err) {
+        if (this.stopped) break;
+        this.logger.error(`claude-watch: bridge inbox disconnected: ${String(err)}`);
+      }
+      if (this.stopped) break;
+      await sleep(backoff);
+      backoff = Math.min(backoff * 2, INBOX_MAX_BACKOFF_MS);
+    }
+  }
+
+  private async drainInbox(body: ReadableStream<Uint8Array>): Promise<void> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      let sep: number;
+      // Frames are separated by a blank line, exactly like the bridge's SSE.
+      while ((sep = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        this.handleFrame(frame);
+      }
+    }
+  }
+
+  private handleFrame(frame: string): void {
+    let event = "message";
+    const dataLines: string[] = [];
+    for (const line of frame.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+      // ":comment" heartbeats and anything else are ignored.
+    }
+    if (event !== "inject" || dataLines.length === 0) return;
+    let msg: { sessionId?: unknown; text?: unknown; source?: unknown };
+    try {
+      msg = JSON.parse(dataLines.join("\n"));
+    } catch {
+      return;
+    }
+    if (typeof msg.sessionId !== "string" || typeof msg.text !== "string") return;
+    const source = typeof msg.source === "string" ? msg.source : "watch";
+    this.logger.log(`claude-watch: inbox inject for session ${msg.sessionId} (source=${source})`);
+    try {
+      this.injectHandler?.(msg.sessionId, msg.text, source);
+    } catch (err) {
+      this.logger.error(`claude-watch: inject handler threw: ${String(err)}`);
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Build the bridge channel, or `null` when this fork was not launched by
+ *  claude-watch (`CLAUDE_WATCH_ACP` unset). Returning null keeps the adapter's
+ *  behaviour byte-for-byte identical to upstream for every other user of the
+ *  fork, and keeps the upstream test suite untouched. */
+export function createBridgeChannel(logger: Logger = console): BridgeChannel | null {
+  if (process.env.CLAUDE_WATCH_ACP !== "1") return null;
+  return new HttpBridgeChannel(logger);
+}
+
+/** Decorate an {@link AcpClient} so every `sessionUpdate` and every
+ *  `requestPermission` RPC is ALSO mirrored to the bridge, without altering the
+ *  real call's arguments, return value, or timing. This is the review-mandated
+ *  tap point: `sendUpdate` alone misses tool results and every permission
+ *  prompt, so we tap the client — the one surface both funnel through. Every
+ *  other method passes straight through untouched. */
+export function teeClientToBridge(inner: AcpClient, bridge: BridgeChannel): AcpClient {
+  return {
+    sessionUpdate(params: SessionNotification): Promise<void> {
+      bridge.forwardSessionUpdate(params);
+      return inner.sessionUpdate(params);
+    },
+    requestPermission(
+      params: RequestPermissionRequest,
+      signal?: AbortSignal,
+    ): Promise<RequestPermissionResponse> {
+      bridge.forwardPermissionRequest(params);
+      return inner.requestPermission(params, signal);
+    },
+    readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+      return inner.readTextFile(params);
+    },
+    writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
+      return inner.writeTextFile(params);
+    },
+    unstable_createElicitation(
+      params: CreateElicitationRequest,
+      signal?: AbortSignal,
+    ): Promise<CreateElicitationResponse> {
+      return inner.unstable_createElicitation(params, signal);
+    },
+    unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+      return inner.unstable_completeElicitation(params);
+    },
+    extNotification(method: string, params: Record<string, unknown>): Promise<void> {
+      return inner.extNotification(method, params);
+    },
+  };
+}

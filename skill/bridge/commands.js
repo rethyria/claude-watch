@@ -45,6 +45,7 @@ import {
 } from "./sessions.js";
 import { pendingPermissions, pendingPermissionBodies, resolvePermission } from "./permissions.js";
 import { codexSyntheticPermissions, resolveCodexSyntheticPermission } from "./codex.js";
+import { injectToAcpSession } from "./acp.js";
 
 export async function handlePair(req, res) {
   if (req.method !== "POST") {
@@ -386,6 +387,25 @@ export async function handleCommand(req, res) {
     } else {
       // Backward compat: route to the most recent active session
       targetSession = findMostRecentActiveSession() || findMostRecentRunningSession();
+    }
+
+    // ACP session (issue #77): hosted by Zed's forked adapter, not a PTY we own
+    // and not a headless fork. Dictation is delivered into the LIVE session over
+    // the loopback channel — the fork's injectUserPrompt wakes it if idle. No
+    // detached `claude -p` (that corrupts the tree); a fork that is not
+    // connected is surfaced honestly so the wear side keeps the text as a draft.
+    if (targetSession && targetSession.kind === "acp") {
+      const promptText = command.replace(/\n$/, "").trim();
+      if (!promptText) return jsonResponse(res, 400, { error: "Empty command" });
+      if (!injectToAcpSession(targetSession.id, promptText, "watch")) {
+        return jsonResponse(res, 502, {
+          error: "ACP session is not reachable (its Zed adapter is not connected); dictation not delivered",
+          sessionId: targetSession.id,
+        });
+      }
+      // The injected turn's working/idle rides the settings.json hooks the SDK
+      // fires, which resolve to this same slot (hook-twin correlation).
+      return jsonResponse(res, 200, { ok: true, sessionId: targetSession.id, agent: targetSession.agent, prompt: true });
     }
 
     // Session exists but has no PTY (external hook-created session) — whether
