@@ -32,6 +32,38 @@ class BackoffPolicyTest {
         assertTrue("expected jittered delays, got a fixed cadence: $samples", samples.size > 1)
     }
 
+    // Battery: a watch away from its bridge must not reconnect (and re-run the
+    // NSD self-heal scan) every 30 s forever. Past the sustained threshold the
+    // cap relaxes so wakeups become far less frequent.
+    @Test
+    fun theSustainedTierRelaxesTheCapOnceFailuresPersist() {
+        val policy = BackoffPolicy(
+            baseMs = 1_000, maxMs = 30_000,
+            sustainedMaxMs = 120_000, sustainedAfterAttempt = 8,
+            random = Random(99),
+        )
+        repeat(100) {
+            // Fast tier (attempt < 8): the unchanged 1 s → 30 s schedule.
+            assertInRange(policy.delayMsFor(1), 500, 1_000)
+            assertInRange(policy.delayMsFor(6), 15_000, 30_000)
+            assertInRange(policy.delayMsFor(7), 15_000, 30_000)
+            // Sustained tier (attempt >= 8): the cap relaxes to [60 s, 120 s].
+            assertInRange(policy.delayMsFor(8), 60_000, 120_000)
+            assertInRange(policy.delayMsFor(10_000), 60_000, 120_000)
+        }
+    }
+
+    // The default (and every non-production caller / test) keeps a SINGLE tier:
+    // the cap is maxMs at every attempt, exactly the pre-battery contract.
+    @Test
+    fun theDefaultPolicyHasNoSustainedTier() {
+        val policy = BackoffPolicy(baseMs = 1_000, maxMs = 30_000, random = Random(7))
+        repeat(100) {
+            assertInRange(policy.delayMsFor(8), 15_000, 30_000)
+            assertInRange(policy.delayMsFor(10_000), 15_000, 30_000)
+        }
+    }
+
     private fun assertInRange(value: Long, lo: Long, hi: Long) {
         assertTrue("expected $value in [$lo, $hi]", value in lo..hi)
     }

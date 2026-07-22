@@ -1091,6 +1091,13 @@ class BridgeViewModel(
             instance ?: synchronized(this) {
                 instance ?: BridgeViewModel(
                     CredentialStore.singleton(context),
+                    // Battery: the fast 1→30 s reconnect schedule is right for a
+                    // transient blip, but a watch carried away from its bridge
+                    // would otherwise reconnect (and re-run the NSD self-heal
+                    // multicast scan) every ~30 s forever. After ~8 sustained
+                    // failures relax the cap to 2 min — far fewer wakeups while
+                    // away; a reachable bridge is still picked up within 2 min.
+                    backoff = BackoffPolicy(sustainedMaxMs = 120_000L, sustainedAfterAttempt = 8),
                     escalator = WifiNetworkEscalator(context.applicationContext),
                     // Issue #23: real mDNS/NSD discovery for zero-typing pairing
                     // and the DHCP self-heal, over the actual Wi-Fi transport.

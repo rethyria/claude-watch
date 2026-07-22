@@ -89,12 +89,26 @@ sealed interface ConnectionState {
 class BackoffPolicy(
     private val baseMs: Long = 1_000L,
     private val maxMs: Long = 30_000L,
+    // Sustained-failure tier (battery). Once a reconnect has failed
+    // [sustainedAfterAttempt] times the bridge is very likely unreachable — the
+    // watch is away from its LAN — and hammering every maxMs is wasted power:
+    // each attempt past rediscoverAfterAttempts re-runs the heavy NSD self-heal
+    // multicast scan, on top of holding Wi-Fi up. Past the threshold the cap
+    // relaxes from maxMs to [sustainedMaxMs], so attempts (and their scans)
+    // become far less frequent while away, at the cost of a slower reconnect
+    // once the bridge is reachable again (bounded by sustainedMaxMs). The
+    // DEFAULTS keep a SINGLE tier (sustainedMaxMs == maxMs, threshold
+    // unreachable) so every existing caller and test is byte-for-byte
+    // unchanged; only production opts in (BridgeViewModel.singleton).
+    private val sustainedMaxMs: Long = maxMs,
+    private val sustainedAfterAttempt: Int = Int.MAX_VALUE,
     private val random: Random = Random.Default,
 ) {
     /** Delay before reconnect [attempt] (1-based). */
     fun delayMsFor(attempt: Int): Long {
         val shift = (attempt - 1).coerceIn(0, MAX_SHIFT)
-        val capped = min(baseMs shl shift, maxMs)
+        val cap = if (attempt >= sustainedAfterAttempt) sustainedMaxMs else maxMs
+        val capped = min(baseMs shl shift, cap)
         val floor = capped / 2
         return floor + random.nextLong(capped - floor + 1)
     }
