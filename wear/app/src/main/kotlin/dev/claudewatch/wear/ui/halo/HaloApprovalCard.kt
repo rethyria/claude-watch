@@ -258,7 +258,7 @@ private fun DecisionLayer(
             Text(
                 text = "${model.waitingCount} waiting",
                 fontSize = Halo.Type.Min,
-                color = Halo.Palette.TextFaint,
+                color = Halo.Palette.TextSecondary,
                 modifier = Modifier.testTag("haloWaitingCount"),
             )
         }
@@ -362,7 +362,7 @@ private fun DecisionLayer(
         if (alwaysOption != null) {
             TextAction(
                 label = "always allow ›",
-                color = Halo.Palette.TextFaint,
+                color = Halo.Palette.TextSecondary,
                 tag = "haloAlwaysAllow",
                 enabled = buttonsEnabled,
                 onClick = { onDecide(alwaysOption.behavior) },
@@ -393,7 +393,7 @@ private fun DecisionLayer(
         }
         TextAction(
             label = "decide later ↓",
-            color = Halo.Palette.TextFaint,
+            color = Halo.Palette.TextSecondary,
             tag = "haloDecideLater",
             onClick = onDecideLater,
         )

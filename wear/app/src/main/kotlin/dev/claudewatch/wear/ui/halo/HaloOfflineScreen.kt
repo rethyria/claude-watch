@@ -187,7 +187,7 @@ fun HaloOfflineScreen(
                     Text(
                         text = "← back",
                         fontSize = Halo.Type.Min,
-                        color = Halo.Palette.TextFaint,
+                        color = Halo.Palette.TextSecondary,
                         textAlign = TextAlign.Center,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -222,7 +222,7 @@ private fun OfflineHeadline(paired: Boolean, ui: BridgeViewModel.UiState) {
     Text(
         text = ui.repairExplanation ?: ui.status,
         fontSize = Halo.Type.Min,
-        color = Halo.Palette.TextFaint,
+        color = Halo.Palette.TextSecondary,
         textAlign = TextAlign.Center,
         maxLines = 3,
         modifier = Modifier.testTag("status"),
@@ -257,7 +257,7 @@ private fun DiscoverStatusPane(
             Text(
                 text = "No bridges found. Is the bridge running and on this Wi-Fi?",
                 fontSize = Halo.Type.Min,
-                color = Halo.Palette.TextFaint,
+                color = Halo.Palette.TextSecondary,
                 textAlign = TextAlign.Center,
                 maxLines = 4,
                 modifier = Modifier.fillMaxWidth().testTag("discoverEmpty"),
@@ -298,7 +298,7 @@ private fun DiscoverStatusPane(
     Text(
         text = "← back",
         fontSize = Halo.Type.Min,
-        color = Halo.Palette.TextFaint,
+        color = Halo.Palette.TextSecondary,
         textAlign = TextAlign.Center,
         modifier = Modifier
             .fillMaxWidth()
@@ -382,7 +382,7 @@ private fun DiscoveredBridgeList(
                 Text(
                     text = "↓ back",
                     fontSize = Halo.Type.Min,
-                    color = Halo.Palette.TextFaint,
+                    color = Halo.Palette.TextSecondary,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 )
@@ -421,7 +421,7 @@ private fun DiscoveredBridgeRow(
         Text(
             text = subtitle,
             fontSize = Halo.Type.Min,
-            color = Halo.Palette.TextFaint,
+            color = Halo.Palette.TextSecondary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -455,7 +455,7 @@ private fun PairField(label: String, value: String, tag: String, onChange: (Stri
                 ?.let { onChange(it.trim()) }
         }
     }
-    Text(label, fontSize = Halo.Type.Min, color = Halo.Palette.TextFaint)
+    Text(label, fontSize = Halo.Type.Min, color = Halo.Palette.TextSecondary)
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -485,7 +485,7 @@ private fun PairField(label: String, value: String, tag: String, onChange: (Stri
         Text(
             text = value.ifEmpty { "tap to enter" },
             fontSize = Halo.Type.Body,
-            color = if (value.isEmpty()) Halo.Palette.TextFaint else Halo.Palette.TextPrimary,
+            color = if (value.isEmpty()) Halo.Palette.TextSecondary else Halo.Palette.TextPrimary,
         )
     }
     Spacer(Modifier.height(4.dp))

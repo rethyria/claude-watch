@@ -309,7 +309,7 @@ private fun QuestionLayer(
 
         TextAction(
             label = "answer later ↓",
-            color = Halo.Palette.TextFaint,
+            color = Halo.Palette.TextSecondary,
             tag = "haloAnswerLater",
             onClick = onAnswerLater,
         )

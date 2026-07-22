@@ -37,7 +37,7 @@ fun HaloProjectPage(
         Text(
             text = "↑ sessions",
             fontSize = Halo.Type.Min,
-            color = Halo.Palette.TextFaint,
+            color = Halo.Palette.TextSecondary,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 26.dp), // clears the page dots underneath

@@ -87,7 +87,7 @@ fun HaloSessionFeed(
             Text(
                 text = "session ended",
                 fontSize = Halo.Type.Body,
-                color = Halo.Palette.TextFaint,
+                color = Halo.Palette.TextSecondary,
                 textAlign = TextAlign.Center,
             )
         }
@@ -201,7 +201,7 @@ private fun FeedHeader(
             Text(
                 text = "$position of $count · ${session.projectName}",
                 fontSize = Halo.Type.Min,
-                color = Halo.Palette.TextFaint,
+                color = Halo.Palette.TextSecondary,
                 maxLines = 1,
             )
             // ⎇ branch badge (issue #54) and workflow-agents indicator
@@ -220,7 +220,7 @@ private fun FeedHeader(
                 Text(
                     text = details.joinToString(" · "),
                     fontSize = Halo.Type.Min,
-                    color = Halo.Palette.TextFaint,
+                    color = Halo.Palette.TextSecondary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -267,7 +267,7 @@ private fun FeedTail(
             Text(
                 text = "no output yet",
                 fontSize = Halo.Type.Min,
-                color = Halo.Palette.TextFaint,
+                color = Halo.Palette.TextSecondary,
             )
         }
         return
@@ -392,7 +392,7 @@ private fun FeedLine(line: TerminalLine) {
                 weight = FontWeight.Medium
             } else { // tool call / meta
                 text = AnnotatedString(line.text)
-                color = Halo.Palette.TextFaint
+                color = Halo.Palette.TextSecondary
             }
         TerminalLineType.OUTPUT ->
             if (line.text.startsWith("[codex] ")) { // agent prose: 25px Roboto
