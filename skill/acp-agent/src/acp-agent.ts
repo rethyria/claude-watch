@@ -1743,6 +1743,20 @@ export class ClaudeAcpAgent {
     return response;
   }
 
+  /** claude-watch: deliver a dictated message from the watch into this session.
+   *  A thin wrapper over {@link prompt} — it reuses that exact enqueue (a Turn on
+   *  `turnQueue`, the `SDKUserMessage` pushed onto the streaming `input`, and
+   *  `ensureConsumer`), so no turn bookkeeping is duplicated and nothing can
+   *  desync. That yields the watch behaviour for free: an idle session is woken
+   *  (the SDK consumes the pushed input), a running turn is queued behind, and an
+   *  ended (`queryClosed`) or unknown session is refused honestly — `prompt()`
+   *  throws before touching state. Returns the turn's PromptResponse (its
+   *  `stopReason`) so the caller can surface a completed/cancelled outcome. */
+  async injectUserPrompt(sessionId: string, text: string, source: string): Promise<PromptResponse> {
+    this.logger.log(`claude-watch: dictated prompt for session ${sessionId} (source=${source})`);
+    return this.prompt({ sessionId, prompt: [{ type: "text", text }] });
+  }
+
   /** Steer the session per the ACP steering wire protocol: apply a follow-up
    *  message to the turn that is currently running, or — if that turn already
    *  finished — start a fresh turn with it. Never drops the message and never

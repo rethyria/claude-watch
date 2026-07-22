@@ -11067,3 +11067,81 @@ describe("agent selection config option", () => {
     });
   });
 });
+
+describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
+  function makeAgent() {
+    const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function resultThenIdle() {
+    return [
+      {
+        type: "result",
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ];
+  }
+
+  it("delegates to prompt(): pushes the dictated text as a user turn and returns its outcome", async () => {
+    const agent = makeAgent();
+    const input = new Pushable<any>();
+    let pushedText: string | undefined;
+    async function* gen() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        const content = (userMessage as any).message?.content;
+        pushedText = Array.isArray(content)
+          ? content.find((c: any) => c.type === "text")?.text
+          : undefined;
+        yield {
+          type: "user",
+          message: (userMessage as any).message,
+          parent_tool_use_id: null,
+          uuid: (userMessage as any).uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* resultThenIdle();
+    }
+    agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(gen()), input });
+
+    const res = await agent.injectUserPrompt("test-session", "add tests to the parser", "watch");
+    expect(pushedText).toBe("add tests to the parser");
+    expect(res.stopReason).toBe("end_turn");
+  });
+
+  it("refuses an ended (queryClosed) session honestly instead of desyncing", async () => {
+    const agent = makeAgent();
+    agent.sessions["test-session"] = mockSessionState({ queryClosed: true });
+    await expect(
+      agent.injectUserPrompt("test-session", "too late", "watch"),
+    ).rejects.toThrow(/ended/i);
+  });
+
+  it("refuses an unknown session", async () => {
+    const agent = makeAgent();
+    await expect(agent.injectUserPrompt("nope", "hi", "watch")).rejects.toThrow(/not found/i);
+  });
+});
