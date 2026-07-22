@@ -191,6 +191,27 @@ class WireModelContractTest {
     }
 
     @Test
+    fun kindAndDictatableParseWhenPresentAndAreNullWhenOmitted() {
+        // Issue #78: an ACP session carries the discriminator + dictatable flag.
+        val acp = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-1","external":true,"kind":"acp","dictatable":true}""",
+        ) as SessionEvent
+        assertEquals("acp", acp.kind)
+        assertEquals(true, acp.dictatable)
+
+        // A PTY/hook session that omits them parses to null (present-only-when
+        // -set, like external); absence never fails the frame and is what the
+        // reducer reads as "not dictatable" / "no kind".
+        val plain = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-2"}""",
+        ) as SessionEvent
+        assertNull(plain.kind)
+        assertNull(plain.dictatable)
+    }
+
+    @Test
     fun idleFlagParsesWhenPresentAndIsNullWhenOmitted() {
         // Issue #60: a session whose last lifecycle signal was a turn end
         // carries the additive flag.

@@ -24,6 +24,15 @@ data class HaloSession(
      * (issue #53). False for bridge-owned PTY sessions (real kill).
      */
     val external: Boolean = false,
+    /**
+     * True when the bridge can deliver a dictated prompt into this session LIVE
+     * (its own PTY, or an ACP inject). The Dictate pill shows ONLY when true;
+     * other sessions get an honest "unavailable" affordance (issue #78). Gated
+     * on this, NOT on !external — an ACP session is external AND dictatable.
+     */
+    val dictatable: Boolean = false,
+    /** Session-type discriminator (issue #78): "acp" for a Zed-hosted session. */
+    val kind: String? = null,
     /** Git branch of the session's root (issue #54); null hides the ⎇ badge. */
     val branch: String? = null,
     /** True when the session runs in a linked git worktree (issue #54). */
@@ -138,6 +147,8 @@ data class HaloModel(
                     state = state,
                     pending = pending,
                     external = s.external,
+                    dictatable = s.dictatable,
+                    kind = s.kind,
                     branch = s.branch,
                     worktree = s.worktree,
                     agentsRunning = s.agents?.running ?: 0,

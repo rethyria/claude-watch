@@ -1632,6 +1632,54 @@ class BridgeViewModelTest {
     }
 
     /**
+     * Issue #78: dictating at a session the bridge cannot reach live (a PTY-less
+     * external hook session — dictatable absent on an external slot) is refused
+     * cleanly. No POST leaves the device, nothing echoes or pends, and the
+     * transcription is kept in the draft rather than silently dropped — never a
+     * detached headless fork on the bridge.
+     */
+    @Test
+    fun dictationToANonDictatableSessionRefusesWithoutAPost() {
+        val haptics = RecordingHaptics()
+        viewModel.haptics = haptics
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        // An external hook session: external:true, no dictatable field → the
+        // reducer resolves it NOT dictatable (only the retired headless fork
+        // could reach it).
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append("""data: {"state":"running","agent":"claude","cwd":"/tmp/ext","folderName":"ext","external":true,"sessionId":"s-ext"}""")
+            append("\n\n")
+            append(":pad\n\n".repeat(80))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.bridge.sessions["s-ext"]?.external == true }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        viewModel.dictationResult("run the migration", "s-ext")
+
+        val refused = awaitState { it.commandResult == "command:not-dictatable" }
+        assertEquals("Dictation isn't available for this session", refused.commandError)
+        assertEquals("never went in-flight", null, refused.commandInFlightText)
+        assertEquals("the transcription is kept, not lost", "run the migration", refused.commandDraft)
+        assertEquals(listOf("failed"), haptics.events.toList())
+        assertNull("no /v1/command POST may leave the device", server.takeRequest(1, TimeUnit.SECONDS))
+    }
+
+    /**
      * Regression (Halo review): a NEW dictation while the draft still holds a
      * previous failed send's restored text must not clobber that text — the
      * Halo UI renders the draft only on the voice overlay, so an overwritten

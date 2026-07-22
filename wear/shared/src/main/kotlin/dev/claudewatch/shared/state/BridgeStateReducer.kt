@@ -62,6 +62,20 @@ data class SessionState(
      */
     val external: Boolean = false,
     /**
+     * Session-type discriminator (additive wire field, issue #78): "acp" for a
+     * session hosted by the Zed ACP adapter; null for bridge-owned PTY and
+     * hook-created slots. Preserve-on-absence, exactly like [external].
+     */
+    val kind: String? = null,
+    /**
+     * True when the bridge can deliver a dictated prompt into this session LIVE
+     * — a bridge-owned PTY (stdin) or an ACP session (inject). The Dictate
+     * affordance gates on THIS, NOT on !external (an ACP session is both
+     * external and dictatable). Additive wire field (issue #78);
+     * preserve-on-absence, exactly like [external].
+     */
+    val dictatable: Boolean = false,
+    /**
      * Git branch of the session's project root (additive wire field, issue
      * #54); null until the bridge reports one (non-git root, older bridge).
      */
@@ -343,6 +357,13 @@ object BridgeEventReducer {
                     // older bridge) must not erase a known external flag — same
                     // preserve-on-resend rule as folderName/title.
                     external = event.external ?: existing.external,
+                    // Session kind + dictatable (issue #78) follow the same
+                    // preserve-on-absence rule as external: the bridge carries
+                    // them on every event of a slot that has them, and a
+                    // payload without either (older bridge, or a slot that
+                    // never had them) must not erase what we knew.
+                    kind = event.kind ?: existing.kind,
+                    dictatable = event.dictatable ?: existing.dictatable,
                     // Git metadata (issue #54) is ONE atomic group keyed on
                     // branch presence: whenever the bridge derives any git
                     // metadata it always sends branch, and worktree/repoRoot
@@ -392,6 +413,20 @@ object BridgeEventReducer {
                     folderName = event.folderName,
                     title = event.title,
                     external = event.external ?: false,
+                    kind = event.kind,
+                    // Backward-compat default (issue #78). Absent means "the
+                    // bridge did not say", which we read as dictatable UNLESS we
+                    // positively know this is an unreachable external session. A
+                    // NEW bridge sends dictatable:true EXPLICITLY for the reachable
+                    // kinds (its own PTY, ACP inject) — so an ACP external session
+                    // resolves true here and the pill, which gates on THIS resolved
+                    // value, still shows for it — and omits it for hook sessions
+                    // (external → false). An OLD bridge that never sends the flag
+                    // keeps PTY dictation working (non-external → true) instead of
+                    // losing the Dictate affordance on every session. NOTE: this is
+                    // a default for ABSENCE only; the gate itself reads `dictatable`,
+                    // never `external`.
+                    dictatable = event.dictatable ?: (event.external != true),
                     branch = event.branch,
                     worktree = event.worktree ?: false,
                     repoRoot = event.repoRoot,

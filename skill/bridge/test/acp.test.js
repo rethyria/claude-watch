@@ -194,6 +194,46 @@ test("a fork whose inbox drops (Zed quit / crash) strands no zombie slot", { tim
   assert.match(ended.parsed.reason, /disconnect/i);
 });
 
+test("dictatable is live-delivery only: PTY yes+killable, hook no, ACP yes+hide (S4 #78)", { timeout: 60_000 }, async (t) => {
+  // A stub claude so a spawn produces a real, bridge-owned PTY session.
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-fakebin-"));
+  t.after(() => { try { fs.rmSync(binDir, { recursive: true, force: true }); } catch { /* ignore */ } });
+  const bin = path.join(binDir, "claude");
+  fs.writeFileSync(bin, "#!/bin/sh\necho READY\nexec cat\n", { mode: 0o755 });
+
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
+  const token = await pair(bridge);
+
+  // (1) A bridge-owned PTY session: dictatable (stdin), NOT external (real kill).
+  const spawned = await request(bridge.port, "POST", "/command", { token, body: { spawn: "claude", cwd: os.homedir() } });
+  assert.equal(spawned.status, 200);
+  const ptyEntry = await statusEntry(bridge, token, spawned.body.sessionId);
+  assert.ok(ptyEntry, "spawned PTY session present");
+  assert.equal(ptyEntry.dictatable, true, "a bridge-owned PTY session is dictatable");
+  assert.notEqual(ptyEntry.external, true, "a PTY session is NOT external (real kill)");
+
+  // (2) A PTY-less external hook session: NOT dictatable (only the retired
+  // headless fork could reach it), external (Hide).
+  const hookCwd = realCwd(t, "hook");
+  await request(bridge.port, "POST", "/hooks/tool-output", {
+    body: { session_id: "hook-1", cwd: hookCwd, tool_name: "Read", tool_output: "hi" },
+  });
+  const hookEntry = (await request(bridge.port, "GET", "/status", { token })).body.sessions.find((s) => s.cwd === hookCwd);
+  assert.ok(hookEntry, "hook session present");
+  assert.notEqual(hookEntry.dictatable, true, "a PTY-less hook session is NOT dictatable");
+  assert.equal(hookEntry.external, true, "a hook session is external (Hide)");
+
+  // (3) An ACP session: dictatable (inject) AND external (Hide, not a fake Kill).
+  const inbox = connectInbox(bridge, "conn-disc");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-disc", sessionId: "acp-disc", cwd: realCwd(t, "disc") });
+  const acpEntry = await statusEntry(bridge, token, "acp-disc");
+  assert.equal(acpEntry.dictatable, true, "an ACP session is dictatable");
+  assert.equal(acpEntry.external, true, "an ACP session is external (Hide)");
+  assert.equal(acpEntry.kind, "acp");
+});
+
 test("ACP endpoints validate their inputs (routes are wired, not 404)", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   // A wired-but-invalid request 400s; a 404 would mean the route table missed

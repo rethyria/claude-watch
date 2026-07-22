@@ -266,6 +266,53 @@ class BridgeEventReducerTest {
     }
 
     @Test
+    fun dictatableAndKindParseAndSurviveAbsentResends() {
+        // An ACP session carries kind:"acp" + dictatable:true (external too — it
+        // is Zed's process, so the row offers Hide, not a fake Kill).
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","external":true,"kind":"acp","dictatable":true,"sessionId":"A"}"""),
+            ),
+        )
+        val acp = state.sessions.getValue("A")
+        assertEquals("kind:acp must parse onto the session", "acp", acp.kind)
+        assertTrue("dictatable:true must parse onto the session", acp.dictatable)
+        assertTrue("an ACP session is also external (Hide, not Kill)", acp.external)
+
+        // A resend WITHOUT the fields (older bridge, or a routine sync of a slot
+        // that never had them) must not erase what we knew — same preserve-on-
+        // absence rule as external/title/folderName.
+        val bare = SseFrame(null, "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}""")
+        val afterSync = (BridgeEventReducer.reduce(state, bare, 1_002_000L) as BridgeEventReducer.Applied).state
+        val kept = afterSync.sessions.getValue("A")
+        assertEquals("an absent kind must not clear a known kind", "acp", kept.kind)
+        assertTrue("an absent dictatable must not clear a known dictatable", kept.dictatable)
+
+        // First sight of a plain (non-external) PTY session with no discriminator
+        // fields: kind null, and dictatable defaults TRUE — the backward-compat
+        // rule reads absence as "dictatable unless positively an unreachable
+        // external session", which keeps PTY dictation working against a bridge
+        // that never sends the flag.
+        val pty = fold(
+            listOf(
+                SseFrame("3", "session", """{"state":"running","agent":"claude","cwd":"/b","folderName":"b","sessionId":"B"}"""),
+            ),
+        )
+        assertNull("a session with no kind field parses kind=null", pty.sessions.getValue("B").kind)
+        assertTrue("a non-external session with no dictatable field defaults to dictatable", pty.sessions.getValue("B").dictatable)
+
+        // An external (hook) session with no dictatable field is NOT dictatable:
+        // only the retired headless fork could reach it, and the bridge signals
+        // that by omitting the flag on an external slot.
+        val hook = fold(
+            listOf(
+                SseFrame("4", "session", """{"state":"running","agent":"claude","cwd":"/c","folderName":"c","external":true,"sessionId":"C"}"""),
+            ),
+        )
+        assertFalse("an external session with no dictatable field is not dictatable", hook.sessions.getValue("C").dictatable)
+    }
+
+    @Test
     fun gitMetadataIsParsedAndSurvivesMetadatalessResends() {
         // Issue #54: a worktree session's `running` carries branch/worktree/
         // repoRoot; all three land on the session state.

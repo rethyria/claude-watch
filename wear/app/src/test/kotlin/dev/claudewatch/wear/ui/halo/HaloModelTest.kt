@@ -27,6 +27,8 @@ class HaloModelTest {
         folderName: String? = "proj",
         cwd: String? = "/home/dev/proj",
         external: Boolean = false,
+        dictatable: Boolean = false,
+        kind: String? = null,
         branch: String? = null,
         worktree: Boolean = false,
         repoRoot: String? = null,
@@ -38,6 +40,8 @@ class HaloModelTest {
         folderName = folderName,
         title = title,
         external = external,
+        dictatable = dictatable,
+        kind = kind,
         branch = branch,
         worktree = worktree,
         repoRoot = repoRoot,
@@ -84,6 +88,31 @@ class HaloModelTest {
         )
         assertFalse("a PTY session is killable", model.sessions.single { it.id == "s-pty" }.external)
         assertTrue("a hook-created session is external (hide, not kill)", model.sessions.single { it.id == "s-ext" }.external)
+    }
+
+    /** Issue #78: the wire `dictatable`/`kind` discriminator is threaded onto the
+     *  HaloSession so the feed can pick the Dictate pill vs the honest
+     *  "unavailable" affordance by it — independently of `external` (an ACP
+     *  session is both external AND dictatable). */
+    @Test
+    fun dictatableAndKindAreThreadedOntoTheHaloSession() {
+        val model = HaloModel.from(
+            uiState(
+                session("s-pty", external = false, dictatable = true, kind = null),
+                session("s-hook", external = true, dictatable = false, kind = null),
+                session("s-acp", external = true, dictatable = true, kind = "acp"),
+            ),
+        )
+        val pty = model.sessions.single { it.id == "s-pty" }
+        assertTrue("a bridge-owned PTY session is dictatable", pty.dictatable)
+
+        val hook = model.sessions.single { it.id == "s-hook" }
+        assertFalse("a PTY-less hook session is not dictatable", hook.dictatable)
+
+        val acp = model.sessions.single { it.id == "s-acp" }
+        assertTrue("an ACP session is dictatable", acp.dictatable)
+        assertTrue("an ACP session is still external (hide, not kill)", acp.external)
+        assertEquals("acp", acp.kind)
     }
 
     /** Issue #53: an honest-hidden external session is filtered OUT of the

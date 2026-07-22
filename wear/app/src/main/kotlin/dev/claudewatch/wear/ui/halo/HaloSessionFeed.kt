@@ -138,8 +138,13 @@ fun HaloSessionFeed(
             )
             if (session.pending != null) {
                 WaitingBanner(state = session.state, onOpenCard = onOpenCard)
-            } else {
+            } else if (session.dictatable) {
                 DictatePill(onDictate = onDictate)
+            } else {
+                // Honest affordance (issue #78): a session the bridge can't
+                // reach live (a PTY-less hook session) shows WHY there's no
+                // Dictate, instead of a pill that would silently do nothing.
+                DictateUnavailablePill()
             }
         }
     }
@@ -453,6 +458,37 @@ private fun WaitingBanner(state: SessionState, onOpenCard: () -> Unit) {
             // Lifts the text off the screen curve; the tap target stays 48dp.
             modifier = Modifier.padding(bottom = 8.dp),
         )
+    }
+}
+
+@Composable
+private fun DictateUnavailablePill() {
+    // Same footprint as DictatePill but non-interactive and muted: the bridge
+    // cannot deliver dictation into this session live (issue #78), so we say so
+    // rather than offer a pill that does nothing.
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(Halo.Geo.TouchMin)
+            .testTag("haloDictateUnavailable"),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .padding(bottom = 8.dp)
+                .background(Halo.Palette.InsetWell, RoundedCornerShape(50))
+                .defaultMinSize(minWidth = 88.dp)
+                .padding(horizontal = 14.dp, vertical = 5.dp),
+        ) {
+            Text(
+                text = "Dictation unavailable here",
+                fontSize = Halo.Type.Caption,
+                fontWeight = FontWeight.Medium,
+                color = Halo.Palette.TextFaint,
+                maxLines = 1,
+            )
+        }
     }
 }
 

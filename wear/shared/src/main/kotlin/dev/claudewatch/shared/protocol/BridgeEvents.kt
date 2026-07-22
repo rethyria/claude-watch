@@ -91,6 +91,22 @@ data class SessionEvent(
      */
     val external: Boolean? = null,
     /**
+     * Additive session-type discriminator (issue #78): the session KIND —
+     * currently "acp" for a session hosted by the Zed ACP adapter. OMITTED
+     * (null) for bridge-owned PTY slots and hook-created slots (older clients
+     * tolerate absence). Preserve-on-absence, exactly like [external].
+     */
+    val kind: String? = null,
+    /**
+     * Additive optional flag (issue #78): `true` when the bridge can deliver a
+     * dictated prompt into this session LIVE — a bridge-owned PTY (stdin) or an
+     * ACP session (inject over the loopback channel). OMITTED (null) for a
+     * session dictation cannot reach without a detached fork. The Dictate
+     * affordance gates on THIS, NOT on `external` — an ACP session is both
+     * external AND dictatable. Preserve-on-absence, exactly like [external].
+     */
+    val dictatable: Boolean? = null,
+    /**
      * Additive optional turn-end flag (issue #60). PRESENT (=true) means the
      * bridge's LAST lifecycle signal for this session was a turn END — a
      * `Stop` or `TaskCompleted` hook. OMITTED (null) means the bridge either

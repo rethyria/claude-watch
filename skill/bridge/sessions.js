@@ -37,7 +37,7 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 //   the turn-end-idle section below): state stays "running" across a finished
 //   turn, so idle is what tells a connect-time snapshot apart from a session
 //   that is actually producing work.
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", dictatable?: boolean, idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -555,12 +555,17 @@ export function sessionEventPayload(slot, fields) {
   // (that flag also means cap-evictable, and ACP slots are cap-exempt), so the
   // `external` tag is derived from both (S3 #77).
   if (slot.hookCreated || slot.kind === "acp") payload.external = true;
-  // Additive session-type discriminator (S3 #77 / S4 #78): present only for
-  // slots that carry it — currently ACP ("acp"), the one dictatable kind so
-  // far. Clients gate the Dictate affordance on `dictatable`, NOT on "external"
-  // (an ACP session is both external and dictatable).
+  // Additive session-type discriminator + dictatable flag (S3 #77 / S4 #78).
+  // `kind` is currently carried only for ACP; `dictatable` is DERIVED, not
+  // stored, so it is always honest: the bridge can deliver dictation into a
+  // session it can reach LIVE — its own PTY (stdin) or an ACP session (inject
+  // over the loopback channel) — and nothing else (a PTY-less hook session
+  // would need the detached headless fork, which is being retired). A PTY that
+  // dies drops ptyProcess to null and the flag vanishes on its own. Clients
+  // gate the Dictate affordance on `dictatable`, NOT on "external" (an ACP
+  // session is both external AND dictatable).
   if (slot.kind) payload.kind = slot.kind;
-  if (slot.dictatable) payload.dictatable = true;
+  if (slot.ptyProcess || slot.kind === "acp") payload.dictatable = true;
   // Rides `ended` payloads too — meaningless there (clients prune ended
   // sessions outright), but uniformity beats a special case nobody reads.
   if (slot.idle) payload.idle = true;
@@ -1219,10 +1224,10 @@ export function getSessionsSnapshot() {
     // omitted for bridge-owned PTY slots (clients treat absent as
     // external=false). Kept in lockstep with sessionEventPayload's SSE tag.
     ...(s.hookCreated || s.kind === "acp" ? { external: true } : {}),
-    // Additive session-type discriminator + dictatable flag (S3 #77 / S4 #78),
-    // in lockstep with sessionEventPayload.
+    // Additive session-type discriminator + DERIVED dictatable flag (S3 #77 /
+    // S4 #78), in lockstep with sessionEventPayload (see the rationale there).
     ...(s.kind ? { kind: s.kind } : {}),
-    ...(s.dictatable ? { dictatable: true } : {}),
+    ...(s.ptyProcess || s.kind === "acp" ? { dictatable: true } : {}),
     // Additive turn-end flag (issue #60): present (=true) when the slot's last
     // lifecycle signal was a Stop/TaskComplete. Same lockstep obligation — a
     // REST snapshot that disagreed with the SSE snapshot about whether a
@@ -1524,7 +1529,6 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd }) {
     // Idempotent re-register (resume/load, or a reconnect): refresh + revive.
     slot.agent = "claude";
     slot.kind = "acp";
-    slot.dictatable = true;
     slot.ptyProcess = null;
     slot.cwd = resolvedCwd;
     slot.folderName = folderName;
@@ -1542,7 +1546,6 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd }) {
       state: "running",
       createdAt: Date.now(),
       kind: "acp",
-      dictatable: true,
     };
     sessions.set(sessionId, slot);
   }
