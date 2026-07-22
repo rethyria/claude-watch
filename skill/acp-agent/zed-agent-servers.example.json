@@ -1,0 +1,13 @@
+{
+  "//": "Add this agent_servers block to Zed's settings.json to launch the claude-watch ACP",
+  "//2": "adapter. Zed's flatpak runs agent_servers commands on the HOST directly, so the command",
+  "//3": "is the host launcher itself (NOT wrapped in flatpak-spawn — that exists only inside the",
+  "//4": "sandbox, not on the host). It uses host node, host ~/.claude subscription, host loopback.",
+  "//5": "Zed settings path (flatpak): ~/.var/app/dev.zed.Zed/config/zed/settings.json",
+  "agent_servers": {
+    "Claude (watch)": {
+      "command": "/home/deck/Development/claude-watch/skill/acp-agent/launch-claude-watch-acp.sh",
+      "args": []
+    }
+  }
+}
