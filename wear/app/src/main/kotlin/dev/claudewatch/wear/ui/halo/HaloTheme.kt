@@ -85,10 +85,10 @@ object Halo {
         val CardRadius = 17.dp               // cards/wells 16–18px
         val RowRadius = 13.dp                // session rows 26px
         val TouchMin = 48.dp
-        /** The dictate pill's microphone. Sized to the caption cap-height it
-         *  replaced, so swapping the label for the glyph left the pill's
-         *  proportions unchanged. */
-        val MicGlyph = 17.dp
+        /** The dictate pill's microphone. Tuned on the real 454px watch rather
+         *  than derived: at the caption cap-height it replaced (17dp) the glyph
+         *  was too small for the cradle and body to read as one object. */
+        val MicGlyph = 20.dp
         // Top-anchored lists (session list, spawn picker, discover list) start
         // their scrollable content this far below the top edge, in place of
         // ScalingLazyColumn's default autoCentering — which reserves ~half a

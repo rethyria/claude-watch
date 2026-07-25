@@ -544,37 +544,52 @@ private fun DictatePill(onDictate: () -> Unit) {
 @Composable
 private fun MicGlyph() {
     Canvas(modifier = Modifier.size(Halo.Geo.MicGlyph).testTag("haloDictateMic")) {
-        val stroke = size.minDimension * 0.10f
-        val capsuleW = size.width * 0.34f
-        val capsuleH = size.height * 0.46f
+        val s = size.minDimension
+        val stroke = s * 0.09f
         val cx = size.width / 2f
 
-        // Mic body: a vertical capsule, fully rounded so the ends read as domes.
+        // Body: FILLED, not outlined. An outlined capsule this small reads as a
+        // hollow ring — the first attempt looked like a face because of it.
+        val bodyW = s * 0.30f
+        val bodyTop = s * 0.06f
+        val bodyH = s * 0.46f
         drawRoundRect(
             color = Halo.Palette.TextPrimary,
-            topLeft = Offset(cx - capsuleW / 2f, size.height * 0.06f),
-            size = Size(capsuleW, capsuleH),
-            cornerRadius = CornerRadius(capsuleW / 2f),
-            style = Stroke(width = stroke),
+            topLeft = Offset(cx - bodyW / 2f, bodyTop),
+            size = Size(bodyW, bodyH),
+            cornerRadius = CornerRadius(bodyW / 2f),
         )
 
-        // The cradle: a half-circle open at the top, hugging the body's lower half.
-        val cradleR = size.width * 0.30f
+        // Cradle: a U that OVERLAPS the body's lower half rather than sitting
+        // below it. Its open ends land above the body's bottom edge, which is
+        // what makes the two read as one object instead of a bowl under a dot.
+        val r = s * 0.28f
+        val cradleCy = bodyTop + bodyH * 0.78f
         drawArc(
             color = Halo.Palette.TextPrimary,
             startAngle = 0f,
             sweepAngle = 180f,
             useCenter = false,
-            topLeft = Offset(cx - cradleR, size.height * 0.40f),
-            size = Size(cradleR * 2f, cradleR * 2f),
+            topLeft = Offset(cx - r, cradleCy - r),
+            size = Size(r * 2f, r * 2f),
             style = Stroke(width = stroke, cap = StrokeCap.Round),
         )
 
-        // Stem down to the base. No foot bar: at 20dp it closes up into a smudge.
+        // Stem from the cradle's base down to the foot.
+        val footY = s * 0.95f
         drawLine(
             color = Halo.Palette.TextPrimary,
-            start = Offset(cx, size.height * 0.70f + cradleR * 0.30f),
-            end = Offset(cx, size.height * 0.94f),
+            start = Offset(cx, cradleCy + r),
+            end = Offset(cx, footY),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+
+        // Foot bar: short, but it is what stops the stem reading as a stray tick.
+        drawLine(
+            color = Halo.Palette.TextPrimary,
+            start = Offset(cx - s * 0.17f, footY),
+            end = Offset(cx + s * 0.17f, footY),
             strokeWidth = stroke,
             cap = StrokeCap.Round,
         )
