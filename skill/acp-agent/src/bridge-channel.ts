@@ -59,7 +59,14 @@ export interface BridgeChannel {
    *  `options.sessionId = sessionId`), so one id correlates the ACP slot with
    *  the settings.json hook events the SDK also fires — the bridge binds them
    *  to a single slot. */
-  registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string }): void;
+  registerSession(info: {
+    sessionId: string;
+    sdkSessionId: string;
+    cwd: string;
+    /** Known thread title, so a bridge restart restores it from the
+     *  re-announce instead of showing the raw uuid until the next turn end. */
+    title?: string;
+  }): void;
   /** The ACP session ended (query closed / closeSession / dispose). */
   deregisterSession(sessionId: string, reason: string): void;
   /** Mirror of a client `sessionUpdate` (prose, tool calls, mode, plan, …). */
@@ -82,6 +89,8 @@ export interface BridgeChannel {
    *  answered in Zed, or the agent cancelled it), so it can retract the wrist
    *  card instead of leaving a zombie prompt (#80). */
   forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void;
+  /** Remember a freshly-learned thread title for the next re-announce (#79). */
+  noteSessionTitle(sessionId: string, title: string): void;
   /** Register the handler the inbox calls when the watch dictates. */
   onInject(handler: InjectHandler): void;
   /** Register the handler the inbox calls when the watch answers a permission
@@ -137,6 +146,9 @@ export class HttpBridgeChannel implements BridgeChannel {
       cwd: string;
       /** The bridge has accepted a register for this session on this connection. */
       acked: boolean;
+      /** Last known thread title, refreshed as the SDK generates one, so a
+       *  re-announce after a bridge restart carries it. */
+      title?: string;
       /** Whether a turn is in flight for this session. Tracked here because a
        *  bridge restart rebuilds its table from the re-announce alone: without
        *  it the bridge has to guess, and guessing "working" shows a live-looking
@@ -166,7 +178,7 @@ export class HttpBridgeChannel implements BridgeChannel {
     this.permissionHandler = handler;
   }
 
-  registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string }): void {
+  registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string; title?: string }): void {
     // A session that has never run a turn is not working — the honest default,
     // and the one the wrist should show for a thread just opened in Zed.
     const entry = { ...info, acked: false, inFlight: true, active: false };
@@ -177,6 +189,7 @@ export class HttpBridgeChannel implements BridgeChannel {
       sdkSessionId: info.sdkSessionId,
       cwd: info.cwd,
       active: entry.active,
+      title: entry.title,
     }).then((ok) => {
       // Only a POST the bridge actually accepted counts. One that failed (bridge
       // still starting, no port file yet) leaves acked=false so the next inbox
@@ -212,6 +225,13 @@ export class HttpBridgeChannel implements BridgeChannel {
       kind: "permission",
       payload: params,
     });
+  }
+
+  /** Remember a title the agent just learned, so the next re-announce carries
+   *  it. Cheap: the agent already computes this for its own client update. */
+  noteSessionTitle(sessionId: string, title: string): void {
+    const live = this.liveSessions.get(sessionId);
+    if (live) live.title = title;
   }
 
   forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void {
@@ -284,6 +304,7 @@ export class HttpBridgeChannel implements BridgeChannel {
           sdkSessionId: info.sdkSessionId,
           cwd: info.cwd,
           active: info.active,
+          title: info.title,
         }).then((ok) => {
           if (ok && this.liveSessions.get(info.sessionId) === info) info.acked = true;
         }),

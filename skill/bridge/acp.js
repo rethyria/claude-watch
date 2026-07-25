@@ -67,14 +67,14 @@ export async function handleAcpRegister(req, res) {
   const body = await readAcpBody(req, res);
   if (body === null) return;
 
-  const { connection, sessionId, sdkSessionId, cwd, active } = body;
+  const { connection, sessionId, sdkSessionId, cwd, active, title } = body;
   if (typeof connection !== "string" || !connection || typeof sessionId !== "string" || !sessionId) {
     return jsonResponse(res, 400, { error: "Missing 'connection' or 'sessionId'" });
   }
 
   // `active` is the fork's report of whether a turn is in flight; it is what
   // stops a re-announce (bridge restart) from showing an idle thread as working.
-  registerAcpSession({ sessionId, sdkSessionId, cwd, active });
+  registerAcpSession({ sessionId, sdkSessionId, cwd, active, title });
   sessionConnection.set(sessionId, connection);
   return jsonResponse(res, 200, { ok: true });
 }

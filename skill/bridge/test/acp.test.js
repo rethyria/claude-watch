@@ -700,3 +700,58 @@ test("answering in Zed retracts the wrist prompt (#80)", { timeout: 60_000 }, as
   const cleared = await sse.waitFor((e) => e.event === "permission-cleared");
   assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
 });
+
+// A bridge restart rebuilds the slot from the fork's re-announce. Without the
+// title on that payload the watch showed the raw uuid until the NEXT turn end,
+// because the adapter only pushes session_info_update when the title CHANGES.
+test("re-announce carries the session title, so a bridge restart doesn't show a uuid (#79)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "retitle");
+
+  const inbox = connectInbox(bridge, "conn-retitle");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+
+  const res = await request(bridge.port, "POST", "/acp/register", {
+    body: {
+      connection: "conn-retitle", sessionId: "acp-retitle", sdkSessionId: "acp-retitle",
+      cwd, active: false, title: "Fix the flaky auth tests",
+    },
+  });
+  assert.equal(res.status, 200);
+  assert.equal((await statusEntry(bridge, token, "acp-retitle")).title, "Fix the flaky auth tests");
+});
+
+// The initial register races a turn that starts immediately after it. If a
+// stale active:false lands after the turn-start boundary it flips a working
+// session back to idle — which is what showed an idle watch mid-turn.
+test("a re-register never clobbers turn state the bridge already tracked (#79)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "clobber");
+
+  const inbox = connectInbox(bridge, "conn-clobber");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-clobber", sessionId: "acp-clobber", cwd });
+
+  // A turn is running.
+  await request(bridge.port, "POST", "/acp/update", {
+    body: { connection: "conn-clobber", sessionId: "acp-clobber", kind: "turn", payload: { phase: "start" } },
+  });
+  assert.equal((await statusEntry(bridge, token, "acp-clobber")).idle, undefined);
+
+  // A late register, minted before the turn began, must not idle it.
+  await request(bridge.port, "POST", "/acp/register", {
+    body: {
+      connection: "conn-clobber", sessionId: "acp-clobber", sdkSessionId: "acp-clobber",
+      cwd, active: false,
+    },
+  });
+  assert.equal(
+    (await statusEntry(bridge, token, "acp-clobber")).idle,
+    undefined,
+    "a stale register must not flip a working session to idle",
+  );
+});

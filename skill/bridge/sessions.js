@@ -1507,7 +1507,7 @@ export function endHookSession(body) {
  *  SDK's underlying session_id used for hook correlation; in this fork it equals
  *  `sessionId`, but it is passed explicitly so the binding is correct even if
  *  that ever diverges. Returns the slot. */
-export function registerAcpSession({ sessionId, sdkSessionId, cwd, active }) {
+export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title }) {
   const boundSdkId = sdkSessionId || sessionId;
   const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
@@ -1537,14 +1537,20 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd, active }) {
     slot.cwd = resolvedCwd;
     slot.folderName = folderName;
     slot.state = "running";
-    // An explicit liveness report from the fork is authoritative; only its
-    // ABSENCE (an older fork) falls through to preserving what we knew.
-    if (typeof active === "boolean") slot.idle = !active;
-    // Otherwise `idle` is deliberately NOT reset. Re-registration is a re-ANNOUNCEMENT —
+    // `active` is NOT applied to a slot we already track. The initial register
+    // races the turn that starts right after it, and a stale `active: false`
+    // landing after the turn-start boundary flips a working session back to
+    // idle — an idle-looking watch mid-turn. Turn boundaries are the authority
+    // for a slot the bridge has been following; `active` only seeds a slot the
+    // bridge is meeting for the first time (below), which is the bridge-restart
+    // case it exists for.
+    //
+    // `idle` is deliberately NOT reset either. Re-registration is a re-ANNOUNCEMENT —
     // a Zed restart, a session resume, a fork reconnect — not new work. Clearing
     // it here told the wrist a session was working whenever the user restarted
     // Zed, even though nothing had started; the flag only moves on a real turn
     // boundary (`kind: "turn"`), which is the sole authority for it.
+    if (typeof title === "string" && title && !slot.title) slot.title = title;
     slot.endedAt = undefined;
     slot.endedAuthoritatively = false;
   } else {
@@ -1561,6 +1567,11 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd, active }) {
       // working just because it is new: the fork tells us whether a turn is
       // actually in flight. Absent (older fork) keeps the previous behaviour.
       ...(typeof active === "boolean" ? { idle: !active } : {}),
+      // Carried on the re-announce so a bridge restart restores the title
+      // immediately: the adapter only pushes session_info_update when the title
+      // CHANGES, so without this the watch shows the raw uuid until the next
+      // turn ends.
+      ...(typeof title === "string" && title ? { title, titleIsAi: true } : {}),
     };
     sessions.set(sessionId, slot);
   }

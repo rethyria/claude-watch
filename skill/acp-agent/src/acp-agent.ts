@@ -1573,6 +1573,9 @@ export class ClaudeAcpAgent {
       return;
     }
     session.lastTitle = title;
+    // Keep the bridge's copy fresh so a bridge restart can restore the title
+    // from the re-announce rather than waiting for the next turn to end.
+    this.bridge?.noteSessionTitle?.(sessionId, title);
     await this.client.sessionUpdate({
       sessionId,
       update: {
