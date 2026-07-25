@@ -398,6 +398,15 @@ private fun FeedLine(line: TerminalLine) {
                 text = highlightPassCounts(line.text)
                 color = Halo.Palette.TextSecondary
             }
+        // Assistant prose (#79): the same speech treatment the `[codex] `
+        // branch above applies, but chosen from the line's TYPE instead of
+        // sniffing its text — proportional, brightest role, body size.
+        TerminalLineType.PROSE -> {
+            text = AnnotatedString(line.text)
+            color = Halo.Palette.TextPrimary
+            family = null
+            size = Halo.Type.Body
+        }
         TerminalLineType.ERROR -> {
             text = AnnotatedString(line.text)
             color = Halo.Palette.Error

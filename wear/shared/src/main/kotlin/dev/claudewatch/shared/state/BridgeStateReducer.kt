@@ -249,7 +249,7 @@ object BridgeEventReducer {
         is MessageEvent -> appendTerminal(
             markWorking(state, event.sessionId, nowMs),
             event.sessionId,
-            listOf(TerminalLine(event.text, TerminalLineType.OUTPUT)),
+            listOf(TerminalLine(event.text, TerminalLineType.PROSE)),
             clearThinking = true,
         )
         // Keyed replace: connect-time snapshots re-send pending prompts, and

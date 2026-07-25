@@ -61,7 +61,7 @@ class BridgeEventReducerTest {
 
         val last = alpha.terminal.items.last()
         assertEquals("looking at the auth tests", last.text)
-        assertEquals(TerminalLineType.OUTPUT, last.type)
+        assertEquals(TerminalLineType.PROSE, last.type)
         assertEquals("99", state.lastEventId)
     }
 
