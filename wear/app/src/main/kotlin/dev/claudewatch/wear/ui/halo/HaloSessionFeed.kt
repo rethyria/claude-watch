@@ -8,6 +8,7 @@
 // px values are at the 450 reference (≈ px/2 in dp, matching HaloTheme).
 package dev.claudewatch.wear.ui.halo
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -36,8 +37,13 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
@@ -138,8 +144,13 @@ fun HaloSessionFeed(
             )
             if (session.pending != null) {
                 WaitingBanner(state = session.state, onOpenCard = onOpenCard)
-            } else {
+            } else if (session.dictatable) {
                 DictatePill(onDictate = onDictate)
+            } else {
+                // Honest affordance (issue #78): a session the bridge can't
+                // reach live (a PTY-less hook session) shows WHY there's no
+                // Dictate, instead of a pill that would silently do nothing.
+                DictateUnavailablePill()
             }
         }
     }
@@ -393,6 +404,15 @@ private fun FeedLine(line: TerminalLine) {
                 text = highlightPassCounts(line.text)
                 color = Halo.Palette.TextSecondary
             }
+        // Assistant prose (#79): the same speech treatment the `[codex] `
+        // branch above applies, but chosen from the line's TYPE instead of
+        // sniffing its text — proportional, brightest role, body size.
+        TerminalLineType.PROSE -> {
+            text = AnnotatedString(line.text)
+            color = Halo.Palette.TextPrimary
+            family = null
+            size = Halo.Type.Body
+        }
         TerminalLineType.ERROR -> {
             text = AnnotatedString(line.text)
             color = Halo.Palette.Error
@@ -457,6 +477,37 @@ private fun WaitingBanner(state: SessionState, onOpenCard: () -> Unit) {
 }
 
 @Composable
+private fun DictateUnavailablePill() {
+    // Same footprint as DictatePill but non-interactive and muted: the bridge
+    // cannot deliver dictation into this session live (issue #78), so we say so
+    // rather than offer a pill that does nothing.
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(Halo.Geo.TouchMin)
+            .testTag("haloDictateUnavailable"),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .padding(bottom = 8.dp)
+                .background(Halo.Palette.InsetWell, RoundedCornerShape(50))
+                .defaultMinSize(minWidth = 88.dp)
+                .padding(horizontal = 14.dp, vertical = 5.dp),
+        ) {
+            Text(
+                text = "Dictation unavailable here",
+                fontSize = Halo.Type.Caption,
+                fontWeight = FontWeight.Medium,
+                color = Halo.Palette.TextFaint,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
 private fun DictatePill(onDictate: () -> Unit) {
     Box(
         contentAlignment = Alignment.Center,
@@ -475,13 +526,72 @@ private fun DictatePill(onDictate: () -> Unit) {
                 .defaultMinSize(minWidth = 88.dp)
                 .padding(horizontal = 14.dp, vertical = 5.dp),
         ) {
-            Text(
-                text = "Dictate",
-                fontSize = Halo.Type.Caption,
-                fontWeight = FontWeight.Medium,
-                color = Halo.Palette.TextPrimary,
-                maxLines = 1,
-            )
+            MicGlyph()
         }
+    }
+}
+
+/**
+ * A microphone, drawn rather than imported: the app carries no icon library and
+ * every other glyph here is a Canvas (see HaloRing), so a dependency for one
+ * shape would be the odd one out.
+ *
+ * Three parts, all derived from the canvas size so it scales with the type
+ * ramp: the capsule (the mic body), the arc cradling it, and the stem. Stroked
+ * rather than filled — at this size a filled mic reads as an ink blot on an
+ * OLED watch face.
+ */
+@Composable
+private fun MicGlyph() {
+    Canvas(modifier = Modifier.size(Halo.Geo.MicGlyph).testTag("haloDictateMic")) {
+        val s = size.minDimension
+        val stroke = s * 0.09f
+        val cx = size.width / 2f
+
+        // Body: FILLED, not outlined. An outlined capsule this small reads as a
+        // hollow ring — the first attempt looked like a face because of it.
+        val bodyW = s * 0.30f
+        val bodyTop = s * 0.06f
+        val bodyH = s * 0.46f
+        drawRoundRect(
+            color = Halo.Palette.TextPrimary,
+            topLeft = Offset(cx - bodyW / 2f, bodyTop),
+            size = Size(bodyW, bodyH),
+            cornerRadius = CornerRadius(bodyW / 2f),
+        )
+
+        // Cradle: a U that OVERLAPS the body's lower half rather than sitting
+        // below it. Its open ends land above the body's bottom edge, which is
+        // what makes the two read as one object instead of a bowl under a dot.
+        val r = s * 0.28f
+        val cradleCy = bodyTop + bodyH * 0.78f
+        drawArc(
+            color = Halo.Palette.TextPrimary,
+            startAngle = 0f,
+            sweepAngle = 180f,
+            useCenter = false,
+            topLeft = Offset(cx - r, cradleCy - r),
+            size = Size(r * 2f, r * 2f),
+            style = Stroke(width = stroke, cap = StrokeCap.Round),
+        )
+
+        // Stem from the cradle's base down to the foot.
+        val footY = s * 0.95f
+        drawLine(
+            color = Halo.Palette.TextPrimary,
+            start = Offset(cx, cradleCy + r),
+            end = Offset(cx, footY),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+
+        // Foot bar: short, but it is what stops the stem reading as a stray tick.
+        drawLine(
+            color = Halo.Palette.TextPrimary,
+            start = Offset(cx - s * 0.17f, footY),
+            end = Offset(cx + s * 0.17f, footY),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
     }
 }

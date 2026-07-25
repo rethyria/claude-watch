@@ -133,6 +133,9 @@ export const PAIRING_CODE_TTL_MS = testOverridable(
 export const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
 export const RATE_LIMIT_MAX_ATTEMPTS = 5;
 export const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
+// Heartbeat + TCP keepalive on the loopback ACP fork inbox (S3 #77). Doubles as
+// the liveness probe that surfaces a dead fork so its zombie slots are reaped.
+export const ACP_INBOX_HEARTBEAT_MS = 15_000;
 
 // Test-only override hook: lets the test suite shorten long production
 // timeouts/bounds (and relocate/widen the port range) via environment

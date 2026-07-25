@@ -204,85 +204,33 @@ test("an idled session that a LIVE client is watching still gets the flag on its
   assert.equal((await snapshotSessionEvent(t, bridge, token, sessionId)).idle, true);
 });
 
-test("a dictated prompt clears idle for the run and restores it when the run ends", { timeout: 60_000 }, async (t) => {
-  // Dictating at a PTY-less external session runs the agent HEADLESSLY: the
-  // bridge spawns the raw binary itself, so no hook of any kind fires for that
-  // run — not on the way in, and crucially not on the way out. Clearing the
-  // flag on the way in without restoring it on exit would pin the slot
-  // "working" for as long as it lives, which is issue #60's symptom again on
-  // the one session the user just interacted with.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-idle-bin-"));
-  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
-  const bin = path.join(dir, "claude");
-  // A real headless run: prints a little, exits. No hooks — that is the point.
-  fs.writeFileSync(bin, "#!/bin/sh\necho HEADLESS-RUN-OUTPUT\n", { mode: 0o755 });
-
-  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
+test("dictating at an external session is refused and does NOT flip the idle slot to working (issue #69)", { timeout: 60_000 }, async (t) => {
+  // The bridge owns no PTY for an external hook-created session, so a dictated
+  // command is refused (409) instead of run as a detached `claude -p --continue`
+  // fork of the user's live session (issue #69). The refusal must not touch the
+  // slot: an idle external session stays idle — no phantom "working" (which was
+  // the old headless path's idle=false, itself issue #60's symptom).
+  const bridge = await startBridge(t);
   const token = await pair(bridge);
-  // A REAL directory: the headless run is a real child process spawned in the
-  // session's cwd, and a bogus one would fail the spawn instead of the run.
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "idle-60-dictated-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "idle-69-dictated-"));
   t.after(() => { try { fs.rmSync(cwd, { recursive: true, force: true }); } catch { /* ignore */ } });
 
   const sessionId = await createSession(bridge, token, "cc-dictated", cwd);
   await request(bridge.port, "POST", "/hooks/stop", { body: { session_id: "cc-dictated", cwd } });
   assert.equal((await statusEntry(bridge, token, sessionId)).idle, true, "idled by the Stop");
 
-  const sse = connectSse(bridge.port, token);
-  t.after(() => sse.close());
-  assert.equal(await sse.statusCode(), 200);
-  // Drain the connect-time sync first (it says idle, correctly) so the next
-  // matching event is unambiguously the one the dictated run pushes.
-  const sync = await sse.waitFor(
-    (e) => e.event === "session" && e.parsed?.state === "running" && e.parsed?.sessionId === sessionId,
-  );
-  assert.equal(sync.parsed.idle, true);
-  const afterSync = sse.events.length;
-
   const resp = await request(bridge.port, "POST", "/command", {
     token,
     body: { sessionId, command: "do the thing\n" },
   });
-  assert.equal(resp.status, 200);
-  assert.equal(resp.body.prompt, true, "the PTY-less session took the headless branch");
+  assert.equal(resp.status, 409, "dictation to an external session is refused, not forked");
+  assert.equal(resp.body.external, true);
+  assert.notEqual(resp.body.ok, true);
 
-  // The run's own `session running` event: it must carry neither `idle` (work
-  // just started) NOR a missing `external` tag — this push is built by
-  // commands.js, and it is the one place a hand-rolled payload could quietly
-  // disagree with PROTOCOL.md's "carried uniformly on every session event".
-  const started = await sse.waitFor(
-    (e, i) => i >= afterSync && e.event === "session" && e.parsed?.state === "running" && e.parsed?.sessionId === sessionId,
+  // The refusal left the slot exactly as it was: still idle, never flipped to
+  // "working".
+  assert.equal(
+    (await statusEntry(bridge, token, sessionId)).idle, true,
+    "the refused dictation did not flip the slot to working",
   );
-  assert.equal(Object.hasOwn(started.parsed, "idle"), false, `a started run is not idle; got ${JSON.stringify(started.parsed)}`);
-  assert.equal(started.parsed.external, true, `the headless-run event must still tag the slot external; got ${JSON.stringify(started.parsed)}`);
-
-  // ...and when the process exits, that IS the turn end. Nothing else is ever
-  // going to say so.
-  await waitForStatusEntry(bridge, token, sessionId, (s) => s?.idle === true, "the finished run to idle the slot again");
-  assert.equal((await snapshotSessionEvent(t, bridge, token, sessionId)).idle, true);
-});
-
-test("a dictated prompt whose agent binary cannot even start does not pin the slot working", { timeout: 60_000 }, async (t) => {
-  // The spawn-failure path fires 'error', never 'close', and produces no
-  // output and no hooks at all — the slot would be left claiming to work on a
-  // run that never began.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-idle-badbin-"));
-  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
-  const bin = path.join(dir, "claude");
-  // Present (so the bridge accepts it as the agent binary) but not executable.
-  fs.writeFileSync(bin, "#!/bin/sh\necho nope\n", { mode: 0o644 });
-
-  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
-  const token = await pair(bridge);
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "idle-60-badbin-"));
-  t.after(() => { try { fs.rmSync(cwd, { recursive: true, force: true }); } catch { /* ignore */ } });
-
-  const sessionId = await createSession(bridge, token, "cc-badbin", cwd);
-  await request(bridge.port, "POST", "/hooks/stop", { body: { session_id: "cc-badbin", cwd } });
-  assert.equal((await statusEntry(bridge, token, sessionId)).idle, true);
-
-  const resp = await request(bridge.port, "POST", "/command", { token, body: { sessionId, command: "go\n" } });
-  assert.equal(resp.status, 200);
-
-  await waitForStatusEntry(bridge, token, sessionId, (s) => s?.idle === true, "a failed spawn to leave the slot idle");
 });

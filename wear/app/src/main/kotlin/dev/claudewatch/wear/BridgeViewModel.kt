@@ -530,6 +530,17 @@ class BridgeViewModel(
             refuse("command:no-session", "No session — command not sent")
             return
         }
+        // Only sessions the bridge can reach LIVE accept dictation — a
+        // bridge-owned PTY (stdin) or an ACP session (inject). A PTY-less hook
+        // session would need the detached headless fork we refuse to run, so
+        // hide the failure honestly and keep the text in the draft (issue #78).
+        // Guard only a KNOWN non-dictatable session: an unknown id (not yet in
+        // bridge state) falls through to the existing send/echo path unchanged.
+        val target = _state.value.bridge.sessions[sessionId]
+        if (target != null && !target.dictatable) {
+            refuse("command:not-dictatable", "Dictation isn't available for this session")
+            return
+        }
         if (_state.value.commandInFlightText != null) {
             // One send at a time: a second command while the first awaits its
             // ack is refused into the draft (kept, never silently dropped).

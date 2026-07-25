@@ -358,10 +358,17 @@ permission with that ID"}`.
 
 - With `sessionId` naming a PTY-backed session: the text is written to its
   stdin → `200 { "ok": true, "sessionId": ..., "agent": ... }`.
-- With `sessionId` naming an external (hook-created, PTY-less) session: the
-  bridge runs the agent CLI headlessly in that session's cwd (`claude -p
-  <text> --continue` / `codex exec <text>`), streaming output as `pty-output`
-  events → `200 { "ok": true, "sessionId": ..., "agent": ..., "prompt": true }`.
+- With `sessionId` naming an **ACP** (Zed-hosted) session: the text is injected
+  into the LIVE session over the loopback channel → `200 { "ok": true,
+  "sessionId": ..., "agent": ..., "prompt": true }`. A session whose adapter is
+  not connected answers **502** so the client can keep the text as a draft.
+- With `sessionId` naming any other PTY-less session (hook-created/external, or
+  a bridge-owned session that has ended): **409**, and nothing is run. The
+  bridge owns no input channel into it. This used to spawn `claude -p <text>
+  --continue` — a detached headless FORK of the live session, concurrently
+  editing the same working tree — which is why it was retired (#69/#81). The
+  refusals are distinguished: an ended bridge-owned session is reported as
+  ended, never mislabeled as external.
 - Without `sessionId`: routed to the most recent active session, or
   **auto-spawns** one (`agent`, default `"claude"`); the command is injected
   only after the new PTY produces output → `200 { "ok": true, "sessionId":
@@ -599,23 +606,81 @@ the indicator clears only once the whole workflow tree has gone quiet for
 `journal.jsonl` **and** its agents' transcripts — `journal.jsonl` alone only
 moves on an agent start/finish, so a long single-agent phase would look dead
 mid-run. This same staleness retires a killed workflow's stuck indicator. A
-bridge restarted mid-workflow misses the launch hook and
-shows no indicator — accepted. Clients should render an indicator only while
+bridge restarted mid-workflow loses its in-memory arming, but re-derives
+`agents` from the on-disk journal when the surviving session re-registers —
+re-arming a still-live workflow, or broadcasting the explicit zero for one that
+finished during the downtime — so a re-registering session's stale blue is
+corrected rather than stranded (issue #68); a session that fires no further hook
+after the restart is left to the authoritative sync (#66). Clients should render
+an indicator only while
 `running > 0`, and must not offer any control affordance (a workflow cannot
 be stopped from a client).
 
 ### `pty-output`
 Raw terminal output from a bridge-owned PTY (ANSI escapes included) or from a
-headless prompt run: `{ "text": "...", "sessionId": ... }`.
+`{ "text": "...", "sessionId": ... }`.
 
 ### `tool-output`
 A completed tool use, forwarded from the PostToolUse hook: hook body (e.g.
 `tool_name`, `tool_output`, `cwd`, `session_id`) plus `source`
 (`"claude"`/`"codex"`) and `sessionId`.
 
+### `permission-request` from an ACP session (#80)
+An ACP session's permission requests reach the wrist through the SAME
+`permission-request` / `permission-cleared` events and the same `POST
+/v1/command` answer path as a hook session's — clients need no ACP-specific
+handling.
+
+Two behaviours are specific to ACP and worth knowing:
+
+- **Two surfaces, one decision.** Zed shows its own dialog for every request;
+  the wrist shows the same one. Whichever answers first wins. If Zed wins, the
+  bridge pushes `permission-cleared` and the wrist card disappears; if the
+  wrist wins, the agent cancels Zed's dialog.
+- **A prompt is only raised if a client is connected**, and only if at least
+  one of the agent's options maps to a machine-readable `behavior`. An
+  unmappable option is dropped rather than guessed at.
+
+Expiry keeps the hook path's no-decision semantics: nothing is sent back to
+the agent, so Zed's own dialog keeps the answer. The bridge never fabricates a
+`deny`.
+
+### `message`
+Assistant prose from an ACP (Zed-hosted) session: `{ "role": "assistant",
+"text": "...", "sessionId": ... }`. Additive in proto 3 — clients ignore
+unknown events, so an older watch is unaffected.
+
+Sourced from the ACP `agent_message_chunk` update, which is **assistant-only**:
+the adapter emits no `user_message_chunk`, so a client's own local echo stays
+the single authority for the user's dictated text and there is no double-echo.
+Only ACP sessions produce this; the hook channel never carried prose at all.
+
+**Coalesced, not streamed.** ACP delivers prose as dozens of small deltas per
+turn; one frame each would be that many radio wakeups on a watch. The bridge
+buffers them and emits ONE `message` carrying the last block, flushed at:
+
+| flush point | why |
+|---|---|
+| turn end (`kind: "turn"`, `phase: "end"`) | the report — what the agent finished saying |
+| permission request (`kind: "permission"`) | a pause needing an answer: the user needs the context that led to it |
+
+A `tool_call` update **resets** the buffer: narration before a tool is
+superseded by whatever is said after it, so a flush carries the last block
+rather than a transcript of the whole turn. Buffer is capped at 4000 chars
+(tail kept). Clients wanting live token-by-token output should not use this
+event.
+
 ### `stop`
 The agent finished a turn and is idle (fires per turn — NOT session end).
 Hook body plus `sessionId`.
+
+Note: an ACP session emits no `stop` event — ACP carries no turn-end update
+variant, so its turn end arrives over the server-local `/acp/update` channel
+as `kind: "turn"`. The bridge then pushes one idempotent **`session` running
+event carrying `idle: true`**, so an already-connected client learns the turn
+ended without a new event type. (Setting the flag alone is not enough for a
+live client: `idle` is designed to ride the next `session` event, and for a
+hook session that push came from the Stop hook.)
 
 ### `notification`
 Claude Code Notification hook events, always with a `notification_type` key

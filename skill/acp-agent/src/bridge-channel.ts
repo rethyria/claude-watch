@@ -1,0 +1,486 @@
+// claude-watch: the fork <-> bridge loopback channel (S3 #77).
+//
+// This whole file is a claude-watch addition — it is NOT upstream
+// `claude-agent-acp` code, so re-pulling the fork from upstream only reconciles
+// the handful of marked injection points in acp-agent.ts / index.ts, never this
+// module.
+//
+// Direction of travel:
+//   fork -> bridge   register / update / deregister  (plain fire-and-forget POSTs)
+//   bridge -> fork   dictation `inject`              (a long-lived SSE the fork holds)
+//
+// The uplink is stateless POSTs; the downlink is one persistent SSE "inbox" the
+// fork opens to the bridge. That connection's liveness IS this fork process's
+// liveness: when the fork dies (even on SIGKILL, where the graceful
+// `deregister` never runs) the inbox socket closes and the bridge ends every
+// ACP slot bound to it — so a Zed quit strands no zombie slot.
+//
+// Everything here is strictly best-effort. The bridge being down, slow, or
+// absent must NEVER change how the ACP session behaves for the Zed user: every
+// call swallows its own errors and the SSE reader reconnects on its own.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import type { AcpClient, Logger } from "./acp-agent.js";
+import type {
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+  SessionNotification,
+  ReadTextFileRequest,
+  ReadTextFileResponse,
+  WriteTextFileRequest,
+  WriteTextFileResponse,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  CompleteElicitationNotification,
+} from "@agentclientprotocol/sdk";
+
+/** Delivered by the bridge down the inbox SSE when the watch dictates. */
+export type InjectHandler = (sessionId: string, text: string, source: string) => void;
+
+/** The wrist's answer to a permission request, arriving down the same inbox as
+ *  dictation. `optionId` is one the AGENT offered — the bridge echoes our own
+ *  vocabulary back rather than inventing one from the behavior. */
+export type PermissionDecision = {
+  sessionId: string;
+  toolCallId: string;
+  optionId: string;
+  behavior: string;
+};
+export type PermissionDecisionHandler = (decision: PermissionDecision) => void;
+
+/** The seam the agent (and its client tee) talk to. A test supplies a fake;
+ *  production uses {@link HttpBridgeChannel}. Every method is best-effort and
+ *  MUST NOT throw into agent code. */
+export interface BridgeChannel {
+  /** Register a live ACP session so the watch can see and dictate at it. The
+   *  SDK session_id equals the ACP session id (the fork passes
+   *  `options.sessionId = sessionId`), so one id correlates the ACP slot with
+   *  the settings.json hook events the SDK also fires — the bridge binds them
+   *  to a single slot. */
+  registerSession(info: {
+    sessionId: string;
+    sdkSessionId: string;
+    cwd: string;
+    /** Known thread title, so a bridge restart restores it from the
+     *  re-announce instead of showing the raw uuid until the next turn end. */
+    title?: string;
+  }): void;
+  /** The ACP session ended (query closed / closeSession / dispose). */
+  deregisterSession(sessionId: string, reason: string): void;
+  /** Mirror of a client `sessionUpdate` (prose, tool calls, mode, plan, …). */
+  forwardSessionUpdate(params: SessionNotification): void;
+  /** Mirror of a client `requestPermission` RPC (missed by `sendUpdate`). */
+  forwardPermissionRequest(params: RequestPermissionRequest): void;
+  /** Turn boundary. The ACP `sessionUpdate` union has no turn-end variant —
+   *  turn end is the `session/prompt` RPC's `stopReason`, a return value on the
+   *  agent→client path that never reaches the client tee. Without this the
+   *  bridge can infer "working" from activity but can never observe idle, so it
+   *  would have to guess from silence. Every settle lane reports its
+   *  `stopReason`, so a cancelled/refused turn idles the slot like a completed
+   *  one. */
+  forwardTurnBoundary(params: {
+    sessionId: string;
+    phase: "start" | "end";
+    stopReason?: string;
+  }): void;
+  /** Tell the bridge a permission request was settled somewhere else (the user
+   *  answered in Zed, or the agent cancelled it), so it can retract the wrist
+   *  card instead of leaving a zombie prompt (#80). */
+  forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void;
+  /** Remember a freshly-learned thread title for the next re-announce (#79). */
+  noteSessionTitle(sessionId: string, title: string): void;
+  /** Register the handler the inbox calls when the watch dictates. */
+  onInject(handler: InjectHandler): void;
+  /** Register the handler the inbox calls when the watch answers a permission
+   *  request (#80). */
+  onPermissionDecision(handler: PermissionDecisionHandler): void;
+  /** Open the inbox SSE and begin its reconnect loop. */
+  start(): void;
+  /** Stop the inbox loop and release the connection. */
+  stop(): void;
+}
+
+function credentialsDir(): string {
+  return process.env.CLAUDE_WATCH_CREDENTIALS_DIR || path.join(os.homedir(), ".claude-watch");
+}
+
+/** The bridge publishes its ACTUAL bound port here on startup (it walks a port
+ *  range because 7860 is often taken), so we must read it rather than assume a
+ *  port. Re-read on every (re)connect: a bridge restart can land on a new port. */
+function readBridgePort(): number | null {
+  try {
+    const raw = fs.readFileSync(path.join(credentialsDir(), "port"), "utf8").trim();
+    const port = Number.parseInt(raw, 10);
+    return Number.isInteger(port) && port > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+const INBOX_MIN_BACKOFF_MS = 500;
+const INBOX_MAX_BACKOFF_MS = 10_000;
+
+export class HttpBridgeChannel implements BridgeChannel {
+  /** Stable id for this fork process across all its POSTs and its inbox SSE, so
+   *  the bridge knows which sessions belong to which fork (and which inbox to
+   *  push a dictation down). */
+  private readonly connectionId = randomUUID();
+  private injectHandler: InjectHandler | null = null;
+  private permissionHandler: PermissionDecisionHandler | null = null;
+  private stopped = false;
+  private abort: AbortController | null = null;
+
+  /** Every session registered and not yet deregistered, kept so they can be
+   *  re-announced after the bridge comes back. registerSession fires exactly
+   *  once per session (at creation), so without this a bridge restart silently
+   *  orphans every live Zed thread: the inbox SSE reconnects and everything
+   *  LOOKS healthy, but the bridge has no slot, dictation 502s, and the thread
+   *  is invisible until the user closes and reopens it in Zed. */
+  private readonly liveSessions = new Map<
+    string,
+    {
+      sessionId: string;
+      sdkSessionId: string;
+      cwd: string;
+      /** The bridge has accepted a register for this session on this connection. */
+      acked: boolean;
+      /** Last known thread title, refreshed as the SDK generates one, so a
+       *  re-announce after a bridge restart carries it. */
+      title?: string;
+      /** Whether a turn is in flight for this session. Tracked here because a
+       *  bridge restart rebuilds its table from the re-announce alone: without
+       *  it the bridge has to guess, and guessing "working" shows a live-looking
+       *  session on the wrist for a thread that is sitting idle. Every boundary
+       *  already passes through forwardTurnBoundary, so this costs nothing. */
+      active: boolean;
+      /** A register POST for it is outstanding RIGHT NOW. Distinct from !acked:
+       *  start() and registerSession() race, so the inbox can come up while the
+       *  very first register is still on the wire. Replaying then would send a
+       *  second, duplicate register for a session that was never missing. */
+      inFlight: boolean;
+    }
+  >();
+
+  /** Whether the inbox has ever been up. Distinguishes "first connect" (each
+   *  session's own register POST is authoritative) from "reconnect" (the bridge
+   *  may be a fresh process with an empty table, so everything must be re-sent). */
+  private connectedOnce = false;
+
+  constructor(private readonly logger: Logger) {}
+
+  onInject(handler: InjectHandler): void {
+    this.injectHandler = handler;
+  }
+
+  onPermissionDecision(handler: PermissionDecisionHandler): void {
+    this.permissionHandler = handler;
+  }
+
+  registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string; title?: string }): void {
+    // A session that has never run a turn is not working — the honest default,
+    // and the one the wrist should show for a thread just opened in Zed.
+    const entry = { ...info, acked: false, inFlight: true, active: false };
+    this.liveSessions.set(info.sessionId, entry);
+    void this.post("/acp/register", {
+      connection: this.connectionId,
+      sessionId: info.sessionId,
+      sdkSessionId: info.sdkSessionId,
+      cwd: info.cwd,
+      active: entry.active,
+      title: entry.title,
+    }).then((ok) => {
+      // Only a POST the bridge actually accepted counts. One that failed (bridge
+      // still starting, no port file yet) leaves acked=false so the next inbox
+      // connect re-sends it — that is the "Zed opened before the bridge" case.
+      if (this.liveSessions.get(info.sessionId) !== entry) return; // deregistered meanwhile
+      entry.inFlight = false;
+      entry.acked = ok;
+    });
+  }
+
+  deregisterSession(sessionId: string, reason: string): void {
+    this.liveSessions.delete(sessionId);
+    void this.post("/acp/deregister", {
+      connection: this.connectionId,
+      sessionId,
+      reason,
+    });
+  }
+
+  forwardSessionUpdate(params: SessionNotification): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "session_update",
+      payload: params,
+    });
+  }
+
+  forwardPermissionRequest(params: RequestPermissionRequest): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "permission",
+      payload: params,
+    });
+  }
+
+  /** Remember a title the agent just learned, so the next re-announce carries
+   *  it. Cheap: the agent already computes this for its own client update. */
+  noteSessionTitle(sessionId: string, title: string): void {
+    const live = this.liveSessions.get(sessionId);
+    if (live) live.title = title;
+  }
+
+  forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "permission-resolved",
+      payload: { sessionId: params.sessionId, toolCallId: params.toolCallId },
+    });
+  }
+
+  forwardTurnBoundary(params: { sessionId: string; phase: "start" | "end"; stopReason?: string }): void {
+    const live = this.liveSessions.get(params.sessionId);
+    if (live) live.active = params.phase === "start";
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "turn",
+      payload: { phase: params.phase, ...(params.stopReason && { stopReason: params.stopReason }) },
+    });
+  }
+
+  start(): void {
+    if (this.stopped) return;
+    void this.runInbox();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    try {
+      this.abort?.abort();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** Fire-and-forget POST to the bridge on loopback. Never rejects into caller
+   *  code: a missing port (bridge not up) or a network error is swallowed. */
+  private async post(route: string, body: Record<string, unknown>): Promise<boolean> {
+    const port = readBridgePort();
+    if (port === null) return false;
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return resp.ok;
+    } catch (err) {
+      this.logger.error(`claude-watch: bridge POST ${route} failed: ${String(err)}`);
+      return false;
+    }
+  }
+
+  /** Re-POST /acp/register for every still-live session. Called on each inbox
+   *  (re)connect so a bridge that restarted learns about threads that were
+   *  created while it was down. Snapshotted first: a deregister landing
+   *  mid-replay must not mutate the map we are iterating. */
+  private async replayRegistrations(): Promise<void> {
+    const pending = [...this.liveSessions.values()].filter((s) => !s.acked && !s.inFlight);
+    if (pending.length === 0) return;
+    this.logger.error(
+      `claude-watch: re-announcing ${pending.length} live session(s) to the bridge`,
+    );
+    await Promise.all(
+      pending.map((info) =>
+        this.post("/acp/register", {
+          connection: this.connectionId,
+          sessionId: info.sessionId,
+          sdkSessionId: info.sdkSessionId,
+          cwd: info.cwd,
+          active: info.active,
+          title: info.title,
+        }).then((ok) => {
+          if (ok && this.liveSessions.get(info.sessionId) === info) info.acked = true;
+        }),
+      ),
+    );
+  }
+
+  /** Hold the inbox SSE open, reconnecting with capped backoff until stopped. */
+  private async runInbox(): Promise<void> {
+    let backoff = INBOX_MIN_BACKOFF_MS;
+    while (!this.stopped) {
+      const port = readBridgePort();
+      if (port === null) {
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, INBOX_MAX_BACKOFF_MS);
+        continue;
+      }
+      this.abort = new AbortController();
+      try {
+        const resp = await fetch(
+          `http://127.0.0.1:${port}/acp/inbox?connection=${this.connectionId}`,
+          {
+            headers: { accept: "text/event-stream" },
+            signal: this.abort.signal,
+          },
+        );
+        if (!resp.ok || !resp.body) {
+          throw new Error(`inbox status ${resp.status}`);
+        }
+        // Connected: reset backoff and drain frames until the stream ends.
+        backoff = INBOX_MIN_BACKOFF_MS;
+        // A RECONNECT means the bridge we are now talking to may be a fresh
+        // process with an empty session table, so nothing we sent earlier can be
+        // assumed to have survived — invalidate every ack and re-announce.
+        // registerSession only ever fires at session creation, so this is the
+        // one thing that puts an already-open Zed thread back on the bridge.
+        // On the FIRST connect we skip the invalidation: each session's own
+        // register POST is authoritative, and replaying it would just duplicate
+        // the POST. Sessions whose register failed (bridge not up yet) still
+        // have acked=false and get sent either way.
+        if (this.connectedOnce) {
+          for (const s of this.liveSessions.values()) {
+            s.acked = false;
+            // Any POST still outstanding across a reconnect was aimed at the
+            // bridge that just went away, so it cannot be trusted to land.
+            // Clearing it lets the replay cover that session; a duplicate
+            // register is harmless (handleAcpRegister refreshes in place).
+            s.inFlight = false;
+          }
+        }
+        this.connectedOnce = true;
+        // Not awaited: a slow re-register must not delay reading inject frames.
+        void this.replayRegistrations();
+        await this.drainInbox(resp.body);
+      } catch (err) {
+        if (this.stopped) break;
+        this.logger.error(`claude-watch: bridge inbox disconnected: ${String(err)}`);
+      }
+      if (this.stopped) break;
+      await sleep(backoff);
+      backoff = Math.min(backoff * 2, INBOX_MAX_BACKOFF_MS);
+    }
+  }
+
+  private async drainInbox(body: ReadableStream<Uint8Array>): Promise<void> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      let sep: number;
+      // Frames are separated by a blank line, exactly like the bridge's SSE.
+      while ((sep = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        this.handleFrame(frame);
+      }
+    }
+  }
+
+  private handleFrame(frame: string): void {
+    let event = "message";
+    const dataLines: string[] = [];
+    for (const line of frame.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+      // ":comment" heartbeats and anything else are ignored.
+    }
+    if (dataLines.length === 0) return;
+    if (event === "permission-decision") {
+      let d: Partial<PermissionDecision>;
+      try {
+        d = JSON.parse(dataLines.join("\n"));
+      } catch {
+        return;
+      }
+      if (typeof d.sessionId !== "string" || typeof d.toolCallId !== "string" || typeof d.optionId !== "string") {
+        return;
+      }
+      this.logger.log(`claude-watch: inbox permission decision for ${d.toolCallId} (${d.behavior ?? "?"})`);
+      try {
+        this.permissionHandler?.(d as PermissionDecision);
+      } catch (err) {
+        this.logger.error(`claude-watch: permission handler threw: ${String(err)}`);
+      }
+      return;
+    }
+    if (event !== "inject") return;
+    let msg: { sessionId?: unknown; text?: unknown; source?: unknown };
+    try {
+      msg = JSON.parse(dataLines.join("\n"));
+    } catch {
+      return;
+    }
+    if (typeof msg.sessionId !== "string" || typeof msg.text !== "string") return;
+    const source = typeof msg.source === "string" ? msg.source : "watch";
+    this.logger.log(`claude-watch: inbox inject for session ${msg.sessionId} (source=${source})`);
+    try {
+      this.injectHandler?.(msg.sessionId, msg.text, source);
+    } catch (err) {
+      this.logger.error(`claude-watch: inject handler threw: ${String(err)}`);
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Build the bridge channel, or `null` when this fork was not launched by
+ *  claude-watch (`CLAUDE_WATCH_ACP` unset). Returning null keeps the adapter's
+ *  behaviour byte-for-byte identical to upstream for every other user of the
+ *  fork, and keeps the upstream test suite untouched. */
+export function createBridgeChannel(logger: Logger = console): BridgeChannel | null {
+  if (process.env.CLAUDE_WATCH_ACP !== "1") return null;
+  return new HttpBridgeChannel(logger);
+}
+
+/** Decorate an {@link AcpClient} so every `sessionUpdate` and every
+ *  `requestPermission` RPC is ALSO mirrored to the bridge, without altering the
+ *  real call's arguments, return value, or timing. This is the review-mandated
+ *  tap point: `sendUpdate` alone misses tool results and every permission
+ *  prompt, so we tap the client — the one surface both funnel through. Every
+ *  other method passes straight through untouched. */
+export function teeClientToBridge(inner: AcpClient, bridge: BridgeChannel): AcpClient {
+  return {
+    sessionUpdate(params: SessionNotification): Promise<void> {
+      bridge.forwardSessionUpdate(params);
+      return inner.sessionUpdate(params);
+    },
+    requestPermission(
+      params: RequestPermissionRequest,
+      signal?: AbortSignal,
+    ): Promise<RequestPermissionResponse> {
+      bridge.forwardPermissionRequest(params);
+      return inner.requestPermission(params, signal);
+    },
+    readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+      return inner.readTextFile(params);
+    },
+    writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
+      return inner.writeTextFile(params);
+    },
+    unstable_createElicitation(
+      params: CreateElicitationRequest,
+      signal?: AbortSignal,
+    ): Promise<CreateElicitationResponse> {
+      return inner.unstable_createElicitation(params, signal);
+    },
+    unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+      return inner.unstable_completeElicitation(params);
+    },
+    extNotification(method: string, params: Record<string, unknown>): Promise<void> {
+      return inner.extNotification(method, params);
+    },
+  };
+}

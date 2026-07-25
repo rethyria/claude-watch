@@ -37,7 +37,7 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 //   the turn-end-idle section below): state stays "running" across a finished
 //   turn, so idle is what tells a connect-time snapshot apart from a session
 //   that is actually producing work.
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -548,7 +548,29 @@ export function sessionEventPayload(slot, fields) {
   if (slot.worktree) payload.worktree = true;
   if (slot.repoRoot) payload.repoRoot = slot.repoRoot;
   if (slot.agents) payload.agents = slot.agents;
-  if (slot.hookCreated) payload.external = true;
+  // `external` marks a slot the bridge does NOT own a PTY for, so the client
+  // offers an honest "hide" instead of a kill (issue #53). Hook-created slots
+  // AND ACP slots both qualify — an ACP session is Zed's process, not ours, so
+  // a "kill" would be the same lie. ACP slots are deliberately NOT hookCreated
+  // (that flag also means cap-evictable, and ACP slots are cap-exempt), so the
+  // `external` tag is derived from both (S3 #77).
+  if (slot.hookCreated || slot.kind === "acp") payload.external = true;
+  // Additive session-type discriminator + dictatable flag (S3 #77 / S4 #78).
+  // `kind` is currently carried only for ACP; `dictatable` is DERIVED, not
+  // stored, so it is always honest: the bridge can deliver dictation into a
+  // session it can reach LIVE — its own PTY (stdin) or an ACP session (inject
+  // over the loopback channel) — and nothing else (a PTY-less hook session
+  // has no reachable input channel at all: /command answers 409 for it, since the
+  // detached headless fork that used to serve it was retired in #81). A PTY that
+  // dies drops ptyProcess to null and the flag vanishes on its own. Clients
+  // gate the Dictate affordance on `dictatable`, NOT on "external" (an ACP
+  // session is both external AND dictatable).
+  if (slot.kind) payload.kind = slot.kind;
+  // Liveness is part of "can the bridge deliver into this", so an ended slot
+  // must drop the flag (#84): delivery already refuses honestly once the
+  // connection binding is gone, but a client gating on `dictatable` alone would
+  // still OFFER Dictate on a dead session and then eat the 502.
+  if (slot.state !== "ended" && (slot.ptyProcess || slot.kind === "acp")) payload.dictatable = true;
   // Rides `ended` payloads too — meaningless there (clients prune ended
   // sessions outright), but uniformity beats a special case nobody reads.
   if (slot.idle) payload.idle = true;
@@ -599,8 +621,13 @@ export function refreshHookSessionTitle(sessionId, body) {
 // workflow-active and runs the first scan immediately so the indicator does
 // not wait out a poll interval. A module-level poll then re-scans ONLY active
 // slots every WORKFLOW_POLL_MS (the poll's cheap boolean gate makes idle
-// ticks free). A bridge restarted mid-workflow never sees the launch signal
-// and shows no indicator — accepted, documented in PROTOCOL.md.
+// ticks free). A bridge restarted mid-workflow loses the in-memory arming and
+// never sees a fresh launch signal; reconcileWorkflowActivity re-derives the
+// indicator from the on-disk journal when the surviving session re-registers,
+// so a re-registering session's stale blue is corrected rather than stranded
+// (issue #68). A session that fires no further hook after the restart (it went
+// idle, or its next hook is SessionEnd) is not re-derived — that residual gap
+// belongs to the authoritative session sync (#66).
 //
 // Completion vs. between-phases: a multi-phase workflow legitimately reads
 // zero running in the gap between phases (phase N's agents all finished,
@@ -836,6 +863,60 @@ export function markWorkflowActivity(sessionId) {
   slot.workflowDone = 0;
   anyWorkflowActive = true;
   scanAndAnnounceWorkflowActivity(slot, Date.now());
+}
+
+// Issue #68: workflow arming lives only in memory, so a workflow in flight when
+// the bridge restarts never re-arms — the scan never runs, the completion
+// {running: 0} is never computed, and a client's preserve-on-absence `agents`
+// value stays stuck blue forever. A session that outlives a bridge restart loses
+// its hookSessionId binding and re-registers through createExternalSession, so
+// that is where we reconcile: read the workflow journal tree from disk and set
+// the slot's authoritative `agents`, which the imminent running broadcast (and
+// the connect-time sync, which reuses sessionEventPayload) then carry to the
+// reconnecting client, overwriting whatever it latched before the restart.
+//   - LIVE journal (a workflow still in flight): re-arm the scanner so the poll
+//     tracks it to completion exactly as a fresh launch would, and seed the
+//     current running count.
+//   - STALE journal (the workflow finished or died during the downtime): set the
+//     explicit zero so the client's stale blue clears. Nothing live to track, so
+//     do not arm.
+//   - no journal tree: no workflow ran — leave `agents` absent, adding no noise
+//     to the far commoner ordinary-session registration.
+// A fresh Workflow hook that already armed this slot takes precedence (guarded).
+function reconcileWorkflowActivity(slot, now = Date.now()) {
+  if (slot.workflowActive) return;
+  const counts = scanWorkflowActivity(slot, now);
+  if (!counts) return;
+  if (now - counts.latestMtimeMs <= WORKFLOW_STALE_MS) {
+    // A workflow is in flight — re-arm so the poll tracks it to completion.
+    // Unlike markWorkflowActivity (which races the runner's first journal
+    // write), reconcile arms only AFTER scanning a live journal tree, so its
+    // workflow is observed by construction: mark it seen so that once the tree
+    // goes stale the poll broadcasts the completion zero (clearing the client)
+    // rather than giving up silently on an "observed nothing live" slot — which
+    // would strand a client that finished-during-downtime on a fresh journal.
+    slot.workflowActive = true;
+    slot.workflowActivatedAt = now;
+    slot.workflowSawRunning = true;
+    slot.workflowDone = counts.done;
+    anyWorkflowActive = true;
+    // Publish only an UNAMBIGUOUS count. running > 0 re-seeds a truthful blue.
+    // running === 0 on a live tree is indeterminate — the between-phases gap
+    // (#70) or a live journal the scan could not read (oversized / racing I/O,
+    // counts.unreadableLive) — exactly the states scanAndAnnounceWorkflowActivity
+    // refuses to broadcast. Leaving `agents` absent lets the client's
+    // preserve-on-absence hold its current value while the armed poll resolves
+    // it (running > 0 once the next phase writes, or the explicit zero once the
+    // tree goes stale); broadcasting a {running: 0} here would wrongly clear a
+    // still-live workflow's blue to green.
+    if (counts.running > 0) slot.agents = { running: counts.running, done: counts.done };
+    return;
+  }
+  // Stale tree: the workflow finished or died during the downtime (running and
+  // done are both 0 — every dir is stale and skipped from the aggregate).
+  // Broadcast the explicit zero so a client latched on a pre-restart blue
+  // clears. Nothing live to track, so do not arm.
+  slot.agents = { running: 0, done: 0 };
 }
 
 // Poll tick (exported so tests can drive it with an injectable `now` instead
@@ -1143,10 +1224,15 @@ export function getSessionsSnapshot() {
     // Additive workflow activity (issue #55): present once observed; the
     // completion state is the explicit {running: 0, done: N}.
     ...(s.agents ? { agents: s.agents } : {}),
-    // Additive: present (=true) only for hook-created (external) slots the
-    // bridge does not own; omitted for PTY slots (clients treat absent as
+    // Additive: present (=true) for slots the bridge does not own a PTY for —
+    // hook-created (external) slots AND ACP slots (Zed's process, not ours);
+    // omitted for bridge-owned PTY slots (clients treat absent as
     // external=false). Kept in lockstep with sessionEventPayload's SSE tag.
-    ...(s.hookCreated ? { external: true } : {}),
+    ...(s.hookCreated || s.kind === "acp" ? { external: true } : {}),
+    // Additive session-type discriminator + DERIVED dictatable flag (S3 #77 /
+    // S4 #78), in lockstep with sessionEventPayload (see the rationale there).
+    ...(s.kind ? { kind: s.kind } : {}),
+    ...(s.state !== "ended" && (s.ptyProcess || s.kind === "acp") ? { dictatable: true } : {}),
     // Additive turn-end flag (issue #60): present (=true) when the slot's last
     // lifecycle signal was a Stop/TaskComplete. Same lockstep obligation — a
     // REST snapshot that disagreed with the SSE snapshot about whether a
@@ -1255,6 +1341,11 @@ function createExternalSession({ source, cwd, hookSessionId, transcriptPath }) {
     // Session creation is one of the opportunistic refresh points: derive the
     // title now so the initial "running" event already carries it.
     refreshSessionTitle(slot, transcriptPath);
+    // A session re-registering after a bridge restart may have a workflow in
+    // flight (or just-finished) on disk; reconcile the indicator the client may
+    // still be holding, so the initial running broadcast below carries the
+    // truth instead of leaving a stale blue latched (issue #68).
+    reconcileWorkflowActivity(slot);
   }
   // Same moment for git metadata (the slot just got its bound root).
   refreshGitMetadata(slot);
@@ -1390,6 +1481,132 @@ export function endHookSession(body) {
   runSessionCleanupHooks(slot.id, "session-end-hook");
   pushSseEvent("session", sessionEventPayload(slot, { state: "ended", agent: slot.agent, folderName: slot.folderName, reason: "session-end" }), slot.id);
   log("info", `External session ${slot.id} ended (SessionEnd hook)`);
+  return slot.id;
+}
+
+// --- ACP sessions (watch dictation via the Zed adapter, S3 #77) --------------
+// An ACP session is hosted by the forked claude-agent-acp launched by Zed, not
+// by a PTY the bridge owns. The fork announces each session over the loopback
+// channel (see acp.js). Represented with kind "acp" + dictatable, and tagged
+// external (Zed's process, not ours → the watch offers Hide, not a fake Kill).
+//
+// Hook-twin correlation is the load-bearing part: the fork's SDK sessions also
+// fire the user's settings.json hooks (PostToolUse/Stop/…), which would
+// otherwise mint a SECOND slot for the same underlying session. Because the
+// fork sets `options.sessionId = <acp id>`, the SDK's session_id EQUALS the ACP
+// session id, so binding `hookSessionIndex[sdkSessionId] → this slot` here makes
+// every later hook resolve to this one slot — one ACP session, one bridge slot
+// — and lets the existing hook path drive its working/idle/title for free.
+//
+// ACP slots are deliberately NOT hookCreated: that flag also enrols a slot in
+// the /hooks cap eviction (evictExternalSessionIfAtCap), and an ACP session the
+// user is actively driving from Zed must never be evicted to make room for an
+// unauthenticated hook slot. `external` is derived from `kind === "acp"`
+// instead (see sessionEventPayload / getSessionsSnapshot).
+
+/** Register (or idempotently refresh) an ACP session. `sdkSessionId` is the
+ *  SDK's underlying session_id used for hook correlation; in this fork it equals
+ *  `sessionId`, but it is passed explicitly so the binding is correct even if
+ *  that ever diverges. Returns the slot. */
+export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title }) {
+  const boundSdkId = sdkSessionId || sessionId;
+  const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
+  const folderName = path.basename(resolvedCwd) || resolvedCwd;
+
+  // Belt-and-suspenders de-dup: if a settings.json hook for this SDK session
+  // raced ahead of the registration and minted an external twin under a
+  // different (random) slot id, absorb it — the ACP registration is
+  // authoritative and owns the canonical slot keyed by the ACP session id. In
+  // practice registration always precedes any hook (it fires on session
+  // creation, before the first turn ever runs), so this path is rarely taken.
+  const twinId = hookSessionIndex.get(boundSdkId);
+  if (twinId && twinId !== sessionId) {
+    const twin = sessions.get(twinId);
+    if (twin && !twin.ptyProcess) {
+      sessions.delete(twinId);
+      hookSessionIndex.delete(boundSdkId);
+      log("info", `ACP register absorbed hook-twin slot ${twinId} for ACP session ${sessionId}`);
+    }
+  }
+
+  let slot = sessions.get(sessionId);
+  if (slot) {
+    // Idempotent re-register (resume/load, or a reconnect): refresh + revive.
+    slot.agent = "claude";
+    slot.kind = "acp";
+    slot.ptyProcess = null;
+    slot.cwd = resolvedCwd;
+    slot.folderName = folderName;
+    slot.state = "running";
+    // `active` is NOT applied to a slot we already track. The initial register
+    // races the turn that starts right after it, and a stale `active: false`
+    // landing after the turn-start boundary flips a working session back to
+    // idle — an idle-looking watch mid-turn. Turn boundaries are the authority
+    // for a slot the bridge has been following; `active` only seeds a slot the
+    // bridge is meeting for the first time (below), which is the bridge-restart
+    // case it exists for.
+    //
+    // `idle` is deliberately NOT reset either. Re-registration is a re-ANNOUNCEMENT —
+    // a Zed restart, a session resume, a fork reconnect — not new work. Clearing
+    // it here told the wrist a session was working whenever the user restarted
+    // Zed, even though nothing had started; the flag only moves on a real turn
+    // boundary (`kind: "turn"`), which is the sole authority for it.
+    if (typeof title === "string" && title && !slot.title) slot.title = title;
+    slot.endedAt = undefined;
+    slot.endedAuthoritatively = false;
+  } else {
+    slot = {
+      id: sessionId,
+      agent: "claude",
+      cwd: resolvedCwd,
+      folderName,
+      ptyProcess: null,
+      state: "running",
+      createdAt: Date.now(),
+      kind: "acp",
+      // A slot rebuilt by a re-announce (bridge restart) must not claim to be
+      // working just because it is new: the fork tells us whether a turn is
+      // actually in flight. Absent (older fork) keeps the previous behaviour.
+      ...(typeof active === "boolean" ? { idle: !active } : {}),
+      // Carried on the re-announce so a bridge restart restores the title
+      // immediately: the adapter only pushes session_info_update when the title
+      // CHANGES, so without this the watch shows the raw uuid until the next
+      // turn ends.
+      ...(typeof title === "string" && title ? { title, titleIsAi: true } : {}),
+    };
+    sessions.set(sessionId, slot);
+  }
+  bindHookSession(slot, boundSdkId);
+  refreshGitMetadata(slot);
+  log("info", `Registered ACP session ${sessionId} (${folderName})`);
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, { state: "running", agent: "claude", cwd: resolvedCwd, folderName }),
+    sessionId,
+  );
+  return slot;
+}
+
+/** End an ACP session (the fork's query closed / Zed quit / connection dropped).
+ *  Authoritative — a stray later hook must not revive it. Returns the slot id or
+ *  null if unknown / already ended. */
+export function endAcpSession(sessionId, reason = "acp-closed") {
+  const slot = sessions.get(sessionId);
+  if (!slot || slot.state === "ended") return slot?.id ?? null;
+  slot.state = "ended";
+  slot.endedAt = Date.now();
+  slot.endedAuthoritatively = true;
+  if (slot.hookSessionId) {
+    hookSessionIndex.delete(slot.hookSessionId);
+    slot.hookSessionId = undefined;
+  }
+  runSessionCleanupHooks(slot.id, reason);
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, { state: "ended", agent: slot.agent, folderName: slot.folderName, reason }),
+    slot.id,
+  );
+  log("info", `ACP session ${slot.id} ended (${reason})`);
   return slot.id;
 }
 

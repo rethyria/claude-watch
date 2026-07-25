@@ -12,6 +12,18 @@ enum class TerminalLineType {
     /** Tool/PTY output text. */
     OUTPUT,
 
+    /**
+     * The agent talking, not tool noise (#79) — assistant prose from an ACP
+     * session. Rendered as speech: proportional, brightest text role, larger
+     * than the dense mono of tool output.
+     *
+     * A distinct type rather than a marker inside the text, so the renderer
+     * chooses styling from the model instead of sniffing a prefix. (The
+     * `[codex] ` prefix is a different job — it marks PROVENANCE, and rides
+     * COMMAND lines too — so it stays.)
+     */
+    PROSE,
+
     /** Meta lines: `Read Foo.kt`, `— stopped —`, session lifecycle notes. */
     SYSTEM,
 

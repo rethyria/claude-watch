@@ -91,6 +91,22 @@ data class SessionEvent(
      */
     val external: Boolean? = null,
     /**
+     * Additive session-type discriminator (issue #78): the session KIND —
+     * currently "acp" for a session hosted by the Zed ACP adapter. OMITTED
+     * (null) for bridge-owned PTY slots and hook-created slots (older clients
+     * tolerate absence). Preserve-on-absence, exactly like [external].
+     */
+    val kind: String? = null,
+    /**
+     * Additive optional flag (issue #78): `true` when the bridge can deliver a
+     * dictated prompt into this session LIVE — a bridge-owned PTY (stdin) or an
+     * ACP session (inject over the loopback channel). OMITTED (null) for a
+     * session dictation cannot reach without a detached fork. The Dictate
+     * affordance gates on THIS, NOT on `external` — an ACP session is both
+     * external AND dictatable. Preserve-on-absence, exactly like [external].
+     */
+    val dictatable: Boolean? = null,
+    /**
      * Additive optional turn-end flag (issue #60). PRESENT (=true) means the
      * bridge's LAST lifecycle signal for this session was a turn END — a
      * `Stop` or `TaskCompleted` hook. OMITTED (null) means the bridge either
@@ -154,6 +170,25 @@ data class SessionEvent(
 @Serializable
 data class PtyOutputEvent(
     val text: String,
+    override val sessionId: String? = null,
+) : BridgeEvent
+
+/**
+ * `message` — assistant prose from an ACP (Zed-hosted) session (#79). The one
+ * capability the hook channel never had: hooks carried tool activity and
+ * lifecycle, never what the agent actually said.
+ *
+ * Assistant-only by construction — the adapter emits no `user_message_chunk` —
+ * so the local echo stays the single authority for the user's own dictated
+ * text and there is nothing to de-duplicate. `role` is defaulted (tolerant:
+ * a future `user` role must not break an older build) but `text` is required:
+ * it is the entire point of the event, and a frame without it would render as
+ * an empty bubble on the wrist instead of failing loudly.
+ */
+@Serializable
+data class MessageEvent(
+    val text: String,
+    val role: String = "assistant",
     override val sessionId: String? = null,
 ) : BridgeEvent
 
@@ -382,6 +417,7 @@ object BridgeEventParser {
         "session" -> json.decodeFromString<SessionEvent>(data)
         "pty-output" -> json.decodeFromString<PtyOutputEvent>(data)
         "tool-output" -> json.decodeFromString<ToolOutputEvent>(data)
+        "message" -> json.decodeFromString<MessageEvent>(data)
         "permission-request" -> json.decodeFromString<PermissionRequestEvent>(data)
         "permission-cleared" -> json.decodeFromString<PermissionClearedEvent>(data)
         "permission-sync" -> json.decodeFromString<PermissionSyncEvent>(data)

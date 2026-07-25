@@ -8,8 +8,6 @@ import path from "node:path";
 import { log, jsonResponse, readBody } from "./util.js";
 import {
   BRIDGE_ID,
-  CLAUDE_BIN,
-  CODEX_BIN,
   CLI_CWD,
   PROTOCOL_VERSION,
   MIN_SUPPORTED_CLIENT_PROTO,
@@ -45,6 +43,7 @@ import {
 } from "./sessions.js";
 import { pendingPermissions, pendingPermissionBodies, resolvePermission } from "./permissions.js";
 import { codexSyntheticPermissions, resolveCodexSyntheticPermission } from "./codex.js";
+import { injectToAcpSession } from "./acp.js";
 
 export async function handlePair(req, res) {
   if (req.method !== "POST") {
@@ -196,90 +195,6 @@ function resolveSpawnCwd(res, requestedCwd) {
   return null;
 }
 
-// Run a dictated prompt for a session the bridge owns no PTY for (external
-// hook-created sessions): invoke the agent CLI headlessly in the session's
-// cwd and stream its output as pty-output events. Used both when the client
-// names such a session explicitly and when the no-session-id fallback selects
-// one — the session's own id attributes the output, never the request's.
-function runHeadlessPrompt(res, targetSession, command) {
-  const targetSessionId = targetSession.id;
-  const promptText = command.replace(/\n$/, "").trim();
-  if (!promptText) {
-    return jsonResponse(res, 400, { error: "Empty command" });
-  }
-
-  const bin = targetSession.agent === "codex" ? CODEX_BIN : CLAUDE_BIN;
-  if (!bin) {
-    return jsonResponse(res, 500, { error: `No binary found for ${targetSession.agent}` });
-  }
-
-  const args = targetSession.agent === "codex"
-    ? ["exec", promptText]
-    : ["-p", promptText, "--continue"];
-
-  log("info", `Running ${targetSession.agent} prompt in ${targetSession.cwd}: "${promptText.slice(0, 80)}"`);
-
-  targetSession.state = "running";
-  // A dictated prompt starts real work on a slot that was very likely idle
-  // (that is why the user is dictating at it): clear the turn-end flag now, so
-  // a watch reconnecting mid-run sees it green rather than grey (issue #60).
-  // The agent's own output will keep it cleared.
-  targetSession.idle = false;
-  // Built through sessionEventPayload like every other session push: this used
-  // to be the one hand-rolled payload in the bridge, which silently dropped
-  // `title`/`external`/`branch` (and would have dropped `idle`) from an event
-  // clients treat as an ordinary idempotent refresh. Uniformity by
-  // construction, not by the accident of a nearby assignment.
-  pushSseEvent(
-    "session",
-    sessionEventPayload(targetSession, {
-      state: "running",
-      agent: targetSession.agent,
-      cwd: targetSession.cwd,
-      folderName: targetSession.folderName,
-    }),
-    targetSessionId,
-  );
-
-  const proc = childSpawn(bin, args, {
-    cwd: targetSession.cwd,
-    env: { ...process.env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  proc.stdout.on("data", (data) => {
-    const text = data.toString().trim();
-    if (text) pushSseEvent("pty-output", { text }, targetSessionId);
-  });
-  proc.stderr.on("data", (data) => {
-    const text = data.toString().trim();
-    if (text && !text.includes("tcgetattr")) {
-      pushSseEvent("pty-output", { text }, targetSessionId);
-    }
-  });
-  // A finished headless run is a turn END, and it is the ONLY turn-end signal
-  // this slot will ever get for it: we spawn the RAW agent binary here, not the
-  // codex-watch wrapper, so nothing POSTs /hooks/stop on our behalf (and a
-  // `claude -p --continue` that reports a fresh session_id gets its hooks
-  // attributed to a different slot entirely). Without this the idle=false set
-  // above is permanent, and one dictated prompt pins the session "working"
-  // forever — re-creating issue #60's green-when-idle symptom on the very slot
-  // the flag was added to keep honest. Setting it never broadcasts; it rides
-  // the next session event, snapshots included (see sessions.js).
-  proc.on("close", (exitCode) => {
-    log("info", `Prompt process exited (code ${exitCode}) for session ${targetSessionId}`);
-    markSessionIdle(targetSessionId);
-  });
-  proc.on("error", (err) => {
-    // Spawn/exec failure: no output, no hooks, no run — the slot is doing even
-    // less than idle, and must not be left claiming otherwise.
-    log("error", `Prompt process error for session ${targetSessionId}: ${err.message}`);
-    markSessionIdle(targetSessionId);
-  });
-
-  return jsonResponse(res, 200, { ok: true, sessionId: targetSessionId, agent: targetSession.agent, prompt: true });
-}
-
 export async function handleCommand(req, res) {
   if (req.method !== "POST") {
     return jsonResponse(res, 405, { error: "Method not allowed" });
@@ -388,12 +303,49 @@ export async function handleCommand(req, res) {
       targetSession = findMostRecentActiveSession() || findMostRecentRunningSession();
     }
 
-    // Session exists but has no PTY (external hook-created session) — whether
-    // it was named explicitly or selected by the no-session-id fallback. Run
-    // the prompt via CLI in non-interactive mode; hooks will forward output.
-    // (Injecting into targetSession.ptyProcess here would dereference null.)
+    // ACP session (issue #77): hosted by Zed's forked adapter, not a PTY we own
+    // and not a headless fork. Dictation is delivered into the LIVE session over
+    // the loopback channel — the fork's injectUserPrompt wakes it if idle. No
+    // detached `claude -p` (that corrupts the tree); a fork that is not
+    // connected is surfaced honestly so the wear side keeps the text as a draft.
+    if (targetSession && targetSession.kind === "acp") {
+      const promptText = command.replace(/\n$/, "").trim();
+      if (!promptText) return jsonResponse(res, 400, { error: "Empty command" });
+      if (!injectToAcpSession(targetSession.id, promptText, "watch")) {
+        return jsonResponse(res, 502, {
+          error: "ACP session is not reachable (its Zed adapter is not connected); dictation not delivered",
+          sessionId: targetSession.id,
+        });
+      }
+      // The injected turn's working/idle rides the settings.json hooks the SDK
+      // fires, which resolve to this same slot (hook-twin correlation).
+      return jsonResponse(res, 200, { ok: true, sessionId: targetSession.id, agent: targetSession.agent, prompt: true });
+    }
+
+    // Session exists but has no PTY, and it is not ACP — so the bridge owns no
+    // input channel into it at all (issue #69 / #81). This used to run
+    // `claude -p "<text>" --continue`: a DETACHED headless fork of the live
+    // session, concurrently editing the same working tree. A control that
+    // claimed to talk to the session actually spawned a second, invisible
+    // editor. Refuse honestly instead — the same honesty class as #53's
+    // fake-kill, and the reason the watch gates its Dictate affordance on
+    // `dictatable` rather than on `external`.
+    //
+    // The two refusals are distinguished deliberately: a bridge-SPAWNED session
+    // that has merely ended has the same PTY-less shape as an external one, and
+    // must not be mislabeled as a session the bridge does not own.
     if (targetSession && !targetSession.ptyProcess) {
-      return runHeadlessPrompt(res, targetSession, command);
+      if (targetSession.state === "ended") {
+        return jsonResponse(res, 409, {
+          error: `Session ${targetSession.id} has ended; command not injected`,
+          sessionId: targetSession.id,
+        });
+      }
+      return jsonResponse(res, 409, {
+        error: `Session ${targetSession.id} is an external session the bridge does not own; dictation is unavailable`,
+        sessionId: targetSession.id,
+        external: true,
+      });
     }
 
     if (!targetSession) {

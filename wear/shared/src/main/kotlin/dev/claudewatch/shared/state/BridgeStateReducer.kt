@@ -21,6 +21,7 @@ import dev.claudewatch.shared.protocol.NotificationEvent
 import dev.claudewatch.shared.protocol.PermissionClearedEvent
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
 import dev.claudewatch.shared.protocol.PermissionSyncEvent
+import dev.claudewatch.shared.protocol.MessageEvent
 import dev.claudewatch.shared.protocol.PtyOutputEvent
 import dev.claudewatch.shared.protocol.SessionEvent
 import dev.claudewatch.shared.protocol.SessionRunState
@@ -61,6 +62,20 @@ data class SessionState(
      * flag and default to false (killable). Additive wire field (issue #53).
      */
     val external: Boolean = false,
+    /**
+     * Session-type discriminator (additive wire field, issue #78): "acp" for a
+     * session hosted by the Zed ACP adapter; null for bridge-owned PTY and
+     * hook-created slots. Preserve-on-absence, exactly like [external].
+     */
+    val kind: String? = null,
+    /**
+     * True when the bridge can deliver a dictated prompt into this session LIVE
+     * — a bridge-owned PTY (stdin) or an ACP session (inject). The Dictate
+     * affordance gates on THIS, NOT on !external (an ACP session is both
+     * external and dictatable). Additive wire field (issue #78);
+     * preserve-on-absence, exactly like [external].
+     */
+    val dictatable: Boolean = false,
     /**
      * Git branch of the session's project root (additive wire field, issue
      * #54); null until the bridge reports one (non-git root, older bridge).
@@ -226,6 +241,17 @@ object BridgeEventReducer {
             ToolOutputFormatter.format(event),
             clearThinking = true,
         )
+        // Assistant prose from an ACP session (#79) — the agent talking, not
+        // tool noise. Same activity semantics as any other output: it restarts
+        // the elapsed span and lowers the thinking cursor. Rendered as OUTPUT
+        // for now, so prose and tool text share a colour role; giving prose its
+        // own role is a UI change, not a reducer one.
+        is MessageEvent -> appendTerminal(
+            markWorking(state, event.sessionId, nowMs),
+            event.sessionId,
+            listOf(TerminalLine(event.text, TerminalLineType.PROSE)),
+            clearThinking = true,
+        )
         // Keyed replace: connect-time snapshots re-send pending prompts, and
         // that must not stack duplicates.
         is PermissionRequestEvent -> state.copy(
@@ -343,6 +369,13 @@ object BridgeEventReducer {
                     // older bridge) must not erase a known external flag — same
                     // preserve-on-resend rule as folderName/title.
                     external = event.external ?: existing.external,
+                    // Session kind + dictatable (issue #78) follow the same
+                    // preserve-on-absence rule as external: the bridge carries
+                    // them on every event of a slot that has them, and a
+                    // payload without either (older bridge, or a slot that
+                    // never had them) must not erase what we knew.
+                    kind = event.kind ?: existing.kind,
+                    dictatable = event.dictatable ?: existing.dictatable,
                     // Git metadata (issue #54) is ONE atomic group keyed on
                     // branch presence: whenever the bridge derives any git
                     // metadata it always sends branch, and worktree/repoRoot
@@ -384,7 +417,21 @@ object BridgeEventReducer {
                     // absence stays preserve-on-absence, exactly as it was, and
                     // live `stop`/output events remain the authority for
                     // everything else.
-                    if (event.idle == true) idled(known, nowMs) else known
+                    // An EXPLICIT `false` is a different statement from absence
+                    // and does wake the session (#79). Absence means "I am not
+                    // telling you" — every routine reconnect snapshot says that,
+                    // which is why waking on it would restart the elapsed clock
+                    // constantly. A present `false` means "I know a turn just
+                    // started", which the bridge sends only on a turn-start
+                    // boundary. ACP sessions need it: their prose is coalesced
+                    // to turn end, so no mid-turn event exists to wake the
+                    // session, and without this the wrist showed idle for the
+                    // whole of every turn.
+                    when (event.idle) {
+                        true -> idled(known, nowMs)
+                        false -> working(known, nowMs)
+                        null -> known
+                    }
                 } ?: SessionState(
                     sessionId = id,
                     agent = event.agent,
@@ -392,6 +439,20 @@ object BridgeEventReducer {
                     folderName = event.folderName,
                     title = event.title,
                     external = event.external ?: false,
+                    kind = event.kind,
+                    // Backward-compat default (issue #78). Absent means "the
+                    // bridge did not say", which we read as dictatable UNLESS we
+                    // positively know this is an unreachable external session. A
+                    // NEW bridge sends dictatable:true EXPLICITLY for the reachable
+                    // kinds (its own PTY, ACP inject) — so an ACP external session
+                    // resolves true here and the pill, which gates on THIS resolved
+                    // value, still shows for it — and omits it for hook sessions
+                    // (external → false). An OLD bridge that never sends the flag
+                    // keeps PTY dictation working (non-external → true) instead of
+                    // losing the Dictate affordance on every session. NOTE: this is
+                    // a default for ABSENCE only; the gate itself reads `dictatable`,
+                    // never `external`.
+                    dictatable = event.dictatable ?: (event.external != true),
                     branch = event.branch,
                     worktree = event.worktree ?: false,
                     repoRoot = event.repoRoot,
@@ -453,6 +514,21 @@ object BridgeEventReducer {
             )
         }
 
+    /** The mirror of [idled]: a turn started, so the elapsed clock runs again.
+     *  Idempotent — an already-WORKING session keeps its existing span rather
+     *  than restarting it, so a repeated `idle: false` cannot inflate the
+     *  clock. */
+    private fun working(session: SessionState, nowMs: Long): SessionState =
+        if (session.activity == SessionActivity.WORKING) {
+            session
+        } else {
+            session.copy(
+                activity = SessionActivity.WORKING,
+                activeSinceMs = nowMs,
+                frozenElapsedMs = null,
+            )
+        }
+
     private fun markIdle(state: BridgeState, sessionId: String?, nowMs: Long): BridgeState {
         val session = sessionId?.let { state.sessions[it] } ?: return state
         val next = idled(session, nowMs)
@@ -480,6 +556,7 @@ object BridgeEventReducer {
         is PtyOutputEvent -> "pty-output ${event.text.take(PTY_LOG_CHARS)}"
         is ToolOutputEvent ->
             listOfNotNull("tool-output", event.toolName, event.toolOutputText).joinToString(" ")
+        is MessageEvent -> "message ${event.role} ${event.text.take(PTY_LOG_CHARS)}"
         is PermissionRequestEvent -> "permission-request ${event.toolName ?: "?"} (${event.permissionId})"
         is PermissionClearedEvent ->
             "permission-cleared ${event.permissionId}${event.reason?.let { " ($it)" } ?: ""}"

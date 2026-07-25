@@ -14,6 +14,13 @@ object WatchTheme {
     val TextSecondary = Color(0xFF9E9E9E)
     val Command = Color.White
 
+    /**
+     * Brightest content role, for assistant prose — the analogue of the Halo
+     * palette's TextPrimary. Same value as [Command] today, but a separate
+     * token: they are different roles and only coincidentally the same colour.
+     */
+    val TextPrimary = Color.White
+
     /** Text-input backdrop (matches the control page's field styling). */
     val FieldBackground = Color(0xFF202020)
 
@@ -21,6 +28,8 @@ object WatchTheme {
     fun colorFor(line: TerminalLine): Color = when (line.type) {
         TerminalLineType.OUTPUT ->
             if (line.text.startsWith("+ ") || line.text.startsWith("  + ")) Success else ClaudeOrange
+        // The agent talking: brightest text role, like any other content line.
+        TerminalLineType.PROSE -> TextPrimary
         TerminalLineType.COMMAND -> Command
         TerminalLineType.SYSTEM -> TextSecondary
         TerminalLineType.ERROR -> Error

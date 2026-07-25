@@ -3,6 +3,7 @@ package dev.claudewatch.wear
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -11,6 +12,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -24,6 +26,7 @@ import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -142,11 +145,46 @@ class DictationFlowTest {
 
     /** Home → all-sessions list → s-1's feed, where the Dictate pill lives. */
     private fun openFeedAndDictate() {
+        openFeed("s-1")
+        compose.onNodeWithTag("haloDictate").assertIsDisplayed().performClick()
+    }
+
+    /** Home → all-sessions list → the named session's feed (no dictation). */
+    private fun openFeed(sessionId: String) {
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
         compose.waitForIdle()
-        compose.onNodeWithTag("haloRow-s-1").performScrollTo().performClick()
+        compose.onNodeWithTag("haloRow-$sessionId").performScrollTo().performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("haloDictate").assertIsDisplayed().performClick()
+    }
+
+    /** Pair and stream one running session described by [sessionData], waiting
+     *  until it is present in bridge state. */
+    private fun pairStreamingSession(sessionData: String, awaitId: String) {
+        server.enqueue(
+            MockResponse().setBody("""{"proto":"3","bridgeId":"b-1","machineName":"m"}"""),
+        )
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append("data: $sessionData")
+            append("\n\n")
+            append(":pad\n\n".repeat(10_000))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(512, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        compose.waitUntil(30_000) { viewModel.state.value.bridge.sessions.containsKey(awaitId) }
+        compose.waitUntil(30_000) { viewModel.state.value.status == "paired, stream open" }
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
     }
 
     private fun waitForNode(tag: String, substring: String? = null, timeoutMs: Long = 30_000) {
@@ -247,6 +285,84 @@ class DictationFlowTest {
         compose.waitUntil(30_000) { nodeCount("haloVoice") == 0 }
         assertEquals("> $recognized", terminalLines("s-1").last())
         compose.onNodeWithText("> $recognized").assertIsDisplayed()
+    }
+
+    /**
+     * Issue #78: an ACP session is EXTERNAL (Zed's process — the row offers
+     * Hide, not a fake Kill) yet still DICTATABLE. The Dictate pill gates on
+     * `dictatable`, not on `!external`, so it must show here.
+     */
+    @Test
+    fun anAcpSessionIsDictatableDespiteBeingExternal() {
+        setAppContent()
+        pairStreamingSession(
+            """{"state":"running","agent":"claude","cwd":"/tmp/acp","folderName":"acp","external":true,"kind":"acp","dictatable":true,"sessionId":"s-acp"}""",
+            "s-acp",
+        )
+        openFeed("s-acp")
+
+        compose.onNodeWithTag("haloDictate").assertIsDisplayed()
+        assertEquals("a dictatable session shows no 'unavailable' affordance", 0, nodeCount("haloDictateUnavailable"))
+    }
+
+    /**
+     * Issue #78: a session the bridge cannot reach live (a PTY-less external
+     * hook session — external:true, no dictatable) shows the honest
+     * "unavailable" affordance instead of a Dictate pill that would do nothing,
+     * and no command can be sent to it.
+     */
+    @Test
+    fun aNonDictatableSessionShowsTheHonestUnavailableAffordance() {
+        setAppContent()
+        pairStreamingSession(
+            """{"state":"running","agent":"claude","cwd":"/tmp/ext","folderName":"ext","external":true,"sessionId":"s-ext"}""",
+            "s-ext",
+        )
+        openFeed("s-ext")
+
+        waitForNode("haloDictateUnavailable")
+        compose.onNodeWithTag("haloDictateUnavailable").assertIsDisplayed()
+        assertEquals("no Dictate pill on a non-dictatable session", 0, nodeCount("haloDictate"))
+        assertNull("a non-dictatable session sends nothing", server.takeRequest(1, TimeUnit.SECONDS))
+    }
+
+    /**
+     * Issue #78 / #53, through HaloSessionList: an ACP session is external
+     * (Zed's process, not one the bridge owns), so its row's trailing quick
+     * action must HIDE it (⊘ "hide" → onHide, local) — never a fake Kill (✕
+     * "close") that pretends to stop a process the bridge cannot. Drives the
+     * real list row: swipe to reveal the action strip and assert the label.
+     */
+    @Test
+    fun anAcpRowOffersHideNotAFakeKill() {
+        setAppContent()
+        pairStreamingSession(
+            """{"state":"running","agent":"claude","cwd":"/tmp/acp","folderName":"acp","external":true,"kind":"acp","dictatable":true,"sessionId":"s-acp"}""",
+            "s-acp",
+        )
+        // All-sessions list, then swipe the ACP row to reveal its action strip.
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloRow-s-acp").performScrollTo().performTouchInput { swipeLeft() }
+        compose.waitForIdle()
+
+        waitForNode("haloRowClose")
+        // The trailing action is the honest Hide, scoped to the ACP row.
+        compose.onNode(
+            hasTestTag("haloRowClose") and
+                hasAnyAncestor(hasTestTag("haloRow-s-acp")) and
+                hasText("hide", substring = true),
+        ).assertIsDisplayed()
+        // …and never the fake Kill.
+        assertEquals(
+            "an ACP row must not offer a fake Kill",
+            0,
+            compose.onAllNodes(
+                hasTestTag("haloRowClose") and
+                    hasAnyAncestor(hasTestTag("haloRow-s-acp")) and
+                    hasText("close", substring = true),
+            ).fetchSemanticsNodes().size,
+        )
     }
 
     @Test
