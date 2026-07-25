@@ -73,8 +73,9 @@ Guarded set: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
 the switches above, and failing on them would false-positive on any machine with the AWS CLI set up.
 
 ## `dist/` is what actually runs, and it is not tracked
-`.gitignore` excludes `dist/`, so it is only ever whatever this machine last compiled — a fresh
-clone cannot launch the adapter until `npm ci && npm run build`. An edit to `src/` with no rebuild
+`.gitignore` excludes `dist/`, so it is only ever whatever this machine last compiled. A fresh
+clone gets one from the `prepare` script — npm runs it on install, so **`npm ci` alone is
+enough** (#82); there is no separate build step to remember. An edit to `src/` with no rebuild
 used to be a **silent no-op** (Zed keeps running the old adapter). The launcher now refuses to start
 when any of `src/`, `tsconfig.json` or `package.json` is newer than `dist/index.js`:
 

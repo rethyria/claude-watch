@@ -29,16 +29,21 @@ fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # dist/ is what actually runs (it is .gitignore'd and NOT tracked, so it is only
-# ever whatever this machine last compiled). An edit to src/ with no rebuild is a
-# SILENT no-op: Zed keeps running the old adapter and you debug code that isn't
-# executing. Refuse instead — deliberately not an auto-build, because putting tsc
-# in Zed's agent-launch path trades a loud failure for a slow, flaky one.
+# ever whatever this machine last compiled). A fresh clone gets one from the
+# `prepare` script — npm runs it on install, so `npm ci` is enough (#82).
+#
+# An edit to src/ with no rebuild is a SILENT no-op: Zed keeps running the old
+# adapter and you debug code that isn't executing. Refuse instead — deliberately
+# not an auto-build, because putting tsc in Zed's agent-launch path trades a
+# loud failure for a slow, flaky one. Note the refusal only covers LAUNCH: a
+# rebuild while Zed is already running cannot be caught here, because the
+# running process does not reload. Restart Zed after rebuilding.
 # Escape hatch: CLAUDE_WATCH_SKIP_BUILD_CHECK=1.
 DIST_ENTRY="$HERE/dist/index.js"
 if [ -z "${CLAUDE_WATCH_SKIP_BUILD_CHECK:-}" ]; then
   if [ ! -f "$DIST_ENTRY" ]; then
     echo "claude-watch-acp: dist/ is missing — the adapter has never been built here." >&2
-    echo "  Build it:  (cd '$HERE' && npm ci && npm run build)" >&2
+    echo "  Build it:  (cd '$HERE' && npm ci)   # the prepare script builds dist/" >&2
     exit 70
   fi
   # -print -quit stops at the first offender, so this stays O(1)-ish on a warm FS.
