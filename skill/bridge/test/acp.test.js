@@ -565,3 +565,97 @@ test("a re-announced session with no turn in flight is idle, not working (#79)",
   });
   assert.equal((await statusEntry(bridge, token, "acp-busy")).idle, undefined);
 });
+
+// --- ACP permissions on the wrist (#80) -------------------------------------
+// The fork mirrors its `requestPermission` RPC here. Zed shows its own prompt
+// regardless; this raises the SAME decision on the watch so it can be answered
+// from the wrist, and whichever surface answers first wins.
+test("an ACP permission request raises a watch prompt (#80)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "perm");
+
+  const inbox = connectInbox(bridge, "conn-perm");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-perm", sessionId: "acp-perm", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-perm");
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-perm",
+      sessionId: "acp-perm",
+      kind: "permission",
+      payload: {
+        sessionId: "acp-perm",
+        toolCall: { toolCallId: "tc-1", title: "Bash", rawInput: { command: "rm -rf build" } },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" },
+        ],
+      },
+    },
+  });
+
+  const ev = await sse.waitFor((e) => e.event === "permission-request" && e.parsed?.sessionId === "acp-perm");
+  assert.ok(ev.parsed.permissionId, "the prompt must carry a permissionId the watch can answer with");
+  assert.equal(ev.parsed.tool_name, "Bash");
+  assert.deepEqual(ev.parsed.tool_input, { command: "rm -rf build" });
+  // Canonical machine-readable semantics, never inferred from label wording.
+  assert.deepEqual(
+    ev.parsed.options.map((o) => o.behavior),
+    ["allow", "deny"],
+  );
+});
+
+// The wrist answer has to reach the agent, and the only downlink to the fork is
+// the inbox SSE. The decision names the ACP optionId the AGENT offered, not one
+// synthesised from the behavior — the agent owns its own option vocabulary.
+test("answering an ACP prompt on the watch sends the decision down the fork's inbox (#80)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "permans");
+
+  const inbox = connectInbox(bridge, "conn-permans");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-permans", sessionId: "acp-permans", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-permans");
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-permans",
+      sessionId: "acp-permans",
+      kind: "permission",
+      payload: {
+        sessionId: "acp-permans",
+        toolCall: { toolCallId: "tc-9", title: "Bash", rawInput: { command: "ls" } },
+        options: [
+          { optionId: "zed-allow", name: "Allow", kind: "allow_once" },
+          { optionId: "zed-reject", name: "Reject", kind: "reject_once" },
+        ],
+      },
+    },
+  });
+
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+
+  const answer = await request(bridge.port, "POST", "/command", {
+    token,
+    body: { permissionId: prompt.parsed.permissionId, decision: { behavior: "allow" } },
+  });
+  assert.equal(answer.status, 200);
+
+  const frame = await inbox.waitFor((e) => e.event === "permission-decision");
+  assert.equal(frame.parsed.toolCallId, "tc-9");
+  assert.equal(frame.parsed.optionId, "zed-allow", "must name the agent's own optionId");
+  assert.equal(frame.parsed.behavior, "allow");
+});

@@ -19,7 +19,9 @@ import {
   registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
 } from "./sessions.js";
 import { ACP_INBOX_HEARTBEAT_MS } from "./config.js";
-import { pushSseEvent } from "./transport-sse.js";
+import { waitForPermission, canonicalPermissionOptions } from "./permissions.js";
+import crypto from "node:crypto";
+import { pushSseEvent, sseClients } from "./transport-sse.js";
 
 /** Live fork inboxes: connectionId -> { res, heartbeat }. The held SSE response
  *  the bridge writes `inject` frames to. */
@@ -31,6 +33,9 @@ const sessionConnection = new Map();
  *  Flushed as ONE `message` event at a turn boundary or a pause (see
  *  flushProse), never per delta. */
 const proseBuffers = new Map();
+/** ACP toolCallId -> the bridge permissionId raised for it (#80), so a request
+ *  answered in Zed can retract the wrist prompt for the SAME tool call. */
+const acpPermissionsByToolCall = new Map();
 /** Hard cap so a pathological turn cannot grow the buffer without bound; the
  *  wrist cannot read more than this anyway. */
 const PROSE_BUFFER_MAX = 4000;
@@ -173,8 +178,11 @@ export async function handleAcpUpdate(req, res) {
 
   // A permission request is a PAUSE, not a turn end: the turn is still open but
   // the user has to answer, so flush what led up to it (#79, the workflow-pause
-  // case). The prompt itself is #80.
-  if (body.kind === "permission" && sessions.has(sessionId)) flushProse(sessionId);
+  // case) and then raise the prompt on the wrist (#80).
+  if (body.kind === "permission" && sessions.has(sessionId)) {
+    flushProse(sessionId);
+    raiseAcpPermission(sessionId, body.payload);
+  }
 
   return jsonResponse(res, 200, { ok: true });
 }
@@ -189,6 +197,86 @@ function flushProse(sessionId) {
   proseBuffers.delete(sessionId);
   if (!text) return;
   pushSseEvent("message", { role: "assistant", text: text.slice(-PROSE_BUFFER_MAX).trim() }, sessionId);
+}
+
+/** Write one SSE frame down the owning fork's inbox. The single place that
+ *  touches the downlink, so dictation (#78) and permission decisions (#80)
+ *  cannot drift apart in framing or error handling. Returns false when the
+ *  session is unknown or its fork has no live inbox. */
+function writeAcpFrame(sessionId, event, data) {
+  const connectionId = sessionConnection.get(sessionId);
+  if (!connectionId) return false;
+  const inbox = acpInboxes.get(connectionId);
+  if (!inbox) return false;
+  try {
+    inbox.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/** Map an ACP option's `kind` onto the bridge's machine-readable behavior. The
+ *  /v1 contract is explicit that clients must never infer approve/deny from a
+ *  label's wording or an option's position, so an unmappable kind is dropped
+ *  rather than guessed at. */
+function behaviorForAcpOption(option) {
+  switch (option?.kind) {
+    case "allow_always": return "allow-always";
+    case "allow_once": return "allow";
+    case "reject_once":
+    case "reject_always": return "deny";
+    default: return null;
+  }
+}
+
+/** Raise an ACP permission request on the wrist (#80) and, once answered, send
+ *  the decision back down the fork's inbox.
+ *
+ *  Zed shows its own prompt for the same request no matter what we do, so this
+ *  is a SECOND surface for one decision, not the only one — whichever answers
+ *  first wins and the fork drops the loser. With no watch connected nobody can
+ *  answer here, so we do not raise at all: a prompt nobody sees would just sit
+ *  until it expired while the user answered in Zed anyway. */
+function raiseAcpPermission(sessionId, payload) {
+  if (sseClients.size === 0) return;
+  const toolCallId = payload?.toolCall?.toolCallId;
+  if (!toolCallId) return;
+
+  const options = [];
+  for (const option of payload?.options ?? []) {
+    const behavior = behaviorForAcpOption(option);
+    if (behavior) options.push({ behavior, label: String(option.name ?? ""), optionId: option.optionId });
+  }
+  if (options.length === 0) return; // nothing answerable — leave it to Zed
+
+  const permissionId = crypto.randomUUID();
+  acpPermissionsByToolCall.set(toolCallId, permissionId);
+  const eventPayload = {
+    permissionId,
+    sessionId,
+    tool_name: payload?.toolCall?.title ?? "tool",
+    tool_input: payload?.toolCall?.rawInput ?? null,
+    options: canonicalPermissionOptions(options.map(({ behavior, label }) => ({ behavior, label }))),
+  };
+  // Carry the ACP optionIds alongside, so the decision we send back names the
+  // option the AGENT offered rather than one we invented from its behavior.
+  const optionIdByBehavior = new Map(options.map((o) => [o.behavior, o.optionId]));
+
+  log("info", `ACP permission ${permissionId} raised on the wrist (session ${sessionId}, tool ${eventPayload.tool_name})`);
+  const decision = waitForPermission(permissionId, { sessionId, payload: eventPayload });
+  pushSseEvent("permission-request", eventPayload, sessionId);
+
+  void decision.then((answer) => {
+    acpPermissionsByToolCall.delete(toolCallId);
+    // A no-decision (expiry, or the prompt voided) is NOT an answer: say
+    // nothing and let Zed's own prompt keep the decision, exactly as the hook
+    // path does. Fabricating a deny here would cancel the dialog on screen.
+    if (!answer || answer.noDecision) return;
+    const optionId = optionIdByBehavior.get(answer.behavior);
+    if (!optionId) return;
+    writeAcpFrame(sessionId, "permission-decision", { sessionId, toolCallId, optionId, behavior: answer.behavior });
+  });
 }
 
 /** Re-announce an ACP slot as one idempotent `session` running event. The
@@ -296,12 +384,7 @@ export function injectToAcpSession(sessionId, text, source = "watch") {
   if (!connectionId) return false;
   const inbox = acpInboxes.get(connectionId);
   if (!inbox) return false;
-  const frame = `event: inject\ndata: ${JSON.stringify({ sessionId, text, source })}\n\n`;
-  try {
-    inbox.res.write(frame);
-  } catch {
-    return false;
-  }
+  if (!writeAcpFrame(sessionId, "inject", { sessionId, text, source })) return false;
   log("info", `Dictated prompt routed to ACP session ${sessionId} (${text.length} chars)`);
   return true;
 }
