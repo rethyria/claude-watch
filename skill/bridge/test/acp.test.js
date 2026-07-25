@@ -501,3 +501,36 @@ test("ACP session_info_update sets the slot title and announces it (#79)", { tim
   assert.equal(ev.parsed.title, "Fix the flaky auth tests");
   assert.equal((await statusEntry(bridge, token, "acp-title")).title, "Fix the flaky auth tests");
 });
+
+// Re-registration happens on every Zed restart / session resume and on every
+// fork reconnect. It is a re-ANNOUNCEMENT, not new work: an idle session that
+// gets re-announced has not started a turn, so forcing it back to "working"
+// left the wrist showing green for a session where nothing was happening.
+test("re-registering an idle ACP session does not resurrect it as working (#79)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "reannounce");
+
+  const inbox = connectInbox(bridge, "conn-reann");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-reann", sessionId: "acp-reann", cwd });
+
+  // A turn runs and ends: the slot is idle.
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-reann", sessionId: "acp-reann", kind: "turn",
+      payload: { phase: "end", stopReason: "end_turn" },
+    },
+  });
+  assert.equal((await statusEntry(bridge, token, "acp-reann")).idle, true);
+
+  // Zed restarts: the fork reconnects and re-announces the same session.
+  await registerAcp(bridge, { connection: "conn-reann2", sessionId: "acp-reann", cwd });
+
+  assert.equal(
+    (await statusEntry(bridge, token, "acp-reann")).idle,
+    true,
+    "a re-announced idle session must stay idle — nothing started",
+  );
+});

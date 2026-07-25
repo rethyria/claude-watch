@@ -1537,7 +1537,11 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd }) {
     slot.cwd = resolvedCwd;
     slot.folderName = folderName;
     slot.state = "running";
-    slot.idle = false;
+    // `idle` is deliberately NOT reset. Re-registration is a re-ANNOUNCEMENT —
+    // a Zed restart, a session resume, a fork reconnect — not new work. Clearing
+    // it here told the wrist a session was working whenever the user restarted
+    // Zed, even though nothing had started; the flag only moves on a real turn
+    // boundary (`kind: "turn"`), which is the sole authority for it.
     slot.endedAt = undefined;
     slot.endedAuthoritatively = false;
   } else {
