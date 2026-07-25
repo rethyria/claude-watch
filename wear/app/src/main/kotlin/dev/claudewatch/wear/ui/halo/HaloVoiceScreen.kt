@@ -124,7 +124,7 @@ fun HaloVoiceScreen(
                 Text(
                     text = "to $targetSessionTitle",
                     fontSize = Halo.Type.Min,
-                    color = Halo.Palette.TextFaint,
+                    color = Halo.Palette.TextSecondary,
                     textAlign = TextAlign.Center,
                     maxLines = 1,
                 )
@@ -167,7 +167,7 @@ fun HaloVoiceScreen(
                 Text(
                     text = ui.commandError,
                     fontSize = Halo.Type.Min,
-                    color = Halo.Palette.TextFaint,
+                    color = Halo.Palette.TextSecondary,
                     textAlign = TextAlign.Center,
                     maxLines = 2,
                 )

@@ -166,7 +166,7 @@ fun HaloSessionList(
                 Text(
                     text = "no sessions",
                     fontSize = Halo.Type.Body,
-                    color = Halo.Palette.TextFaint,
+                    color = Halo.Palette.TextSecondary,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth().padding(top = 18.dp),
                 )
@@ -233,7 +233,7 @@ private fun SpawnRow(onSpawn: () -> Unit) {
         Text(
             text = "+ new claude session",
             fontSize = Halo.Type.Caption,
-            color = Halo.Palette.TextFaint,
+            color = Halo.Palette.TextSecondary,
             textAlign = TextAlign.Center,
         )
     }
@@ -363,7 +363,7 @@ private fun RowContent(session: HaloSession, waiting: Boolean) {
             Text(
                 text = statusLabel(session.state),
                 fontSize = Halo.Type.Min,
-                color = if (waiting) Halo.Palette.WaitingForYou else Halo.Palette.TextFaint,
+                color = if (waiting) Halo.Palette.WaitingForYou else Halo.Palette.TextSecondary,
                 maxLines = 1,
             )
             // ⎇ branch (· wt for a worktree) — issue #54. Absent branch =
@@ -373,7 +373,7 @@ private fun RowContent(session: HaloSession, waiting: Boolean) {
                 Text(
                     text = label,
                     fontSize = Halo.Type.Min,
-                    color = Halo.Palette.TextFaint,
+                    color = Halo.Palette.TextSecondary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )

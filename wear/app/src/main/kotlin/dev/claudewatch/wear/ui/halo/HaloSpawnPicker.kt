@@ -117,7 +117,7 @@ fun HaloSpawnPicker(
             Text(
                 text = "↓ cancel",
                 fontSize = Halo.Type.Min,
-                color = Halo.Palette.TextFaint,
+                color = Halo.Palette.TextSecondary,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
@@ -155,7 +155,7 @@ private fun SpawnTargetRow(
         Text(
             text = subtitle,
             fontSize = Halo.Type.Min,
-            color = Halo.Palette.TextFaint,
+            color = Halo.Palette.TextSecondary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
