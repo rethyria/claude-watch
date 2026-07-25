@@ -11257,6 +11257,7 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
     const registers: any[] = [];
     const deregisters: any[] = [];
     const updates: any[] = [];
+    const inboxConnects: number[] = [];
     let inboxRes: http.ServerResponse | null = null;
 
     const server = http.createServer((req, res) => {
@@ -11265,6 +11266,7 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.write(":connected\n\n");
         inboxRes = res;
+        inboxConnects.push(Date.now());
         return;
       }
       let raw = "";
@@ -11284,7 +11286,9 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       registers: any[];
       deregisters: any[];
       updates: any[];
+      inboxConnects: number[];
       pushInject: (data: unknown) => void;
+      dropInbox: () => void;
       close: () => void;
     }>((resolve) => {
       server.listen(0, "127.0.0.1", () => {
@@ -11294,7 +11298,14 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
           registers,
           deregisters,
           updates,
+          inboxConnects,
           pushInject: (data) => inboxRes?.write(`event: inject\ndata: ${JSON.stringify(data)}\n\n`),
+          // Kill the SSE without stopping the server: models a bridge restart
+          // from the fork's point of view (the downlink drops, the port stays).
+          dropInbox: () => {
+            try { inboxRes?.end(); } catch { /* ignore */ }
+            inboxRes = null;
+          },
           close: () => {
             try { inboxRes?.end(); } catch { /* ignore */ }
             server.close();
@@ -11352,4 +11363,63 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       else process.env.CLAUDE_WATCH_CREDENTIALS_DIR = prevDir;
     }
   });
+
+  // registerSession fires exactly once per session, at creation. Without a
+  // replay, a bridge restart silently orphans every open Zed thread: the inbox
+  // SSE reconnects so everything LOOKS healthy, but the bridge has no slot for
+  // the session, dictation 502s, and the thread stays invisible until the user
+  // closes and reopens it in Zed.
+  it("re-announces live sessions after the inbox reconnects, and not before", async () => {
+    const bridge = await startFakeBridge();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-chan-"));
+    fs.writeFileSync(path.join(dir, "port"), `${bridge.port}\n`);
+    const prevAcp = process.env.CLAUDE_WATCH_ACP;
+    const prevDir = process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+    process.env.CLAUDE_WATCH_ACP = "1";
+    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = dir;
+
+    const channel = createBridgeChannel({ log() {}, error() {} })!;
+    try {
+      channel.start();
+      await waitFor(() => bridge.inboxConnects.length === 1);
+
+      channel.registerSession({ sessionId: "acp-1", sdkSessionId: "sdk-1", cwd: "/proj" });
+      channel.registerSession({ sessionId: "acp-2", sdkSessionId: "sdk-2", cwd: "/other" });
+      await waitFor(() => bridge.registers.length === 2);
+
+      // A live inbox must NOT re-register on its own — that would double every
+      // register POST and is what a naive replay-on-every-connect does.
+      await new Promise((r) => setTimeout(r, 150));
+      expect(bridge.registers.length).toBe(2);
+
+      // One session ends before the drop: it must NOT come back afterwards.
+      channel.deregisterSession("acp-2", "query-closed");
+      await waitFor(() => bridge.deregisters.length === 1);
+
+      bridge.dropInbox();
+      await waitFor(() => bridge.inboxConnects.length === 2, 6000);
+      await waitFor(() => bridge.registers.length === 3, 6000);
+
+      const replayed = bridge.registers[2];
+      expect(replayed).toMatchObject({ sessionId: "acp-1", sdkSessionId: "sdk-1", cwd: "/proj" });
+      // Same connection id across the reconnect, so the bridge routes dictation
+      // for the re-announced session down the NEW inbox.
+      expect(replayed.connection).toBe(bridge.registers[0].connection);
+
+      // Still exactly one replay: the ended session is gone for good.
+      await new Promise((r) => setTimeout(r, 150));
+      expect(bridge.registers.length).toBe(3);
+    } finally {
+      channel.stop();
+      bridge.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (prevAcp === undefined) delete process.env.CLAUDE_WATCH_ACP;
+      else process.env.CLAUDE_WATCH_ACP = prevAcp;
+      if (prevDir === undefined) delete process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+      else process.env.CLAUDE_WATCH_CREDENTIALS_DIR = prevDir;
+    }
+    // 15s, not vitest's default 5s: this test deliberately waits out a real
+    // INBOX_MIN_BACKOFF_MS reconnect. Without it the suite's timeout fires
+    // before waitFor's, hiding which predicate actually failed.
+  }, 15_000);
 });

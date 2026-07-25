@@ -92,6 +92,33 @@ export class HttpBridgeChannel implements BridgeChannel {
   private stopped = false;
   private abort: AbortController | null = null;
 
+  /** Every session registered and not yet deregistered, kept so they can be
+   *  re-announced after the bridge comes back. registerSession fires exactly
+   *  once per session (at creation), so without this a bridge restart silently
+   *  orphans every live Zed thread: the inbox SSE reconnects and everything
+   *  LOOKS healthy, but the bridge has no slot, dictation 502s, and the thread
+   *  is invisible until the user closes and reopens it in Zed. */
+  private readonly liveSessions = new Map<
+    string,
+    {
+      sessionId: string;
+      sdkSessionId: string;
+      cwd: string;
+      /** The bridge has accepted a register for this session on this connection. */
+      acked: boolean;
+      /** A register POST for it is outstanding RIGHT NOW. Distinct from !acked:
+       *  start() and registerSession() race, so the inbox can come up while the
+       *  very first register is still on the wire. Replaying then would send a
+       *  second, duplicate register for a session that was never missing. */
+      inFlight: boolean;
+    }
+  >();
+
+  /** Whether the inbox has ever been up. Distinguishes "first connect" (each
+   *  session's own register POST is authoritative) from "reconnect" (the bridge
+   *  may be a fresh process with an empty table, so everything must be re-sent). */
+  private connectedOnce = false;
+
   constructor(private readonly logger: Logger) {}
 
   onInject(handler: InjectHandler): void {
@@ -99,15 +126,25 @@ export class HttpBridgeChannel implements BridgeChannel {
   }
 
   registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string }): void {
+    const entry = { ...info, acked: false, inFlight: true };
+    this.liveSessions.set(info.sessionId, entry);
     void this.post("/acp/register", {
       connection: this.connectionId,
       sessionId: info.sessionId,
       sdkSessionId: info.sdkSessionId,
       cwd: info.cwd,
+    }).then((ok) => {
+      // Only a POST the bridge actually accepted counts. One that failed (bridge
+      // still starting, no port file yet) leaves acked=false so the next inbox
+      // connect re-sends it — that is the "Zed opened before the bridge" case.
+      if (this.liveSessions.get(info.sessionId) !== entry) return; // deregistered meanwhile
+      entry.inFlight = false;
+      entry.acked = ok;
     });
   }
 
   deregisterSession(sessionId: string, reason: string): void {
+    this.liveSessions.delete(sessionId);
     void this.post("/acp/deregister", {
       connection: this.connectionId,
       sessionId,
@@ -149,18 +186,44 @@ export class HttpBridgeChannel implements BridgeChannel {
 
   /** Fire-and-forget POST to the bridge on loopback. Never rejects into caller
    *  code: a missing port (bridge not up) or a network error is swallowed. */
-  private async post(route: string, body: Record<string, unknown>): Promise<void> {
+  private async post(route: string, body: Record<string, unknown>): Promise<boolean> {
     const port = readBridgePort();
-    if (port === null) return;
+    if (port === null) return false;
     try {
-      await fetch(`http://127.0.0.1:${port}${route}`, {
+      const resp = await fetch(`http://127.0.0.1:${port}${route}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
+      return resp.ok;
     } catch (err) {
       this.logger.error(`claude-watch: bridge POST ${route} failed: ${String(err)}`);
+      return false;
     }
+  }
+
+  /** Re-POST /acp/register for every still-live session. Called on each inbox
+   *  (re)connect so a bridge that restarted learns about threads that were
+   *  created while it was down. Snapshotted first: a deregister landing
+   *  mid-replay must not mutate the map we are iterating. */
+  private async replayRegistrations(): Promise<void> {
+    const pending = [...this.liveSessions.values()].filter((s) => !s.acked && !s.inFlight);
+    if (pending.length === 0) return;
+    this.logger.error(
+      `claude-watch: re-announcing ${pending.length} live session(s) to the bridge`,
+    );
+    await Promise.all(
+      pending.map((info) =>
+        this.post("/acp/register", {
+          connection: this.connectionId,
+          sessionId: info.sessionId,
+          sdkSessionId: info.sdkSessionId,
+          cwd: info.cwd,
+        }).then((ok) => {
+          if (ok && this.liveSessions.get(info.sessionId) === info) info.acked = true;
+        }),
+      ),
+    );
   }
 
   /** Hold the inbox SSE open, reconnecting with capped backoff until stopped. */
@@ -187,6 +250,28 @@ export class HttpBridgeChannel implements BridgeChannel {
         }
         // Connected: reset backoff and drain frames until the stream ends.
         backoff = INBOX_MIN_BACKOFF_MS;
+        // A RECONNECT means the bridge we are now talking to may be a fresh
+        // process with an empty session table, so nothing we sent earlier can be
+        // assumed to have survived — invalidate every ack and re-announce.
+        // registerSession only ever fires at session creation, so this is the
+        // one thing that puts an already-open Zed thread back on the bridge.
+        // On the FIRST connect we skip the invalidation: each session's own
+        // register POST is authoritative, and replaying it would just duplicate
+        // the POST. Sessions whose register failed (bridge not up yet) still
+        // have acked=false and get sent either way.
+        if (this.connectedOnce) {
+          for (const s of this.liveSessions.values()) {
+            s.acked = false;
+            // Any POST still outstanding across a reconnect was aimed at the
+            // bridge that just went away, so it cannot be trusted to land.
+            // Clearing it lets the replay cover that session; a duplicate
+            // register is harmless (handleAcpRegister refreshes in place).
+            s.inFlight = false;
+          }
+        }
+        this.connectedOnce = true;
+        // Not awaited: a slow re-register must not delay reading inject frames.
+        void this.replayRegistrations();
         await this.drainInbox(resp.body);
       } catch (err) {
         if (this.stopped) break;
