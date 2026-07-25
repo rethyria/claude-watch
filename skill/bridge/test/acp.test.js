@@ -312,3 +312,29 @@ test("a new turn clears the ACP slot's idle flag (#83)", { timeout: 60_000 }, as
     "a new turn must clear idle",
   );
 });
+
+// #84: `dictatable` is DERIVED from kind alone, so it survived the slot ending.
+// Delivery was always honest (injectToAcpSession 502s once the connection
+// binding is gone) — the defect is that the watch would OFFER Dictate on a dead
+// session and then eat the 502.
+test("an ended ACP slot stops advertising dictatable (#84)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "ended");
+
+  const inbox = connectInbox(bridge, "conn-ended");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+
+  await registerAcp(bridge, { connection: "conn-ended", sessionId: "acp-ended", cwd });
+  assert.equal((await statusEntry(bridge, token, "acp-ended")).dictatable, true);
+
+  const res = await request(bridge.port, "POST", "/acp/deregister", {
+    body: { connection: "conn-ended", sessionId: "acp-ended", reason: "query-closed" },
+  });
+  assert.equal(res.status, 200);
+
+  const ended = await statusEntry(bridge, token, "acp-ended");
+  assert.equal(ended.state, "ended");
+  assert.equal(ended.dictatable, undefined, "an ended slot must not offer Dictate");
+});

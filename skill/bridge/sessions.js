@@ -565,7 +565,11 @@ export function sessionEventPayload(slot, fields) {
   // gate the Dictate affordance on `dictatable`, NOT on "external" (an ACP
   // session is both external AND dictatable).
   if (slot.kind) payload.kind = slot.kind;
-  if (slot.ptyProcess || slot.kind === "acp") payload.dictatable = true;
+  // Liveness is part of "can the bridge deliver into this", so an ended slot
+  // must drop the flag (#84): delivery already refuses honestly once the
+  // connection binding is gone, but a client gating on `dictatable` alone would
+  // still OFFER Dictate on a dead session and then eat the 502.
+  if (slot.state !== "ended" && (slot.ptyProcess || slot.kind === "acp")) payload.dictatable = true;
   // Rides `ended` payloads too — meaningless there (clients prune ended
   // sessions outright), but uniformity beats a special case nobody reads.
   if (slot.idle) payload.idle = true;
@@ -1227,7 +1231,7 @@ export function getSessionsSnapshot() {
     // Additive session-type discriminator + DERIVED dictatable flag (S3 #77 /
     // S4 #78), in lockstep with sessionEventPayload (see the rationale there).
     ...(s.kind ? { kind: s.kind } : {}),
-    ...(s.ptyProcess || s.kind === "acp" ? { dictatable: true } : {}),
+    ...(s.state !== "ended" && (s.ptyProcess || s.kind === "acp") ? { dictatable: true } : {}),
     // Additive turn-end flag (issue #60): present (=true) when the slot's last
     // lifecycle signal was a Stop/TaskComplete. Same lockstep obligation — a
     // REST snapshot that disagreed with the SSE snapshot about whether a
