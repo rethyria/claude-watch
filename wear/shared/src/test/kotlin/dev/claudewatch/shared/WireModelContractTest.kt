@@ -2,6 +2,7 @@ package dev.claudewatch.shared
 
 import dev.claudewatch.shared.protocol.BridgeEvent
 import dev.claudewatch.shared.protocol.BridgeEventParser
+import dev.claudewatch.shared.protocol.MessageEvent
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
 import dev.claudewatch.shared.protocol.SessionEvent
 import dev.claudewatch.shared.protocol.SessionRunState
@@ -392,5 +393,30 @@ class WireModelContractTest {
         // for the empty "retract everything" set. If it had a default, a
         // truncated frame would clear the whole wrist.
         assertFailsLoudly("permission-sync", """{"sessionId":"A"}""")
+    }
+
+    // ------------------------------------------------------------------
+    // Assistant prose (#79) — the capability the hook channel never had.
+    // Only ACP (Zed-hosted) sessions produce it.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun messageEventCarriesAssistantProse() {
+        val ev = BridgeEventParser.parse(
+            "message",
+            """{"role":"assistant","text":"on it","sessionId":"acp-1"}""",
+        ) as MessageEvent
+        assertEquals("assistant", ev.role)
+        assertEquals("on it", ev.text)
+        assertEquals("acp-1", ev.sessionId)
+    }
+
+    /**
+     * `text` is the whole point of the event, so a frame without it is a
+     * contract violation rather than an empty bubble on the wrist.
+     */
+    @Test
+    fun messageEventWithoutTextFailsLoudly() {
+        assertFailsLoudly("message", """{"role":"assistant","sessionId":"acp-1"}""")
     }
 }

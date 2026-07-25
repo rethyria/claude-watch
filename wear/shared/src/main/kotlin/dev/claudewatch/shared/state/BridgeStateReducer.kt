@@ -21,6 +21,7 @@ import dev.claudewatch.shared.protocol.NotificationEvent
 import dev.claudewatch.shared.protocol.PermissionClearedEvent
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
 import dev.claudewatch.shared.protocol.PermissionSyncEvent
+import dev.claudewatch.shared.protocol.MessageEvent
 import dev.claudewatch.shared.protocol.PtyOutputEvent
 import dev.claudewatch.shared.protocol.SessionEvent
 import dev.claudewatch.shared.protocol.SessionRunState
@@ -238,6 +239,17 @@ object BridgeEventReducer {
             markWorking(state, event.sessionId, nowMs),
             event.sessionId,
             ToolOutputFormatter.format(event),
+            clearThinking = true,
+        )
+        // Assistant prose from an ACP session (#79) — the agent talking, not
+        // tool noise. Same activity semantics as any other output: it restarts
+        // the elapsed span and lowers the thinking cursor. Rendered as OUTPUT
+        // for now, so prose and tool text share a colour role; giving prose its
+        // own role is a UI change, not a reducer one.
+        is MessageEvent -> appendTerminal(
+            markWorking(state, event.sessionId, nowMs),
+            event.sessionId,
+            listOf(TerminalLine(event.text, TerminalLineType.OUTPUT)),
             clearThinking = true,
         )
         // Keyed replace: connect-time snapshots re-send pending prompts, and
@@ -515,6 +527,7 @@ object BridgeEventReducer {
         is PtyOutputEvent -> "pty-output ${event.text.take(PTY_LOG_CHARS)}"
         is ToolOutputEvent ->
             listOfNotNull("tool-output", event.toolName, event.toolOutputText).joinToString(" ")
+        is MessageEvent -> "message ${event.role} ${event.text.take(PTY_LOG_CHARS)}"
         is PermissionRequestEvent -> "permission-request ${event.toolName ?: "?"} (${event.permissionId})"
         is PermissionClearedEvent ->
             "permission-cleared ${event.permissionId}${event.reason?.let { " ($it)" } ?: ""}"

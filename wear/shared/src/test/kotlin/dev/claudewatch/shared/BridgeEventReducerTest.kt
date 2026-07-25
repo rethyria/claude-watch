@@ -41,6 +41,30 @@ class BridgeEventReducerTest {
     // Snapshot tests over the fixture corpus
     // ------------------------------------------------------------------
 
+    /**
+     * Assistant prose (#79) reaches the session feed and counts as activity —
+     * a session that idled after a turn is working again when the agent starts
+     * talking. Only ACP sessions produce this; hooks never carried prose.
+     */
+    @Test
+    fun assistantProseLandsInTheFeedAndCountsAsActivity() {
+        val state = fold(
+            corpusPrefix(6) + SseFrame(
+                "99",
+                "message",
+                """{"role":"assistant","text":"looking at the auth tests","sessionId":"$SESSION_ALPHA"}""",
+            ),
+        )
+
+        val alpha = state.sessions.getValue(SESSION_ALPHA)
+        assertEquals(SessionActivity.WORKING, alpha.activity)
+
+        val last = alpha.terminal.items.last()
+        assertEquals("looking at the auth tests", last.text)
+        assertEquals(TerminalLineType.OUTPUT, last.type)
+        assertEquals("99", state.lastEventId)
+    }
+
     @Test
     fun twoRunningSessionsSnapshot() {
         val state = fold(corpusPrefix(6))

@@ -174,6 +174,25 @@ data class PtyOutputEvent(
 ) : BridgeEvent
 
 /**
+ * `message` — assistant prose from an ACP (Zed-hosted) session (#79). The one
+ * capability the hook channel never had: hooks carried tool activity and
+ * lifecycle, never what the agent actually said.
+ *
+ * Assistant-only by construction — the adapter emits no `user_message_chunk` —
+ * so the local echo stays the single authority for the user's own dictated
+ * text and there is nothing to de-duplicate. `role` is defaulted (tolerant:
+ * a future `user` role must not break an older build) but `text` is required:
+ * it is the entire point of the event, and a frame without it would render as
+ * an empty bubble on the wrist instead of failing loudly.
+ */
+@Serializable
+data class MessageEvent(
+    val text: String,
+    val role: String = "assistant",
+    override val sessionId: String? = null,
+) : BridgeEvent
+
+/**
  * `tool-output` — a PostToolUse hook body (or Codex tool call) forwarded
  * verbatim with `source` and `sessionId` injected by the bridge. Everything
  * except the attribution is hook-defined, so all fields are optional and
@@ -398,6 +417,7 @@ object BridgeEventParser {
         "session" -> json.decodeFromString<SessionEvent>(data)
         "pty-output" -> json.decodeFromString<PtyOutputEvent>(data)
         "tool-output" -> json.decodeFromString<ToolOutputEvent>(data)
+        "message" -> json.decodeFromString<MessageEvent>(data)
         "permission-request" -> json.decodeFromString<PermissionRequestEvent>(data)
         "permission-cleared" -> json.decodeFromString<PermissionClearedEvent>(data)
         "permission-sync" -> json.decodeFromString<PermissionSyncEvent>(data)
