@@ -511,6 +511,15 @@ object BridgeEventReducer {
                 activity = SessionActivity.IDLE,
                 activeSinceMs = null,
                 frozenElapsedMs = session.activeSinceMs?.let { nowMs - it },
+                // #64: the ring renders green on `thinking || activity ==
+                // WORKING`, so leaving the cursor raised MASKS this transition
+                // entirely — the session stays green however idle it is. The
+                // live stop/task-complete path cleared it separately, outside
+                // this function, which is exactly the drift this function's own
+                // doc comment claimed it prevented. Clearing it here makes the
+                // two ways of going idle one transition in fact, not just in
+                // the comment.
+                thinking = false,
             )
         }
 

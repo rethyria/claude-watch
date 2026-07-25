@@ -65,6 +65,40 @@ class BridgeEventReducerTest {
         assertEquals("99", state.lastEventId)
     }
 
+    /**
+     * #64: the Halo ring renders green on `thinking || activity == WORKING`, so
+     * an idle transition that leaves the cursor raised is invisible — the
+     * session stays green forever. The live `stop` path clears it; the
+     * `idle: true` flag path went through [idled] alone, which did not.
+     *
+     * Coalesced prose (#79) makes this reachable in normal use: a turn whose
+     * last act is a tool call emits no `message`, so nothing else clears it.
+     */
+    @Test
+    fun anIdleFlagClearsTheThinkingCursorItWouldOtherwiseMask() {
+        val base = fold(corpusPrefix(6))
+        // The user dictates: the cursor goes up locally, no event involved.
+        val dispatched = base.echoCommand(SESSION_ALPHA, "run the tests")
+        assertTrue(dispatched.sessions.getValue(SESSION_ALPHA).thinking)
+
+        // The turn ends while we are not listening; the truth arrives as the
+        // additive idle flag on a session resend.
+        val idled = fold(
+            listOf(
+                SseFrame(
+                    "97",
+                    "session",
+                    """{"state":"running","sessionId":"$SESSION_ALPHA","idle":true}""",
+                ),
+            ),
+            dispatched,
+        )
+
+        val alpha = idled.sessions.getValue(SESSION_ALPHA)
+        assertEquals(SessionActivity.IDLE, alpha.activity)
+        assertFalse("an idled session must not keep a raised thinking cursor (#64)", alpha.thinking)
+    }
+
     @Test
     fun twoRunningSessionsSnapshot() {
         val state = fold(corpusPrefix(6))
