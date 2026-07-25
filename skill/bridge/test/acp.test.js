@@ -338,3 +338,43 @@ test("an ended ACP slot stops advertising dictatable (#84)", { timeout: 60_000 }
   assert.equal(ended.state, "ended");
   assert.equal(ended.dictatable, undefined, "an ended slot must not offer Dictate");
 });
+
+// #79: assistant prose is the thing hooks never carried. It arrives as the ACP
+// `agent_message_chunk` update (assistant-only — the adapter emits no
+// user_message_chunk), and is fanned out as a NEW additive `message` event so
+// older clients, which ignore unknown events, are unaffected.
+test("ACP assistant prose is fanned out as an additive `message` SSE event (#79)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "prose");
+
+  const inbox = connectInbox(bridge, "conn-prose");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+
+  await registerAcp(bridge, { connection: "conn-prose", sessionId: "acp-prose", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+
+  const res = await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-prose",
+      sessionId: "acp-prose",
+      kind: "session_update",
+      payload: {
+        sessionId: "acp-prose",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "on it" },
+        },
+      },
+    },
+  });
+  assert.equal(res.status, 200);
+
+  const ev = await sse.waitFor((e) => e.event === "message" && e.parsed?.sessionId === "acp-prose");
+  assert.equal(ev.parsed.text, "on it");
+  assert.equal(ev.parsed.role, "assistant");
+});

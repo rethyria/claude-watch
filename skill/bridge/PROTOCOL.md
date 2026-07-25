@@ -618,9 +618,24 @@ A completed tool use, forwarded from the PostToolUse hook: hook body (e.g.
 `tool_name`, `tool_output`, `cwd`, `session_id`) plus `source`
 (`"claude"`/`"codex"`) and `sessionId`.
 
+### `message`
+Assistant prose from an ACP (Zed-hosted) session: `{ "role": "assistant",
+"text": "...", "sessionId": ... }`. Additive in proto 3 — clients ignore
+unknown events, so an older watch is unaffected.
+
+Sourced from the ACP `agent_message_chunk` update, which is **assistant-only**:
+the adapter emits no `user_message_chunk`, so a client's own local echo stays
+the single authority for the user's dictated text and there is no double-echo.
+Only ACP sessions produce this; the hook channel never carried prose at all.
+
 ### `stop`
 The agent finished a turn and is idle (fires per turn — NOT session end).
 Hook body plus `sessionId`.
+
+Note: an ACP session has no `stop` event — ACP carries no turn-end update
+variant, so its turn end arrives over the server-local `/acp/update` channel
+as `kind: "turn"` and surfaces to clients as the `idle` flag on the next
+`session` event (see `GET /v1/status`).
 
 ### `notification`
 Claude Code Notification hook events, always with a `notification_type` key

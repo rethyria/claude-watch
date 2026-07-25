@@ -17,6 +17,7 @@
 import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
 import { registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking } from "./sessions.js";
 import { ACP_INBOX_HEARTBEAT_MS } from "./config.js";
+import { pushSseEvent } from "./transport-sse.js";
 
 /** Live fork inboxes: connectionId -> { res, heartbeat }. The held SSE response
  *  the bridge writes `inject` frames to. */
@@ -62,7 +63,7 @@ export async function handleAcpRegister(req, res) {
   return jsonResponse(res, 200, { ok: true });
 }
 
-// POST /acp/update { connection, sessionId, kind: "session_update"|"permission", payload }
+// POST /acp/update { connection, sessionId, kind: "session_update"|"permission"|"turn", payload }
 //
 // The tap the review mandated: the fork mirrors BOTH `sessionUpdate` and the
 // `requestPermission` RPC here (sendUpdate alone misses tool results and every
@@ -73,8 +74,9 @@ export async function handleAcpRegister(req, res) {
 // the SDK fires (hook-twin correlation resolves them onto this same slot —
 // verified live 2026-07-25). That channel is being retired, so this handler is
 // now the SOLE authority for an ACP slot's turn state: `kind: "turn"` drives
-// `slot.idle`. Prose rendering is the rest of #79; interactive permissions from
-// the wrist are #80 — both still ack-only here.
+// `slot.idle`, and `agent_message_chunk` is fanned out as assistant prose —
+// the one capability hooks never had. Interactive permissions from the wrist
+// are #80, so `kind: "permission"` stays ack-only for now.
 export async function handleAcpUpdate(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   if (!requireLoopback(req, res)) return;
@@ -104,6 +106,22 @@ export async function handleAcpUpdate(req, res) {
     const phase = body.payload?.phase;
     if (phase === "end") markSessionIdle(sessionId);
     else if (phase === "start") markSessionWorking(sessionId);
+  }
+
+  // Assistant prose (#79) — the capability hooks never had. Fanned out as a NEW
+  // `message` event rather than folded into `tool-output`: clients ignore
+  // unknown events, so the proto stays additive and older watches are
+  // unaffected. Assistant-only by construction — the adapter emits no
+  // `user_message_chunk`, so the watch's own local echo remains the single
+  // authority for the user's dictated text (no double-echo).
+  if (body.kind === "session_update" && sessions.has(sessionId)) {
+    const update = body.payload?.update;
+    if (update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") {
+      const text = update.content.text;
+      if (typeof text === "string" && text) {
+        pushSseEvent("message", { role: "assistant", text }, sessionId);
+      }
+    }
   }
 
   return jsonResponse(res, 200, { ok: true });
