@@ -290,6 +290,15 @@ async function startServer() {
     type: "claude-watch",
     protocol: "tcp",
     port: boundPort,
+    // Advertise IPv4 ONLY. bonjour-service otherwise announces every non-internal
+    // host address, which on this machine means one reachable IPv4 plus a pile of
+    // IPv6 ULAs (fda6:…) and a link-local (fe80::). The watch's NsdManager
+    // resolveService returns a SINGLE host; if it picks one of those IPv6
+    // addresses the watch cannot route to the host on, the discovery confirm-ping
+    // fails and the bridge is silently discarded — discovery "finds nothing" even
+    // though it is right there on IPv4. The watch always reaches the bridge over
+    // the IPv4 LAN, so those AAAA records are pure liability.
+    disableIPv6: true,
     // txt.v carries the protocol version (PROTOCOL.md "Versioning");
     // txt.version/txt.sessionId are frozen legacy aliases.
     txt: bonjourTxtRecord(),
