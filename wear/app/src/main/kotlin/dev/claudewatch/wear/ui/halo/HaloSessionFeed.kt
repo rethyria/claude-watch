@@ -8,6 +8,7 @@
 // px values are at the 450 reference (≈ px/2 in dp, matching HaloTheme).
 package dev.claudewatch.wear.ui.halo
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -36,8 +37,13 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
@@ -520,13 +526,57 @@ private fun DictatePill(onDictate: () -> Unit) {
                 .defaultMinSize(minWidth = 88.dp)
                 .padding(horizontal = 14.dp, vertical = 5.dp),
         ) {
-            Text(
-                text = "Dictate",
-                fontSize = Halo.Type.Caption,
-                fontWeight = FontWeight.Medium,
-                color = Halo.Palette.TextPrimary,
-                maxLines = 1,
-            )
+            MicGlyph()
         }
+    }
+}
+
+/**
+ * A microphone, drawn rather than imported: the app carries no icon library and
+ * every other glyph here is a Canvas (see HaloRing), so a dependency for one
+ * shape would be the odd one out.
+ *
+ * Three parts, all derived from the canvas size so it scales with the type
+ * ramp: the capsule (the mic body), the arc cradling it, and the stem. Stroked
+ * rather than filled — at this size a filled mic reads as an ink blot on an
+ * OLED watch face.
+ */
+@Composable
+private fun MicGlyph() {
+    Canvas(modifier = Modifier.size(Halo.Geo.MicGlyph).testTag("haloDictateMic")) {
+        val stroke = size.minDimension * 0.10f
+        val capsuleW = size.width * 0.34f
+        val capsuleH = size.height * 0.46f
+        val cx = size.width / 2f
+
+        // Mic body: a vertical capsule, fully rounded so the ends read as domes.
+        drawRoundRect(
+            color = Halo.Palette.TextPrimary,
+            topLeft = Offset(cx - capsuleW / 2f, size.height * 0.06f),
+            size = Size(capsuleW, capsuleH),
+            cornerRadius = CornerRadius(capsuleW / 2f),
+            style = Stroke(width = stroke),
+        )
+
+        // The cradle: a half-circle open at the top, hugging the body's lower half.
+        val cradleR = size.width * 0.30f
+        drawArc(
+            color = Halo.Palette.TextPrimary,
+            startAngle = 0f,
+            sweepAngle = 180f,
+            useCenter = false,
+            topLeft = Offset(cx - cradleR, size.height * 0.40f),
+            size = Size(cradleR * 2f, cradleR * 2f),
+            style = Stroke(width = stroke, cap = StrokeCap.Round),
+        )
+
+        // Stem down to the base. No foot bar: at 20dp it closes up into a smudge.
+        drawLine(
+            color = Halo.Palette.TextPrimary,
+            start = Offset(cx, size.height * 0.70f + cradleR * 0.30f),
+            end = Offset(cx, size.height * 0.94f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
     }
 }
