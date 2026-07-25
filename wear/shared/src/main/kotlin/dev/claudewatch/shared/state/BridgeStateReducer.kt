@@ -417,7 +417,21 @@ object BridgeEventReducer {
                     // absence stays preserve-on-absence, exactly as it was, and
                     // live `stop`/output events remain the authority for
                     // everything else.
-                    if (event.idle == true) idled(known, nowMs) else known
+                    // An EXPLICIT `false` is a different statement from absence
+                    // and does wake the session (#79). Absence means "I am not
+                    // telling you" — every routine reconnect snapshot says that,
+                    // which is why waking on it would restart the elapsed clock
+                    // constantly. A present `false` means "I know a turn just
+                    // started", which the bridge sends only on a turn-start
+                    // boundary. ACP sessions need it: their prose is coalesced
+                    // to turn end, so no mid-turn event exists to wake the
+                    // session, and without this the wrist showed idle for the
+                    // whole of every turn.
+                    when (event.idle) {
+                        true -> idled(known, nowMs)
+                        false -> working(known, nowMs)
+                        null -> known
+                    }
                 } ?: SessionState(
                     sessionId = id,
                     agent = event.agent,
@@ -497,6 +511,21 @@ object BridgeEventReducer {
                 activity = SessionActivity.IDLE,
                 activeSinceMs = null,
                 frozenElapsedMs = session.activeSinceMs?.let { nowMs - it },
+            )
+        }
+
+    /** The mirror of [idled]: a turn started, so the elapsed clock runs again.
+     *  Idempotent — an already-WORKING session keeps its existing span rather
+     *  than restarting it, so a repeated `idle: false` cannot inflate the
+     *  clock. */
+    private fun working(session: SessionState, nowMs: Long): SessionState =
+        if (session.activity == SessionActivity.WORKING) {
+            session
+        } else {
+            session.copy(
+                activity = SessionActivity.WORKING,
+                activeSinceMs = nowMs,
+                frozenElapsedMs = null,
             )
         }
 

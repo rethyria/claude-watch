@@ -755,3 +755,44 @@ test("a re-register never clobbers turn state the bridge already tracked (#79)",
     "a stale register must not flip a working session to idle",
   );
 });
+
+// The wrist's idle flag is a ONE-WAY latch (#60): absence never wakes a
+// session, because every reconnect snapshot omits it. So a turn START has to
+// say `idle: false` out loud, or the watch stays idle for the whole turn —
+// there is no other mid-turn signal now that prose is coalesced to turn end.
+test("turn start announces an explicit idle:false, turn end idle:true (#79)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "wake");
+
+  const inbox = connectInbox(bridge, "conn-wake");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-wake", sessionId: "acp-wake", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-wake");
+
+  const turn = (phase) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: { connection: "conn-wake", sessionId: "acp-wake", kind: "turn", payload: { phase } },
+    });
+
+  await turn("end");
+  const ended = await sse.waitFor((e) => e.event === "session" && e.parsed?.idle === true);
+  assert.equal(ended.parsed.idle, true);
+
+  await turn("start");
+  const started = await sse.waitFor((e) => e.event === "session" && e.parsed?.idle === false);
+  assert.equal(started.parsed.idle, false, "a turn start must say idle:false out loud");
+
+  // A connect-time snapshot must NOT carry it: absence is what keeps a routine
+  // reconnect from restarting every session's elapsed clock.
+  const snap = connectSse(bridge.port, token);
+  t.after(() => snap.close());
+  assert.equal(await snap.statusCode(), 200);
+  const resent = await snap.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-wake");
+  assert.equal(resent.parsed.idle, undefined, "the reconnect snapshot must stay silent about idle");
+});

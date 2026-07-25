@@ -134,7 +134,7 @@ export async function handleAcpUpdate(req, res) {
     // "working" forever. One idempotent `session` running event — the same shape
     // the connect-time sync re-sends, and the same trick announceMetadataRefresh
     // uses — carries the flag with no new event type and no client change.
-    announceAcpSlot(sessionId);
+    announceAcpSlot(sessionId, { announceWorking: phase === "start" });
   }
 
   // Assistant prose (#79) — the capability hooks never had. Fanned out as a NEW
@@ -298,16 +298,19 @@ function raiseAcpPermission(sessionId, payload) {
  *  additive fields (`idle`, `title`, git metadata) ride this payload, so a
  *  client that is already connected learns about them without a new event type.
  *  Mirrors announceMetadataRefresh in sessions.js. */
-function announceAcpSlot(sessionId) {
+function announceAcpSlot(sessionId, { announceWorking = false } = {}) {
   const slot = sessions.get(sessionId);
   if (!slot || slot.state !== "running") return;
-  pushSseEvent(
-    "session",
-    sessionEventPayload(slot, {
-      state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName,
-    }),
-    sessionId,
-  );
+  const payload = sessionEventPayload(slot, {
+    state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName,
+  });
+  // `idle` is a ONE-WAY latch on the client (issue #60): a present `true` idles
+  // a session, but ABSENCE never wakes one, because every reconnect snapshot
+  // omits it and waking on that would restart the elapsed clock each time. A
+  // turn start therefore has to say `false` OUT LOUD. Only here — never on a
+  // snapshot — which is exactly what keeps the latch's protection intact.
+  if (announceWorking) payload.idle = false;
+  pushSseEvent("session", payload, sessionId);
 }
 
 // POST /acp/deregister { connection, sessionId, reason }
