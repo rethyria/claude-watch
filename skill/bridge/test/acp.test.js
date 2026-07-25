@@ -339,11 +339,12 @@ test("an ended ACP slot stops advertising dictatable (#84)", { timeout: 60_000 }
   assert.equal(ended.dictatable, undefined, "an ended slot must not offer Dictate");
 });
 
-// #79: assistant prose is the thing hooks never carried. It arrives as the ACP
-// `agent_message_chunk` update (assistant-only — the adapter emits no
-// user_message_chunk), and is fanned out as a NEW additive `message` event so
-// older clients, which ignore unknown events, are unaffected.
-test("ACP assistant prose is fanned out as an additive `message` SSE event (#79)", { timeout: 60_000 }, async (t) => {
+// #79: assistant prose is the thing hooks never carried. It arrives as ACP
+// `agent_message_chunk` updates (assistant-only — the adapter emits no
+// user_message_chunk), which stream in many small deltas. Pushing one SSE frame
+// per delta is ~100 radio wakeups a turn for content the wrist does not want, so
+// prose is COALESCED and flushed once per turn. See the flush rules below.
+test("ACP prose is coalesced and flushed once at turn end, not streamed (#79)", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   const token = await pair(bridge);
   const cwd = realCwd(t, "prose");
@@ -351,32 +352,82 @@ test("ACP assistant prose is fanned out as an additive `message` SSE event (#79)
   const inbox = connectInbox(bridge, "conn-prose");
   t.after(() => inbox.close());
   assert.equal(await inbox.statusCode(), 200);
-
   await registerAcp(bridge, { connection: "conn-prose", sessionId: "acp-prose", cwd });
 
   const sse = connectSse(bridge.port, token);
   t.after(() => sse.close());
   assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-prose");
 
-  const res = await request(bridge.port, "POST", "/acp/update", {
-    body: {
-      connection: "conn-prose",
-      sessionId: "acp-prose",
-      kind: "session_update",
-      payload: {
-        sessionId: "acp-prose",
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "on it" },
+  const chunk = (text) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: {
+        connection: "conn-prose", sessionId: "acp-prose", kind: "session_update",
+        payload: {
+          sessionId: "acp-prose",
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
         },
       },
+    });
+
+  await chunk("on ");
+  await chunk("it");
+  assert.equal(
+    sse.events.filter((e) => e.event === "message").length,
+    0,
+    "mid-turn deltas must not each push a frame",
+  );
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-prose", sessionId: "acp-prose", kind: "turn",
+      payload: { phase: "end", stopReason: "end_turn" },
     },
   });
-  assert.equal(res.status, 200);
 
   const ev = await sse.waitFor((e) => e.event === "message" && e.parsed?.sessionId === "acp-prose");
-  assert.equal(ev.parsed.text, "on it");
+  assert.equal(ev.parsed.text, "on it", "the turn's prose arrives as ONE coalesced message");
   assert.equal(ev.parsed.role, "assistant");
+});
+
+// "The last message" means the final prose block, not a transcript of the whole
+// turn: narration before a tool call is superseded by whatever is said after it.
+test("a tool call resets the prose buffer so only the final block is sent (#79)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "prose2");
+
+  const inbox = connectInbox(bridge, "conn-prose2");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-prose2", sessionId: "acp-prose2", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-prose2");
+
+  const send = (update) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: {
+        connection: "conn-prose2", sessionId: "acp-prose2", kind: "session_update",
+        payload: { sessionId: "acp-prose2", update },
+      },
+    });
+
+  await send({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "let me check" } });
+  await send({ sessionUpdate: "tool_call", toolCallId: "t1", title: "Bash" });
+  await send({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "all 211 pass" } });
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-prose2", sessionId: "acp-prose2", kind: "turn",
+      payload: { phase: "end", stopReason: "end_turn" },
+    },
+  });
+
+  const ev = await sse.waitFor((e) => e.event === "message" && e.parsed?.sessionId === "acp-prose2");
+  assert.equal(ev.parsed.text, "all 211 pass", "pre-tool narration is superseded");
 });
 
 // A connected watch learns "turn ended" from a pushed event, not from a flag.

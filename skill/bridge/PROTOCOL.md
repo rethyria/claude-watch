@@ -628,6 +628,21 @@ the adapter emits no `user_message_chunk`, so a client's own local echo stays
 the single authority for the user's dictated text and there is no double-echo.
 Only ACP sessions produce this; the hook channel never carried prose at all.
 
+**Coalesced, not streamed.** ACP delivers prose as dozens of small deltas per
+turn; one frame each would be that many radio wakeups on a watch. The bridge
+buffers them and emits ONE `message` carrying the last block, flushed at:
+
+| flush point | why |
+|---|---|
+| turn end (`kind: "turn"`, `phase: "end"`) | the report — what the agent finished saying |
+| permission request (`kind: "permission"`) | a pause needing an answer: the user needs the context that led to it |
+
+A `tool_call` update **resets** the buffer: narration before a tool is
+superseded by whatever is said after it, so a flush carries the last block
+rather than a transcript of the whole turn. Buffer is capped at 4000 chars
+(tail kept). Clients wanting live token-by-token output should not use this
+event.
+
 ### `stop`
 The agent finished a turn and is idle (fires per turn — NOT session end).
 Hook body plus `sessionId`.

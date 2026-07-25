@@ -27,6 +27,13 @@ const acpInboxes = new Map();
 /** Routing: ACP sessionId -> the connectionId (fork) that owns it. The source
  *  of truth for which inbox a dictation goes down. */
 const sessionConnection = new Map();
+/** Coalescing buffer: ACP sessionId -> prose accumulated since the last flush.
+ *  Flushed as ONE `message` event at a turn boundary or a pause (see
+ *  flushProse), never per delta. */
+const proseBuffers = new Map();
+/** Hard cap so a pathological turn cannot grow the buffer without bound; the
+ *  wrist cannot read more than this anyway. */
+const PROSE_BUFFER_MAX = 4000;
 
 function requireLoopback(req, res) {
   const addr = req.socket?.remoteAddress;
@@ -106,8 +113,14 @@ export async function handleAcpUpdate(req, res) {
   // turn-level truth that rides the next session event.
   if (body.kind === "turn" && sessions.has(sessionId)) {
     const phase = body.payload?.phase;
-    if (phase === "end") markSessionIdle(sessionId);
-    else if (phase === "start") markSessionWorking(sessionId);
+    if (phase === "end") {
+      markSessionIdle(sessionId);
+      flushProse(sessionId);
+    } else if (phase === "start") {
+      markSessionWorking(sessionId);
+      // A new turn starts a new message; anything unflushed is stale.
+      proseBuffers.delete(sessionId);
+    }
     // Setting the flag is not enough for a watch that is ALREADY connected:
     // `idle` is designed to ride the next session event, and a hook session got
     // that push from the Stop hook. Without an equivalent here the wrist sits on
@@ -123,14 +136,24 @@ export async function handleAcpUpdate(req, res) {
   // unaffected. Assistant-only by construction — the adapter emits no
   // `user_message_chunk`, so the watch's own local echo remains the single
   // authority for the user's dictated text (no double-echo).
+  //
+  // COALESCED, not streamed (see flushProse): the deltas arrive in dozens of
+  // tiny chunks per turn, and one SSE frame each is that many radio wakeups on
+  // a watch for content the wrist explicitly does not want mid-turn. The wrist
+  // wants the LAST thing said — the report or the request.
   if (body.kind === "session_update" && sessions.has(sessionId)) {
     const update = body.payload?.update;
     if (update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") {
       const text = update.content.text;
       if (typeof text === "string" && text) {
-        pushSseEvent("message", { role: "assistant", text }, sessionId);
+        proseBuffers.set(sessionId, (proseBuffers.get(sessionId) ?? "") + text);
       }
     }
+    // A tool call supersedes whatever was being narrated before it: "let me
+    // check the tests" is not the message, the verdict after it is. Dropping the
+    // buffer here is what makes the flush "the last block" rather than a
+    // transcript of the whole turn.
+    if (update?.sessionUpdate === "tool_call") proseBuffers.delete(sessionId);
     // The SDK auto-generates a thread title in the background and the adapter
     // polls it at turn end, pushing `session_info_update`. Without this the slot
     // has no title at all — the transcript-scraping path that titles hook
@@ -146,7 +169,24 @@ export async function handleAcpUpdate(req, res) {
     }
   }
 
+  // A permission request is a PAUSE, not a turn end: the turn is still open but
+  // the user has to answer, so flush what led up to it (#79, the workflow-pause
+  // case). The prompt itself is #80.
+  if (body.kind === "permission" && sessions.has(sessionId)) flushProse(sessionId);
+
   return jsonResponse(res, 200, { ok: true });
+}
+
+/** Emit the session's buffered prose as ONE `message` event and clear it.
+ *  Called at the points where the wrist actually wants to read: the end of a
+ *  turn, and a pause that needs an answer (a permission request — the user has
+ *  to decide, so they need the context that led to it). No-op when nothing has
+ *  been said since the last flush. */
+function flushProse(sessionId) {
+  const text = proseBuffers.get(sessionId);
+  proseBuffers.delete(sessionId);
+  if (!text) return;
+  pushSseEvent("message", { role: "assistant", text: text.slice(-PROSE_BUFFER_MAX).trim() }, sessionId);
 }
 
 /** Re-announce an ACP slot as one idempotent `session` running event. The
@@ -178,6 +218,7 @@ export async function handleAcpDeregister(req, res) {
   }
   endAcpSession(sessionId, typeof reason === "string" ? reason : "acp-closed");
   sessionConnection.delete(sessionId);
+  proseBuffers.delete(sessionId);
   return jsonResponse(res, 200, { ok: true });
 }
 
