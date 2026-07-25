@@ -1,8 +1,9 @@
 // Session spawn / command-injection reliability, black-box: auto-spawn must
 // inject the dictated command only after the PTY's first output (the ready
-// signal), surface injection failure to the client instead of ok:true, and
-// the no-session-id fallback must run PTY-less external sessions through the
-// headless CLI branch instead of dereferencing a null ptyProcess.
+// signal), surface injection failure to the client instead of ok:true, and a
+// command that resolves to a PTY-less external session is REFUSED (409), never
+// run as a detached headless `claude -p --continue` fork of the live session
+// (issue #69).
 //
 // Each test points the bridge at a stub `claude` binary via the test-only
 // CLAUDE_WATCH_CLAUDE_BIN override so agent behavior is deterministic.
@@ -174,14 +175,15 @@ test("auto-spawn whose PTY dies immediately surfaces an error and leaves the bri
   assert.ok(!/uncaughtException/.test(bridge.output()), "no uncaught exception may be logged");
 });
 
-test("command without session id against an external PTY-less session runs the headless branch", { timeout: 60_000 }, async (t) => {
+test("a text command that resolves to an external PTY-less session is refused, never forked headlessly (issue #69)", { timeout: 60_000 }, async (t) => {
+  // If the bridge DID fork, this stub would run and echo a marker; the test
+  // proves it never does.
   const bin = makeFakeClaude(t, '#!/bin/sh\necho "HEADLESS-RAN $@"\n');
   const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
   const { token, sse } = await pairAndConnect(t, bridge);
 
   // A hook from an external Claude instance auto-creates a session the bridge
-  // owns no PTY for. The cwd must exist: the headless branch spawns the agent
-  // CLI inside it.
+  // owns no PTY for.
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-headless-project-"));
   t.after(() => {
     try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -194,21 +196,61 @@ test("command without session id against an external PTY-less session runs the h
   const externalSessionId = toolEvent.parsed.sessionId;
   assert.ok(externalSessionId, "hook must be attributed to a session");
 
-  // No session id: the fallback selects that PTY-less session. This used to
-  // 500 with a null dereference on ptyProcess.stdin; it must instead run the
-  // prompt via the headless CLI branch.
+  // No session id: the fallback selects that PTY-less external session. It must
+  // be REFUSED (409), never turned into a `claude -p --continue` fork of the
+  // live interactive session (issue #69).
   const resp = await request(bridge.port, "POST", "/command", {
     token,
     body: { command: "summarize the repo\n" },
   });
-  assert.equal(resp.status, 200);
-  assert.equal(resp.body.ok, true);
-  assert.equal(resp.body.prompt, true, "must take the headless prompt branch");
-  assert.equal(resp.body.sessionId, externalSessionId, "output is attributed to the external session");
+  assert.equal(resp.status, 409);
+  assert.notEqual(resp.body.ok, true);
+  assert.equal(resp.body.external, true);
+  assert.equal(resp.body.sessionId, externalSessionId, "the refusal names the external session it resolved to");
+  assert.match(resp.body.error, /external session/i);
 
-  const output = await sse.waitFor(
+  // Belt-and-suspenders: give the (refused) request a moment and assert no
+  // headless child ever emitted the stub marker.
+  await new Promise((r) => setTimeout(r, 300));
+  const forked = sse.events.some(
     (e) => e.event === "pty-output" && e.parsed?.text?.includes("HEADLESS-RAN"),
   );
-  assert.equal(output.parsed.sessionId, externalSessionId);
-  assert.match(output.parsed.text, /-p summarize the repo --continue/);
+  assert.equal(forked, false, "no detached headless run was spawned");
+});
+
+test("a command to an ENDED bridge-owned session is refused as ended, not mislabeled external (issue #69)", { timeout: 60_000 }, async (t) => {
+  // A bridge-owned PTY session that has ended lingers in the map (pre-prune)
+  // with ptyProcess=null — the same "no PTY" shape as an external session. Its
+  // refusal must say it ENDED, never falsely claim it is an external session
+  // the bridge does not own (the bridge spawned it).
+  const bin = makeFakeClaude(t, "#!/bin/sh\necho SPAWN-READY\nexec cat\n");
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
+  const { token, sse } = await pairAndConnect(t, bridge);
+
+  // Auto-spawn a bridge-owned (NOT external) session and capture its id.
+  const spawn = await request(bridge.port, "POST", "/command", {
+    token, body: { command: "hello\n" },
+  });
+  assert.equal(spawn.status, 200);
+  const sessionId = spawn.body.sessionId;
+  assert.ok(sessionId, "auto-spawn names the session");
+
+  // Kill it and wait for the ended broadcast (state ended, ptyProcess null).
+  const kill = await request(bridge.port, "POST", "/command", {
+    token, body: { kill: true, sessionId },
+  });
+  assert.equal(kill.status, 200);
+  await sse.waitFor(
+    (e) => e.event === "session" && e.parsed?.sessionId === sessionId && e.parsed?.state === "ended",
+  );
+
+  // Dictate at the ended slot before it prunes: an honest "ended" refusal, and
+  // crucially NOT an external:true mislabel.
+  const resp = await request(bridge.port, "POST", "/command", {
+    token, body: { sessionId, command: "too late\n" },
+  });
+  assert.equal(resp.status, 409);
+  assert.notEqual(resp.body.ok, true);
+  assert.notEqual(resp.body.external, true, "a bridge-spawned session must not be mislabeled external");
+  assert.match(resp.body.error, /ended/i);
 });

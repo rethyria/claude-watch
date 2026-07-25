@@ -560,7 +560,8 @@ export function sessionEventPayload(slot, fields) {
   // stored, so it is always honest: the bridge can deliver dictation into a
   // session it can reach LIVE — its own PTY (stdin) or an ACP session (inject
   // over the loopback channel) — and nothing else (a PTY-less hook session
-  // would need the detached headless fork, which is being retired). A PTY that
+  // has no reachable input channel at all: /command answers 409 for it, since the
+  // detached headless fork that used to serve it was retired in #81). A PTY that
   // dies drops ptyProcess to null and the flag vanishes on its own. Clients
   // gate the Dictate affordance on `dictatable`, NOT on "external" (an ACP
   // session is both external AND dictatable).

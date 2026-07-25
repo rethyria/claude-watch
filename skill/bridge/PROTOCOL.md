@@ -358,10 +358,17 @@ permission with that ID"}`.
 
 - With `sessionId` naming a PTY-backed session: the text is written to its
   stdin → `200 { "ok": true, "sessionId": ..., "agent": ... }`.
-- With `sessionId` naming an external (hook-created, PTY-less) session: the
-  bridge runs the agent CLI headlessly in that session's cwd (`claude -p
-  <text> --continue` / `codex exec <text>`), streaming output as `pty-output`
-  events → `200 { "ok": true, "sessionId": ..., "agent": ..., "prompt": true }`.
+- With `sessionId` naming an **ACP** (Zed-hosted) session: the text is injected
+  into the LIVE session over the loopback channel → `200 { "ok": true,
+  "sessionId": ..., "agent": ..., "prompt": true }`. A session whose adapter is
+  not connected answers **502** so the client can keep the text as a draft.
+- With `sessionId` naming any other PTY-less session (hook-created/external, or
+  a bridge-owned session that has ended): **409**, and nothing is run. The
+  bridge owns no input channel into it. This used to spawn `claude -p <text>
+  --continue` — a detached headless FORK of the live session, concurrently
+  editing the same working tree — which is why it was retired (#69/#81). The
+  refusals are distinguished: an ended bridge-owned session is reported as
+  ended, never mislabeled as external.
 - Without `sessionId`: routed to the most recent active session, or
   **auto-spawns** one (`agent`, default `"claude"`); the command is injected
   only after the new PTY produces output → `200 { "ok": true, "sessionId":
@@ -611,7 +618,7 @@ be stopped from a client).
 
 ### `pty-output`
 Raw terminal output from a bridge-owned PTY (ANSI escapes included) or from a
-headless prompt run: `{ "text": "...", "sessionId": ... }`.
+`{ "text": "...", "sessionId": ... }`.
 
 ### `tool-output`
 A completed tool use, forwarded from the PostToolUse hook: hook body (e.g.
