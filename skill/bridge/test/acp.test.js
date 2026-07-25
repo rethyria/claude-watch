@@ -534,3 +534,34 @@ test("re-registering an idle ACP session does not resurrect it as working (#79)"
     "a re-announced idle session must stay idle — nothing started",
   );
 });
+
+// A bridge restart rebuilds the session table from the fork's re-announce, so
+// the slot is brand new and has no idle flag to preserve. The fork reports
+// whether a turn is in flight; without that the bridge had to guess, and
+// guessing "working" showed green for a thread sitting idle.
+test("a re-announced session with no turn in flight is idle, not working (#79)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "revive");
+
+  const inbox = connectInbox(bridge, "conn-revive");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+
+  // Fresh bridge, fork re-announces an idle session.
+  const res = await request(bridge.port, "POST", "/acp/register", {
+    body: { connection: "conn-revive", sessionId: "acp-revive", sdkSessionId: "acp-revive", cwd, active: false },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(
+    (await statusEntry(bridge, token, "acp-revive")).idle,
+    true,
+    "no turn in flight means idle",
+  );
+
+  // And one announced mid-turn is working.
+  await request(bridge.port, "POST", "/acp/register", {
+    body: { connection: "conn-revive", sessionId: "acp-busy", sdkSessionId: "acp-busy", cwd, active: true },
+  });
+  assert.equal((await statusEntry(bridge, token, "acp-busy")).idle, undefined);
+});

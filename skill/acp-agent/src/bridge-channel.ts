@@ -118,6 +118,12 @@ export class HttpBridgeChannel implements BridgeChannel {
       cwd: string;
       /** The bridge has accepted a register for this session on this connection. */
       acked: boolean;
+      /** Whether a turn is in flight for this session. Tracked here because a
+       *  bridge restart rebuilds its table from the re-announce alone: without
+       *  it the bridge has to guess, and guessing "working" shows a live-looking
+       *  session on the wrist for a thread that is sitting idle. Every boundary
+       *  already passes through forwardTurnBoundary, so this costs nothing. */
+      active: boolean;
       /** A register POST for it is outstanding RIGHT NOW. Distinct from !acked:
        *  start() and registerSession() race, so the inbox can come up while the
        *  very first register is still on the wire. Replaying then would send a
@@ -138,13 +144,16 @@ export class HttpBridgeChannel implements BridgeChannel {
   }
 
   registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string }): void {
-    const entry = { ...info, acked: false, inFlight: true };
+    // A session that has never run a turn is not working — the honest default,
+    // and the one the wrist should show for a thread just opened in Zed.
+    const entry = { ...info, acked: false, inFlight: true, active: false };
     this.liveSessions.set(info.sessionId, entry);
     void this.post("/acp/register", {
       connection: this.connectionId,
       sessionId: info.sessionId,
       sdkSessionId: info.sdkSessionId,
       cwd: info.cwd,
+      active: entry.active,
     }).then((ok) => {
       // Only a POST the bridge actually accepted counts. One that failed (bridge
       // still starting, no port file yet) leaves acked=false so the next inbox
@@ -183,6 +192,8 @@ export class HttpBridgeChannel implements BridgeChannel {
   }
 
   forwardTurnBoundary(params: { sessionId: string; phase: "start" | "end"; stopReason?: string }): void {
+    const live = this.liveSessions.get(params.sessionId);
+    if (live) live.active = params.phase === "start";
     void this.post("/acp/update", {
       connection: this.connectionId,
       sessionId: params.sessionId,
@@ -240,6 +251,7 @@ export class HttpBridgeChannel implements BridgeChannel {
           sessionId: info.sessionId,
           sdkSessionId: info.sdkSessionId,
           cwd: info.cwd,
+          active: info.active,
         }).then((ok) => {
           if (ok && this.liveSessions.get(info.sessionId) === info) info.acked = true;
         }),

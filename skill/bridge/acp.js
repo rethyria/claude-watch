@@ -55,19 +55,21 @@ async function readAcpBody(req, res) {
   }
 }
 
-// POST /acp/register { connection, sessionId, sdkSessionId, cwd }
+// POST /acp/register { connection, sessionId, sdkSessionId, cwd, active? }
 export async function handleAcpRegister(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   if (!requireLoopback(req, res)) return;
   const body = await readAcpBody(req, res);
   if (body === null) return;
 
-  const { connection, sessionId, sdkSessionId, cwd } = body;
+  const { connection, sessionId, sdkSessionId, cwd, active } = body;
   if (typeof connection !== "string" || !connection || typeof sessionId !== "string" || !sessionId) {
     return jsonResponse(res, 400, { error: "Missing 'connection' or 'sessionId'" });
   }
 
-  registerAcpSession({ sessionId, sdkSessionId, cwd });
+  // `active` is the fork's report of whether a turn is in flight; it is what
+  // stops a re-announce (bridge restart) from showing an idle thread as working.
+  registerAcpSession({ sessionId, sdkSessionId, cwd, active });
   sessionConnection.set(sessionId, connection);
   return jsonResponse(res, 200, { ok: true });
 }

@@ -11424,6 +11424,43 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
     }
   });
 
+  // A bridge restart rebuilds its session table from the re-announce alone. If
+  // that carries no turn state the bridge must guess, and guessing "working"
+  // showed green on the wrist for sessions sitting idle. The channel already
+  // sees every boundary, so it can report liveness without the agent's help.
+  it("reports whether a turn is in flight on register and on re-announce", async () => {
+    const bridge = await startFakeBridge();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-chan-"));
+    fs.writeFileSync(path.join(dir, "port"), `${bridge.port}\n`);
+    const prevAcp = process.env.CLAUDE_WATCH_ACP;
+    const prevDir = process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+    process.env.CLAUDE_WATCH_ACP = "1";
+    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = dir;
+
+    const channel = createBridgeChannel({ log() {}, error() {} })!;
+    try {
+      channel.start();
+      channel.registerSession({ sessionId: "acp-a", sdkSessionId: "acp-a", cwd: "/proj" });
+      await waitFor(() => bridge.registers.length === 1);
+      // A session that has never run a turn is not working.
+      expect(bridge.registers[0].active).toBe(false);
+
+      // A turn starts, then the bridge dies and the inbox reconnects.
+      channel.forwardTurnBoundary({ sessionId: "acp-a", phase: "start" });
+      bridge.dropInbox();
+      await waitFor(() => bridge.registers.length === 2, 15000);
+      expect(bridge.registers[1].active).toBe(true);
+    } finally {
+      channel.stop();
+      bridge.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (prevAcp === undefined) delete process.env.CLAUDE_WATCH_ACP;
+      else process.env.CLAUDE_WATCH_ACP = prevAcp;
+      if (prevDir === undefined) delete process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+      else process.env.CLAUDE_WATCH_CREDENTIALS_DIR = prevDir;
+    }
+  }, 20000);
+
   // The ACP sessionUpdate union has no turn-boundary variant: turn end is the
   // session/prompt RPC's stopReason, which never reaches the client tee. So the
   // bridge can infer "working" from activity but can never observe idle unless

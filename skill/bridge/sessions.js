@@ -1507,7 +1507,7 @@ export function endHookSession(body) {
  *  SDK's underlying session_id used for hook correlation; in this fork it equals
  *  `sessionId`, but it is passed explicitly so the binding is correct even if
  *  that ever diverges. Returns the slot. */
-export function registerAcpSession({ sessionId, sdkSessionId, cwd }) {
+export function registerAcpSession({ sessionId, sdkSessionId, cwd, active }) {
   const boundSdkId = sdkSessionId || sessionId;
   const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
@@ -1537,7 +1537,10 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd }) {
     slot.cwd = resolvedCwd;
     slot.folderName = folderName;
     slot.state = "running";
-    // `idle` is deliberately NOT reset. Re-registration is a re-ANNOUNCEMENT —
+    // An explicit liveness report from the fork is authoritative; only its
+    // ABSENCE (an older fork) falls through to preserving what we knew.
+    if (typeof active === "boolean") slot.idle = !active;
+    // Otherwise `idle` is deliberately NOT reset. Re-registration is a re-ANNOUNCEMENT —
     // a Zed restart, a session resume, a fork reconnect — not new work. Clearing
     // it here told the wrist a session was working whenever the user restarted
     // Zed, even though nothing had started; the flag only moves on a real turn
@@ -1554,6 +1557,10 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd }) {
       state: "running",
       createdAt: Date.now(),
       kind: "acp",
+      // A slot rebuilt by a re-announce (bridge restart) must not claim to be
+      // working just because it is new: the fork tells us whether a turn is
+      // actually in flight. Absent (older fork) keeps the previous behaviour.
+      ...(typeof active === "boolean" ? { idle: !active } : {}),
     };
     sessions.set(sessionId, slot);
   }
