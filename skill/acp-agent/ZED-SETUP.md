@@ -34,11 +34,28 @@ comments and trailing commas survive) and refuses to write anything it cannot pa
 ```json
 "agent_servers": {
   "Claude (watch)": {
+    "type": "custom",
     "command": "/home/deck/Development/claude-watch/skill/acp-agent/launch-claude-watch-acp.sh",
     "args": []
   }
 }
 ```
+
+### `"type": "custom"` is required
+
+`agent_servers` is a **tagged union**: the Zed binary carries `custom | command | env`
+alongside the registry variant's `default_config_options | favorite_config_option_values`.
+An entry with a `command` but no `type` is not registered as a custom agent server —
+opening a thread fails with:
+
+```
+Custom agent server `Claude (watch)` is not registered
+```
+
+and the agent panel rewrites the entry into a `{"type": "registry"}` stub. That is the
+mechanism behind both observed reverts (2026-07-22 23:26 and 2026-07-25 18:15); the
+missing tag was the cause, and the registry stub was the symptom. `--check` verifies the
+tag as well as the command, so an untagged entry fails the doctor rather than passing it.
 
 ## Billing guard (must-fix from review #74)
 Two layers, because a scrub you can walk around is not a guarantee:

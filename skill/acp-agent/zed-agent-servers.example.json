@@ -4,8 +4,13 @@
   "//3": "is the host launcher itself (NOT wrapped in flatpak-spawn — that exists only inside the",
   "//4": "sandbox, not on the host). It uses host node, host ~/.claude subscription, host loopback.",
   "//5": "Zed settings path (flatpak): ~/.var/app/dev.zed.Zed/config/zed/settings.json",
+  "//6": "\"type\": \"custom\" is REQUIRED — agent_servers is a tagged union (custom vs registry).",
+  "//7": "Without it Zed does not register this as a custom agent server: opening a thread fails",
+  "//8": "with `Custom agent server ... is not registered`, and the agent panel rewrites the entry",
+  "//9": "into a {\"type\": \"registry\"} stub. Run ./apply-zed-config.sh --check to verify.",
   "agent_servers": {
     "Claude (watch)": {
+      "type": "custom",
       "command": "/home/deck/Development/claude-watch/skill/acp-agent/launch-claude-watch-acp.sh",
       "args": []
     }

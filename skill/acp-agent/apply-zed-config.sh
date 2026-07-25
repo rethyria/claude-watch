@@ -115,7 +115,11 @@ except Exception as e:
 
 current = (parsed.get("agent_servers") or {}).get(agent_name)
 current_cmd = current.get("command") if isinstance(current, dict) else None
-ok = current_cmd == launcher
+current_type = current.get("type") if isinstance(current, dict) else None
+# Both must hold. A `command` without `type: "custom"` looks right in the file
+# but Zed will not register it as a custom agent — so the doctor must fail on it,
+# or it green-lights the exact state that produces "is not registered".
+ok = current_cmd == launcher and current_type == "custom"
 
 if mode == "check":
     if ok:
@@ -129,13 +133,28 @@ if mode == "check":
             "Zed has replaced it — probably with a registry stub — so the adapter cannot launch.",
             file=sys.stderr,
         )
-    else:
+    elif current_cmd != launcher:
         print(f"FAIL: '{agent_name}' points at {current_cmd}, expected {launcher}", file=sys.stderr)
+    else:
+        print(
+            f"FAIL: '{agent_name}' has the right command but type={current_type!r}, expected 'custom'. "
+            "Zed will not register an untagged entry as a custom agent server — opening a thread "
+            "fails with \"Custom agent server ... is not registered\".",
+            file=sys.stderr,
+        )
     print("  Repair:  ./apply-zed-config.sh", file=sys.stderr)
     sys.exit(1)
 
+# "type": "custom" is REQUIRED, not decorative. Zed's agent_servers schema is a
+# tagged union — the binary carries `custom | command | env` alongside the
+# registry variant's `default_config_options | favorite_config_option_values`.
+# Without the tag Zed does not classify this as a custom agent server: opening a
+# thread fails with `Custom agent server ... is not registered`, and the agent
+# panel rewrites the entry into a `{"type": "registry"}` stub. That rewrite is
+# what happened on 2026-07-22 and again on 2026-07-25.
 entry = (
     f'"{agent_name}": {{\n'
+    f'      "type": "custom",\n'
     f'      "command": "{launcher}",\n'
     f'      "args": []\n'
     f"    }}"
@@ -191,9 +210,13 @@ except Exception as e:
     print(f"FAIL: refusing to write — result would not parse: {e}", file=sys.stderr)
     sys.exit(1)
 if mode != "remove":
-    got = (check.get("agent_servers") or {}).get(agent_name, {}).get("command")
-    if got != launcher:
-        print(f"FAIL: refusing to write — post-edit command is {got!r}", file=sys.stderr)
+    written = (check.get("agent_servers") or {}).get(agent_name, {})
+    got, got_type = written.get("command"), written.get("type")
+    if got != launcher or got_type != "custom":
+        print(
+            f"FAIL: refusing to write — post-edit entry is type={got_type!r} command={got!r}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 backup = settings_path + ".bak-claudewatch"
