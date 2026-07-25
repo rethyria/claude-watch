@@ -81,6 +81,14 @@ object Halo {
         const val RingEdgeGap = 6f           // px at 450 ref, edge → outer stroke
         const val RingStroke = 9f            // px at 450 ref (scaled at draw time)
         const val RingStrokeAmbient = 4f
+        /**
+         * Clearance between the ring's INNER stroke edge and the outer edge of
+         * a page dot. The dots ride an arc concentric with the ring (see
+         * PageDots): laid out in a straight row they hold that clearance only
+         * at 6 o'clock, and the outermost dots of a 5+ page row run straight
+         * into the ring as the curve drops away from them.
+         */
+        const val DotArcGap = 10f            // px at 450 ref, ring inner → dot
         val SafeInset = 28.dp                // ~56px circular safe-area inset
         val CardRadius = 17.dp               // cards/wells 16–18px
         val RowRadius = 13.dp                // session rows 26px
