@@ -11181,6 +11181,33 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
     expect(res.stopReason).toBe("end_turn");
   });
 
+  // Zed renders only the prompts IT sent via session/prompt. A dictated prompt
+  // goes straight onto session.input, so without an explicit echo the thread
+  // shows two assistant messages back to back and the user's own words are
+  // missing from their conversation.
+  it("echoes the dictated text to the client so it appears in the thread", async () => {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => { updates.push(u); },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    const input = new Pushable<any>();
+    async function* gen() {
+      const iter = input[Symbol.asyncIterator]();
+      await iter.next();
+      yield* resultThenIdle();
+    }
+    agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(gen()), input });
+
+    await agent.injectUserPrompt("test-session", "run the tests", "watch");
+
+    const echo = updates.find((u) => u.update?.sessionUpdate === "user_message_chunk");
+    expect(echo, "dictation must be echoed as a user_message_chunk").toBeTruthy();
+    expect(echo.sessionId).toBe("test-session");
+    expect(echo.update.content).toEqual({ type: "text", text: "run the tests" });
+  });
+
   it("refuses an ended (queryClosed) session honestly instead of desyncing", async () => {
     const agent = makeAgent();
     agent.sessions["test-session"] = mockSessionState({ queryClosed: true });

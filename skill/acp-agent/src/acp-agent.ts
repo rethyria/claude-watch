@@ -1769,6 +1769,25 @@ export class ClaudeAcpAgent {
    *  `stopReason`) so the caller can surface a completed/cancelled outcome. */
   async injectUserPrompt(sessionId: string, text: string, source: string): Promise<PromptResponse> {
     this.logger.log(`claude-watch: dictated prompt for session ${sessionId} (source=${source})`);
+    // Echo the dictation into the client's own thread. Zed renders only the
+    // prompts IT sent via `session/prompt`; a dictated one arrives on
+    // `session.input` behind its back, so without this the thread shows two
+    // assistant messages back to back and the user's words are simply missing
+    // from their own conversation.
+    //
+    // Best-effort: a client that cannot render the echo must not cost the user
+    // their prompt, so a failure here is logged and the turn proceeds.
+    try {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "user_message_chunk",
+          content: { type: "text", text },
+        },
+      });
+    } catch (err) {
+      this.logger.error(`claude-watch: failed to echo dictated prompt to the client: ${String(err)}`);
+    }
     return this.prompt({ sessionId, prompt: [{ type: "text", text }] });
   }
 
