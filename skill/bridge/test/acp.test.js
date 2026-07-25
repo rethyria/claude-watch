@@ -659,3 +659,44 @@ test("answering an ACP prompt on the watch sends the decision down the fork's in
   assert.equal(frame.parsed.optionId, "zed-allow", "must name the agent's own optionId");
   assert.equal(frame.parsed.behavior, "allow");
 });
+
+// If the user answers in Zed, the wrist card must go away. Otherwise it sits
+// there as a zombie whose eventual answer applies to a decided request.
+test("answering in Zed retracts the wrist prompt (#80)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "permzed");
+
+  const inbox = connectInbox(bridge, "conn-permzed");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-permzed", sessionId: "acp-permzed", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-permzed");
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-permzed", sessionId: "acp-permzed", kind: "permission",
+      payload: {
+        sessionId: "acp-permzed",
+        toolCall: { toolCallId: "tc-z", title: "Bash", rawInput: { command: "ls" } },
+        options: [{ optionId: "a", name: "Allow", kind: "allow_once" }],
+      },
+    },
+  });
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+
+  // The fork reports the request was settled elsewhere.
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-permzed", sessionId: "acp-permzed", kind: "permission-resolved",
+      payload: { sessionId: "acp-permzed", toolCallId: "tc-z" },
+    },
+  });
+
+  const cleared = await sse.waitFor((e) => e.event === "permission-cleared");
+  assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
+});

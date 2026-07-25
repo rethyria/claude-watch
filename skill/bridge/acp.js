@@ -19,7 +19,7 @@ import {
   registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
 } from "./sessions.js";
 import { ACP_INBOX_HEARTBEAT_MS } from "./config.js";
-import { waitForPermission, canonicalPermissionOptions } from "./permissions.js";
+import { waitForPermission, canonicalPermissionOptions, cancelPermission } from "./permissions.js";
 import crypto from "node:crypto";
 import { pushSseEvent, sseClients } from "./transport-sse.js";
 
@@ -182,6 +182,21 @@ export async function handleAcpUpdate(req, res) {
   if (body.kind === "permission" && sessions.has(sessionId)) {
     flushProse(sessionId);
     raiseAcpPermission(sessionId, body.payload);
+  }
+
+  // The request was settled somewhere else — the user answered in Zed, or the
+  // agent cancelled it. Retract the wrist card rather than leaving a zombie
+  // whose eventual answer would apply to an already-decided request. Routed
+  // through cancelPermission so it announces itself exactly like every other
+  // non-answer exit (permission-cleared), and so the waiter resolves as a
+  // no-decision rather than hanging until expiry.
+  if (body.kind === "permission-resolved") {
+    const toolCallId = body.payload?.toolCallId;
+    const permissionId = toolCallId ? acpPermissionsByToolCall.get(toolCallId) : null;
+    if (permissionId) {
+      acpPermissionsByToolCall.delete(toolCallId);
+      cancelPermission(permissionId);
+    }
   }
 
   return jsonResponse(res, 200, { ok: true });

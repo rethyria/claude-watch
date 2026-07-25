@@ -39,6 +39,17 @@ import type {
 /** Delivered by the bridge down the inbox SSE when the watch dictates. */
 export type InjectHandler = (sessionId: string, text: string, source: string) => void;
 
+/** The wrist's answer to a permission request, arriving down the same inbox as
+ *  dictation. `optionId` is one the AGENT offered — the bridge echoes our own
+ *  vocabulary back rather than inventing one from the behavior. */
+export type PermissionDecision = {
+  sessionId: string;
+  toolCallId: string;
+  optionId: string;
+  behavior: string;
+};
+export type PermissionDecisionHandler = (decision: PermissionDecision) => void;
+
 /** The seam the agent (and its client tee) talk to. A test supplies a fake;
  *  production uses {@link HttpBridgeChannel}. Every method is best-effort and
  *  MUST NOT throw into agent code. */
@@ -67,8 +78,15 @@ export interface BridgeChannel {
     phase: "start" | "end";
     stopReason?: string;
   }): void;
+  /** Tell the bridge a permission request was settled somewhere else (the user
+   *  answered in Zed, or the agent cancelled it), so it can retract the wrist
+   *  card instead of leaving a zombie prompt (#80). */
+  forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void;
   /** Register the handler the inbox calls when the watch dictates. */
   onInject(handler: InjectHandler): void;
+  /** Register the handler the inbox calls when the watch answers a permission
+   *  request (#80). */
+  onPermissionDecision(handler: PermissionDecisionHandler): void;
   /** Open the inbox SSE and begin its reconnect loop. */
   start(): void;
   /** Stop the inbox loop and release the connection. */
@@ -101,6 +119,7 @@ export class HttpBridgeChannel implements BridgeChannel {
    *  push a dictation down). */
   private readonly connectionId = randomUUID();
   private injectHandler: InjectHandler | null = null;
+  private permissionHandler: PermissionDecisionHandler | null = null;
   private stopped = false;
   private abort: AbortController | null = null;
 
@@ -141,6 +160,10 @@ export class HttpBridgeChannel implements BridgeChannel {
 
   onInject(handler: InjectHandler): void {
     this.injectHandler = handler;
+  }
+
+  onPermissionDecision(handler: PermissionDecisionHandler): void {
+    this.permissionHandler = handler;
   }
 
   registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string }): void {
@@ -188,6 +211,15 @@ export class HttpBridgeChannel implements BridgeChannel {
       sessionId: params.sessionId,
       kind: "permission",
       payload: params,
+    });
+  }
+
+  forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "permission-resolved",
+      payload: { sessionId: params.sessionId, toolCallId: params.toolCallId },
     });
   }
 
@@ -342,7 +374,26 @@ export class HttpBridgeChannel implements BridgeChannel {
       else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
       // ":comment" heartbeats and anything else are ignored.
     }
-    if (event !== "inject" || dataLines.length === 0) return;
+    if (dataLines.length === 0) return;
+    if (event === "permission-decision") {
+      let d: Partial<PermissionDecision>;
+      try {
+        d = JSON.parse(dataLines.join("\n"));
+      } catch {
+        return;
+      }
+      if (typeof d.sessionId !== "string" || typeof d.toolCallId !== "string" || typeof d.optionId !== "string") {
+        return;
+      }
+      this.logger.log(`claude-watch: inbox permission decision for ${d.toolCallId} (${d.behavior ?? "?"})`);
+      try {
+        this.permissionHandler?.(d as PermissionDecision);
+      } catch (err) {
+        this.logger.error(`claude-watch: permission handler threw: ${String(err)}`);
+      }
+      return;
+    }
+    if (event !== "inject") return;
     let msg: { sessionId?: unknown; text?: unknown; source?: unknown };
     try {
       msg = JSON.parse(dataLines.join("\n"));

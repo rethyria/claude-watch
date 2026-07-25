@@ -2003,10 +2003,17 @@ describe("permission request cancellation", () => {
     // Let canUseTool reach the awaited requestPermission before cancelling.
     await Promise.resolve();
 
-    // The tool-call signal is threaded through as the cancellation signal.
-    expect(receivedSignal).toBe(controller.signal);
+    // The tool-call signal reaches the client as a cancellation signal. It is
+    // no longer the SAME object: since #80 the request gets its own controller
+    // chained to this one, so the wrist winning the race can cancel Zed's
+    // dialog without cancelling the tool use itself. What matters — and what
+    // this asserts — is that aborting the caller's signal still cancels the
+    // request, which the rejection below proves end to end.
+    expect(receivedSignal).toBeDefined();
+    expect(receivedSignal!.aborted).toBe(false);
 
     controller.abort();
+    expect(receivedSignal!.aborted).toBe(true);
 
     await expect(pending).rejects.toThrow("Tool use aborted");
   });
@@ -2533,6 +2540,7 @@ describe("subagent permission attribution (issue #851)", () => {
       forwardTurnBoundary: (p: { sessionId: string; phase: string; stopReason?: string }) =>
         boundaries.push(p),
       onInject: () => {},
+      onPermissionDecision: () => {},
       start: () => {},
       stop: () => {},
     } as unknown as BridgeChannel;
@@ -11117,6 +11125,14 @@ describe("agent selection config option", () => {
   });
 });
 
+async function waitForCondition(predicate: () => boolean, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for condition");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
   function makeAgent() {
     const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
@@ -11208,6 +11224,76 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
     expect(echo.update.content).toEqual({ type: "text", text: "run the tests" });
   });
 
+  // Two surfaces, one decision (#80). Zed always shows its own dialog; the wrist
+  // shows the same request. Whichever answers FIRST wins, and the loser must be
+  // dropped — including cancelling Zed's dialog, or the user is left staring at
+  // a prompt they already answered on their watch.
+  it("takes the wrist's answer when it beats Zed, and cancels Zed's dialog", async () => {
+    let zedSignal: AbortSignal | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      // Zed never answers in this test: the watch gets there first.
+      requestPermission: (_p: any, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          zedSignal = signal;
+          signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+        }),
+    } as unknown as AcpClient;
+
+    let notify: ((d: any) => void) | undefined;
+    const bridge = {
+      registerSession: () => {}, deregisterSession: () => {},
+      forwardSessionUpdate: () => {}, forwardPermissionRequest: () => {},
+      forwardTurnBoundary: () => {}, onInject: () => {},
+      onPermissionDecision: (h: (d: any) => void) => { notify = h; },
+      start: () => {}, stop: () => {},
+    } as unknown as BridgeChannel;
+
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
+    agent.sessions["s1"] = mockSessionState({});
+
+    const pending = agent.canUseTool("s1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tc-7",
+    } as any);
+
+    await waitForCondition(() => notify !== undefined && zedSignal !== undefined);
+    notify!({ sessionId: "s1", toolCallId: "tc-7", optionId: "allow", behavior: "allow" });
+
+    const result = await pending;
+    expect(result?.behavior).toBe("allow");
+    expect(zedSignal!.aborted, "Zed's dialog must be cancelled once the wrist answered").toBe(true);
+  });
+
+  it("retracts the wrist card when Zed answers first", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow" } }),
+    } as unknown as AcpClient;
+
+    const resolved: Array<{ sessionId: string; toolCallId: string }> = [];
+    const bridge = {
+      registerSession: () => {}, deregisterSession: () => {},
+      forwardSessionUpdate: () => {}, forwardPermissionRequest: () => {},
+      forwardTurnBoundary: () => {},
+      forwardPermissionResolved: (p: { sessionId: string; toolCallId: string }) => resolved.push(p),
+      onInject: () => {}, onPermissionDecision: () => {},
+      start: () => {}, stop: () => {},
+    } as unknown as BridgeChannel;
+
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
+    agent.sessions["s2"] = mockSessionState({});
+
+    await agent.canUseTool("s2")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tc-8",
+    } as any);
+
+    expect(resolved).toEqual([{ sessionId: "s2", toolCallId: "tc-8" }]);
+  });
+
   it("refuses an ended (queryClosed) session honestly instead of desyncing", async () => {
     const agent = makeAgent();
     agent.sessions["test-session"] = mockSessionState({ queryClosed: true });
@@ -11243,7 +11329,9 @@ describe("teeClientToBridge (claude-watch, S3 #77 output tap)", () => {
       deregisterSession: vi.fn(),
       forwardSessionUpdate: vi.fn(),
       forwardPermissionRequest: vi.fn(),
+      forwardTurnBoundary: vi.fn(),
       onInject: vi.fn(),
+      onPermissionDecision: vi.fn(),
       start: vi.fn(),
       stop: vi.fn(),
     } as unknown as BridgeChannel & Record<string, ReturnType<typeof vi.fn>>;
@@ -11348,6 +11436,7 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       updates: any[];
       inboxConnects: number[];
       pushInject: (data: unknown) => void;
+      pushFrame: (event: string, data: unknown) => void;
       dropInbox: () => void;
       close: () => void;
     }>((resolve) => {
@@ -11360,6 +11449,8 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
           updates,
           inboxConnects,
           pushInject: (data) => inboxRes?.write(`event: inject\ndata: ${JSON.stringify(data)}\n\n`),
+          pushFrame: (event: string, data: unknown) =>
+            inboxRes?.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
           // Kill the SSE without stopping the server: models a bridge restart
           // from the fork's point of view (the downlink drops, the port stays).
           dropInbox: () => {
@@ -11413,6 +11504,44 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       channel.deregisterSession("acp-1", "query-closed");
       await waitFor(() => bridge.deregisters.length === 1);
       expect(bridge.deregisters[0]).toMatchObject({ sessionId: "acp-1", reason: "query-closed" });
+    } finally {
+      channel.stop();
+      bridge.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (prevAcp === undefined) delete process.env.CLAUDE_WATCH_ACP;
+      else process.env.CLAUDE_WATCH_ACP = prevAcp;
+      if (prevDir === undefined) delete process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+      else process.env.CLAUDE_WATCH_CREDENTIALS_DIR = prevDir;
+    }
+  });
+
+  // The wrist's answer arrives down the same inbox SSE dictation uses. Without
+  // this the watch prompt is decorative: the user answers and nothing happens.
+  it("delivers a permission decision from the inbox to its handler", async () => {
+    const bridge = await startFakeBridge();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-chan-"));
+    fs.writeFileSync(path.join(dir, "port"), `${bridge.port}\n`);
+    const prevAcp = process.env.CLAUDE_WATCH_ACP;
+    const prevDir = process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+    process.env.CLAUDE_WATCH_ACP = "1";
+    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = dir;
+
+    const channel = createBridgeChannel({ log() {}, error() {} })!;
+    const decisions: Array<{ sessionId: string; toolCallId: string; optionId: string }> = [];
+    channel.onPermissionDecision((d) => decisions.push(d));
+    try {
+      channel.start();
+      channel.registerSession({ sessionId: "acp-p", sdkSessionId: "acp-p", cwd: "/proj" });
+      await waitFor(() => bridge.registers.length === 1);
+
+      bridge.pushFrame("permission-decision", {
+        sessionId: "acp-p",
+        toolCallId: "tc-42",
+        optionId: "zed-allow",
+        behavior: "allow",
+      });
+      await waitFor(() => decisions.length === 1);
+      expect(decisions[0]).toMatchObject({ sessionId: "acp-p", toolCallId: "tc-42", optionId: "zed-allow" });
     } finally {
       channel.stop();
       bridge.close();

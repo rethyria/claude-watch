@@ -618,6 +618,26 @@ A completed tool use, forwarded from the PostToolUse hook: hook body (e.g.
 `tool_name`, `tool_output`, `cwd`, `session_id`) plus `source`
 (`"claude"`/`"codex"`) and `sessionId`.
 
+### `permission-request` from an ACP session (#80)
+An ACP session's permission requests reach the wrist through the SAME
+`permission-request` / `permission-cleared` events and the same `POST
+/v1/command` answer path as a hook session's — clients need no ACP-specific
+handling.
+
+Two behaviours are specific to ACP and worth knowing:
+
+- **Two surfaces, one decision.** Zed shows its own dialog for every request;
+  the wrist shows the same one. Whichever answers first wins. If Zed wins, the
+  bridge pushes `permission-cleared` and the wrist card disappears; if the
+  wrist wins, the agent cancels Zed's dialog.
+- **A prompt is only raised if a client is connected**, and only if at least
+  one of the agent's options maps to a machine-readable `behavior`. An
+  unmappable option is dropped rather than guessed at.
+
+Expiry keeps the hook path's no-decision semantics: nothing is sent back to
+the agent, so Zed's own dialog keeps the answer. The bridge never fabricates a
+`deny`.
+
 ### `message`
 Assistant prose from an ACP (Zed-hosted) session: `{ "role": "assistant",
 "text": "...", "sessionId": ... }`. Additive in proto 3 — clients ignore

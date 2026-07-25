@@ -123,7 +123,9 @@ import {
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 // claude-watch: the fork <-> bridge loopback channel (S3 #77).
-import { BridgeChannel, createBridgeChannel, teeClientToBridge } from "./bridge-channel.js";
+import {
+  BridgeChannel, PermissionDecision, createBridgeChannel, teeClientToBridge,
+} from "./bridge-channel.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -1292,12 +1294,22 @@ export class ClaudeAcpAgent {
    *  (sessionUpdate + requestPermission mirroring) is wired separately, on the
    *  {@link client} handed to this constructor. All calls are best-effort. */
   bridge?: BridgeChannel;
+  /** In-flight permission requests the watch could still answer, keyed by the
+   *  tool call the request is for (#80). Populated only while a request is
+   *  actually pending, so a late decision for a finished call finds nothing and
+   *  is dropped rather than resolving the wrong prompt. */
+  private readonly wristDecisionWaiters = new Map<string, (d: PermissionDecision) => void>();
 
   constructor(client: AcpClient, logger?: Logger, bridge?: BridgeChannel) {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
     this.bridge = bridge;
+    // The wrist's answers arrive asynchronously down the inbox; route each to
+    // the request that is waiting for its tool call, if any is still open.
+    bridge?.onPermissionDecision?.((d) => {
+      this.wristDecisionWaiters.get(d.toolCallId)?.(d);
+    });
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -4421,14 +4433,63 @@ export class ClaudeAcpAgent {
       params.toolCall.rawInput,
       parentToolUseId,
     );
+    // Two surfaces, one decision (#80). Zed always shows its own dialog; the
+    // bridge may be showing the same request on the user's wrist. Whichever
+    // answers FIRST wins.
+    //
+    // The loser has to be dropped, and for Zed that means actually cancelling
+    // its RPC: leaving it pending would strand a dialog on screen for a request
+    // the user already answered on their watch. So Zed's call gets its own
+    // AbortController, chained to the caller's signal, which we abort the
+    // moment the wrist wins.
+    const toolCallId = params.toolCall.toolCallId;
+    const wrist = toolCallId ? this.awaitWristDecision(toolCallId) : null;
+    const zedAbort = new AbortController();
+    const chain = () => zedAbort.abort();
+    signal.addEventListener("abort", chain, { once: true });
+
     try {
-      return await this.client.requestPermission(params, signal);
+      const zed = this.client.requestPermission(params, zedAbort.signal);
+      if (!wrist) return await zed;
+
+      const winner = await Promise.race([
+        zed.then((response) => ({ from: "zed" as const, response })),
+        wrist.decision.then((d) => ({ from: "wrist" as const, d })),
+      ]);
+
+      if (winner.from === "zed") {
+        // Retract the wrist card: the decision is made, and a prompt left on
+        // the watch would either mislead or be answered into a dead request.
+        this.bridge?.forwardPermissionResolved?.({ sessionId: params.sessionId, toolCallId });
+        return winner.response;
+      }
+
+      zedAbort.abort();
+      return { outcome: { outcome: "selected", optionId: winner.d.optionId } };
     } catch (error) {
       if (signal.aborted) {
         throw new Error("Tool use aborted", { cause: error });
       }
       throw error;
+    } finally {
+      signal.removeEventListener("abort", chain);
+      wrist?.dispose();
     }
+  }
+
+  /** A promise that settles when the watch answers THIS tool call, plus the
+   *  disposer that unregisters it. Never rejects: a wrist that never answers
+   *  simply loses the race, and the request is left to Zed. */
+  private awaitWristDecision(toolCallId: string): {
+    decision: Promise<PermissionDecision>;
+    dispose: () => void;
+  } {
+    let settle!: (d: PermissionDecision) => void;
+    const decision = new Promise<PermissionDecision>((resolve) => {
+      settle = resolve;
+    });
+    this.wristDecisionWaiters.set(toolCallId, settle);
+    return { decision, dispose: () => this.wristDecisionWaiters.delete(toolCallId) };
   }
 
   /** Emit the `tool_call` a permission request references if it hasn't been sent
