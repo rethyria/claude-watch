@@ -244,3 +244,71 @@ test("ACP endpoints validate their inputs (routes are wired, not 404)", { timeou
   const badInbox = await request(bridge.port, "GET", "/acp/inbox");
   assert.equal(badInbox.status, 400, "inbox requires a connection id");
 });
+
+// --- Turn-level idle for ACP slots (#79 re-scope / #83) ----------------------
+// The ACP `sessionUpdate` union carries no turn-boundary variant (turn end is
+// the session/prompt RPC's `stopReason`), so the fork forwards it explicitly as
+// kind:"turn". Without it an ACP slot is never flagged idle or working — the
+// only writers of `slot.idle` are the hook channel and the headless path, and
+// the user has removed the hooks block. NOTE: `state` deliberately stays
+// "running" across a finished turn (issue #60); `idle` is the turn-level truth.
+test("an ACP slot is flagged idle at turn end, with no hook traffic (#83)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "turn");
+
+  const inbox = connectInbox(bridge, "conn-turn");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+
+  await registerAcp(bridge, { connection: "conn-turn", sessionId: "acp-turn", cwd });
+
+  // A freshly registered slot is working, not idle.
+  const fresh = await statusEntry(bridge, token, "acp-turn");
+  assert.equal(fresh.idle, undefined, "a just-registered ACP slot must not be idle");
+
+  // The fork reports the turn settled.
+  const res = await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-turn",
+      sessionId: "acp-turn",
+      kind: "turn",
+      payload: { phase: "end", stopReason: "end_turn" },
+    },
+  });
+  assert.equal(res.status, 200);
+
+  // `state` keeps its #60 semantics; `idle` carries the turn-level truth.
+  const settled = await statusEntry(bridge, token, "acp-turn");
+  assert.equal(settled.state, "running", "state must NOT be repurposed (issue #60)");
+  assert.equal(settled.idle, true, "turn end must flag the ACP slot idle");
+});
+
+test("a new turn clears the ACP slot's idle flag (#83)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "turn2");
+
+  const inbox = connectInbox(bridge, "conn-turn2");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+
+  await registerAcp(bridge, { connection: "conn-turn2", sessionId: "acp-turn2", cwd });
+
+  const turn = (phase, stopReason) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: { connection: "conn-turn2", sessionId: "acp-turn2", kind: "turn", payload: { phase, stopReason } },
+    });
+
+  await turn("end", "end_turn");
+  assert.equal((await statusEntry(bridge, token, "acp-turn2")).idle, true);
+
+  // Dictation (or the user typing in Zed) starts a fresh turn: the slot is
+  // working again, so the stale idle flag must not ride the next snapshot.
+  await turn("start");
+  assert.equal(
+    (await statusEntry(bridge, token, "acp-turn2")).idle,
+    undefined,
+    "a new turn must clear idle",
+  );
+});

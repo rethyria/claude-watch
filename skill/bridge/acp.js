@@ -15,7 +15,7 @@
 // sessions or inject prompts. It is NOT part of the versioned /v1 client
 // protocol.
 import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
-import { registerAcpSession, endAcpSession, sessions } from "./sessions.js";
+import { registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking } from "./sessions.js";
 import { ACP_INBOX_HEARTBEAT_MS } from "./config.js";
 
 /** Live fork inboxes: connectionId -> { res, heartbeat }. The held SSE response
@@ -66,12 +66,15 @@ export async function handleAcpRegister(req, res) {
 //
 // The tap the review mandated: the fork mirrors BOTH `sessionUpdate` and the
 // `requestPermission` RPC here (sendUpdate alone misses tool results and every
-// permission prompt). S3 only needs the chokepoint to EXIST and be accepted —
-// the ACP slot's working/idle/title are already driven by the settings.json
-// hooks the SDK fires (they resolve to the same slot via hook-twin
-// correlation). Rendering this prose on the watch is #79; making the permission
-// interactive from the wrist is #80. So for now: validate, keep the routing
-// binding fresh, and ack.
+// permission prompt), plus an explicit `turn` boundary the ACP protocol has no
+// update variant for.
+//
+// S3 could ack-and-discard because working/idle rode the settings.json hooks
+// the SDK fires (hook-twin correlation resolves them onto this same slot —
+// verified live 2026-07-25). That channel is being retired, so this handler is
+// now the SOLE authority for an ACP slot's turn state: `kind: "turn"` drives
+// `slot.idle`. Prose rendering is the rest of #79; interactive permissions from
+// the wrist are #80 — both still ack-only here.
 export async function handleAcpUpdate(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   if (!requireLoopback(req, res)) return;
@@ -88,6 +91,21 @@ export async function handleAcpUpdate(req, res) {
   if (typeof connection === "string" && connection && sessions.has(sessionId)) {
     sessionConnection.set(sessionId, connection);
   }
+
+  // Turn boundary (#79 / #83). The ACP `sessionUpdate` union has no turn-end
+  // variant — turn end is the session/prompt RPC's `stopReason`, which never
+  // flows through the client tee — so the fork forwards it explicitly. This is
+  // the ONLY driver of turn-level state for an ACP slot: every writer of
+  // `slot.idle` is otherwise the hook channel or the headless path, and the
+  // hooks block is being retired. `state` is deliberately left alone: it stays
+  // "running" across a finished turn by design (issue #60), and `idle` is the
+  // turn-level truth that rides the next session event.
+  if (body.kind === "turn" && sessions.has(sessionId)) {
+    const phase = body.payload?.phase;
+    if (phase === "end") markSessionIdle(sessionId);
+    else if (phase === "start") markSessionWorking(sessionId);
+  }
+
   return jsonResponse(res, 200, { ok: true });
 }
 

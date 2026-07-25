@@ -2518,6 +2518,39 @@ describe("subagent permission attribution (issue #851)", () => {
     };
   }
 
+  // The wiring for #79/#83: activateTurn and settleActive are the two
+  // chokepoints, so a real turn must produce exactly one start and one end with
+  // the settle's stopReason. Without this the bridge cannot tell a Zed session
+  // that is thinking from one that finished, because ACP carries no turn-end
+  // update variant.
+  it("reports a turn boundary to the watch bridge at both ends of a real turn", async () => {
+    const boundaries: Array<{ sessionId: string; phase: string; stopReason?: string }> = [];
+    const bridge = {
+      registerSession: () => {},
+      deregisterSession: () => {},
+      forwardSessionUpdate: () => {},
+      forwardPermissionRequest: () => {},
+      forwardTurnBoundary: (p: { sessionId: string; phase: string; stopReason?: string }) =>
+        boundaries.push(p),
+      onInject: () => {},
+      start: () => {},
+      stop: () => {},
+    } as unknown as BridgeChannel;
+
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      bridge,
+    );
+    injectGeneratorSession(agent, makeGenerator([successResult()]));
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(boundaries.map((b) => b.phase)).toEqual(["start", "end"]);
+    expect(boundaries[0]!.sessionId).toBe("test-session");
+    expect(boundaries[1]!.stopReason).toBe("end_turn");
+  });
+
   it("records task_started's task_id → tool_use_id mapping while consuming the stream", async () => {
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
@@ -11353,6 +11386,54 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       channel.deregisterSession("acp-1", "query-closed");
       await waitFor(() => bridge.deregisters.length === 1);
       expect(bridge.deregisters[0]).toMatchObject({ sessionId: "acp-1", reason: "query-closed" });
+    } finally {
+      channel.stop();
+      bridge.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (prevAcp === undefined) delete process.env.CLAUDE_WATCH_ACP;
+      else process.env.CLAUDE_WATCH_ACP = prevAcp;
+      if (prevDir === undefined) delete process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+      else process.env.CLAUDE_WATCH_CREDENTIALS_DIR = prevDir;
+    }
+  });
+
+  // The ACP sessionUpdate union has no turn-boundary variant: turn end is the
+  // session/prompt RPC's stopReason, which never reaches the client tee. So the
+  // bridge can infer "working" from activity but can never observe idle unless
+  // the fork says so explicitly. This is the only turn-state driver for an ACP
+  // slot now that the settings.json hook channel is being retired (#79/#83).
+  it("POSTs an explicit turn boundary the ACP update union cannot carry", async () => {
+    const bridge = await startFakeBridge();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-chan-"));
+    fs.writeFileSync(path.join(dir, "port"), `${bridge.port}\n`);
+    const prevAcp = process.env.CLAUDE_WATCH_ACP;
+    const prevDir = process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+    process.env.CLAUDE_WATCH_ACP = "1";
+    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = dir;
+
+    const channel = createBridgeChannel({ log() {}, error() {} })!;
+    try {
+      channel.start();
+      channel.registerSession({ sessionId: "acp-t", sdkSessionId: "acp-t", cwd: "/proj" });
+      await waitFor(() => bridge.registers.length === 1);
+
+      channel.forwardTurnBoundary({ sessionId: "acp-t", phase: "start" });
+      await waitFor(() => bridge.updates.length === 1);
+      expect(bridge.updates[0]).toMatchObject({
+        sessionId: "acp-t",
+        kind: "turn",
+        payload: { phase: "start" },
+      });
+
+      // Every settle lane reports its stopReason, so a cancelled turn idles the
+      // slot exactly like a completed one.
+      channel.forwardTurnBoundary({ sessionId: "acp-t", phase: "end", stopReason: "cancelled" });
+      await waitFor(() => bridge.updates.length === 2);
+      expect(bridge.updates[1]).toMatchObject({
+        sessionId: "acp-t",
+        kind: "turn",
+        payload: { phase: "end", stopReason: "cancelled" },
+      });
     } finally {
       channel.stop();
       bridge.close();

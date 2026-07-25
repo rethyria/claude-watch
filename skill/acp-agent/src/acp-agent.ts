@@ -1961,6 +1961,10 @@ export class ClaudeAcpAgent {
      *  result isn't wrongly skipped. */
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
+      // claude-watch: the single turn-start chokepoint. ACP has no update
+      // variant for a turn boundary, so the watch bridge learns it here or not
+      // at all (#79/#83). Best-effort and non-throwing, like every bridge call.
+      this.bridge?.forwardTurnBoundary({ sessionId: session.sessionId, phase: "start" });
       session.cancelled = false;
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
@@ -2184,6 +2188,15 @@ export class ClaudeAcpAgent {
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
+      // claude-watch: turn end. settleActive is idempotent and every settle
+      // lane funnels through it (end_turn, cancelled, refusal, max_tokens,
+      // max_turn_requests), so the watch bridge sees exactly one boundary per
+      // turn regardless of how it ended (#79/#83).
+      this.bridge?.forwardTurnBoundary({
+        sessionId: session.sessionId,
+        phase: "end",
+        stopReason: result.stopReason,
+      });
       disarmForceCancel(session);
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;

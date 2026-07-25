@@ -55,6 +55,18 @@ export interface BridgeChannel {
   forwardSessionUpdate(params: SessionNotification): void;
   /** Mirror of a client `requestPermission` RPC (missed by `sendUpdate`). */
   forwardPermissionRequest(params: RequestPermissionRequest): void;
+  /** Turn boundary. The ACP `sessionUpdate` union has no turn-end variant —
+   *  turn end is the `session/prompt` RPC's `stopReason`, a return value on the
+   *  agent→client path that never reaches the client tee. Without this the
+   *  bridge can infer "working" from activity but can never observe idle, so it
+   *  would have to guess from silence. Every settle lane reports its
+   *  `stopReason`, so a cancelled/refused turn idles the slot like a completed
+   *  one. */
+  forwardTurnBoundary(params: {
+    sessionId: string;
+    phase: "start" | "end";
+    stopReason?: string;
+  }): void;
   /** Register the handler the inbox calls when the watch dictates. */
   onInject(handler: InjectHandler): void;
   /** Open the inbox SSE and begin its reconnect loop. */
@@ -167,6 +179,15 @@ export class HttpBridgeChannel implements BridgeChannel {
       sessionId: params.sessionId,
       kind: "permission",
       payload: params,
+    });
+  }
+
+  forwardTurnBoundary(params: { sessionId: string; phase: "start" | "end"; stopReason?: string }): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "turn",
+      payload: { phase: params.phase, ...(params.stopReason && { stopReason: params.stopReason }) },
     });
   }
 
