@@ -632,10 +632,13 @@ Only ACP sessions produce this; the hook channel never carried prose at all.
 The agent finished a turn and is idle (fires per turn — NOT session end).
 Hook body plus `sessionId`.
 
-Note: an ACP session has no `stop` event — ACP carries no turn-end update
+Note: an ACP session emits no `stop` event — ACP carries no turn-end update
 variant, so its turn end arrives over the server-local `/acp/update` channel
-as `kind: "turn"` and surfaces to clients as the `idle` flag on the next
-`session` event (see `GET /v1/status`).
+as `kind: "turn"`. The bridge then pushes one idempotent **`session` running
+event carrying `idle: true`**, so an already-connected client learns the turn
+ended without a new event type. (Setting the flag alone is not enough for a
+live client: `idle` is designed to ride the next `session` event, and for a
+hook session that push came from the Stop hook.)
 
 ### `notification`
 Claude Code Notification hook events, always with a `notification_type` key

@@ -378,3 +378,75 @@ test("ACP assistant prose is fanned out as an additive `message` SSE event (#79)
   assert.equal(ev.parsed.text, "on it");
   assert.equal(ev.parsed.role, "assistant");
 });
+
+// A connected watch learns "turn ended" from a pushed event, not from a flag.
+// markSessionIdle only sets `idle`, which by design rides the NEXT session
+// event; hook sessions got that push from the Stop hook. ACP had no equivalent,
+// so a live watch sat on green forever.
+test("ACP turn end pushes a session event carrying idle, so a live watch updates", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "idlepush");
+
+  const inbox = connectInbox(bridge, "conn-idlepush");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-idlepush", sessionId: "acp-idlepush", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-idlepush");
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-idlepush",
+      sessionId: "acp-idlepush",
+      kind: "turn",
+      payload: { phase: "end", stopReason: "end_turn" },
+    },
+  });
+
+  const ev = await sse.waitFor(
+    (e) => e.event === "session" && e.parsed?.sessionId === "acp-idlepush" && e.parsed?.idle === true,
+  );
+  assert.equal(ev.parsed.state, "running", "state keeps its #60 semantics");
+  assert.equal(ev.parsed.idle, true);
+});
+
+// The adapter already pushes the SDK's auto-generated thread title as a
+// `session_info_update` at each turn end — the bridge was discarding it, so the
+// watch fell back to showing the raw session uuid.
+test("ACP session_info_update sets the slot title and announces it (#79)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "title");
+
+  const inbox = connectInbox(bridge, "conn-title");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-title", sessionId: "acp-title", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-title");
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-title",
+      sessionId: "acp-title",
+      kind: "session_update",
+      payload: {
+        sessionId: "acp-title",
+        update: { sessionUpdate: "session_info_update", title: "Fix the flaky auth tests" },
+      },
+    },
+  });
+
+  const ev = await sse.waitFor(
+    (e) => e.event === "session" && e.parsed?.sessionId === "acp-title" && e.parsed?.title,
+  );
+  assert.equal(ev.parsed.title, "Fix the flaky auth tests");
+  assert.equal((await statusEntry(bridge, token, "acp-title")).title, "Fix the flaky auth tests");
+});

@@ -15,7 +15,9 @@
 // sessions or inject prompts. It is NOT part of the versioned /v1 client
 // protocol.
 import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
-import { registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking } from "./sessions.js";
+import {
+  registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
+} from "./sessions.js";
 import { ACP_INBOX_HEARTBEAT_MS } from "./config.js";
 import { pushSseEvent } from "./transport-sse.js";
 
@@ -106,6 +108,13 @@ export async function handleAcpUpdate(req, res) {
     const phase = body.payload?.phase;
     if (phase === "end") markSessionIdle(sessionId);
     else if (phase === "start") markSessionWorking(sessionId);
+    // Setting the flag is not enough for a watch that is ALREADY connected:
+    // `idle` is designed to ride the next session event, and a hook session got
+    // that push from the Stop hook. Without an equivalent here the wrist sits on
+    // "working" forever. One idempotent `session` running event — the same shape
+    // the connect-time sync re-sends, and the same trick announceMetadataRefresh
+    // uses — carries the flag with no new event type and no client change.
+    announceAcpSlot(sessionId);
   }
 
   // Assistant prose (#79) — the capability hooks never had. Fanned out as a NEW
@@ -122,9 +131,38 @@ export async function handleAcpUpdate(req, res) {
         pushSseEvent("message", { role: "assistant", text }, sessionId);
       }
     }
+    // The SDK auto-generates a thread title in the background and the adapter
+    // polls it at turn end, pushing `session_info_update`. Without this the slot
+    // has no title at all — the transcript-scraping path that titles hook
+    // sessions is never fed for ACP — so the watch fell back to the raw uuid.
+    if (update?.sessionUpdate === "session_info_update" && typeof update.title === "string") {
+      const slot = sessions.get(sessionId);
+      const title = update.title.trim();
+      if (slot && title && slot.title !== title) {
+        slot.title = title;
+        slot.titleIsAi = true;
+        announceAcpSlot(sessionId);
+      }
+    }
   }
 
   return jsonResponse(res, 200, { ok: true });
+}
+
+/** Re-announce an ACP slot as one idempotent `session` running event. The
+ *  additive fields (`idle`, `title`, git metadata) ride this payload, so a
+ *  client that is already connected learns about them without a new event type.
+ *  Mirrors announceMetadataRefresh in sessions.js. */
+function announceAcpSlot(sessionId) {
+  const slot = sessions.get(sessionId);
+  if (!slot || slot.state !== "running") return;
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, {
+      state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName,
+    }),
+    sessionId,
+  );
 }
 
 // POST /acp/deregister { connection, sessionId, reason }
