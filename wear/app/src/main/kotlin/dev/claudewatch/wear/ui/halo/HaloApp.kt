@@ -25,12 +25,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
@@ -54,7 +50,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material.TimeText
 import androidx.wear.compose.material.TimeTextDefaults
@@ -65,7 +63,10 @@ import dev.claudewatch.wear.BridgeViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /** Everything Halo can ask the ViewModel to do (mirror of the VM's actions). */
 data class HaloActions(
@@ -824,22 +825,43 @@ private fun PagerLayer(
                 }
             }
         }
+        // Full-screen, not bottom-aligned: the dots place themselves on an arc
+        // measured from the display centre, so they need the whole face.
         PageDots(
             count = pageCount,
             current = pagerState.currentPage,
             onSelect = { scope.launch { pagerState.animateScrollToPage(it) } },
-            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 6.dp),
+            modifier = Modifier.fillMaxSize(),
         )
     }
 }
 
+/** Arc-length pitch between dot centres, and the tap slot built around it. */
+private val DOT_PITCH = 14.dp
+private val DOT_SLOT_HEIGHT = 20.dp
+private val DOT_SIZE_CURRENT = 5.5.dp
+private val DOT_SIZE_OTHER = 4.dp
+
 /**
- * Bottom-center page dots (handoff: current 11px cream, others 8px grey,
- * tappable). Tap targets are deliberately larger than the dots; a full 48dp
- * per dot would overflow the curve with 4+ pages. The TWO LEADING dots are the
- * non-session pages (issue #57): slot 0 is settings, slot 1 is usage, both
- * drawn as an outlined ring instead of a fill — visually distinct and faint, so
- * the home/project pages' dots keep reading as the row's "real" content.
+ * Widest arc the row may occupy. Past this the dots would climb the sides of
+ * the face rather than read as a bottom-of-screen row, so a long pager tightens
+ * its pitch instead of spreading further.
+ */
+private const val DOT_ARC_MAX_DEGREES = 120f
+
+/**
+ * Page dots, curved along the bottom of the face (handoff: current 11px cream,
+ * others 8px grey, tappable). They sit on an arc CONCENTRIC with the status
+ * ring, [Halo.Geo.DotArcGap] inside its inner stroke edge, so every dot holds
+ * the same clearance from the ring however many pages there are — a straight
+ * row only clears at 6 o'clock and collides at the ends, where the ring curves
+ * down to meet it.
+ *
+ * Tap targets are deliberately larger than the dots; a full 48dp per dot would
+ * overflow the curve with 4+ pages. The TWO LEADING dots are the non-session
+ * pages (issue #57): slot 0 is settings, slot 1 is usage, both drawn as an
+ * outlined ring instead of a fill — visually distinct and faint, so the
+ * home/project pages' dots keep reading as the row's "real" content.
  */
 @Composable
 private fun PageDots(
@@ -849,32 +871,66 @@ private fun PageDots(
     modifier: Modifier = Modifier,
 ) {
     if (count <= 1) return
-    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
-        repeat(count) { index ->
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(width = 14.dp, height = 20.dp)
-                    .clickable { onSelect(index) },
-            ) {
-                val isCurrent = index == current
-                val color = if (isCurrent) Halo.Palette.DotCurrent else Halo.Palette.DotOther
-                if (index <= 1) {
-                    // The settings (slot 0) and usage (slot 1) dots: same
-                    // footprint, ring not fill — the flat glance pages read as
-                    // a distinct pair leading the session dots.
-                    Box(
-                        modifier = Modifier
-                            .size(if (isCurrent) 5.5.dp else 4.dp)
-                            .border(1.dp, color, CircleShape),
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .size(if (isCurrent) 5.5.dp else 4.dp)
-                            .background(color, CircleShape),
-                    )
+    Layout(
+        modifier = modifier,
+        content = {
+            repeat(count) { index ->
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(width = DOT_PITCH, height = DOT_SLOT_HEIGHT)
+                        .clickable { onSelect(index) }
+                        .testTag("haloDot-$index"),
+                ) {
+                    val isCurrent = index == current
+                    val color = if (isCurrent) Halo.Palette.DotCurrent else Halo.Palette.DotOther
+                    val dotSize = if (isCurrent) DOT_SIZE_CURRENT else DOT_SIZE_OTHER
+                    if (index <= 1) {
+                        // The settings (slot 0) and usage (slot 1) dots: same
+                        // footprint, ring not fill — the flat glance pages read
+                        // as a distinct pair leading the session dots.
+                        Box(modifier = Modifier.size(dotSize).border(1.dp, color, CircleShape))
+                    } else {
+                        Box(modifier = Modifier.size(dotSize).background(color, CircleShape))
+                    }
                 }
+            }
+        },
+    ) { measurables, constraints ->
+        val width = constraints.maxWidth
+        val height = constraints.maxHeight
+        val slots = measurables.map { it.measure(Constraints()) }
+
+        // Same derivation as HaloRing, one step further in: display radius,
+        // minus the rim gap and the full stroke (radius there is the arc's
+        // CENTRELINE, so the inner edge is another half-stroke in), minus the
+        // clearance token and the dot's own radius — the largest one, so the
+        // current dot growing never eats the gap.
+        val minDim = minOf(width, height).toFloat()
+        val scale = minDim / HALO_REF_PX
+        val ringInner = minDim / 2f - (Halo.Geo.RingEdgeGap + Halo.Geo.RingStroke) * scale
+        val radius = ringInner - Halo.Geo.DotArcGap * scale - DOT_SIZE_CURRENT.toPx() / 2f
+
+        // Arc-length pitch → angle, so dot spacing looks identical to the old
+        // straight row at 6 o'clock and stays even all the way round.
+        val pitch = if (radius > 0f) DOT_PITCH.toPx() / radius else 0f
+        val maxSpan = DOT_ARC_MAX_DEGREES * PI.toFloat() / 180f
+        val step = if (pitch * (count - 1) > maxSpan) maxSpan / (count - 1) else pitch
+        val centerX = width / 2f
+        val centerY = height / 2f
+
+        layout(width, height) {
+            slots.forEachIndexed { index, slot ->
+                // 6 o'clock is +90° with y pointing down, and x = cos θ runs
+                // right-to-left as θ grows, so the angle DECREASES as the page
+                // index rises — page 0 stays the leftmost dot.
+                val angle = PI.toFloat() / 2f - (index - (count - 1) / 2f) * step
+                val x = centerX + radius * cos(angle)
+                val y = centerY + radius * sin(angle)
+                slot.place(
+                    x = (x - slot.width / 2f).roundToInt(),
+                    y = (y - slot.height / 2f).roundToInt(),
+                )
             }
         }
     }

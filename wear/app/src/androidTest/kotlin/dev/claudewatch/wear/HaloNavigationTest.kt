@@ -249,6 +249,31 @@ class HaloNavigationTest {
         assertEquals("confirm-then-tap fires onUnpair once", 1, unpairs)
     }
 
+    /**
+     * The page dots ride an arc concentric with the status ring (a straight row
+     * clears it only at 6 o'clock and its end dots collide with the curve), so
+     * their tap targets are placed by hand-rolled polar geometry instead of a
+     * Row. Both ENDS of the arc — the dots that moved furthest — must still
+     * select their own page.
+     */
+    @Test
+    fun curvedPageDotsSelectTheirOwnPage() {
+        val bridge = fold(fixtureFrames())
+        compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
+        compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
+
+        // Last dot: the second project's page (5 pages — settings, usage, home,
+        // alpha, beta).
+        compose.onNodeWithTag("haloDot-4").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("beta").assertIsDisplayed()
+
+        // First dot: settings, the far end of the arc.
+        compose.onNodeWithTag("haloDot-0").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloSettings").assertIsDisplayed()
+    }
+
     @Test
     fun killedSessionsFeedBacksOutAndItsRowIsPruned() {
         var bridge by mutableStateOf(fold(fixtureFrames()))
