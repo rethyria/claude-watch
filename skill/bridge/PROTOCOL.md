@@ -324,6 +324,20 @@ this order:
 → `200 { "ok": true, "sessionId": "<uuid>", "agent": "claude" }`. Invalid
 agent → `400`; spawn failure → `500`.
 
+A **claude** spawn is *born in Zed-land*: the bridge routes it to the forked
+adapter Zed launched (a new `spawn` frame down the `/acp/inbox` channel), which
+creates a real ACP session — detached until an editor thread adopts it — and
+the response carries the additive fields `kind: "acp"` and `spawnRequestId`.
+There is deliberately **no PTY fallback**: with no adapter connected the spawn
+answers `409 {"error": "No Zed agent connection — open Zed …"}` and creates
+nothing. A spawn that outlives the bridge's wait (~10 s) still converges: the
+adapter's own register announces the session over SSE with the same
+`spawnRequestId`, so the client can attribute the late arrival to the spawn it
+reported as failed. The session appears in Zed either via **New Thread** (the
+adapter adopts the newest unclaimed watch-spawned session for that directory —
+one click, history replayed, live continuation) or Zed's *Import Threads*.
+Codex spawns remain bridge-owned PTYs.
+
 `cwd` selects the new session's working directory (issue #56):
 
 - an **absolute path to an existing directory** — the session spawns there
