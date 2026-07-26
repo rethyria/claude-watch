@@ -299,7 +299,13 @@ describe("wrist-only permissions for a detached session", () => {
     });
     // Same self-referencing wiring shape as runAcp: the guard's predicate
     // closes over `agent`, which is assigned before any call can flow.
+    // NOT `const`: a bare `let` binding is initialized to undefined at its
+    // declaration, so the predicate's `agent ?` guard reads undefined if it
+    // ever does run during construction. `const agent = new …` would leave the
+    // binding in its temporal dead zone for that same read, turning the guard
+    // into a ReferenceError.
     let agent: ClaudeAcpAgentType;
+    // eslint-disable-next-line prefer-const
     agent = new ClaudeAcpAgent(
       teeClientToBridge(
         guardDetachedClient(inner, (id) => (agent ? agent.isSessionDetached(id) : false)),

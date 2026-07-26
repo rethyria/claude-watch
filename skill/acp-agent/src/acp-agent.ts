@@ -1604,7 +1604,7 @@ export class ClaudeAcpAgent {
     // the pickup API, and a bridge failure of any shape must fall through to
     // the normal fresh-session path.
     if (!this.bridge?.takePendingPickup) return null;
-    let sessionId: string | null = null;
+    let sessionId: string | null;
     try {
       sessionId = await this.bridge.takePendingPickup(params.cwd);
     } catch {
