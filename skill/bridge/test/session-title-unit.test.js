@@ -274,3 +274,97 @@ test("non-regular transcript files (FIFO, device nodes, directories) yield no ti
     sessions.clear();
   }
 });
+
+test("a slot that existed before its first hook is titled MID-turn, not at the turn's end", async () => {
+  const { sessions, registerAcpSession, resolveHookSession } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  try {
+    // An ACP session is registered when Zed creates it — before a first
+    // message, so before any transcript exists.
+    registerAcpSession({ sessionId: "acp-title-1", sdkSessionId: "acp-title-1", cwd: "/tmp/acp-title-proj" });
+    assert.equal(sessions.get("acp-title-1").title, undefined, "no transcript yet: no title");
+
+    // The user sends the first message; Claude Code writes the prompt and,
+    // seconds later, the ai-title — all before the turn's first tool call.
+    const transcript = writeTranscript([userPrompt("make the nav dots curve"), aiTitle("Curve navigation dots")]);
+
+    // The turn's FIRST hook must surface it: this slot is already bound, so it
+    // takes the fast path that used to skip the transcript entirely and leave
+    // the watch showing the bare folder name until Stop.
+    resolveHookSession({ session_id: "acp-title-1", cwd: "/tmp/acp-title-proj", transcript_path: transcript });
+    assert.equal(sessions.get("acp-title-1").title, "Curve navigation dots");
+    const announced = lastSessionEvent(sseBuffer, "acp-title-1");
+    assert.equal(announced?.state, "running");
+    assert.equal(announced?.title, "Curve navigation dots", "clients learn it through an idempotent running event");
+  } finally {
+    sessions.clear();
+  }
+});
+
+test("the mid-turn scan is bounded: an AI title disarms it, and it runs at most once a second", async () => {
+  const { sessions, resolveHookSession } = await import("../sessions.js");
+
+  try {
+    // Slot created by its own first hook, BEFORE the ai-title landed: born
+    // with the first-prompt fallback.
+    const transcript = writeTranscript([userPrompt("make the nav dots curve")]);
+    const sid = resolveHookSession({ session_id: "cc-title-mid", cwd: "/tmp/title-proj-mid", transcript_path: transcript });
+    const slot = sessions.get(sid);
+    assert.equal(slot.title, "make the nav dots curve");
+    assert.equal(slot.titleIsAi, false);
+
+    // The turn's next hook scans (nothing has changed yet) and starts the
+    // rate-limit clock.
+    resolveHookSession({ session_id: "cc-title-mid", cwd: "/tmp/title-proj-mid", transcript_path: transcript });
+    assert.equal(typeof slot.titleScanAt, "number");
+
+    // The ai-title lands mid-turn. Hooks inside the 1s window skip the scan —
+    // a burst of parallel tool calls costs one read, not one per call.
+    fs.appendFileSync(transcript, JSON.stringify(aiTitle("Curve navigation dots")) + "\n");
+    resolveHookSession({ session_id: "cc-title-mid", cwd: "/tmp/title-proj-mid", transcript_path: transcript });
+    assert.equal(slot.title, "make the nav dots curve", "rate-limited: still the fallback");
+
+    // A hook a second later picks it up.
+    slot.titleScanAt -= 1000;
+    resolveHookSession({ session_id: "cc-title-mid", cwd: "/tmp/title-proj-mid", transcript_path: transcript });
+    assert.equal(slot.title, "Curve navigation dots");
+    assert.equal(slot.titleIsAi, true);
+
+    // Disarmed for good: a later ai-title is a title EVOLUTION, which is not
+    // urgent and keeps riding the Stop refresh rather than the hot path.
+    const scannedAt = slot.titleScanAt;
+    fs.appendFileSync(transcript, JSON.stringify(aiTitle("Curve the halo navigation dots")) + "\n");
+    slot.titleScanAt -= 10_000;
+    resolveHookSession({ session_id: "cc-title-mid", cwd: "/tmp/title-proj-mid", transcript_path: transcript });
+    assert.equal(slot.title, "Curve navigation dots", "hot path no longer reads the transcript");
+    assert.equal(slot.titleScanAt, scannedAt - 10_000, "…and no longer even stamps an attempt");
+  } finally {
+    sessions.clear();
+  }
+});
+
+test("a transcript that never yields an ai-title cannot scan forever: the mid-turn scan is capped", async () => {
+  const { sessions, resolveHookSession } = await import("../sessions.js");
+
+  try {
+    // No ai-title record will ever appear, so the AI-title gate never disarms
+    // the scan — only the hard cap can.
+    const transcript = writeTranscript([userPrompt("a session whose title never becomes ai-derived")]);
+    const sid = resolveHookSession({ session_id: "cc-title-cap", cwd: "/tmp/title-proj-cap", transcript_path: transcript });
+    const slot = sessions.get(sid);
+    assert.equal(slot.titleIsAi, false);
+
+    for (let i = 0; i < 60; i++) {
+      // Each hook is a second later than the last, and the transcript keeps
+      // growing, so nothing but the cap can stop the scans.
+      if (slot.titleScanAt !== undefined) slot.titleScanAt -= 1000;
+      fs.appendFileSync(transcript, JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `turn ${i}` }] } }) + "\n");
+      resolveHookSession({ session_id: "cc-title-cap", cwd: "/tmp/title-proj-cap", transcript_path: transcript });
+    }
+    assert.equal(slot.titleScanCount, 30, "capped at MID_TURN_TITLE_SCAN_LIMIT, not once per hook");
+    assert.equal(slot.title, "a session whose title never becomes ai-derived", "the fallback title still stands");
+  } finally {
+    sessions.clear();
+  }
+});
