@@ -12010,4 +12010,49 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       expect(bridge.registers[3].detached).toBeUndefined();
     });
   }, 20_000);
+
+  // #97: the register carries the wrist subheading's seed (model display
+  // name, mode id, context tokens), and the restart replay re-announces the
+  // CURRENT model/mode — noteSessionMeta's whole purpose. The context pair
+  // deliberately replays at its registration-time reading (the next teed
+  // usage_update corrects a stale percent; a stale model/mode would stick).
+  it("register carries the subheading meta and the replay reflects noteSessionMeta", async () => {
+    await withChannel(async (channel, bridge) => {
+      channel.start();
+      channel.registerSession({
+        sessionId: "meta-1",
+        sdkSessionId: "meta-1",
+        cwd: "/proj",
+        model: "Opus",
+        mode: "default",
+        contextUsed: 12000,
+        contextSize: 200000,
+      });
+      await waitFor(() => bridge.registers.length === 1);
+      expect(bridge.registers[0]).toMatchObject({
+        model: "Opus",
+        mode: "default",
+        contextUsed: 12000,
+        contextSize: 200000,
+      });
+
+      // A mid-session mode change is noted; the model must survive the
+      // partial note untouched (absent key = preserve).
+      channel.noteSessionMeta("meta-1", { mode: "plan" });
+      bridge.dropInbox();
+      await waitFor(() => bridge.registers.length === 2, 15000);
+      expect(bridge.registers[1]).toMatchObject({
+        model: "Opus",
+        mode: "plan",
+        contextUsed: 12000,
+        contextSize: 200000,
+      });
+
+      // And a model change rides the next replay the same way.
+      channel.noteSessionMeta("meta-1", { model: "Sonnet" });
+      bridge.dropInbox();
+      await waitFor(() => bridge.registers.length === 3, 15000);
+      expect(bridge.registers[2]).toMatchObject({ model: "Sonnet", mode: "plan" });
+    });
+  }, 20_000);
 });

@@ -78,6 +78,19 @@ async function readAcpBody(req, res) {
   }
 }
 
+/** Integer percent of the context window used, from a used/size token pair
+ *  (#97). One function for BOTH sources of the number — the register body's
+ *  seed and every teed `usage_update` — so the seed and the live path can
+ *  never round differently. `null` (never a guess) when the pair can't
+ *  honestly yield one: a missing/absurd size, or a fork too old to send it.
+ *  Clamped to 100 — the SDK can briefly report used > size around a window
+ *  correction, and a wrist showing 104% helps nobody. */
+function contextPctOf(used, size) {
+  if (typeof used !== "number" || typeof size !== "number") return null;
+  if (!Number.isFinite(used) || !Number.isFinite(size) || used < 0 || size <= 0) return null;
+  return Math.min(100, Math.round((used / size) * 100));
+}
+
 // POST /acp/register { connection, sessionId, sdkSessionId, cwd, active? }
 export async function handleAcpRegister(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
@@ -85,14 +98,20 @@ export async function handleAcpRegister(req, res) {
   const body = await readAcpBody(req, res);
   if (body === null) return;
 
-  const { connection, sessionId, sdkSessionId, cwd, active, title, detached } = body;
+  const { connection, sessionId, sdkSessionId, cwd, active, title, detached, model, mode } = body;
   if (typeof connection !== "string" || !connection || typeof sessionId !== "string" || !sessionId) {
     return jsonResponse(res, 400, { error: "Missing 'connection' or 'sessionId'" });
   }
 
   // `active` is the fork's report of whether a turn is in flight; it is what
   // stops a re-announce (bridge restart) from showing an idle thread as working.
-  const slot = registerAcpSession({ sessionId, sdkSessionId, cwd, active, title, detached });
+  // The subheading meta (#97) is seeded here too: the register carries context
+  // TOKENS (used + window size) and the bridge owns the percent, so the wire
+  // seed and the teed usage_update path share contextPctOf above.
+  const slot = registerAcpSession({
+    sessionId, sdkSessionId, cwd, active, title, detached, model, mode,
+    contextPct: contextPctOf(body.contextUsed, body.contextSize),
+  });
   sessionConnection.set(sessionId, connection);
   // Pickup registry maintenance. A register WITH the flag (spawn, or the
   // fork's replay after a bridge restart) marks the session claimable; one
@@ -363,6 +382,36 @@ export async function handleAcpUpdate(req, res) {
         announceAcpSlot(sessionId);
       }
     }
+    // The wrist subheading's `model · mode · use%` (#97). All three ride the
+    // client tee already — the adapter sends nothing new — and each announces
+    // ONLY on change, via the same idempotent running event the title uses.
+    // For usage that change-gate is the throttle: mid-turn usage_updates
+    // stream once per message, but the INTEGER percent moves far less often,
+    // and a wrist meter has no use for sub-percent motion.
+    if (update?.sessionUpdate === "usage_update") {
+      const slot = sessions.get(sessionId);
+      const contextPct = contextPctOf(update.used, update.size);
+      if (slot && contextPct !== null && slot.contextPct !== contextPct) {
+        slot.contextPct = contextPct;
+        announceAcpSlot(sessionId);
+      }
+    }
+    if (update?.sessionUpdate === "current_mode_update" && typeof update.currentModeId === "string") {
+      const slot = sessions.get(sessionId);
+      const mode = update.currentModeId;
+      if (slot && mode && slot.mode !== mode) {
+        slot.mode = mode;
+        announceAcpSlot(sessionId);
+      }
+    }
+    if (update?.sessionUpdate === "config_option_update") {
+      const slot = sessions.get(sessionId);
+      const model = modelDisplayFromConfigOptions(update.configOptions);
+      if (slot && model && slot.model !== model) {
+        slot.model = model;
+        announceAcpSlot(sessionId);
+      }
+    }
   }
 
   // A permission request is a PAUSE, not a turn end: the turn is still open but
@@ -389,6 +438,28 @@ export async function handleAcpUpdate(req, res) {
   }
 
   return jsonResponse(res, 200, { ok: true });
+}
+
+/** The current model's DISPLAY name from a teed `config_option_update`'s
+ *  option list (#97): the model-category option's currentValue, resolved to
+ *  its option row's human name. Falls back to the currentValue verbatim when
+ *  no row matches — a session running an out-of-picker model (refusal
+ *  fallback, allowlist-excluded resume) reports a currentValue with no entry,
+ *  and the raw id is then the only honest label. `null` means "this update
+ *  says nothing about the model" (no model option at all), never "clear":
+ *  effort/agent/fast-mode rebuilds arrive as the same update kind. Option
+ *  rows can be grouped (an entry carrying its own `options`), so flatten one
+ *  level, exactly as the adapter's own value validation does. */
+function modelDisplayFromConfigOptions(configOptions) {
+  if (!Array.isArray(configOptions)) return null;
+  const option =
+    configOptions.find((o) => o?.category === "model") ?? configOptions.find((o) => o?.id === "model");
+  if (!option || typeof option.currentValue !== "string" || !option.currentValue) return null;
+  const rows = Array.isArray(option.options)
+    ? option.options.flatMap((o) => (o && Array.isArray(o.options) ? o.options : [o]))
+    : [];
+  const row = rows.find((o) => o?.value === option.currentValue);
+  return typeof row?.name === "string" && row.name ? row.name : option.currentValue;
 }
 
 /** Emit the session's buffered prose as ONE `message` event and clear it.

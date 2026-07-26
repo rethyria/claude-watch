@@ -581,6 +581,15 @@ export function sessionEventPayload(slot, fields) {
   // the late arrival to it ("arrived late", not a mystery session). Clients
   // that don't know the field ignore it.
   if (slot.spawnRequestId) payload.spawnRequestId = slot.spawnRequestId;
+  // Additive subheading meta (#97, Halo v2): the session's model display name,
+  // ACP permission-mode id, and integer context-used percent. Written only by
+  // the ACP lane (register seed + teed updates, acp.js), so PTY/hook sessions
+  // simply omit them; absent means preserve, per the title doctrine.
+  // `contextPct` is compared as a number, not truthiness — 0% is a real value
+  // a fresh session legitimately reports.
+  if (slot.model) payload.model = slot.model;
+  if (slot.mode) payload.mode = slot.mode;
+  if (typeof slot.contextPct === "number") payload.contextPct = slot.contextPct;
   return payload;
 }
 
@@ -1285,6 +1294,12 @@ export function getSessionsSnapshot() {
     // REST snapshot that disagreed with the SSE snapshot about whether a
     // session is working would just relocate the bug.
     ...(s.idle ? { idle: true } : {}),
+    // Additive subheading meta (#97), in lockstep with sessionEventPayload —
+    // including the number-not-truthiness comparison that keeps a real 0%
+    // from vanishing off the REST snapshot.
+    ...(s.model ? { model: s.model } : {}),
+    ...(s.mode ? { mode: s.mode } : {}),
+    ...(typeof s.contextPct === "number" ? { contextPct: s.contextPct } : {}),
   }));
 }
 
@@ -1557,7 +1572,7 @@ export function endHookSession(body) {
  *  SDK's underlying session_id used for hook correlation; in this fork it equals
  *  `sessionId`, but it is passed explicitly so the binding is correct even if
  *  that ever diverges. Returns the slot. */
-export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title, detached }) {
+export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title, detached, model, mode, contextPct }) {
   const boundSdkId = sdkSessionId || sessionId;
   const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
@@ -1601,6 +1616,16 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title
     // Zed, even though nothing had started; the flag only moves on a real turn
     // boundary (`kind: "turn"`), which is the sole authority for it.
     if (typeof title === "string" && title && !slot.title) slot.title = title;
+    // Subheading meta (#97). Model/mode apply on a re-register: the fork's
+    // noteSessionMeta keeps its replay copy current, so these are never staler
+    // than what the slot holds. `contextPct` deliberately does NOT — it is the
+    // one meta value the replay carries at its REGISTRATION-TIME reading (the
+    // adapter refreshes model/mode only), so on a slot the bridge has been
+    // following it would rewind a percent the teed usage_updates had advanced.
+    // It only seeds a first-met slot (below), the bridge-restart case, same as
+    // `active`.
+    if (typeof model === "string" && model) slot.model = model;
+    if (typeof mode === "string" && mode) slot.mode = mode;
     slot.endedAt = undefined;
     slot.endedAuthoritatively = false;
     // Watch-spawned pickup state, driven entirely by what the fork announces:
@@ -1630,6 +1655,13 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title
       ...(typeof title === "string" && title ? { title, titleIsAi: true } : {}),
       // Watch-spawned, no editor thread yet (see the refresh branch above).
       ...(detached === true ? { detached: true } : {}),
+      // Subheading meta (#97), seeded from the register body so a fresh slot
+      // (and a bridge restart's rebuilt one) has the fields before any teed
+      // update arrives. Integer-guarded: the percent is bridge-computed
+      // (contextPctOf in acp.js) but a foreign caller must not plant NaN.
+      ...(typeof model === "string" && model ? { model } : {}),
+      ...(typeof mode === "string" && mode ? { mode } : {}),
+      ...(Number.isInteger(contextPct) ? { contextPct } : {}),
     };
     sessions.set(sessionId, slot);
   }

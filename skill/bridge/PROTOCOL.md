@@ -264,6 +264,11 @@ Authenticated snapshot:
   `{ "running": n, "done": n }` — workflow subagent activity, present once
   observed. Completion is the **explicit** `{running: 0, ...}` state; absence
   preserves the last known value. See the [`session`](#session) event.
+- `sessions[].model` / `sessions[].mode` / `sessions[].contextPct`
+  (**optional, additive** — issue #97): the subheading meta of an ACP
+  session — model display name, permission-mode id, integer context-used
+  percent. Omitted for hook/PTY sessions, which never carry them. See the
+  [`session`](#session) event.
 - `hasPty` / `activeAgent`: legacy conveniences describing the most recent
   active session; prefer `sessions[]`.
 
@@ -637,6 +642,33 @@ after the restart is left to the authoritative sync (#66). Clients should render
 an indicator only while
 `running > 0`, and must not offer any control affordance (a workflow cannot
 be stopped from a client).
+
+**`model`** / **`mode`** / **`contextPct`** (**optional, additive** — issue
+#97, Halo v2): the session subheading's `model · mode · use%`, carried on
+every session event of a slot that has them (`running`/`ended`, the
+idempotent refresh, the connect-time sync) and mirrored on
+`sessions[].model` / `sessions[].mode` / `sessions[].contextPct` in
+`/v1/status`. Only **ACP** (Zed-hosted) sessions ever have them — the hook
+and PTY paths carry no equivalent signal, so those sessions simply omit all
+three. Absent means **preserve what you knew** (the `title` doctrine); per
+the additive-field rules there is no protocol-version bump and older clients
+ignore them.
+
+- `model` (string): the **human display name** of the session's current
+  model (e.g. `"Opus"`), as the agent's model picker names it — the
+  `default` alias is resolved through the model it currently points at
+  before falling back to `"Default"`. Third-party backends can yield a raw
+  model id here; the bridge passes it verbatim rather than guessing.
+- `mode` (string): the ACP permission-mode id **verbatim** (`default` /
+  `plan` / `acceptEdits` / `bypassPermissions` / …). Clients wanting a label
+  map the ids they know and show the id itself otherwise — the vocabulary is
+  the agent's and may grow.
+- `contextPct` (integer 0–100): percent of the model's context window
+  **USED**, same direction as `/v1/usage`. Seeded at registration from the
+  adapter's context accounting and re-announced **only when the integer
+  changes** — mid-turn usage streams once per message, but sub-percent
+  motion never produces an event. `0` is a real value (a fresh session), so
+  clients must key on the field's presence, not its truthiness.
 
 ### `pty-output`
 Raw terminal output from a bridge-owned PTY (ANSI escapes included) or from a

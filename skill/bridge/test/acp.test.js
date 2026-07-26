@@ -800,3 +800,227 @@ test("turn start announces an explicit idle:false, turn end idle:true (#79)", { 
   const resent = await snap.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-wake");
   assert.equal(resent.parsed.idle, undefined, "the reconnect snapshot must stay silent about idle");
 });
+
+// --- Wrist subheading meta: model · mode · contextPct (#97, Halo v2 S8) ------
+// The v2 pager shows `model · mode · use%` under each session title. The
+// register body seeds all three (context arrives as TOKENS, the bridge owns
+// the percent); the teed updates the bridge used to ignore keep them current.
+
+test("register seeds model/mode/contextPct, and SSE + REST agree — 0% included (#97)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "meta");
+
+  const inbox = connectInbox(bridge, "conn-meta");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+
+  const res = await request(bridge.port, "POST", "/acp/register", {
+    body: {
+      connection: "conn-meta", sessionId: "acp-meta", sdkSessionId: "acp-meta", cwd,
+      model: "Opus", mode: "default", contextUsed: 0, contextSize: 200000,
+    },
+  });
+  assert.equal(res.status, 200);
+
+  // The connect-time snapshot carries the seeded meta — including the 0% a
+  // fresh session honestly reports (presence, not truthiness).
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  const ev = await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-meta");
+  assert.equal(ev.parsed.model, "Opus");
+  assert.equal(ev.parsed.mode, "default");
+  assert.equal(ev.parsed.contextPct, 0, "a real 0% must survive the omit-when-false doctrine");
+
+  const entry = await statusEntry(bridge, token, "acp-meta");
+  assert.equal(entry.model, "Opus");
+  assert.equal(entry.mode, "default");
+  assert.equal(entry.contextPct, 0);
+
+  // A hook session never carries the fields — there is no signal to derive
+  // them from, and a fabricated value would be a lie.
+  const hookCwd = realCwd(t, "metahook");
+  await request(bridge.port, "POST", "/hooks/tool-output", {
+    body: { session_id: "hook-meta", cwd: hookCwd, tool_name: "Read", tool_output: "hi" },
+  });
+  const hookEntry = (await request(bridge.port, "GET", "/status", { token })).body.sessions.find((s) => s.cwd === hookCwd);
+  assert.ok(hookEntry, "hook session present");
+  assert.equal(hookEntry.model, undefined);
+  assert.equal(hookEntry.mode, undefined);
+  assert.equal(hookEntry.contextPct, undefined);
+});
+
+test("teed usage_update announces contextPct only when the integer changes (#97)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "pct");
+
+  const inbox = connectInbox(bridge, "conn-pct");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await request(bridge.port, "POST", "/acp/register", {
+    body: {
+      connection: "conn-pct", sessionId: "acp-pct", sdkSessionId: "acp-pct", cwd,
+      model: "Opus", mode: "default", contextUsed: 0, contextSize: 200000,
+    },
+  });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-pct");
+
+  const usage = (used, size) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: {
+        connection: "conn-pct", sessionId: "acp-pct", kind: "session_update",
+        payload: { sessionId: "acp-pct", update: { sessionUpdate: "usage_update", used, size } },
+      },
+    });
+
+  await usage(800, 200000);    // 0.4% → still 0: below the integer step, no event
+  await usage(100000, 200000); // 50% → announce
+  await usage(100600, 200000); // 50.3% → still 50: the mid-stream duplicate case
+  await usage(120000, 200000); // 60% → announce
+
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.contextPct === 60);
+  const pcts = sse.events
+    .filter((e) => e.event === "session" && e.parsed?.sessionId === "acp-pct")
+    .map((e) => e.parsed.contextPct);
+  assert.deepEqual(pcts, [0, 50, 60], "one event per INTEGER move — sub-percent motion is silent");
+});
+
+test("teed current_mode_update announces the mode on change, not on repeat (#97)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "mode");
+
+  const inbox = connectInbox(bridge, "conn-mode");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await request(bridge.port, "POST", "/acp/register", {
+    body: {
+      connection: "conn-mode", sessionId: "acp-mode", sdkSessionId: "acp-mode", cwd,
+      model: "Opus", mode: "default", contextUsed: 0, contextSize: 200000,
+    },
+  });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-mode");
+
+  const modeUpdate = (currentModeId) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: {
+        connection: "conn-mode", sessionId: "acp-mode", kind: "session_update",
+        payload: { sessionId: "acp-mode", update: { sessionUpdate: "current_mode_update", currentModeId } },
+      },
+    });
+
+  await modeUpdate("default"); // the register already said so — no event
+  await modeUpdate("plan");
+  await modeUpdate("plan");    // repeat — no event
+  await modeUpdate("acceptEdits");
+
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.mode === "acceptEdits");
+  const modes = sse.events
+    .filter((e) => e.event === "session" && e.parsed?.sessionId === "acp-mode")
+    .map((e) => e.parsed.mode);
+  assert.deepEqual(modes, ["default", "plan", "acceptEdits"], "announce on change only");
+  assert.equal((await statusEntry(bridge, token, "acp-mode")).mode, "acceptEdits");
+});
+
+test("teed config_option_update announces the model DISPLAY name, raw id verbatim off-picker (#97)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "model");
+
+  const inbox = connectInbox(bridge, "conn-model");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await request(bridge.port, "POST", "/acp/register", {
+    body: {
+      connection: "conn-model", sessionId: "acp-model", sdkSessionId: "acp-model", cwd,
+      model: "Opus", mode: "default", contextUsed: 0, contextSize: 200000,
+    },
+  });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-model");
+
+  const configUpdate = (currentValue) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: {
+        connection: "conn-model", sessionId: "acp-model", kind: "session_update",
+        payload: {
+          sessionId: "acp-model",
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: [
+              { id: "mode", category: "mode", currentValue: "default", options: [] },
+              {
+                id: "model", category: "model", currentValue,
+                options: [
+                  { value: "opus[1m]", name: "Opus" },
+                  { value: "sonnet", name: "Sonnet" },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    });
+
+  await configUpdate("opus[1m]"); // display name "Opus" — unchanged, no event
+  await configUpdate("sonnet");
+  await configUpdate("sonnet");   // an effort/agent rebuild re-sends the list — no event
+  // A refusal fallback outside the picker: no option row, so the raw id is
+  // the only honest label.
+  await configUpdate("claude-weird-9");
+
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.model === "claude-weird-9");
+  const models = sse.events
+    .filter((e) => e.event === "session" && e.parsed?.sessionId === "acp-model")
+    .map((e) => e.parsed.model);
+  assert.deepEqual(models, ["Opus", "Sonnet", "claude-weird-9"], "display name on change only");
+});
+
+// The replay's context pair is a registration-time reading (the fork refreshes
+// only model/mode in its replay copy), so a re-register must behave like the
+// `active` doctrine: refresh what is current, never rewind what the teed
+// updates advanced.
+test("a re-register refreshes model/mode but never rewinds contextPct (#97)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "rewind");
+
+  const inbox = connectInbox(bridge, "conn-rewind");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  const register = (fields) =>
+    request(bridge.port, "POST", "/acp/register", {
+      body: { connection: "conn-rewind", sessionId: "acp-rewind", sdkSessionId: "acp-rewind", cwd, ...fields },
+    });
+  await register({ model: "Opus", mode: "default", contextUsed: 0, contextSize: 200000 });
+
+  // The turn advances the meter to 50%.
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-rewind", sessionId: "acp-rewind", kind: "session_update",
+      payload: { sessionId: "acp-rewind", update: { sessionUpdate: "usage_update", used: 100000, size: 200000 } },
+    },
+  });
+  assert.equal((await statusEntry(bridge, token, "acp-rewind")).contextPct, 50);
+
+  // A duplicate register (reconnect replay) carries the stale creation-time
+  // tokens but the CURRENT mode the fork's noteSessionMeta kept fresh.
+  await register({ model: "Opus", mode: "plan", contextUsed: 0, contextSize: 200000 });
+
+  const entry = await statusEntry(bridge, token, "acp-rewind");
+  assert.equal(entry.mode, "plan", "model/mode refresh on a re-register");
+  assert.equal(entry.contextPct, 50, "a stale register must not rewind the meter");
+});
