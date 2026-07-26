@@ -271,6 +271,15 @@ export const ACP_SPAWN_TIMEOUT_MS = testOverridable(
 // CLAUDE_WATCH_WORKFLOW_STALE_MS (test-only).
 export const WORKFLOW_POLL_MS = testOverridable("CLAUDE_WATCH_WORKFLOW_POLL_MS", 20_000);
 export const WORKFLOW_STALE_MS = testOverridable("CLAUDE_WATCH_WORKFLOW_STALE_MS", 300_000);
+// Where the Claude Code CLI keeps per-project transcripts. Hook bodies carry
+// the real transcript_path, but the ACP channel has no equivalent field on any
+// wire — the bridge derives it from this root plus the CLI's cwd-munging
+// convention (issue #105, see deriveAcpTranscriptPath in sessions.js).
+// Overridable so tests can point the derivation at a fixture tree.
+export const CLAUDE_PROJECTS_ROOT = testOverridableString(
+  "CLAUDE_WATCH_CLAUDE_PROJECTS_ROOT",
+  path.join(os.homedir(), ".claude", "projects"),
+);
 export const CODEX_SESSION_SCAN_INTERVAL_MS = 1_500;
 export const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 export const CODEX_SESSION_SCAN_LIMIT = 25;

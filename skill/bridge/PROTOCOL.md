@@ -620,7 +620,9 @@ opportunistic points as `title`; a change is broadcast as the idempotent
 
 **`agents`** (object `{ "running": n, "done": n }`, **optional, additive** —
 issue #55): multi-agent workflow activity observed for this session. The
-bridge learns a workflow **started** from the Workflow tool's PostToolUse hook
+bridge learns a workflow **started** from the wire that names the Workflow
+tool — its PostToolUse hook for hook sessions, the teed ACP `tool_call` for
+ACP sessions (issue #105) —
 and then watches the session's workflow journals on a slow poll; `running`
 counts agents started without a result, `done` counts completed agents of
 currently-live workflows. Completion is signaled by the **explicit**

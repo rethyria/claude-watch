@@ -14,6 +14,7 @@ import {
   MAX_EXTERNAL_SESSIONS,
   WORKFLOW_POLL_MS,
   WORKFLOW_STALE_MS,
+  CLAUDE_PROJECTS_ROOT,
 } from "./config.js";
 import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
@@ -672,18 +673,21 @@ function acquireTitleMidTurn(slot) {
 // falling back to agentId for records that lack it). running = started keys
 // without a matching result key.
 //
-// Lifecycle: a PostToolUse hook with tool_name "Workflow" is the launch
-// signal (hooks.js calls markWorkflowActivity) — it flips the slot
-// workflow-active and runs the first scan immediately so the indicator does
-// not wait out a poll interval. A module-level poll then re-scans ONLY active
-// slots every WORKFLOW_POLL_MS (the poll's cheap boolean gate makes idle
-// ticks free). A bridge restarted mid-workflow loses the in-memory arming and
-// never sees a fresh launch signal; reconcileWorkflowActivity re-derives the
-// indicator from the on-disk journal when the surviving session re-registers,
-// so a re-registering session's stale blue is corrected rather than stranded
-// (issue #68). A session that fires no further hook after the restart (it went
-// idle, or its next hook is SessionEnd) is not re-derived — that residual gap
-// belongs to the authoritative session sync (#66).
+// Lifecycle: the launch signal is a Workflow tool call, observed per channel —
+// a PostToolUse hook with tool_name "Workflow" (hooks.js) or a teed ACP
+// tool_call whose _meta names the tool (acp.js, issue #105); both call
+// markWorkflowActivity, which flips the slot workflow-active and runs the
+// first scan immediately so the indicator does not wait out a poll interval.
+// A module-level poll then re-scans ONLY active slots every WORKFLOW_POLL_MS
+// (the poll's cheap boolean gate makes idle ticks free). A bridge restarted
+// mid-workflow loses the in-memory arming and never sees a fresh launch
+// signal; reconcileWorkflowActivity re-derives the indicator from the on-disk
+// journal when the surviving session re-registers — createExternalSession for
+// a hook session, registerAcpSession for an ACP one — so a re-registering
+// session's stale blue is corrected rather than stranded (issue #68). A hook
+// session that fires no further hook after the restart (it went idle, or its
+// next hook is SessionEnd) is not re-derived — that residual gap belongs to
+// the authoritative session sync (#66).
 //
 // Completion vs. between-phases: a multi-phase workflow legitimately reads
 // zero running in the gap between phases (phase N's agents all finished,
@@ -971,8 +975,12 @@ function reconcileWorkflowActivity(slot, now = Date.now()) {
   // Stale tree: the workflow finished or died during the downtime (running and
   // done are both 0 — every dir is stale and skipped from the aggregate).
   // Broadcast the explicit zero so a client latched on a pre-restart blue
-  // clears. Nothing live to track, so do not arm.
-  slot.agents = { running: 0, done: 0 };
+  // clears. Nothing live to track, so do not arm. The peak done survives when
+  // this slot itself tracked the workflow (an ACP re-register after the
+  // completion broadcast, issue #105) so the zero re-announced here agrees
+  // with the completion state clients already hold; a restart-fresh slot has
+  // no peak and reports 0, exactly as before.
+  slot.agents = { running: 0, done: slot.workflowDone ?? 0 };
 }
 
 // Poll tick (exported so tests can drive it with an injectable `now` instead
@@ -1568,6 +1576,28 @@ export function endHookSession(body) {
 // unauthenticated hook slot. `external` is derived from `kind === "acp"`
 // instead (see sessionEventPayload / getSessionsSnapshot).
 
+// The workflow-activity scanner reads slot.transcriptPath, which only hook
+// bodies ever carried — the ACP channel has no transcript field on any wire,
+// so an ACP slot had nothing to scan and the DELEGATED indicator could never
+// arm (issue #105). Derive the path instead, from the cwd + SDK session id the
+// registration already holds.
+//
+// CONVENTION-COUPLED: mirrors the CLI's projects-dir layout,
+//   <CLAUDE_PROJECTS_ROOT>/<cwd with [^a-zA-Z0-9] → "-">/<session_id>.jsonl
+// — the same munge findVerifiedProjectRoot verifies in the other direction
+// (see the sanitize-char-class note there, verified two ways on this machine).
+// Its known hole is inherited too: a cwd whose munged name exceeds ~200 chars
+// is truncated and hash-suffixed by the CLI, so the derived path misses and
+// the indicator simply stays unfed for that session. The id gate keeps a
+// foreign registration body from planting path separators (or a bare "..")
+// inside the filename; a real SDK uuid always passes, and an id that does not
+// just means no derivation — the slot behaves exactly as before this feature.
+function deriveAcpTranscriptPath(cwd, sdkSessionId) {
+  if (typeof cwd !== "string" || !path.isAbsolute(cwd)) return null;
+  if (typeof sdkSessionId !== "string" || !/^[A-Za-z0-9_-]+$/.test(sdkSessionId)) return null;
+  return path.join(CLAUDE_PROJECTS_ROOT, sanitizeProjectPath(path.resolve(cwd)), `${sdkSessionId}.jsonl`);
+}
+
 /** Register (or idempotently refresh) an ACP session. `sdkSessionId` is the
  *  SDK's underlying session_id used for hook correlation; in this fork it equals
  *  `sessionId`, but it is passed explicitly so the binding is correct even if
@@ -1666,6 +1696,30 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title
     sessions.set(sessionId, slot);
   }
   bindHookSession(slot, boundSdkId);
+  // Feed the workflow scanner (issue #105). Derivation only fills an EMPTY
+  // slot, for two reasons that point the same way: a hook-carried path — the
+  // real one, straight from Claude Code — must never be clobbered by the
+  // convention-derived guess, and the transcript's location is fixed by the
+  // session's BIRTH cwd, so the first register's derivation stays correct even
+  // if a later re-announce ever named a different directory. Only the caller's
+  // explicit cwd may feed it: the spawn-result early-register can race in
+  // cwd-less, and locking a path derived from the fallback chain would leave a
+  // guess-on-a-guess that the fork's real register (which does carry the cwd,
+  // and lands here moments later) could no longer correct.
+  //
+  // Reconciliation then mirrors the hook path's #68 semantics on EVERY
+  // register, because both restart shapes land here: a bridge restart re-meets
+  // the session as a fresh slot (the createExternalSession analogue), and a
+  // fork restart (Zed relaunch) re-registers a surviving slot whose poll went
+  // quiet when the inbox drop ended it — either way a workflow still on disk
+  // must re-arm the scan, and a finished one must broadcast its explicit zero
+  // instead of stranding a stale blue. An armed slot is untouched (reconcile's
+  // first guard), so the common live re-register stays a no-op.
+  if (!slot.transcriptPath) {
+    const derived = deriveAcpTranscriptPath(cwd, boundSdkId);
+    if (derived) slot.transcriptPath = derived;
+  }
+  reconcileWorkflowActivity(slot);
   refreshGitMetadata(slot);
   log("info", `Registered ACP session ${sessionId} (${folderName})`);
   pushSseEvent(

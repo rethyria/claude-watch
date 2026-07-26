@@ -17,6 +17,7 @@
 import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
 import {
   registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
+  markWorkflowActivity,
 } from "./sessions.js";
 import { ACP_INBOX_HEARTBEAT_MS, ACP_SPAWN_TIMEOUT_MS } from "./config.js";
 import { waitForPermission, canonicalPermissionOptions, cancelPermission } from "./permissions.js";
@@ -369,6 +370,22 @@ export async function handleAcpUpdate(req, res) {
     // buffer here is what makes the flush "the last block" rather than a
     // transcript of the whole turn.
     if (update?.sessionUpdate === "tool_call") proseBuffers.delete(sessionId);
+    // Workflow launch signal (issue #105) — the ACP-era replacement for the
+    // PostToolUse arming in hooks.js, which no ACP session ever fires. The
+    // adapter stamps the RAW tool name on every tool_call it emits
+    // (`_meta.claudeCode.toolName`, exactly once per tool_use — its
+    // emittedToolCalls dedup demotes later surfaces to tool_call_update), so
+    // this is the same "the Workflow tool was called" fact the hook carried.
+    // It just arrives BEFORE execution rather than after: the immediate scan
+    // usually sees no journal yet and the poll picks the tree up as it
+    // materializes — and a Workflow that never runs (permission denied) is the
+    // already-handled journals-never-materialize case, a quiet give-up after
+    // the stale window. tool_call_updates are deliberately NOT matched: each
+    // arming resets the observed/peak-done state, and the refine/progress
+    // updates for one call would re-reset it mid-workflow.
+    if (update?.sessionUpdate === "tool_call" && update._meta?.claudeCode?.toolName === "Workflow") {
+      markWorkflowActivity(sessionId);
+    }
     // The SDK auto-generates a thread title in the background and the adapter
     // polls it at turn end, pushing `session_info_update`. Without this the slot
     // has no title at all — the transcript-scraping path that titles hook
