@@ -1570,6 +1570,14 @@ export class ClaudeAcpAgent {
    *  wrist keeps following the same slot as a normal Zed session. */
   private attachDetachedSession(sessionId: string, session: Session, via: string): void {
     session.detached = false;
+    // Reset the editor-visible title baseline. Every title poll that ran while
+    // detached advanced `lastTitle` — with the guard (correctly) dropping the
+    // editor leg of the update — so the change detector's state describes what
+    // the WATCH has seen, not what this editor has. Left in place, the
+    // post-attach poll would early-return on "unchanged" and the thread would
+    // sit as "New Agent Thread" forever. The bridge side is idempotent
+    // (slot.title comparison), so the wrist sees no duplicate announce.
+    session.lastTitle = undefined;
     this.logger.log(
       `claude-watch: watch-spawned session ${sessionId} attached to the editor (${via})`,
     );

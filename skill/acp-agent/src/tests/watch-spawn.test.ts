@@ -363,6 +363,27 @@ describe("session/new desk pickup", () => {
     expect(bridge.noteSessionTitle).toHaveBeenCalledWith("watch-1", "hello from the wrist");
   });
 
+  it("pushes the title to the editor even when a detached-era poll already recorded it", async () => {
+    // The 5s post-turn retry ran while detached: lastTitle is set, but the
+    // guard dropped that update's editor leg — the editor has seen NOTHING.
+    // Adoption must reset the baseline or the change detector early-returns
+    // and the thread sits as "New Agent Thread" forever (desk-found).
+    const bridge = makeFakeBridge({ takePendingPickup: vi.fn(async () => "watch-1") });
+    const client = makeMockClient();
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }, bridge);
+    agent.sessions["watch-1"] = fakeSession({ lastTitle: "hello from the wrist" });
+
+    await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+    const updateSpy = client.sessionUpdate as unknown as ReturnType<typeof vi.fn>;
+    await vi.waitFor(() => {
+      const titles = updateSpy.mock.calls
+        .filter((c: any[]) => c[0]?.update?.sessionUpdate === "session_info_update")
+        .map((c: any[]) => c[0].update.title);
+      expect(titles).toContain("hello from the wrist");
+    });
+  });
+
   it("adopts despite a fingerprint mismatch (editor MCP servers must not kill the live session)", async () => {
     const bridge = makeFakeBridge({ takePendingPickup: vi.fn(async () => "watch-1") });
     const agent = new ClaudeAcpAgent(makeMockClient(), { log: () => {}, error: () => {} }, bridge);
