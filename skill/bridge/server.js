@@ -33,6 +33,8 @@ import {
   handleAcpUpdate,
   handleAcpDeregister,
   handleAcpInbox,
+  handleAcpSpawnResult,
+  handleAcpClaim,
   closeAllAcpInboxes,
 } from "./acp.js";
 import { handlePair, handleCommand, handleStatus, handlePing } from "./commands.js";
@@ -112,6 +114,10 @@ const routes = {
   "POST /acp/update": handleAcpUpdate,
   "POST /acp/deregister": handleAcpDeregister,
   "GET /acp/inbox": handleAcpInbox,
+  // Watch spawn (born-in-Zed sessions): the fork's explicit answer to a
+  // `spawn` frame, and the desk-pickup claim its session/new makes.
+  "POST /acp/spawn-result": handleAcpSpawnResult,
+  "POST /acp/claim": handleAcpClaim,
   // Operator device admin (issue #72): loopback-only, not part of the /v1
   // client protocol. See admin.js / PROTOCOL.md "Admin surface".
   "GET /admin/devices": handleAdminDevices,
@@ -282,29 +288,41 @@ async function startServer() {
 
   // Bonjour (error callback: mDNS failures — bound 5353, no multicast — must
   // not crash the bridge; discovery degrades to manual IP entry)
-  bonjourInstance = new Bonjour(undefined, (err) => {
-    log("warn", `Bonjour/mDNS error (discovery disabled): ${err?.message || err}`);
-  });
-  bonjourService = bonjourInstance.publish({
-    name: `Agent Watch Bridge (${os.hostname()})`,
-    type: "claude-watch",
-    protocol: "tcp",
-    port: boundPort,
-    // Advertise IPv4 ONLY. bonjour-service otherwise announces every non-internal
-    // host address, which on this machine means one reachable IPv4 plus a pile of
-    // IPv6 ULAs (fda6:…) and a link-local (fe80::). The watch's NsdManager
-    // resolveService returns a SINGLE host; if it picks one of those IPv6
-    // addresses the watch cannot route to the host on, the discovery confirm-ping
-    // fails and the bridge is silently discarded — discovery "finds nothing" even
-    // though it is right there on IPv4. The watch always reaches the bridge over
-    // the IPv4 LAN, so those AAAA records are pure liability.
-    disableIPv6: true,
-    // txt.v carries the protocol version (PROTOCOL.md "Versioning");
-    // txt.version/txt.sessionId are frozen legacy aliases.
-    txt: bonjourTxtRecord(),
-  });
+  //
+  // CLAUDE_WATCH_DISABLE_MDNS=1 (test-only) skips advertising entirely. A
+  // second bridge on the same machine — every test bridge, any scratch run —
+  // probes the SAME service name the live bridge is defending, and
+  // bonjour-service surfaces that conflict as an uncaught 'error' event that
+  // kills the process 1–3 s after boot, depending on multicast delivery
+  // timing. That coin flip is a long-standing source of test flakiness; test
+  // bridges are reached by explicit port and never need discovery.
+  if (process.env.CLAUDE_WATCH_DISABLE_MDNS === "1") {
+    log("info", "Bonjour advertising disabled (CLAUDE_WATCH_DISABLE_MDNS=1)");
+  } else {
+    bonjourInstance = new Bonjour(undefined, (err) => {
+      log("warn", `Bonjour/mDNS error (discovery disabled): ${err?.message || err}`);
+    });
+    bonjourService = bonjourInstance.publish({
+      name: `Agent Watch Bridge (${os.hostname()})`,
+      type: "claude-watch",
+      protocol: "tcp",
+      port: boundPort,
+      // Advertise IPv4 ONLY. bonjour-service otherwise announces every non-internal
+      // host address, which on this machine means one reachable IPv4 plus a pile of
+      // IPv6 ULAs (fda6:…) and a link-local (fe80::). The watch's NsdManager
+      // resolveService returns a SINGLE host; if it picks one of those IPv6
+      // addresses the watch cannot route to the host on, the discovery confirm-ping
+      // fails and the bridge is silently discarded — discovery "finds nothing" even
+      // though it is right there on IPv4. The watch always reaches the bridge over
+      // the IPv4 LAN, so those AAAA records are pure liability.
+      disableIPv6: true,
+      // txt.v carries the protocol version (PROTOCOL.md "Versioning");
+      // txt.version/txt.sessionId are frozen legacy aliases.
+      txt: bonjourTxtRecord(),
+    });
 
-  log("info", `Bonjour advertising _claude-watch._tcp on port ${boundPort}`);
+    log("info", `Bonjour advertising _claude-watch._tcp on port ${boundPort}`);
+  }
   startCodexMonitor();
 
   // --- Graceful shutdown ---
