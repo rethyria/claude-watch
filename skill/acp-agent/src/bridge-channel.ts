@@ -77,6 +77,17 @@ export interface BridgeChannel {
      *  adopts it (desk pickup / session load). Rides the replay too, so a
      *  bridge restart keeps knowing which sessions are pickup candidates. */
     detached?: boolean;
+    /** Halo v2 (#97): the wrist subheading's `model · mode · use%`. The model
+     *  is the human DISPLAY name (default-alias already resolved by the agent
+     *  — the bridge has no model list to resolve against); the mode is the ACP
+     *  permission-mode id verbatim; the context pair is TOKENS (used + window
+     *  size), from which the bridge derives its integer percent. All mid-
+     *  session changes reach the bridge through the client tee — these only
+     *  seed the slot and ride the restart replay. */
+    model?: string;
+    mode?: string;
+    contextUsed?: number;
+    contextSize?: number;
   }): void;
   /** The ACP session ended (query closed / closeSession / dispose). */
   deregisterSession(sessionId: string, reason: string): void;
@@ -107,6 +118,14 @@ export interface BridgeChannel {
   forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void;
   /** Remember a freshly-learned thread title for the next re-announce (#79). */
   noteSessionTitle(sessionId: string, title: string): void;
+  /** Remember a mid-session model/mode change for the next re-announce (#97,
+   *  the noteSessionTitle pattern). The LIVE bridge already learns these from
+   *  the teed `config_option_update`/`current_mode_update`; this only keeps
+   *  the restart replay from re-announcing the values the session was born
+   *  with. The context pair is deliberately NOT noted: a replayed percent one
+   *  turn stale is corrected by the next teed `usage_update`, whereas a wrong
+   *  model/mode would sit until the user changes it again. */
+  noteSessionMeta(sessionId: string, meta: { model?: string; mode?: string }): void;
   /** Register the handler the inbox calls when the watch dictates. */
   onInject(handler: InjectHandler): void;
   /** Register the handler the inbox calls when the watch answers a permission
@@ -184,6 +203,13 @@ export class HttpBridgeChannel implements BridgeChannel {
        *  so a replay after a bridge restart re-announces the truth — a restarted
        *  bridge that lost its pickup registry relearns it from this flag. */
       detached?: boolean;
+      /** Subheading meta (#97). Model/mode are refreshed by noteSessionMeta as
+       *  they change, so a replay re-announces the CURRENT values; the context
+       *  pair stays as registered (see the interface doc for why). */
+      model?: string;
+      mode?: string;
+      contextUsed?: number;
+      contextSize?: number;
       /** Whether a turn is in flight for this session. Tracked here because a
        *  bridge restart rebuilds its table from the re-announce alone: without
        *  it the bridge has to guess, and guessing "working" shows a live-looking
@@ -236,6 +262,10 @@ export class HttpBridgeChannel implements BridgeChannel {
     cwd: string;
     title?: string;
     detached?: boolean;
+    model?: string;
+    mode?: string;
+    contextUsed?: number;
+    contextSize?: number;
   }): void {
     // A session that has never run a turn is not working — the honest default,
     // and the one the wrist should show for a thread just opened in Zed.
@@ -253,6 +283,10 @@ export class HttpBridgeChannel implements BridgeChannel {
       cwd: info.cwd,
       active: entry.active,
       title: entry.title,
+      model: entry.model,
+      mode: entry.mode,
+      contextUsed: entry.contextUsed,
+      contextSize: entry.contextSize,
       ...(entry.detached ? { detached: true } : {}),
     }).then((ok) => {
       // Only a POST the bridge actually accepted counts. One that failed (bridge
@@ -320,6 +354,17 @@ export class HttpBridgeChannel implements BridgeChannel {
     if (live) live.title = title;
   }
 
+  /** Remember a model/mode change for the next re-announce (#97) — the
+   *  noteSessionTitle pattern; the agent already computed the display name for
+   *  its own client update. Partial on purpose: an absent key preserves the
+   *  other value, so a mode flip never clobbers the model (or vice versa). */
+  noteSessionMeta(sessionId: string, meta: { model?: string; mode?: string }): void {
+    const live = this.liveSessions.get(sessionId);
+    if (!live) return;
+    if (meta.model !== undefined) live.model = meta.model;
+    if (meta.mode !== undefined) live.mode = meta.mode;
+  }
+
   forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void {
     void this.post("/acp/update", {
       connection: this.connectionId,
@@ -329,7 +374,11 @@ export class HttpBridgeChannel implements BridgeChannel {
     });
   }
 
-  forwardTurnBoundary(params: { sessionId: string; phase: "start" | "end"; stopReason?: string }): void {
+  forwardTurnBoundary(params: {
+    sessionId: string;
+    phase: "start" | "end";
+    stopReason?: string;
+  }): void {
     const live = this.liveSessions.get(params.sessionId);
     if (live) live.active = params.phase === "start";
     void this.post("/acp/update", {
@@ -391,6 +440,10 @@ export class HttpBridgeChannel implements BridgeChannel {
           cwd: info.cwd,
           active: info.active,
           title: info.title,
+          model: info.model,
+          mode: info.mode,
+          contextUsed: info.contextUsed,
+          contextSize: info.contextSize,
           ...(info.detached ? { detached: true } : {}),
         }).then((ok) => {
           if (ok && this.liveSessions.get(info.sessionId) === info) info.acked = true;
@@ -490,10 +543,16 @@ export class HttpBridgeChannel implements BridgeChannel {
       } catch {
         return;
       }
-      if (typeof d.sessionId !== "string" || typeof d.toolCallId !== "string" || typeof d.optionId !== "string") {
+      if (
+        typeof d.sessionId !== "string" ||
+        typeof d.toolCallId !== "string" ||
+        typeof d.optionId !== "string"
+      ) {
         return;
       }
-      this.logger.log(`claude-watch: inbox permission decision for ${d.toolCallId} (${d.behavior ?? "?"})`);
+      this.logger.log(
+        `claude-watch: inbox permission decision for ${d.toolCallId} (${d.behavior ?? "?"})`,
+      );
       try {
         this.permissionHandler?.(d as PermissionDecision);
       } catch (err) {

@@ -6,6 +6,7 @@ import {
   resolveModelPreference,
   applyAvailableModelsAllowlist,
   matchResumedModel,
+  modelDisplayName,
 } from "../acp-agent.js";
 
 // Mirrors a real `supportedModels()` response: alias rows carry
@@ -230,6 +231,47 @@ describe("applyAvailableModelsAllowlist - modelOverrides", () => {
       supportsEffort: true,
       supportedEffortLevels: ["low", "high"],
     });
+  });
+});
+
+// claude-watch (#97): the display name the wrist subheading shows. The
+// interesting tier is the `default` alias: its own displayName ("Default
+// (recommended)") tells the wrist nothing, so it resolves THROUGH its
+// resolvedModel to the named sibling.
+describe("modelDisplayName (claude-watch #97)", () => {
+  it("names a concrete alias by its own display name", () => {
+    expect(modelDisplayName(LIVE_SHAPED_MODELS, "opus[1m]")).toBe("Opus");
+    expect(modelDisplayName(LIVE_SHAPED_MODELS, "sonnet")).toBe("Sonnet");
+  });
+
+  it("resolves the default alias through its resolved model", () => {
+    // default → claude-opus-4-8[1m] → the "opus[1m]" row's human name.
+    expect(modelDisplayName(LIVE_SHAPED_MODELS, "default")).toBe("Opus");
+  });
+
+  it("hops across the hint-spelling divide (-1m id vs [1m] row)", () => {
+    const models: ModelInfo[] = [
+      {
+        value: "default",
+        resolvedModel: "claude-opus-4-8-1m",
+        displayName: "Default (recommended)",
+        description: "",
+      },
+      LIVE_SHAPED_MODELS[1], // opus[1m] → claude-opus-4-8[1m]
+    ];
+    expect(modelDisplayName(models, "default")).toBe("Opus");
+  });
+
+  it("falls back to the default row's own name when no sibling shares its resolution", () => {
+    // e.g. an `availableModels` allowlist that kept only Default.
+    const models: ModelInfo[] = [LIVE_SHAPED_MODELS[0]];
+    expect(modelDisplayName(models, "default")).toBe("Default (recommended)");
+  });
+
+  it("passes an out-of-picker id through verbatim (third-party backends, refusal fallbacks)", () => {
+    expect(modelDisplayName(LIVE_SHAPED_MODELS, "some-gateway/model-x")).toBe(
+      "some-gateway/model-x",
+    );
   });
 });
 

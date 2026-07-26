@@ -116,7 +116,12 @@ function fakeSession(overrides: Record<string, unknown> = {}) {
     agents: [],
     currentAgent: "default",
     settingsManager: { dispose: vi.fn() },
-    accumulatedUsage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
+    accumulatedUsage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    },
     abortController: new AbortController(),
     emitRawSDKMessages: false,
     contextWindowSize: 200000,
@@ -327,7 +332,12 @@ describe("wrist-only permissions for a detached session", () => {
     // …and never to the editor.
     expect(inner.requestPermission).not.toHaveBeenCalled();
 
-    wristNotify!({ sessionId: "watch-1", toolCallId: "tc-9", optionId: "allow", behavior: "allow" });
+    wristNotify!({
+      sessionId: "watch-1",
+      toolCallId: "tc-9",
+      optionId: "allow",
+      behavior: "allow",
+    });
     const result = await pending;
     expect(result?.behavior).toBe("allow");
   });

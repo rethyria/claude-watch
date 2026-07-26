@@ -58,11 +58,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import {
-  createBridgeChannel,
-  teeClientToBridge,
-  type BridgeChannel,
-} from "../bridge-channel.js";
+import { createBridgeChannel, teeClientToBridge, type BridgeChannel } from "../bridge-channel.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -11331,7 +11327,9 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
   it("echoes the dictated text to the client so it appears in the thread", async () => {
     const updates: any[] = [];
     const mockClient = {
-      sessionUpdate: async (u: any) => { updates.push(u); },
+      sessionUpdate: async (u: any) => {
+        updates.push(u);
+      },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
 
@@ -11369,11 +11367,17 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
 
     let notify: ((d: any) => void) | undefined;
     const bridge = {
-      registerSession: () => {}, deregisterSession: () => {},
-      forwardSessionUpdate: () => {}, forwardPermissionRequest: () => {},
-      forwardTurnBoundary: () => {}, onInject: () => {},
-      onPermissionDecision: (h: (d: any) => void) => { notify = h; },
-      start: () => {}, stop: () => {},
+      registerSession: () => {},
+      deregisterSession: () => {},
+      forwardSessionUpdate: () => {},
+      forwardPermissionRequest: () => {},
+      forwardTurnBoundary: () => {},
+      onInject: () => {},
+      onPermissionDecision: (h: (d: any) => void) => {
+        notify = h;
+      },
+      start: () => {},
+      stop: () => {},
     } as unknown as BridgeChannel;
 
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
@@ -11401,12 +11405,16 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
 
     const resolved: Array<{ sessionId: string; toolCallId: string }> = [];
     const bridge = {
-      registerSession: () => {}, deregisterSession: () => {},
-      forwardSessionUpdate: () => {}, forwardPermissionRequest: () => {},
+      registerSession: () => {},
+      deregisterSession: () => {},
+      forwardSessionUpdate: () => {},
+      forwardPermissionRequest: () => {},
       forwardTurnBoundary: () => {},
       forwardPermissionResolved: (p: { sessionId: string; toolCallId: string }) => resolved.push(p),
-      onInject: () => {}, onPermissionDecision: () => {},
-      start: () => {}, stop: () => {},
+      onInject: () => {},
+      onPermissionDecision: () => {},
+      start: () => {},
+      stop: () => {},
     } as unknown as BridgeChannel;
 
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
@@ -11424,9 +11432,9 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
   it("refuses an ended (queryClosed) session honestly instead of desyncing", async () => {
     const agent = makeAgent();
     agent.sessions["test-session"] = mockSessionState({ queryClosed: true });
-    await expect(
-      agent.injectUserPrompt("test-session", "too late", "watch"),
-    ).rejects.toThrow(/ended/i);
+    await expect(agent.injectUserPrompt("test-session", "too late", "watch")).rejects.toThrow(
+      /ended/i,
+    );
   });
 
   it("refuses an unknown session", async () => {
@@ -11468,7 +11476,10 @@ describe("teeClientToBridge (claude-watch, S3 #77 output tap)", () => {
     const { inner } = makeInner();
     const bridge = makeSpyBridge();
     const client = teeClientToBridge(inner, bridge);
-    const notification = { sessionId: "s1", update: { sessionUpdate: "agent_message_chunk" } } as any;
+    const notification = {
+      sessionId: "s1",
+      update: { sessionUpdate: "agent_message_chunk" },
+    } as any;
 
     await client.sessionUpdate(notification);
 
@@ -11593,18 +11604,28 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
           spawnResults,
           claims,
           inboxConnects,
-          setClaimAnswer: (sessionId) => { claimAnswer = sessionId; },
+          setClaimAnswer: (sessionId) => {
+            claimAnswer = sessionId;
+          },
           pushInject: (data) => inboxRes?.write(`event: inject\ndata: ${JSON.stringify(data)}\n\n`),
           pushFrame: (event: string, data: unknown) =>
             inboxRes?.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
           // Kill the SSE without stopping the server: models a bridge restart
           // from the fork's point of view (the downlink drops, the port stays).
           dropInbox: () => {
-            try { inboxRes?.end(); } catch { /* ignore */ }
+            try {
+              inboxRes?.end();
+            } catch {
+              /* ignore */
+            }
             inboxRes = null;
           },
           close: () => {
-            try { inboxRes?.end(); } catch { /* ignore */ }
+            try {
+              inboxRes?.end();
+            } catch {
+              /* ignore */
+            }
             server.close();
           },
         });
@@ -11638,7 +11659,11 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
 
       channel.registerSession({ sessionId: "acp-1", sdkSessionId: "acp-1", cwd: "/proj" });
       await waitFor(() => bridge.registers.length === 1);
-      expect(bridge.registers[0]).toMatchObject({ sessionId: "acp-1", sdkSessionId: "acp-1", cwd: "/proj" });
+      expect(bridge.registers[0]).toMatchObject({
+        sessionId: "acp-1",
+        sdkSessionId: "acp-1",
+        cwd: "/proj",
+      });
       expect(typeof bridge.registers[0].connection).toBe("string");
 
       // The inbox must be connected before a pushed inject can arrive.
@@ -11687,7 +11712,11 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
         behavior: "allow",
       });
       await waitFor(() => decisions.length === 1);
-      expect(decisions[0]).toMatchObject({ sessionId: "acp-p", toolCallId: "tc-42", optionId: "zed-allow" });
+      expect(decisions[0]).toMatchObject({
+        sessionId: "acp-p",
+        toolCallId: "tc-42",
+        optionId: "zed-allow",
+      });
     } finally {
       channel.stop();
       bridge.close();
@@ -11884,7 +11913,12 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       await waitFor(() => spawns.length === 1);
       expect(spawns[0]).toEqual({ requestId: "req-1", cwd: "/proj", agent: "claude" });
 
-      channel.reportSpawnResult({ requestId: "req-1", ok: true, sessionId: "born-1", cwd: "/proj" });
+      channel.reportSpawnResult({
+        requestId: "req-1",
+        ok: true,
+        sessionId: "born-1",
+        cwd: "/proj",
+      });
       await waitFor(() => bridge.spawnResults.length === 1);
       expect(bridge.spawnResults[0]).toMatchObject({
         requestId: "req-1",
@@ -11932,7 +11966,9 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
     // Bridge down entirely (no port file) → null, never a throw: this sits on
     // the session/new path and must not break New Thread.
     const prevDir = process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
-    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "acp-noport-"));
+    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = fs.mkdtempSync(
+      path.join(os.tmpdir(), "acp-noport-"),
+    );
     process.env.CLAUDE_WATCH_ACP = "1";
     try {
       const channel = createBridgeChannel({ log() {}, error() {} })!;
@@ -11948,7 +11984,12 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
   it("register carries `detached` and the reconnect replay preserves it", async () => {
     await withChannel(async (channel, bridge) => {
       channel.start();
-      channel.registerSession({ sessionId: "det-1", sdkSessionId: "det-1", cwd: "/proj", detached: true });
+      channel.registerSession({
+        sessionId: "det-1",
+        sdkSessionId: "det-1",
+        cwd: "/proj",
+        detached: true,
+      });
       await waitFor(() => bridge.registers.length === 1);
       expect(bridge.registers[0].detached).toBe(true);
 
@@ -11967,6 +12008,51 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       bridge.dropInbox();
       await waitFor(() => bridge.registers.length === 4, 15000);
       expect(bridge.registers[3].detached).toBeUndefined();
+    });
+  }, 20_000);
+
+  // #97: the register carries the wrist subheading's seed (model display
+  // name, mode id, context tokens), and the restart replay re-announces the
+  // CURRENT model/mode — noteSessionMeta's whole purpose. The context pair
+  // deliberately replays at its registration-time reading (the next teed
+  // usage_update corrects a stale percent; a stale model/mode would stick).
+  it("register carries the subheading meta and the replay reflects noteSessionMeta", async () => {
+    await withChannel(async (channel, bridge) => {
+      channel.start();
+      channel.registerSession({
+        sessionId: "meta-1",
+        sdkSessionId: "meta-1",
+        cwd: "/proj",
+        model: "Opus",
+        mode: "default",
+        contextUsed: 12000,
+        contextSize: 200000,
+      });
+      await waitFor(() => bridge.registers.length === 1);
+      expect(bridge.registers[0]).toMatchObject({
+        model: "Opus",
+        mode: "default",
+        contextUsed: 12000,
+        contextSize: 200000,
+      });
+
+      // A mid-session mode change is noted; the model must survive the
+      // partial note untouched (absent key = preserve).
+      channel.noteSessionMeta("meta-1", { mode: "plan" });
+      bridge.dropInbox();
+      await waitFor(() => bridge.registers.length === 2, 15000);
+      expect(bridge.registers[1]).toMatchObject({
+        model: "Opus",
+        mode: "plan",
+        contextUsed: 12000,
+        contextSize: 200000,
+      });
+
+      // And a model change rides the next replay the same way.
+      channel.noteSessionMeta("meta-1", { model: "Sonnet" });
+      bridge.dropInbox();
+      await waitFor(() => bridge.registers.length === 3, 15000);
+      expect(bridge.registers[2]).toMatchObject({ model: "Sonnet", mode: "plan" });
     });
   }, 20_000);
 });

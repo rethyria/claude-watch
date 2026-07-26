@@ -125,7 +125,10 @@ import {
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 // claude-watch: the fork <-> bridge loopback channel (S3 #77).
 import {
-  BridgeChannel, PermissionDecision, createBridgeChannel, teeClientToBridge,
+  BridgeChannel,
+  PermissionDecision,
+  createBridgeChannel,
+  teeClientToBridge,
   guardDetachedClient,
 } from "./bridge-channel.js";
 
@@ -1588,7 +1591,18 @@ export class ClaudeAcpAgent {
     this.logger.log(
       `claude-watch: watch-spawned session ${sessionId} attached to the editor (${via})`,
     );
-    this.bridge?.registerSession({ sessionId, sdkSessionId: sessionId, cwd: session.cwd });
+    this.bridge?.registerSession({
+      sessionId,
+      sdkSessionId: sessionId,
+      cwd: session.cwd,
+      // Halo v2 (#97): the attach re-register replaces the channel's replay
+      // entry, so it must carry the session's CURRENT meta — the birth values
+      // would resurface on the next bridge restart otherwise.
+      model: modelDisplayName(session.modelInfos, session.models.currentModelId),
+      mode: session.modes.currentModeId,
+      contextUsed: session.lastReportedUsedTokens ?? 0,
+      contextSize: session.contextWindowSize,
+    });
   }
 
   /** claude-watch: try to satisfy a `session/new` with a pending watch-spawned
@@ -2063,7 +2077,9 @@ export class ClaudeAcpAgent {
         },
       });
     } catch (err) {
-      this.logger.error(`claude-watch: failed to echo dictated prompt to the client: ${String(err)}`);
+      this.logger.error(
+        `claude-watch: failed to echo dictated prompt to the client: ${String(err)}`,
+      );
     }
     return this.prompt({ sessionId, prompt: [{ type: "text", text }] });
   }
@@ -5208,6 +5224,14 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     if (configId === MODE_CONFIG_ID) {
       session.modes = { ...session.modes, currentModeId: value };
+      // claude-watch (#97): every mode writer funnels through here (setMode,
+      // set_config_option, enter/exit plan), so this one call keeps the bridge
+      // replay's mode current. The live bridge learns the change from the
+      // teed updates — a current_mode_update where the path emits one, else
+      // the config_option_update's mode option (session/set_mode emits ONLY
+      // that; the bridge reads the mode from both) — this is restart
+      // bookkeeping only.
+      this.bridge?.noteSessionMeta?.(sessionId, { mode: value });
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
@@ -5252,6 +5276,13 @@ export class ClaudeAcpAgent {
           .catch(() => {
             /* best-effort: the next turn re-publishes both numbers anyway */
           });
+        // claude-watch (#97): both model writers (user switch, refusal
+        // fallback) pass through here, so the bridge replay's model display
+        // name stays current. Live-bridge delivery rides the caller's teed
+        // config_option_update.
+        this.bridge?.noteSessionMeta?.(sessionId, {
+          model: modelDisplayName(session.modelInfos, value),
+        });
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -5275,6 +5306,9 @@ export class ClaudeAcpAgent {
           availableModes: newAvailableModes,
           currentModeId: "default",
         };
+        // claude-watch (#97): the clamp is a real mode change that bypasses
+        // the MODE branch above, so it notes its own replay state.
+        this.bridge?.noteSessionMeta?.(sessionId, { mode: "default" });
         try {
           await session.query.setPermissionMode("default");
         } catch (err) {
@@ -6111,6 +6145,14 @@ export class ClaudeAcpAgent {
       sessionId,
       sdkSessionId: sessionId,
       cwd: params.cwd,
+      // Halo v2 (#97): seed the wrist subheading. Model as a display name (the
+      // bridge has no model list to resolve an alias against), mode verbatim,
+      // and the SAME context numbers the initial usage_update below publishes
+      // to the editor — the two surfaces must not disagree about the meter.
+      model: modelDisplayName(modelInfos, models.currentModelId),
+      mode: modes.currentModeId,
+      contextUsed: resumedUsedTokens ?? 0,
+      contextSize: seededWindow.size,
       ...(detached ? { detached: true } : {}),
     });
 
@@ -6837,6 +6879,34 @@ export function matchResumedModel(models: ModelInfo[], liveModel: string): Model
       description: "",
     }
   );
+}
+
+/** claude-watch (#97): the human display name the wrist subheading shows for a
+ *  session's current model. Three tiers:
+ *   1. No picker row for the id — a third-party backend's raw id, or a refusal
+ *      fallback outside the `availableModels` allowlist. The id is all we
+ *      know, so pass it verbatim (mirrors `matchResumedModel`'s tier 5).
+ *   2. The `default` alias — its own displayName is "Default (recommended)"-
+ *      shaped, which tells the wrist nothing. Resolve THROUGH its
+ *      `resolvedModel` to the named sibling row (the same resolvedModel-first
+ *      matching `resolveModelPreference` does elsewhere), so Default shows as
+ *      the model it currently is. Default itself is excluded from the hop —
+ *      it would trivially match its own resolvedModel.
+ *   3. Everything else: the row's displayName.
+ *  Fall-through when the hop finds no sibling (e.g. an `availableModels`
+ *  allowlist that kept only Default): the row's own displayName — "Default"
+ *  is then the honest answer. */
+export function modelDisplayName(modelInfos: ModelInfo[], currentModelId: string): string {
+  const info = modelInfos.find((m) => m.value === currentModelId);
+  if (!info) return currentModelId;
+  if (info.value === "default" && info.resolvedModel) {
+    const named = resolveModelPreference(
+      modelInfos.filter((m) => m.value !== "default"),
+      info.resolvedModel,
+    );
+    if (named) return named.displayName;
+  }
+  return info.displayName;
 }
 
 function resolveSettingsModel(
