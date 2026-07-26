@@ -6,14 +6,47 @@
 // died into an instantly-ended session), and an omitted cwd must keep the
 // historical fallback chain (bridge CLI positional arg first).
 //
-// Each test points the bridge at a stub `claude` binary via the test-only
-// CLAUDE_WATCH_CLAUDE_BIN override so no real agent ever launches.
+// Claude spawns are born in Zed-land now (ACP-only, no PTY fallback), so the
+// claude-spawn tests drive a FAKE FORK: an inbox SSE that answers the bridge's
+// `spawn` frame with /acp/register + /acp/spawn-result, exactly as the real
+// adapter does. The resolved cwd must survive the whole pipeline — request →
+// frame → registered slot. The auto-spawn command path still mints a claude
+// PTY and keeps the stub binary.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startBridge, request, tempDir } from "./helpers.js";
+import crypto from "node:crypto";
+import { startBridge, request, tempDir, connectSse } from "./helpers.js";
+
+/** A fake Zed-launched adapter: holds the inbox open and fulfills each `spawn`
+ *  frame like the real fork — register (detached) first, then spawn-result.
+ *  Returns the inbox handle plus the frames it served. */
+function connectFakeFork(t, bridge, connectionId) {
+  const inbox = connectSse(bridge.port, undefined, { path: `/acp/inbox?connection=${connectionId}` });
+  t.after(() => inbox.close());
+  const served = [];
+  const serve = async () => {
+    for (;;) {
+      const frame = await inbox.waitFor(
+        (e) => e.event === "spawn" && !served.includes(e),
+        60_000,
+      );
+      served.push(frame);
+      const { requestId, cwd } = frame.parsed;
+      const sessionId = crypto.randomUUID();
+      await request(bridge.port, "POST", "/acp/register", {
+        body: { connection: connectionId, sessionId, sdkSessionId: sessionId, cwd, detached: true },
+      });
+      await request(bridge.port, "POST", "/acp/spawn-result", {
+        body: { connection: connectionId, requestId, ok: true, sessionId, cwd },
+      });
+    }
+  };
+  void serve().catch(() => { /* inbox closed — test over */ });
+  return { inbox, served };
+}
 
 // A stub agent that reports readiness immediately and then idles: spawn
 // succeeds deterministically and the auto-spawn injection path's ready gate
@@ -44,6 +77,8 @@ async function sessionSnapshot(bridge, token) {
 test("spawn with a valid cwd lands the session in that directory", { timeout: 60_000 }, async (t) => {
   const { bridge, token } = await pairedBridge(t);
   const projectDir = tempDir(t, "claude-watch-spawn-cwd-project-");
+  const fork = connectFakeFork(t, bridge, "fork-cwd");
+  assert.equal(await fork.inbox.statusCode(), 200);
 
   const resp = await request(bridge.port, "POST", "/v1/command", {
     token,
@@ -52,7 +87,11 @@ test("spawn with a valid cwd lands the session in that directory", { timeout: 60
   assert.equal(resp.status, 200);
   assert.equal(resp.body.ok, true);
   assert.ok(resp.body.sessionId, "spawn response names the new session");
+  assert.equal(resp.body.kind, "acp", "a claude spawn is born in Zed-land, not a PTY");
 
+  // The resolved cwd rode the spawn frame to the fork verbatim…
+  assert.equal(fork.served[0].parsed.cwd, projectDir, "the frame carries the requested directory");
+  // …and the registered slot lives there.
   const slot = (await sessionSnapshot(bridge, token)).find((s) => s.id === resp.body.sessionId);
   assert.ok(slot, "the spawned session appears in the snapshot");
   assert.equal(slot.cwd, projectDir, "the session's cwd is the requested directory");
@@ -60,6 +99,8 @@ test("spawn with a valid cwd lands the session in that directory", { timeout: 60
 
 test('the "~" sentinel spawns the session in the bridge user\'s home', { timeout: 60_000 }, async (t) => {
   const { bridge, token } = await pairedBridge(t);
+  const fork = connectFakeFork(t, bridge, "fork-home");
+  assert.equal(await fork.inbox.statusCode(), 200);
 
   const resp = await request(bridge.port, "POST", "/v1/command", {
     token,
@@ -71,7 +112,9 @@ test('the "~" sentinel spawns the session in the bridge user\'s home', { timeout
   const slot = (await sessionSnapshot(bridge, token)).find((s) => s.id === resp.body.sessionId);
   assert.ok(slot, "the spawned session appears in the snapshot");
   // The bridge child inherits this process's HOME, so os.homedir() here is
-  // the bridge user's home there.
+  // the bridge user's home there — resolved BEFORE the frame goes out (the
+  // watch cannot know that path, and neither should the fork have to).
+  assert.equal(fork.served[0].parsed.cwd, os.homedir(), '"~" resolves before the spawn frame');
   assert.equal(slot.cwd, os.homedir(), '"~" resolves to the bridge user\'s home directory');
 });
 
@@ -141,6 +184,8 @@ test("an omitted cwd keeps the historical fallback chain (bridge CLI arg first)"
   // chain; a spawn without cwd must land there, exactly as before #56.
   const cliCwd = tempDir(t, "claude-watch-spawn-cwd-cli-");
   const { bridge, token } = await pairedBridge(t, { args: [cliCwd] });
+  const fork = connectFakeFork(t, bridge, "fork-fallback");
+  assert.equal(await fork.inbox.statusCode(), 200);
 
   const resp = await request(bridge.port, "POST", "/v1/command", {
     token,

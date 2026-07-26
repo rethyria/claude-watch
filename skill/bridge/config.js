@@ -251,6 +251,18 @@ export const SPAWN_INJECT_TIMEOUT_MS = testOverridable(
   "CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS",
   15_000,
 );
+// ACP spawn (watch → Zed's adapter): how long the bridge waits for the fork's
+// /acp/spawn-result before answering the watch with an error. Session creation
+// is normally 1–4 s; the ceiling must stay under the wear client's 20 s read
+// timeout or the watch gives up on a response that was still coming. A spawn
+// that completes AFTER this window is not lost — the fork's own register
+// announces it over SSE and it appears on the wrist seconds later (the
+// spawnRequestId echo lets the client attribute it). Overridable via
+// CLAUDE_WATCH_ACP_SPAWN_TIMEOUT_MS (test-only).
+export const ACP_SPAWN_TIMEOUT_MS = testOverridable(
+  "CLAUDE_WATCH_ACP_SPAWN_TIMEOUT_MS",
+  10_000,
+);
 // Workflow-activity scanning (issue #55). The poll re-reads workflow journals
 // only for slots a Workflow tool hook marked active, so the interval can stay
 // coarse; the staleness window declares a journal untouched this long dead —

@@ -204,9 +204,13 @@ test("dictatable is live-delivery only: PTY yes+killable, hook no, ACP yes+hide 
   const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
   const token = await pair(bridge);
 
-  // (1) A bridge-owned PTY session: dictatable (stdin), NOT external (real kill).
-  const spawned = await request(bridge.port, "POST", "/command", { token, body: { spawn: "claude", cwd: os.homedir() } });
+  // (1) A bridge-owned PTY session: dictatable (stdin), NOT external (real
+  // kill). Created via the auto-spawn command path — the explicit claude spawn
+  // action is ACP-only now (born in Zed), so the dictate-with-no-session path
+  // is what still mints a claude PTY.
+  const spawned = await request(bridge.port, "POST", "/command", { token, body: { command: "hello\n", cwd: os.homedir() } });
   assert.equal(spawned.status, 200);
+  assert.equal(spawned.body.spawned, true, "the command auto-spawned a PTY session");
   const ptyEntry = await statusEntry(bridge, token, spawned.body.sessionId);
   assert.ok(ptyEntry, "spawned PTY session present");
   assert.equal(ptyEntry.dictatable, true, "a bridge-owned PTY session is dictatable");

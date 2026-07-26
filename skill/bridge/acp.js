@@ -18,9 +18,10 @@ import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
 import {
   registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
 } from "./sessions.js";
-import { ACP_INBOX_HEARTBEAT_MS } from "./config.js";
+import { ACP_INBOX_HEARTBEAT_MS, ACP_SPAWN_TIMEOUT_MS } from "./config.js";
 import { waitForPermission, canonicalPermissionOptions, cancelPermission } from "./permissions.js";
 import crypto from "node:crypto";
+import path from "node:path";
 import { pushSseEvent, sseClients } from "./transport-sse.js";
 
 /** Live fork inboxes: connectionId -> { res, heartbeat }. The held SSE response
@@ -39,6 +40,23 @@ const acpPermissionsByToolCall = new Map();
 /** Hard cap so a pathological turn cannot grow the buffer without bound; the
  *  wrist cannot read more than this anyway. */
 const PROSE_BUFFER_MAX = 4000;
+/** In-flight watch spawns awaiting the fork's /acp/spawn-result:
+ *  requestId -> { resolve, timer, connectionId }. Settled exactly once — by
+ *  the result, the timeout, or the owning inbox closing. */
+const pendingAcpSpawns = new Map();
+/** Watch-spawned sessions no editor thread has adopted yet:
+ *  sessionId -> { cwd, createdAt }. The desk-pickup registry /acp/claim takes
+ *  from. Deliberately SEPARATE from the sessions map: a fork death ends the
+ *  slot, but the pickup must survive it (that is the "Zed restarted between
+ *  wrist and desk" case — the claim then resumes the session from disk).
+ *  In-memory only; after a bridge restart it is rebuilt from the fork's
+ *  register replay, which re-announces live detached sessions with the flag.
+ *  (A bridge restart AFTER the fork also died does lose the pickup — the
+ *  session still sits on disk for Zed's Import Threads.) */
+const pendingPickups = new Map();
+/** Cap on remembered pickups; beyond it the OLDEST is evicted. Pickups are
+ *  claimed in newest-first order, so evicting the oldest loses the least. */
+const PENDING_PICKUPS_MAX = 32;
 
 function requireLoopback(req, res) {
   const addr = req.socket?.remoteAddress;
@@ -67,16 +85,187 @@ export async function handleAcpRegister(req, res) {
   const body = await readAcpBody(req, res);
   if (body === null) return;
 
-  const { connection, sessionId, sdkSessionId, cwd, active, title } = body;
+  const { connection, sessionId, sdkSessionId, cwd, active, title, detached } = body;
   if (typeof connection !== "string" || !connection || typeof sessionId !== "string" || !sessionId) {
     return jsonResponse(res, 400, { error: "Missing 'connection' or 'sessionId'" });
   }
 
   // `active` is the fork's report of whether a turn is in flight; it is what
   // stops a re-announce (bridge restart) from showing an idle thread as working.
-  registerAcpSession({ sessionId, sdkSessionId, cwd, active, title });
+  const slot = registerAcpSession({ sessionId, sdkSessionId, cwd, active, title, detached });
   sessionConnection.set(sessionId, connection);
+  // Pickup registry maintenance. A register WITH the flag (spawn, or the
+  // fork's replay after a bridge restart) marks the session claimable; one
+  // WITHOUT it (a normal Zed session, or the attach-time re-register after a
+  // desk pickup / session load) retires the pickup — including the case where
+  // the user opened the session some other way (Import Threads) and a stale
+  // pickup would otherwise hand an already-attached session to a New Thread.
+  if (detached === true) {
+    addPendingPickup(sessionId, slot.cwd);
+  } else {
+    pendingPickups.delete(sessionId);
+  }
   return jsonResponse(res, 200, { ok: true });
+}
+
+/** Remember a watch-spawned session as awaiting its desk pickup. Bounded:
+ *  beyond the cap the oldest pickup is evicted (and logged — a silent drop
+ *  would read as "covered" when it isn't). */
+function addPendingPickup(sessionId, cwd) {
+  if (pendingPickups.has(sessionId)) {
+    pendingPickups.get(sessionId).cwd = cwd;
+    return;
+  }
+  while (pendingPickups.size >= PENDING_PICKUPS_MAX) {
+    const oldest = pendingPickups.keys().next().value;
+    pendingPickups.delete(oldest);
+    log("warn", `Pickup registry full (${PENDING_PICKUPS_MAX}); evicted oldest pending pickup ${oldest}`);
+  }
+  pendingPickups.set(sessionId, { cwd, createdAt: Date.now() });
+}
+
+// POST /acp/claim { connection, cwd } — atomically take the newest unclaimed
+// watch-spawned session for `cwd`. The fork calls this on session/new (the
+// desk pickup); at most one caller wins a given session. `sessionId: null`
+// means "nothing pending — mint a fresh session".
+export async function handleAcpClaim(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
+  const body = await readAcpBody(req, res);
+  if (body === null) return;
+
+  const { cwd } = body;
+  if (typeof cwd !== "string" || !cwd) {
+    return jsonResponse(res, 400, { error: "Missing 'cwd'" });
+  }
+  const resolved = path.resolve(cwd);
+  let best = null;
+  for (const [sid, info] of pendingPickups) {
+    if (path.resolve(info.cwd) !== resolved) continue;
+    if (!best || info.createdAt > best.info.createdAt) best = { sid, info };
+  }
+  if (!best) return jsonResponse(res, 200, { ok: true, sessionId: null });
+  pendingPickups.delete(best.sid);
+  log("info", `ACP pickup claimed: watch-spawned session ${best.sid} adopted by a new editor thread`);
+  return jsonResponse(res, 200, { ok: true, sessionId: best.sid });
+}
+
+// POST /acp/spawn-result { connection, requestId, ok, sessionId?, cwd?, error? }
+// — the fork's explicit answer to a `spawn` frame. Separate from /acp/register
+// on purpose: a createSession THROW never registers, and the register replay
+// on reconnect re-sends payloads verbatim — piggybacking correlation on either
+// would mean failures surface only by timeout and stale requestIds replay.
+export async function handleAcpSpawnResult(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireLoopback(req, res)) return;
+  const body = await readAcpBody(req, res);
+  if (body === null) return;
+
+  const { connection, requestId, ok, sessionId, cwd, error } = body;
+  if (typeof requestId !== "string" || !requestId) {
+    return jsonResponse(res, 400, { error: "Missing 'requestId'" });
+  }
+
+  // Success bookkeeping happens whether or not the waiter is still around: a
+  // session that finished creating AFTER the bridge gave up (the timeout
+  // ghost) must still become a visible, attributable, pickable-up session —
+  // that convergence is the self-healing contract.
+  if (ok === true && typeof sessionId === "string" && sessionId) {
+    // Early-register: the fork's own register POST and this ack race on two
+    // sockets. Registering here (idempotently) guarantees the slot exists
+    // before the watch's spawn response names it, so an immediate follow-up
+    // dictation can never miss the slot.
+    if (!sessions.has(sessionId)) {
+      registerAcpSession({ sessionId, sdkSessionId: sessionId, cwd, detached: true });
+    }
+    if (typeof connection === "string" && connection) {
+      sessionConnection.set(sessionId, connection);
+    }
+    const slot = sessions.get(sessionId);
+    if (slot) {
+      addPendingPickup(sessionId, slot.cwd);
+      if (slot.spawnRequestId !== requestId) {
+        // The requestId rides the session announce so the watch can attribute
+        // a late arrival to the spawn it reported as failed ("arrived late",
+        // not a mystery session).
+        slot.spawnRequestId = requestId;
+        announceAcpSlot(sessionId);
+      }
+    }
+  }
+
+  const pending = pendingAcpSpawns.get(requestId);
+  if (!pending) {
+    log("warn", `ACP spawn-result for unknown/expired request ${requestId} (${ok ? `session ${sessionId}` : `error: ${error}`}) — accepted late`);
+    return jsonResponse(res, 200, { ok: true, stale: true });
+  }
+  settlePendingSpawn(requestId, ok === true && typeof sessionId === "string" && sessionId
+    ? { ok: true, sessionId, requestId }
+    : { ok: false, error: typeof error === "string" && error ? error : "adapter could not create the session", requestId });
+  return jsonResponse(res, 200, { ok: true });
+}
+
+/** Settle (exactly once) an in-flight watch spawn. */
+function settlePendingSpawn(requestId, result) {
+  const pending = pendingAcpSpawns.get(requestId);
+  if (!pending) return;
+  pendingAcpSpawns.delete(requestId);
+  clearTimeout(pending.timer);
+  pending.resolve(result);
+}
+
+/** Pick the fork connection a watch spawn should land on. Preference order:
+ *  a connection already hosting a running ACP session in the SAME directory
+ *  (that window's fork is where a later session/load adopts the live session),
+ *  else the single live inbox, else the newest one (multi-window Zed with no
+ *  cwd match — the most recently opened window is the best guess). `null`
+ *  means no fork is connected at all. */
+function pickSpawnConnection(cwd) {
+  if (acpInboxes.size === 0) return null;
+  const resolved = path.resolve(cwd);
+  for (const [sid, connectionId] of sessionConnection) {
+    if (!acpInboxes.has(connectionId)) continue;
+    const slot = sessions.get(sid);
+    if (slot && slot.state === "running" && slot.cwd && path.resolve(slot.cwd) === resolved) {
+      return connectionId;
+    }
+  }
+  if (acpInboxes.size === 1) return acpInboxes.keys().next().value;
+  let newest = null;
+  for (const [connectionId, inbox] of acpInboxes) {
+    if (!newest || inbox.connectedAt > newest.connectedAt) {
+      newest = { connectionId, connectedAt: inbox.connectedAt };
+    }
+  }
+  return newest?.connectionId ?? null;
+}
+
+/** Spawn a claude session inside the Zed-launched fork (the watch "new
+ *  session" path). Resolves `null` when no fork is connected (caller answers
+ *  the watch honestly — there is deliberately NO PTY fallback for claude),
+ *  else `{ ok, sessionId?, error?, requestId }`. Never rejects. */
+export function requestAcpSpawn(cwd) {
+  const connectionId = pickSpawnConnection(cwd);
+  if (!connectionId) return Promise.resolve(null);
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      // An old adapter build silently DROPS the unknown frame (its reader
+      // hard-ignores foreign events), so a timeout with Zed open most likely
+      // means a stale dist/ — name that, it already bit once.
+      log("warn", `ACP spawn ${requestId} timed out after ${ACP_SPAWN_TIMEOUT_MS}ms (connection ${connectionId})`);
+      settlePendingSpawn(requestId, {
+        ok: false,
+        error: "Zed's agent did not answer — if Zed is open, the claude-watch adapter may need a rebuild",
+        requestId,
+      });
+    }, ACP_SPAWN_TIMEOUT_MS);
+    pendingAcpSpawns.set(requestId, { resolve, timer, connectionId });
+    log("info", `ACP spawn ${requestId} requested (cwd ${cwd}) → connection ${connectionId}`);
+    if (!writeAcpFrameToConnection(connectionId, "spawn", { requestId, cwd, agent: "claude" })) {
+      settlePendingSpawn(requestId, { ok: false, error: "Zed agent connection lost", requestId });
+    }
+  });
 }
 
 // POST /acp/update { connection, sessionId, kind: "session_update"|"permission"|"turn", payload }
@@ -214,13 +403,11 @@ function flushProse(sessionId) {
   pushSseEvent("message", { role: "assistant", text: text.slice(-PROSE_BUFFER_MAX).trim() }, sessionId);
 }
 
-/** Write one SSE frame down the owning fork's inbox. The single place that
- *  touches the downlink, so dictation (#78) and permission decisions (#80)
- *  cannot drift apart in framing or error handling. Returns false when the
- *  session is unknown or its fork has no live inbox. */
-function writeAcpFrame(sessionId, event, data) {
-  const connectionId = sessionConnection.get(sessionId);
-  if (!connectionId) return false;
+/** Write one SSE frame down a SPECIFIC fork's inbox. The single place that
+ *  touches the downlink socket, so dictation (#78), permission decisions
+ *  (#80), and spawn requests cannot drift apart in framing or error handling.
+ *  Returns false when that connection has no live inbox. */
+function writeAcpFrameToConnection(connectionId, event, data) {
   const inbox = acpInboxes.get(connectionId);
   if (!inbox) return false;
   try {
@@ -229,6 +416,14 @@ function writeAcpFrame(sessionId, event, data) {
     return false;
   }
   return true;
+}
+
+/** Session-addressed variant: route by the session's owning fork. Returns
+ *  false when the session is unknown or its fork has no live inbox. */
+function writeAcpFrame(sessionId, event, data) {
+  const connectionId = sessionConnection.get(sessionId);
+  if (!connectionId) return false;
+  return writeAcpFrameToConnection(connectionId, event, data);
 }
 
 /** Map an ACP option's `kind` onto the bridge's machine-readable behavior. The
@@ -252,9 +447,17 @@ function behaviorForAcpOption(option) {
  *  is a SECOND surface for one decision, not the only one — whichever answers
  *  first wins and the fork drops the loser. With no watch connected nobody can
  *  answer here, so we do not raise at all: a prompt nobody sees would just sit
- *  until it expired while the user answered in Zed anyway. */
+ *  until it expired while the user answered in Zed anyway.
+ *
+ *  EXCEPT for a detached (watch-spawned, no editor thread) session: there the
+ *  wrist is the ONLY surface, so the card is registered even with zero SSE
+ *  clients — `pendingPermissionsSync` replays it the moment the watch
+ *  connects. If nobody ever answers, the bridge card expires as a no-decision
+ *  (nothing is sent down the inbox) and the FORK's own detached backstop
+ *  settles the turn as cancelled shortly after — an honest ending, not a
+ *  wedge. */
 function raiseAcpPermission(sessionId, payload) {
-  if (sseClients.size === 0) return;
+  if (sseClients.size === 0 && sessions.get(sessionId)?.detached !== true) return;
   const toolCallId = payload?.toolCall?.toolCallId;
   if (!toolCallId) return;
 
@@ -374,7 +577,10 @@ export function handleAcpInbox(req, res) {
     }
   }, ACP_INBOX_HEARTBEAT_MS);
 
-  acpInboxes.set(connectionId, { res, heartbeat });
+  // `connectedAt` feeds pickSpawnConnection's newest-wins fallback; Map
+  // insertion order is NOT a substitute (a reconnect `set()` on an existing
+  // key keeps its old position).
+  acpInboxes.set(connectionId, { res, heartbeat, connectedAt: Date.now() });
   log("info", `ACP fork inbox connected (connection ${connectionId}; ${acpInboxes.size} total)`);
 
   req.on("close", () => {
@@ -384,6 +590,12 @@ export function handleAcpInbox(req, res) {
     // sessions and must not be collaterally cleaned up).
     if (acpInboxes.get(connectionId)?.res !== res) return;
     acpInboxes.delete(connectionId);
+    // Fail this fork's in-flight spawns fast — waiting out the timer would
+    // just make the wrist stare at a spinner for a fork that is gone.
+    for (const [requestId, pending] of pendingAcpSpawns) {
+      if (pending.connectionId !== connectionId) continue;
+      settlePendingSpawn(requestId, { ok: false, error: "Zed agent connection lost", requestId });
+    }
     let ended = 0;
     for (const [sid, conn] of sessionConnection) {
       if (conn !== connectionId) continue;
@@ -416,6 +628,9 @@ export function isAcpSession(sessionId) {
 
 /** End every inbox (graceful shutdown). */
 export function closeAllAcpInboxes() {
+  for (const requestId of [...pendingAcpSpawns.keys()]) {
+    settlePendingSpawn(requestId, { ok: false, error: "bridge shutting down", requestId });
+  }
   for (const { res, heartbeat } of acpInboxes.values()) {
     clearInterval(heartbeat);
     try { res.end(); } catch { /* ignore */ }

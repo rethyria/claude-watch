@@ -43,7 +43,7 @@ import {
 } from "./sessions.js";
 import { pendingPermissions, pendingPermissionBodies, resolvePermission } from "./permissions.js";
 import { codexSyntheticPermissions, resolveCodexSyntheticPermission } from "./codex.js";
-import { injectToAcpSession } from "./acp.js";
+import { injectToAcpSession, requestAcpSpawn } from "./acp.js";
 
 export async function handlePair(req, res) {
   if (req.method !== "POST") {
@@ -233,6 +233,29 @@ export async function handleCommand(req, res) {
     }
     const cwd = resolveSpawnCwd(res, body.cwd);
     if (cwd === null) return; // 400 already sent — no session slot created
+    // Claude sessions are born in Zed-land (the fork Zed launches hosts them),
+    // never in a bridge-owned PTY: the product is Zed-only and a PTY fallback
+    // would silently produce a second species of session that can never appear
+    // in the editor. No fork connected = an honest error the wrist can show.
+    // Codex has no ACP adapter, so it keeps the PTY path below.
+    if (spawnRequest === "claude") {
+      const acp = await requestAcpSpawn(cwd);
+      if (acp === null) {
+        return jsonResponse(res, 409, {
+          error: "No Zed agent connection — open Zed (claude-watch agent) and try again",
+        });
+      }
+      if (!acp.ok) {
+        // `spawnRequestId` rides the error so the client can attribute a
+        // session that finishes creating AFTER this response (the fork's own
+        // register still announces it over SSE — see the self-healing notes
+        // in acp.js).
+        return jsonResponse(res, 409, { error: acp.error, spawnRequestId: acp.requestId });
+      }
+      return jsonResponse(res, 200, {
+        ok: true, sessionId: acp.sessionId, agent: "claude", kind: "acp", spawnRequestId: acp.requestId,
+      });
+    }
     const newId = spawnSession(spawnRequest, cwd);
     if (!newId) {
       return jsonResponse(res, 500, { error: `Failed to spawn ${spawnRequest}` });

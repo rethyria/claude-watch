@@ -11520,8 +11520,12 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
     const registers: any[] = [];
     const deregisters: any[] = [];
     const updates: any[] = [];
+    const spawnResults: any[] = [];
+    const claims: any[] = [];
     const inboxConnects: number[] = [];
     let inboxRes: http.ServerResponse | null = null;
+    // What /acp/claim answers with; null models "nothing pending".
+    let claimAnswer: string | null = null;
 
     const server = http.createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -11539,6 +11543,15 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
         if (url.pathname === "/acp/register") registers.push(body);
         else if (url.pathname === "/acp/deregister") deregisters.push(body);
         else if (url.pathname === "/acp/update") updates.push(body);
+        else if (url.pathname === "/acp/spawn-result") spawnResults.push(body);
+        else if (url.pathname === "/acp/claim") {
+          claims.push(body);
+          const sessionId = claimAnswer;
+          claimAnswer = null; // atomic take: one claim per answer
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, sessionId }));
+          return;
+        }
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");
       });
@@ -11549,7 +11562,10 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
       registers: any[];
       deregisters: any[];
       updates: any[];
+      spawnResults: any[];
+      claims: any[];
       inboxConnects: number[];
+      setClaimAnswer: (sessionId: string) => void;
       pushInject: (data: unknown) => void;
       pushFrame: (event: string, data: unknown) => void;
       dropInbox: () => void;
@@ -11562,7 +11578,10 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
           registers,
           deregisters,
           updates,
+          spawnResults,
+          claims,
           inboxConnects,
+          setClaimAnswer: (sessionId) => { claimAnswer = sessionId; },
           pushInject: (data) => inboxRes?.write(`event: inject\ndata: ${JSON.stringify(data)}\n\n`),
           pushFrame: (event: string, data: unknown) =>
             inboxRes?.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
@@ -11811,4 +11830,131 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
     // INBOX_MIN_BACKOFF_MS reconnect. Without it the suite's timeout fires
     // before waitFor's, hiding which predicate actually failed.
   }, 15_000);
+
+  /** The env dance every channel test repeats, factored for the spawn tests. */
+  async function withChannel(
+    run: (
+      channel: NonNullable<ReturnType<typeof createBridgeChannel>>,
+      bridge: Awaited<ReturnType<typeof startFakeBridge>>,
+    ) => Promise<void>,
+  ) {
+    const bridge = await startFakeBridge();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-chan-"));
+    fs.writeFileSync(path.join(dir, "port"), `${bridge.port}\n`);
+    const prevAcp = process.env.CLAUDE_WATCH_ACP;
+    const prevDir = process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+    process.env.CLAUDE_WATCH_ACP = "1";
+    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = dir;
+    const channel = createBridgeChannel({ log() {}, error() {} })!;
+    try {
+      await run(channel, bridge);
+    } finally {
+      channel.stop();
+      bridge.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (prevAcp === undefined) delete process.env.CLAUDE_WATCH_ACP;
+      else process.env.CLAUDE_WATCH_ACP = prevAcp;
+      if (prevDir === undefined) delete process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+      else process.env.CLAUDE_WATCH_CREDENTIALS_DIR = prevDir;
+    }
+  }
+
+  // --- Watch spawn (born in Zed) — the third inbox frame type -----------------
+
+  it("delivers a spawn frame to the handler and reports the result upstream", async () => {
+    await withChannel(async (channel, bridge) => {
+      const spawns: Array<{ requestId: string; cwd: string; agent: string }> = [];
+      channel.onSpawn((s) => spawns.push(s));
+      channel.start();
+      await waitFor(() => bridge.inboxConnects.length === 1);
+
+      bridge.pushFrame("spawn", { requestId: "req-1", cwd: "/proj", agent: "claude" });
+      await waitFor(() => spawns.length === 1);
+      expect(spawns[0]).toEqual({ requestId: "req-1", cwd: "/proj", agent: "claude" });
+
+      channel.reportSpawnResult({ requestId: "req-1", ok: true, sessionId: "born-1", cwd: "/proj" });
+      await waitFor(() => bridge.spawnResults.length === 1);
+      expect(bridge.spawnResults[0]).toMatchObject({
+        requestId: "req-1",
+        ok: true,
+        sessionId: "born-1",
+        cwd: "/proj",
+      });
+      // The connection id is what lets the bridge bind the early-registered
+      // slot to this fork's inbox.
+      expect(typeof bridge.spawnResults[0].connection).toBe("string");
+    });
+  });
+
+  it("drops malformed spawn frames and unknown events without wedging the inbox", async () => {
+    await withChannel(async (channel, bridge) => {
+      const spawns: unknown[] = [];
+      const injected: unknown[] = [];
+      channel.onSpawn((s) => spawns.push(s));
+      channel.onInject((sessionId) => injected.push(sessionId));
+      channel.start();
+      await waitFor(() => bridge.inboxConnects.length === 1);
+
+      bridge.pushFrame("spawn", { cwd: "/proj" }); // no requestId
+      bridge.pushFrame("spawn", { requestId: "req-x" }); // no cwd
+      bridge.pushFrame("some-future-frame", { anything: true }); // version skew
+      channel.registerSession({ sessionId: "s-alive", sdkSessionId: "s-alive", cwd: "/proj" });
+      await waitFor(() => bridge.registers.length === 1);
+      // The inbox still works after all of that.
+      bridge.pushInject({ sessionId: "s-alive", text: "still alive", source: "watch" });
+      await waitFor(() => injected.length === 1);
+      expect(spawns.length).toBe(0);
+    });
+  });
+
+  it("takePendingPickup claims through the real HTTP path and degrades to null", async () => {
+    await withChannel(async (channel, bridge) => {
+      bridge.setClaimAnswer("picked-1");
+      expect(await channel.takePendingPickup("/proj")).toBe("picked-1");
+      expect(bridge.claims[0]).toMatchObject({ cwd: "/proj" });
+      expect(typeof bridge.claims[0].connection).toBe("string");
+
+      // Nothing pending → null.
+      expect(await channel.takePendingPickup("/proj")).toBe(null);
+    });
+    // Bridge down entirely (no port file) → null, never a throw: this sits on
+    // the session/new path and must not break New Thread.
+    const prevDir = process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+    process.env.CLAUDE_WATCH_CREDENTIALS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "acp-noport-"));
+    process.env.CLAUDE_WATCH_ACP = "1";
+    try {
+      const channel = createBridgeChannel({ log() {}, error() {} })!;
+      expect(await channel.takePendingPickup("/proj")).toBe(null);
+    } finally {
+      fs.rmSync(process.env.CLAUDE_WATCH_CREDENTIALS_DIR, { recursive: true, force: true });
+      if (prevDir === undefined) delete process.env.CLAUDE_WATCH_CREDENTIALS_DIR;
+      else process.env.CLAUDE_WATCH_CREDENTIALS_DIR = prevDir;
+      delete process.env.CLAUDE_WATCH_ACP;
+    }
+  });
+
+  it("register carries `detached` and the reconnect replay preserves it", async () => {
+    await withChannel(async (channel, bridge) => {
+      channel.start();
+      channel.registerSession({ sessionId: "det-1", sdkSessionId: "det-1", cwd: "/proj", detached: true });
+      await waitFor(() => bridge.registers.length === 1);
+      expect(bridge.registers[0].detached).toBe(true);
+
+      // Bridge restart: the replay must re-announce detachedness, or a
+      // restarted bridge forgets the session is a pickup candidate.
+      bridge.dropInbox();
+      await waitFor(() => bridge.registers.length === 2, 15000);
+      expect(bridge.registers[1]).toMatchObject({ sessionId: "det-1", detached: true });
+
+      // The attach-time re-register replaces the entry WITHOUT the flag…
+      channel.registerSession({ sessionId: "det-1", sdkSessionId: "det-1", cwd: "/proj" });
+      await waitFor(() => bridge.registers.length === 3);
+      expect(bridge.registers[2].detached).toBeUndefined();
+
+      // …and a later replay stays flag-free (adoption survives reconnects).
+      bridge.dropInbox();
+      await waitFor(() => bridge.registers.length === 4, 15000);
+      expect(bridge.registers[3].detached).toBeUndefined();
+    });
+  }, 20_000);
 });

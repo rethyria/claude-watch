@@ -50,6 +50,12 @@ export type PermissionDecision = {
 };
 export type PermissionDecisionHandler = (decision: PermissionDecision) => void;
 
+/** A watch "new session" the bridge routed to this fork (the third inbox frame
+ *  type). The fork creates a detached session for `cwd` and answers with
+ *  {@link BridgeChannel.reportSpawnResult}, echoing the `requestId`. */
+export type SpawnRequest = { requestId: string; cwd: string; agent: string };
+export type SpawnHandler = (request: SpawnRequest) => void;
+
 /** The seam the agent (and its client tee) talk to. A test supplies a fake;
  *  production uses {@link HttpBridgeChannel}. Every method is best-effort and
  *  MUST NOT throw into agent code. */
@@ -66,9 +72,19 @@ export interface BridgeChannel {
     /** Known thread title, so a bridge restart restores it from the
      *  re-announce instead of showing the raw uuid until the next turn end. */
     title?: string;
+    /** The session was spawned from the watch and no editor thread exists for
+     *  it yet. Cleared by re-registering WITHOUT the flag when a Zed thread
+     *  adopts it (desk pickup / session load). Rides the replay too, so a
+     *  bridge restart keeps knowing which sessions are pickup candidates. */
+    detached?: boolean;
   }): void;
   /** The ACP session ended (query closed / closeSession / dispose). */
   deregisterSession(sessionId: string, reason: string): void;
+  /** Atomically take the newest unclaimed watch-spawned session for `cwd` from
+   *  the bridge's pickup registry, or resolve `null` when there is none (or the
+   *  bridge is down/slow — a New Thread must never hang on this). At most one
+   *  caller wins a given session; the bridge clears the entry on claim. */
+  takePendingPickup(cwd: string): Promise<string | null>;
   /** Mirror of a client `sessionUpdate` (prose, tool calls, mode, plan, …). */
   forwardSessionUpdate(params: SessionNotification): void;
   /** Mirror of a client `requestPermission` RPC (missed by `sendUpdate`). */
@@ -96,6 +112,20 @@ export interface BridgeChannel {
   /** Register the handler the inbox calls when the watch answers a permission
    *  request (#80). */
   onPermissionDecision(handler: PermissionDecisionHandler): void;
+  /** Register the handler the inbox calls when the watch asks this fork to
+   *  create a session (the born-in-Zed spawn). */
+  onSpawn(handler: SpawnHandler): void;
+  /** Answer a spawn frame: the explicit ack the bridge correlates by
+   *  `requestId` (never piggybacked on register — a createSession throw must
+   *  surface immediately, and register replay must not re-trigger
+   *  correlation). Best-effort like every uplink POST. */
+  reportSpawnResult(result: {
+    requestId: string;
+    ok: boolean;
+    sessionId?: string;
+    cwd?: string;
+    error?: string;
+  }): void;
   /** Open the inbox SSE and begin its reconnect loop. */
   start(): void;
   /** Stop the inbox loop and release the connection. */
@@ -129,6 +159,7 @@ export class HttpBridgeChannel implements BridgeChannel {
   private readonly connectionId = randomUUID();
   private injectHandler: InjectHandler | null = null;
   private permissionHandler: PermissionDecisionHandler | null = null;
+  private spawnHandler: SpawnHandler | null = null;
   private stopped = false;
   private abort: AbortController | null = null;
 
@@ -149,6 +180,10 @@ export class HttpBridgeChannel implements BridgeChannel {
       /** Last known thread title, refreshed as the SDK generates one, so a
        *  re-announce after a bridge restart carries it. */
       title?: string;
+      /** Watch-spawned, no editor thread yet (see the interface doc). Kept here
+       *  so a replay after a bridge restart re-announces the truth — a restarted
+       *  bridge that lost its pickup registry relearns it from this flag. */
+      detached?: boolean;
       /** Whether a turn is in flight for this session. Tracked here because a
        *  bridge restart rebuilds its table from the re-announce alone: without
        *  it the bridge has to guess, and guessing "working" shows a live-looking
@@ -178,9 +213,37 @@ export class HttpBridgeChannel implements BridgeChannel {
     this.permissionHandler = handler;
   }
 
-  registerSession(info: { sessionId: string; sdkSessionId: string; cwd: string; title?: string }): void {
+  onSpawn(handler: SpawnHandler): void {
+    this.spawnHandler = handler;
+  }
+
+  reportSpawnResult(result: {
+    requestId: string;
+    ok: boolean;
+    sessionId?: string;
+    cwd?: string;
+    error?: string;
+  }): void {
+    void this.post("/acp/spawn-result", {
+      connection: this.connectionId,
+      ...result,
+    });
+  }
+
+  registerSession(info: {
+    sessionId: string;
+    sdkSessionId: string;
+    cwd: string;
+    title?: string;
+    detached?: boolean;
+  }): void {
     // A session that has never run a turn is not working — the honest default,
     // and the one the wrist should show for a thread just opened in Zed.
+    // An attach-time re-register (same key, no `detached`) deliberately
+    // replaces the old entry, clearing the flag for future replays; the
+    // title/active reset it also causes is benign — the bridge keeps its own
+    // slot state, the next turn boundary refreshes `active`, and the next
+    // title change re-notes `title`.
     const entry = { ...info, acked: false, inFlight: true, active: false };
     this.liveSessions.set(info.sessionId, entry);
     void this.post("/acp/register", {
@@ -190,6 +253,7 @@ export class HttpBridgeChannel implements BridgeChannel {
       cwd: info.cwd,
       active: entry.active,
       title: entry.title,
+      ...(entry.detached ? { detached: true } : {}),
     }).then((ok) => {
       // Only a POST the bridge actually accepted counts. One that failed (bridge
       // still starting, no port file yet) leaves acked=false so the next inbox
@@ -207,6 +271,28 @@ export class HttpBridgeChannel implements BridgeChannel {
       sessionId,
       reason,
     });
+  }
+
+  /** Ask the bridge for (and atomically claim) the newest unclaimed
+   *  watch-spawned session for `cwd`. Bounded hard at 1s: this sits on the
+   *  session/new path, and a down/slow bridge must degrade to "no pickup",
+   *  never to a hung New Thread. */
+  async takePendingPickup(cwd: string): Promise<string | null> {
+    const port = readBridgePort();
+    if (port === null) return null;
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/acp/claim`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ connection: this.connectionId, cwd }),
+        signal: AbortSignal.timeout(1000),
+      });
+      if (!resp.ok) return null;
+      const body = (await resp.json()) as { sessionId?: unknown };
+      return typeof body.sessionId === "string" && body.sessionId ? body.sessionId : null;
+    } catch {
+      return null;
+    }
   }
 
   forwardSessionUpdate(params: SessionNotification): void {
@@ -305,6 +391,7 @@ export class HttpBridgeChannel implements BridgeChannel {
           cwd: info.cwd,
           active: info.active,
           title: info.title,
+          ...(info.detached ? { detached: true } : {}),
         }).then((ok) => {
           if (ok && this.liveSessions.get(info.sessionId) === info) info.acked = true;
         }),
@@ -414,6 +501,25 @@ export class HttpBridgeChannel implements BridgeChannel {
       }
       return;
     }
+    if (event === "spawn") {
+      let s: Partial<SpawnRequest>;
+      try {
+        s = JSON.parse(dataLines.join("\n"));
+      } catch {
+        return;
+      }
+      if (typeof s.requestId !== "string" || !s.requestId || typeof s.cwd !== "string" || !s.cwd) {
+        return;
+      }
+      const agent = typeof s.agent === "string" && s.agent ? s.agent : "claude";
+      this.logger.log(`claude-watch: inbox spawn request ${s.requestId} (cwd=${s.cwd})`);
+      try {
+        this.spawnHandler?.({ requestId: s.requestId, cwd: s.cwd, agent });
+      } catch (err) {
+        this.logger.error(`claude-watch: spawn handler threw: ${String(err)}`);
+      }
+      return;
+    }
     if (event !== "inject") return;
     let msg: { sessionId?: unknown; text?: unknown; source?: unknown };
     try {
@@ -443,6 +549,101 @@ function sleep(ms: number): Promise<void> {
 export function createBridgeChannel(logger: Logger = console): BridgeChannel | null {
   if (process.env.CLAUDE_WATCH_ACP !== "1") return null;
   return new HttpBridgeChannel(logger);
+}
+
+/** How long a detached session's permission request may sit unanswered before
+ *  the guard settles it as cancelled. Slightly ABOVE the bridge's own wrist-card
+ *  expiry (~9.5 min), so the wrist always gets the full window first; after it,
+ *  the turn ends honestly ("Tool use aborted") instead of wedging forever in a
+ *  session with no second surface to fall back to. */
+const DETACHED_PERMISSION_TIMEOUT_MS = 600_000;
+
+/** Wrap an {@link AcpClient} so a DETACHED session — one spawned from the watch
+ *  that no editor thread exists for yet — never reaches the editor. ACP routes
+ *  notifications and RPCs by session id, and the editor has never seen this id:
+ *  best case the message is dropped, worst case a strict client errors on it.
+ *  So while `isDetached(sessionId)` holds:
+ *
+ *    - notifications (`sessionUpdate`, `extNotification`,
+ *      `completeElicitation`) resolve without being sent;
+ *    - `requestPermission` never asks the editor: it stays pending so the
+ *      wrist lane of the #80 race is the only answerable surface, resolves
+ *      `cancelled` when the tool call's signal aborts (turn cancel), and
+ *      resolves `cancelled` after {@link DETACHED_PERMISSION_TIMEOUT_MS} as a
+ *      backstop so an unanswered card can never wedge the turn forever;
+ *    - fs and elicitation REQUESTS reject, which every call site already
+ *      catches and degrades gracefully (MCP elicitation → decline,
+ *      AskUserQuestion → deny with a message, refusal dialog → cancelled).
+ *
+ *  Compose UNDER the bridge tee (`teeClientToBridge(guardDetachedClient(...))`)
+ *  so the watch mirror keeps flowing while the editor leg is suppressed. The
+ *  guard re-checks `isDetached` on every call, so the moment a session is
+ *  adopted by a Zed thread the same client object serves it normally. */
+export function guardDetachedClient(
+  inner: AcpClient,
+  isDetached: (sessionId: string) => boolean,
+): AcpClient {
+  return {
+    sessionUpdate(params: SessionNotification): Promise<void> {
+      if (isDetached(params.sessionId)) return Promise.resolve();
+      return inner.sessionUpdate(params);
+    },
+    requestPermission(
+      params: RequestPermissionRequest,
+      signal?: AbortSignal,
+    ): Promise<RequestPermissionResponse> {
+      if (!isDetached(params.sessionId)) return inner.requestPermission(params, signal);
+      return new Promise<RequestPermissionResponse>((resolve) => {
+        const settle = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", settle);
+          resolve({ outcome: { outcome: "cancelled" } });
+        };
+        // unref'd: a pending backstop must not hold the process open past a
+        // Zed quit — the fork's lifetime belongs to the ACP connection.
+        const timer = setTimeout(settle, DETACHED_PERMISSION_TIMEOUT_MS);
+        timer.unref?.();
+        if (signal?.aborted) settle();
+        else signal?.addEventListener("abort", settle, { once: true });
+      });
+    },
+    readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+      if (isDetached(params.sessionId)) {
+        return Promise.reject(new Error("detached session: no editor attached to read from"));
+      }
+      return inner.readTextFile(params);
+    },
+    writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
+      if (isDetached(params.sessionId)) {
+        return Promise.reject(new Error("detached session: no editor attached to write to"));
+      }
+      return inner.writeTextFile(params);
+    },
+    unstable_createElicitation(
+      params: CreateElicitationRequest,
+      signal?: AbortSignal,
+    ): Promise<CreateElicitationResponse> {
+      // The request is a scope union: session-scoped variants carry
+      // `sessionId`, request-scoped ones don't (and aren't session-bound, so
+      // they pass through).
+      const sid = (params as { sessionId?: unknown }).sessionId;
+      if (typeof sid === "string" && isDetached(sid)) {
+        return Promise.reject(new Error("detached session: no editor to present this"));
+      }
+      return inner.unstable_createElicitation(params, signal);
+    },
+    unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+      // Carries only an elicitationId — and no elicitation can exist for a
+      // detached session (creation is blocked above), so pass through.
+      return inner.unstable_completeElicitation(params);
+    },
+    extNotification(method: string, params: Record<string, unknown>): Promise<void> {
+      if (typeof params.sessionId === "string" && isDetached(params.sessionId)) {
+        return Promise.resolve();
+      }
+      return inner.extNotification(method, params);
+    },
+  };
 }
 
 /** Decorate an {@link AcpClient} so every `sessionUpdate` and every

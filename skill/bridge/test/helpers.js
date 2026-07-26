@@ -78,7 +78,18 @@ export async function startBridge(t, { credentialsDir, args = [], env: extraEnv 
   // parallel processes, each spawning bridges, and the production range of
   // ten ports gets exhausted (bridge exits 1, flaky suite). Callers can still
   // override with their own value.
-  const env = { CLAUDE_WATCH_PORT_RANGE_END: "7929", ...process.env, ...extraEnv };
+  // CLAUDE_WATCH_DISABLE_MDNS: a test bridge probes the SAME Bonjour service
+  // name a live bridge on this machine is defending, and bonjour-service
+  // surfaces the conflict as an uncaught 'error' that kills the process 1–3 s
+  // after boot — whether it lands is a multicast-delivery coin flip, i.e.
+  // random test flakiness. Test bridges are reached by explicit port; they
+  // never need discovery.
+  const env = {
+    CLAUDE_WATCH_PORT_RANGE_END: "7929",
+    CLAUDE_WATCH_DISABLE_MDNS: "1",
+    ...process.env,
+    ...extraEnv,
+  };
   let ownedTempDir = null;
   if (credentialsDir === undefined) {
     ownedTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-test-creds-"));
