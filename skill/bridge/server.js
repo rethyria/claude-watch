@@ -388,6 +388,28 @@ async function startServer() {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
+  // Orphan watchdog (test-only: CLAUDE_WATCH_EXIT_WHEN_ORPHANED=1). The suite
+  // spawns bridges as child processes and reaps them in t.after (helpers.js).
+  // That covers every path where the runner lives long enough to run it — but
+  // not a runner that dies first: a SIGKILLed or aborted run leaves each bridge
+  // reparented to init, alive indefinitely, squatting a port in the production
+  // range. One aborted run stranded 26 of them on a dev machine, spinning at
+  // ~100% CPU each. Polling process.ppid catches exactly that case: the pid
+  // changes the instant our spawner is gone. Production must NEVER set this —
+  // the live bridge is started with `setsid nohup`, i.e. orphaned by design.
+  if (process.env.CLAUDE_WATCH_EXIT_WHEN_ORPHANED === "1") {
+    const spawnerPid = process.ppid;
+    const orphanWatchdog = setInterval(() => {
+      if (process.ppid === spawnerPid) return;
+      clearInterval(orphanWatchdog);
+      log("warn", `Spawner ${spawnerPid} exited (reparented to ${process.ppid}); shutting down`);
+      shutdown("orphaned");
+    }, 2000);
+    // The listening server already holds the loop open; never let the watchdog
+    // be the reason a process that is otherwise done lingers.
+    orphanWatchdog.unref();
+  }
+
   const agents = [];
   if (CLAUDE_BIN) agents.push("Claude");
   if (CODEX_BIN) agents.push("Codex");

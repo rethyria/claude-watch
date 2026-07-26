@@ -84,9 +84,16 @@ export async function startBridge(t, { credentialsDir, args = [], env: extraEnv 
   // after boot — whether it lands is a multicast-delivery coin flip, i.e.
   // random test flakiness. Test bridges are reached by explicit port; they
   // never need discovery.
+  // CLAUDE_WATCH_EXIT_WHEN_ORPHANED: the t.after below is a promise the runner
+  // has to survive to keep. When it doesn't — SIGKILL, OOM, an aborted run —
+  // the bridges are reparented to init and outlive the suite; they do not exit
+  // on their own, and they keep holding ports in the production range. This
+  // tells each bridge to watch its parent and shut itself down once we're gone,
+  // so the worst case is a few seconds of stray bridge instead of forever.
   const env = {
     CLAUDE_WATCH_PORT_RANGE_END: "7929",
     CLAUDE_WATCH_DISABLE_MDNS: "1",
+    CLAUDE_WATCH_EXIT_WHEN_ORPHANED: "1",
     ...process.env,
     ...extraEnv,
   };
