@@ -395,6 +395,39 @@ class HaloModelTest {
         assertEquals(listOf(SpawnTarget("proj", "/home/dev/proj")), model.spawnTargets)
     }
 
+    /**
+     * Halo v2 S1: ONE session order everywhere. The bridge interleaves
+     * projects freely (alpha, beta, alpha), and the All ring used to draw
+     * that insertion order while the list grouped by project — two orders
+     * that diverge the moment projects interleave, so the pager's ring
+     * highlight could sit on the wrong segment. The flat list is now the
+     * project flatten BY CONSTRUCTION — a deliberate, user-visible All-ring
+     * reorder for interleaved-project bridges.
+     */
+    @Test
+    fun theFlatSessionListIsProjectGroupedByConstruction() {
+        val model = HaloModel.from(
+            uiState(
+                session("s-a1", folderName = "alpha", cwd = "/home/dev/alpha"),
+                session("s-b1", folderName = "beta", cwd = "/home/dev/beta"),
+                session("s-a2", folderName = "alpha", cwd = "/home/dev/alpha"),
+            ),
+        )
+        // Bridge insertion order was a1, b1, a2; project grouping (first-seen
+        // project order) regroups a2 next to its sibling.
+        assertEquals(listOf("s-a1", "s-a2", "s-b1"), model.sessions.map { it.id })
+        // Ring (model.sessions), pager (sessionsIn(All)), and grouped list
+        // (projects flattened) are the SAME list by construction — assert the
+        // identities, not three hand-copied orders.
+        assertEquals(model.sessions, model.sessionsIn(ListScope.All))
+        assertEquals(model.projects.flatMap { it.sessions }, model.sessions)
+        // A project scope is exactly its own group.
+        assertEquals(
+            model.projects.single { it.name == "beta" }.sessions,
+            model.sessionsIn(ListScope.Project("beta")),
+        )
+    }
+
     @Test
     fun mixedSessionsKeepEachTheirOwnLabel() {
         val model = HaloModel.from(

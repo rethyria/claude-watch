@@ -72,7 +72,13 @@ data class SpawnTarget(val projectName: String, val root: String)
 /** The whole derived tree plus the cross-cutting waiting queue. */
 data class HaloModel(
     val projects: List<HaloProject>,
-    val sessions: List<HaloSession>, // flat, project-order — drives the "All" ring
+    /**
+     * The flat session list, project-grouped BY CONSTRUCTION (the flatten of
+     * [projects]): the All ring, the list pager, and the grouped list render
+     * this ONE order, so they can never diverge however the bridge
+     * interleaves projects (Halo v2 S1).
+     */
+    val sessions: List<HaloSession>,
     /** Waiting sessions in queue order: drives tap-center + card chaining. */
     val queue: List<HaloSession>,
 ) {
@@ -193,9 +199,15 @@ data class HaloModel(
             val byId = all.associateBy { it.id }
             val queue = ui.permissionQueue.mapNotNull { p -> byId[p.sessionId ?: "prompt:${p.permissionId}"] }
 
+            val grouped = projects.map { (name, sessions) -> HaloProject(name, sessions) }
             return HaloModel(
-                projects = projects.map { (name, sessions) -> HaloProject(name, sessions) },
-                sessions = all,
+                projects = grouped,
+                // The flatten of the grouping, NOT bridge-insertion order: a
+                // bridge that interleaves projects would otherwise give the
+                // All ring one order and the grouped list another, and the v2
+                // pager needs them to be the same list. A deliberate,
+                // user-visible All-ring reorder for interleaved projects.
+                sessions = grouped.flatMap { it.sessions },
                 queue = queue,
             )
         }

@@ -1,9 +1,10 @@
 // Halo's navigation state machine: horizontal = pages (settings and usage left
-// of home, All, then one per project), vertical = depth (page → list → session
-// feed), plus the approval/question card as an overlay flag. Pure Kotlin over
-// HaloModel — no Compose, no I/O — so every transition is unit-testable,
-// including the edge cases (no waiting items, a project vanishing under the
-// user, the depth-less settings/usage pages).
+// of home, All, then one per project), vertical = depth (page → list pager →
+// session feed), plus the approval/question card as an overlay flag. Pure
+// Kotlin over HaloModel — no Compose, no I/O — so every transition is
+// unit-testable, including the edge cases (no waiting items, a project
+// vanishing under the user, the depth-less settings/usage pages, the pager's
+// spawn slot and empty scopes).
 package dev.claudewatch.wear.ui.halo
 
 /**
@@ -35,12 +36,30 @@ sealed interface ListScope {
     data class Project(val name: String) : ListScope
 }
 
+/**
+ * The ordered sessions a list scope shows — the ONE source of session order
+ * for the pager, the ring, and the self-heal. All is the model's flat list
+ * (itself the project flatten by construction, so ring order == pager order);
+ * a project is exactly its own group; a scope whose project vanished under
+ * the user degrades to empty rather than crashing.
+ */
+fun HaloModel.sessionsIn(scope: ListScope): List<HaloSession> = when (scope) {
+    ListScope.All -> sessions
+    is ListScope.Project -> projects.firstOrNull { it.name == scope.name }?.sessions.orEmpty()
+}
+
 data class HaloNavState(
     /** Pager index: [SETTINGS_PAGE] = settings, [USAGE_PAGE] = usage, 0 = All, 1..n = model.projects[page - 1]. */
     val page: Int = 0,
     val depth: HaloDepth = HaloDepth.PAGE,
     val listScope: ListScope = ListScope.All,
-    /** Session whose feed is open; only meaningful at [HaloDepth.SESSION]. */
+    /**
+     * The selected session. At [HaloDepth.SESSION] it is the open feed; at
+     * [HaloDepth.LIST] it is the pager's selected card — null there means the
+     * trailing spawn card (All scope) or an empty scope, not "nothing". Always
+     * null at [HaloDepth.PAGE]: a page has no selection, and a stale id would
+     * leak into the next drill's keep-if-in-scope resolution.
+     */
     val sessionId: String? = null,
     /**
      * The approval/question card overlay. A flag rather than a depth because
@@ -68,21 +87,55 @@ fun scopeForPage(page: Int, model: HaloModel): ListScope =
     else model.projects.getOrNull(page - 1)?.let { ListScope.Project(it.name) } ?: ListScope.All
 
 /**
- * Swipe up on a page: into the All list or the current project's list. The
- * settings and usage pages have no depth below them (issue #57) — both are
- * `< 0`, so a drill from either is a NO-OP, never a surprise jump into the All
- * list.
+ * Swipe up on a page: into the All list or the current project's list, with
+ * the pager selection resolved up front — keep the current session if it is
+ * in scope, else the scope's first, else null (the spawn card alone, or an
+ * empty scope). The settings and usage pages have no depth below them (issue
+ * #57) — both are `< 0`, so a drill from either is a NO-OP, never a surprise
+ * jump into the All list.
  */
 fun HaloNavState.drillToList(model: HaloModel): HaloNavState {
     if (page < 0) return this
+    val scope = scopeForPage(page, model)
+    val inScope = model.sessionsIn(scope)
     return copy(
         depth = HaloDepth.LIST,
-        listScope = scopeForPage(page, model),
-        sessionId = null,
+        listScope = scope,
+        sessionId = sessionId.takeIf { id -> inScope.any { it.id == id } }
+            ?: inScope.firstOrNull()?.id,
         cardOpen = false,
         cardPermissionId = null,
     )
 }
+
+/**
+ * Swipe on the list pager: move the selection by [delta] slots (+1 next, −1
+ * previous), NO wrap — both ends are hard stops, so the ring highlight never
+ * teleports across midnight. All scope appends ONE trailing spawn slot
+ * (`sessionId = null`) as the true end: last session → spawn card → no-op. A
+ * project scope ends at its last session. Only meaningful at LIST depth, and
+ * a no-op when the selection already vanished under us — repairing that is
+ * the self-heal's job, not a swipe's.
+ */
+fun HaloNavState.step(delta: Int, model: HaloModel): HaloNavState {
+    if (depth != HaloDepth.LIST) return this
+    val slots: List<String?> = model.sessionsIn(listScope).map { it.id } +
+        if (listScope == ListScope.All) listOf(null) else emptyList()
+    val at = slots.indexOf(sessionId)
+    if (at < 0) return this
+    val to = at + delta
+    if (to !in slots.indices) return this
+    return copy(sessionId = slots[to])
+}
+
+/**
+ * True on the FIRST pager slot of the current scope: there the UI maps
+ * swipe-right/‹ to [back] instead of a step. With sessions present the spawn
+ * card is the END, so a null selection is NOT the start; an empty scope's
+ * sole slot (spawn card, or nothing) is trivially both — back must work.
+ */
+fun HaloNavState.atListStart(model: HaloModel): Boolean =
+    sessionId == model.sessionsIn(listScope).firstOrNull()?.id
 
 /** Tap a session row: into its live feed. */
 fun HaloNavState.drillToSession(sessionId: String): HaloNavState =
@@ -92,11 +145,25 @@ fun HaloNavState.drillToSession(sessionId: String): HaloNavState =
 fun HaloNavState.openCard(permissionId: String?): HaloNavState =
     copy(cardOpen = true, cardPermissionId = permissionId)
 
+/**
+ * The pager card's Answer pill: raise the card OVER the list — depth stays
+ * LIST — pinned to THIS session's own prompt, so "decide later" lands right
+ * back on the same pager card (unlike a feed's [openCard], there is no feed
+ * underneath to land in). No pending prompt → no-op: a null pin would render
+ * the global queue front, floating some OTHER session's prompt over this card.
+ */
+fun HaloNavState.openCardForListSession(session: HaloSession): HaloNavState {
+    val pending = session.pending ?: return this
+    return copy(sessionId = session.id, cardOpen = true, cardPermissionId = pending.permissionId)
+}
+
 /** Swipe down: card → feed → list → page; no-op at the top. */
 fun HaloNavState.back(): HaloNavState = when {
     cardOpen -> copy(cardOpen = false, cardPermissionId = null)
-    depth == HaloDepth.SESSION -> copy(depth = HaloDepth.LIST, sessionId = null)
-    depth == HaloDepth.LIST -> copy(depth = HaloDepth.PAGE)
+    // Feed → list KEEPS the session: it becomes the pager selection, and the
+    // shrink morph must land on that session's ring segment, not the first's.
+    depth == HaloDepth.SESSION -> copy(depth = HaloDepth.LIST)
+    depth == HaloDepth.LIST -> copy(depth = HaloDepth.PAGE, sessionId = null)
     else -> this
 }
 
