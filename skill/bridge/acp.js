@@ -404,12 +404,28 @@ export async function handleAcpUpdate(req, res) {
         announceAcpSlot(sessionId);
       }
     }
+    // A config_option_update re-sends the WHOLE option list, so one frame can
+    // move both fields — and for a mode change made with Zed's native selector
+    // (session/set_mode) it is the ONLY teed footprint: the adapter emits
+    // current_mode_update on its other mode paths (set_config_option, the
+    // plan-mode hooks, the model-switch clamp) but not on that one. Reading
+    // the mode option here too is what keeps a Zed mode flip from sitting
+    // stale on the wrist until a bridge restart.
     if (update?.sessionUpdate === "config_option_update") {
       const slot = sessions.get(sessionId);
-      const model = modelDisplayFromConfigOptions(update.configOptions);
-      if (slot && model && slot.model !== model) {
-        slot.model = model;
-        announceAcpSlot(sessionId);
+      if (slot) {
+        const model = modelDisplayFromConfigOptions(update.configOptions);
+        const mode = modeIdFromConfigOptions(update.configOptions);
+        let changed = false;
+        if (model && slot.model !== model) {
+          slot.model = model;
+          changed = true;
+        }
+        if (mode && slot.mode !== mode) {
+          slot.mode = mode;
+          changed = true;
+        }
+        if (changed) announceAcpSlot(sessionId);
       }
     }
   }
@@ -446,20 +462,47 @@ export async function handleAcpUpdate(req, res) {
  *  no row matches — a session running an out-of-picker model (refusal
  *  fallback, allowlist-excluded resume) reports a currentValue with no entry,
  *  and the raw id is then the only honest label. `null` means "this update
- *  says nothing about the model" (no model option at all), never "clear":
- *  effort/agent/fast-mode rebuilds arrive as the same update kind. Option
- *  rows can be grouped (an entry carrying its own `options`), so flatten one
- *  level, exactly as the adapter's own value validation does. */
+ *  says nothing about the model" (no model option at all, or the unresolvable
+ *  `default` alias below), never "clear": effort/agent/fast-mode rebuilds
+ *  arrive as the same update kind. Option rows can be grouped (an entry
+ *  carrying its own `options`), so flatten one level, exactly as the
+ *  adapter's own value validation does. */
 function modelDisplayFromConfigOptions(configOptions) {
   if (!Array.isArray(configOptions)) return null;
   const option =
     configOptions.find((o) => o?.category === "model") ?? configOptions.find((o) => o?.id === "model");
   if (!option || typeof option.currentValue !== "string" || !option.currentValue) return null;
+  // The `default` alias is UNRESOLVABLE here: option rows on the wire carry
+  // only value/name, never the `resolvedModel` the issue's default-alias hop
+  // needs, so taking the row's own name would rewrite a seeded "Opus" as
+  // "Default (recommended)" on the first mode/effort/fast rebuild — and the
+  // next bridge restart's replay (which DOES carry the resolved name) would
+  // flip it back. Say nothing instead: the register seed and its replay, both
+  // computed by the adapter's modelDisplayName — the one place that can
+  // resolve the alias — own the field for a session sitting on `default`.
+  if (option.currentValue === "default") return null;
   const rows = Array.isArray(option.options)
     ? option.options.flatMap((o) => (o && Array.isArray(o.options) ? o.options : [o]))
     : [];
   const row = rows.find((o) => o?.value === option.currentValue);
   return typeof row?.name === "string" && row.name ? row.name : option.currentValue;
+}
+
+/** The current ACP permission-mode id from a teed `config_option_update`'s
+ *  option list (#97). Unlike the model there is nothing to resolve: the mode
+ *  option's currentValue IS the mode id verbatim, which is exactly the
+ *  field's contract. This lookup exists because Zed's native mode selector
+ *  lands on session/set_mode, whose only teed footprint is the
+ *  config_option_update it triggers — every OTHER mode writer also emits a
+ *  current_mode_update, that one does not. `null` means "this update says
+ *  nothing about the mode", never "clear". */
+function modeIdFromConfigOptions(configOptions) {
+  if (!Array.isArray(configOptions)) return null;
+  const option =
+    configOptions.find((o) => o?.category === "mode") ?? configOptions.find((o) => o?.id === "mode");
+  return option && typeof option.currentValue === "string" && option.currentValue
+    ? option.currentValue
+    : null;
 }
 
 /** Emit the session's buffered prose as ONE `message` event and clear it.

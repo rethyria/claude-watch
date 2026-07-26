@@ -965,6 +965,7 @@ test("teed config_option_update announces the model DISPLAY name, raw id verbati
               {
                 id: "model", category: "model", currentValue,
                 options: [
+                  { value: "default", name: "Default (recommended)" },
                   { value: "opus[1m]", name: "Opus" },
                   { value: "sonnet", name: "Sonnet" },
                 ],
@@ -975,6 +976,12 @@ test("teed config_option_update announces the model DISPLAY name, raw id verbati
       },
     });
 
+  // The never-touched-the-picker session: its currentValue is the `default`
+  // alias, whose row name says nothing about the model. The register seeded
+  // the adapter-RESOLVED name, and the wire carries no resolvedModel to
+  // re-derive it from — so the alias must announce nothing, not clobber the
+  // seed with "Default (recommended)".
+  await configUpdate("default");
   await configUpdate("opus[1m]"); // display name "Opus" — unchanged, no event
   await configUpdate("sonnet");
   await configUpdate("sonnet");   // an effort/agent rebuild re-sends the list — no event
@@ -987,6 +994,81 @@ test("teed config_option_update announces the model DISPLAY name, raw id verbati
     .filter((e) => e.event === "session" && e.parsed?.sessionId === "acp-model")
     .map((e) => e.parsed.model);
   assert.deepEqual(models, ["Opus", "Sonnet", "claude-weird-9"], "display name on change only");
+  assert.ok(!models.includes("Default (recommended)"), "the alias row's own name never announces");
+});
+
+// Zed's native mode selector is session/set_mode, and the adapter's only teed
+// footprint for it is the config_option_update its updateConfigOption emits —
+// no current_mode_update. The bridge must read the mode option out of that
+// frame, or a Zed mode flip sits stale on the wrist until a bridge restart.
+// The same frame re-sends the model option with the `default` alias as its
+// currentValue (the never-touched-the-picker session), so this also pins the
+// seeded display name surviving every alias-bearing rebuild.
+test("a Zed set_mode flip — teed as config_option_update alone — announces the mode (#97)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "setmode");
+
+  const inbox = connectInbox(bridge, "conn-setmode");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await request(bridge.port, "POST", "/acp/register", {
+    body: {
+      connection: "conn-setmode", sessionId: "acp-setmode", sdkSessionId: "acp-setmode", cwd,
+      model: "Opus", mode: "default", contextUsed: 0, contextSize: 200000,
+    },
+  });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-setmode");
+
+  const setMode = (modeId) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: {
+        connection: "conn-setmode", sessionId: "acp-setmode", kind: "session_update",
+        payload: {
+          sessionId: "acp-setmode",
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: [
+              {
+                id: "mode", category: "mode", currentValue: modeId,
+                options: [
+                  { value: "default", name: "Always Ask" },
+                  { value: "plan", name: "Plan Mode" },
+                  { value: "acceptEdits", name: "Accept Edits" },
+                ],
+              },
+              {
+                id: "model", category: "model", currentValue: "default",
+                options: [
+                  { value: "default", name: "Default (recommended)" },
+                  { value: "opus[1m]", name: "Opus" },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    });
+
+  await setMode("plan");
+  const flip = await sse.waitFor((e) => e.event === "session" && e.parsed?.mode === "plan");
+  assert.equal(flip.parsed.model, "Opus", "the seeded resolved name rides the mode flip untouched");
+  await setMode("plan"); // an effort/fast rebuild re-sends the list — no event
+  await setMode("acceptEdits");
+
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.mode === "acceptEdits");
+  const frames = sse.events.filter((e) => e.event === "session" && e.parsed?.sessionId === "acp-setmode");
+  assert.deepEqual(frames.map((e) => e.parsed.mode), ["default", "plan", "acceptEdits"], "announce on change only");
+  assert.deepEqual([...new Set(frames.map((e) => e.parsed.model))], ["Opus"],
+    "no frame ever rewrites the model as the alias row's own name");
+
+  const entry = await statusEntry(bridge, token, "acp-setmode");
+  assert.equal(entry.mode, "acceptEdits");
+  assert.equal(entry.model, "Opus");
 });
 
 // The replay's context pair is a registration-time reading (the fork refreshes

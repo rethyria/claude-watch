@@ -5227,7 +5227,10 @@ export class ClaudeAcpAgent {
       // claude-watch (#97): every mode writer funnels through here (setMode,
       // set_config_option, enter/exit plan), so this one call keeps the bridge
       // replay's mode current. The live bridge learns the change from the
-      // teed current_mode_update — this is restart bookkeeping only.
+      // teed updates — a current_mode_update where the path emits one, else
+      // the config_option_update's mode option (session/set_mode emits ONLY
+      // that; the bridge reads the mode from both) — this is restart
+      // bookkeeping only.
       this.bridge?.noteSessionMeta?.(sessionId, { mode: value });
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,

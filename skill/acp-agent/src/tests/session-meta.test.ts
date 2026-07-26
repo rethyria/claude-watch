@@ -176,13 +176,15 @@ describe("session register carries the subheading meta", () => {
 describe("noteSessionMeta fires on model/mode changes", () => {
   const SESSION_ID = "meta-session";
   let bridge: ReturnType<typeof makeFakeBridge>;
+  let client: AcpClient;
   let agent: ClaudeAcpAgentType;
   let setModelSpy: ReturnType<typeof vi.fn>;
   let setPermissionModeSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     bridge = makeFakeBridge();
-    agent = new ClaudeAcpAgent(makeMockClient(), { log: () => {}, error: () => {} }, bridge);
+    client = makeMockClient();
+    agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }, bridge);
     setModelSpy = vi.fn();
     setPermissionModeSpy = vi.fn();
     const availableModes = [
@@ -251,9 +253,23 @@ describe("noteSessionMeta fires on model/mode changes", () => {
     expect(bridge.noteSessionMeta).toHaveBeenCalledWith(SESSION_ID, { mode: "plan" });
   });
 
-  it("notes the mode id on a session/set_mode change (same choke point)", async () => {
+  it("a session/set_mode change notes replay state AND emits the config_option_update the live bridge reads", async () => {
     await agent.setSessionMode({ sessionId: SESSION_ID, modeId: "acceptEdits" });
+    // Restart-replay bookkeeping (the same choke point every mode writer hits).
     expect(bridge.noteSessionMeta).toHaveBeenCalledWith(SESSION_ID, { mode: "acceptEdits" });
+    // LIVE delivery. Zed's native mode selector is this RPC, and it emits no
+    // current_mode_update — asserted here because that absence is exactly why
+    // the bridge reads the mode out of the config_option_update's mode option.
+    // If this path ever gains a current_mode_update, the bridge's dual read
+    // stays correct (change-gated), but re-check the assertion below.
+    const updates = (client.sessionUpdate as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: any[]) => c[0].update,
+    );
+    expect(updates.some((u: any) => u.sessionUpdate === "current_mode_update")).toBe(false);
+    const cfg = updates.find((u: any) => u.sessionUpdate === "config_option_update");
+    expect(cfg).toBeDefined();
+    const modeOption = cfg.configOptions.find((o: any) => o.id === "mode");
+    expect(modeOption?.currentValue).toBe("acceptEdits");
   });
 
   it("notes the model DISPLAY name on a model change", async () => {
