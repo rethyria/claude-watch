@@ -1,7 +1,9 @@
 // Issue #55: the workflow-activity indicator. The Workflow tool returns
-// immediately (it runs in the background), so the PostToolUse hook is the
-// ONLY launch signal; completion is discovered by a slow poll over the
-// session's workflow journals:
+// immediately (it runs in the background), so the launch signal is the one
+// wire that names the tool — the PostToolUse hook for hook sessions, the teed
+// ACP tool_call for ACP sessions (issue #105, the ACP-feed section below);
+// completion is discovered by a slow poll over the session's workflow
+// journals:
 //   <transcript minus .jsonl>/subagents/workflows/wf_*/journal.jsonl
 // running = `started` records without a matching `result` (matched on `key`),
 // done = matched ones in LIVE (non-stale) journals. The completion state is
@@ -31,6 +33,11 @@ const STALE_MS = 60_000;
 process.env.CLAUDE_WATCH_WORKFLOW_STALE_MS = String(STALE_MS);
 
 const fixturesRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-wf-fixtures-"));
+// The ACP feed (issue #105) has no transcript_path on any wire — the bridge
+// derives it from the CLI's projects-dir convention, so point that root at
+// the fixture tree before any bridge module loads.
+const projectsRoot = path.join(fixturesRoot, "projects");
+process.env.CLAUDE_WATCH_CLAUDE_PROJECTS_ROOT = projectsRoot;
 after(() => {
   for (const dir of [credsDir, fixturesRoot]) {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -64,6 +71,30 @@ function makeWorkflowTree(name, sid, records) {
 
 const started = (key) => ({ type: "started", key, agentId: `agent-${key}` });
 const result = (key) => ({ type: "result", key, value: "ok" });
+
+// ACP variant of makeWorkflowTree: the tree is built at the location the
+// bridge must DERIVE from cwd + SDK session id, since ACP registration carries
+// no transcript path (issue #105):
+//   <projectsRoot>/<munged cwd>/<sid>.jsonl
+//   <projectsRoot>/<munged cwd>/<sid>/subagents/workflows/wf_a/journal.jsonl
+// The CLI's cwd munge is deliberately re-implemented here, so a drift in the
+// bridge's convention breaks the test instead of agreeing with itself.
+// `records: null` builds only the transcript (a session that never ran a
+// workflow — no workflows dir at all).
+function makeAcpWorkflowTree(name, sid, records) {
+  const cwd = path.join(fixturesRoot, "acp-cwd", name);
+  fs.mkdirSync(cwd, { recursive: true });
+  const projectDir = path.join(projectsRoot, cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+  fs.mkdirSync(projectDir, { recursive: true });
+  const transcriptPath = path.join(projectDir, `${sid}.jsonl`);
+  fs.writeFileSync(transcriptPath, "");
+  const journalPath = path.join(projectDir, sid, "subagents", "workflows", "wf_a", "journal.jsonl");
+  if (records) {
+    fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+    fs.writeFileSync(journalPath, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  }
+  return { cwd, transcriptPath, journalPath };
+}
 
 test("the launch signal scans immediately: 3 started / 1 result → {running: 2, done: 1} on payload + snapshot", async () => {
   const { sessions, resolveHookSession, markWorkflowActivity, getSessionsSnapshot } = await import("../sessions.js");
@@ -539,4 +570,241 @@ test("restart onto a just-finished workflow with a still-fresh journal holds, th
   } finally {
     sessions.delete(id);
   }
+});
+
+// --- The ACP feed (issue #105) -----------------------------------------------
+// ACP sessions fire no hooks (the Zed-only pivot retired them), so the
+// hook-fed indicator above never armed and never had a transcript to scan.
+// The ACP feed is additive: registration derives the transcript path from
+// cwd + SDK session id (the CLI projects-dir convention) and reconciles like
+// the hook path's #68 registration; the launch signal is the teed tool_call
+// whose _meta names the Workflow tool (handleAcpUpdate → markWorkflowActivity).
+// Scanner/staleness semantics are shared and covered above — these tests cover
+// the ACP-specific feed points.
+
+test("ACP registration derives the transcript path and reconciles a live journal — no hook ever fires (#105)", async () => {
+  const { sessions, registerAcpSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // A live workflow already on disk, as after a bridge restart mid-workflow:
+  // the fork's replay re-registers the session, and that registration is the
+  // only signal the bridge gets — no Workflow hook, no fresh tool_call.
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("restart-live", "acp-wf-restart-live",
+    [started("k1"), started("k2"), started("k3"), result("k1")]); // running=2, done=1, fresh
+  const before = sseBuffer.length;
+  registerAcpSession({ sessionId: "acp-wf-restart-live", sdkSessionId: "acp-wf-restart-live", cwd });
+  const slot = sessions.get("acp-wf-restart-live");
+  try {
+    assert.equal(slot.transcriptPath, transcriptPath, "derived from cwd + SDK session id — the CLI convention");
+    assert.deepEqual(slot.agents, { running: 2, done: 1 }, "re-seeded the running count at registration");
+    assert.equal(slot.workflowActive, true, "re-armed the scanner without any launch signal");
+    const event = lastSessionEvent(sseBuffer.slice(before), "acp-wf-restart-live");
+    assert.ok(event, "the registration running event carried the reconciled agents");
+    assert.deepEqual(event.agents, { running: 2, done: 1 });
+
+    // From here the shared machinery tracks to completion exactly like an
+    // armed hook workflow: fresh zero held (#70), stale tree clears.
+    fs.appendFileSync(journalPath, [result("k2"), result("k3")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.agents.running, 2, "held through the fresh inter-phase zero");
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 3 }, "tracked to completion, peak done preserved");
+    assert.equal(slot.workflowActive, false, "poll went quiet");
+  } finally {
+    sessions.delete("acp-wf-restart-live");
+  }
+});
+
+test("ACP re-register after the workflow finished during bridge downtime broadcasts the explicit zero (#68 x #105)", async () => {
+  const { sessions, registerAcpSession } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  const { cwd, journalPath } = makeAcpWorkflowTree("restart-stale", "acp-wf-restart-stale", [started("k1")]);
+  const old = new Date(Date.now() - 2 * STALE_MS);
+  fs.utimesSync(journalPath, old, old);
+  const before = sseBuffer.length;
+  registerAcpSession({ sessionId: "acp-wf-restart-stale", sdkSessionId: "acp-wf-restart-stale", cwd });
+  const slot = sessions.get("acp-wf-restart-stale");
+  try {
+    // A watch latched on a pre-restart blue must be overwritten explicitly —
+    // preserve-on-absence means only a broadcast zero can clear it.
+    assert.deepEqual(slot.agents, { running: 0, done: 0 }, "reconciled to the explicit zero");
+    assert.notEqual(slot.workflowActive, true, "nothing live to track — not armed");
+    const event = lastSessionEvent(sseBuffer.slice(before), "acp-wf-restart-stale");
+    assert.ok(event, "the registration event carried the clearing zero");
+    assert.deepEqual(event.agents, { running: 0, done: 0 });
+  } finally {
+    sessions.delete("acp-wf-restart-stale");
+  }
+});
+
+test("an ACP session that never ran a workflow still gets its derived path, but no agents field (#105)", async () => {
+  const { sessions, registerAcpSession } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  const { cwd, transcriptPath } = makeAcpWorkflowTree("no-wf", "acp-wf-none", null);
+  const before = sseBuffer.length;
+  registerAcpSession({ sessionId: "acp-wf-none", sdkSessionId: "acp-wf-none", cwd });
+  const slot = sessions.get("acp-wf-none");
+  try {
+    // The path is seeded unconditionally — a later Workflow tool_call must be
+    // able to arm a scan for a journal that does not exist yet.
+    assert.equal(slot.transcriptPath, transcriptPath, "path derived even with no workflow on disk");
+    assert.equal(slot.agents, undefined, "no workflow tree → no agents field, not a phantom zero");
+    const event = lastSessionEvent(sseBuffer.slice(before), "acp-wf-none");
+    assert.ok(event, "a running event was still broadcast");
+    assert.ok(!Object.hasOwn(event, "agents"), "no agents field on the wire");
+  } finally {
+    sessions.delete("acp-wf-none");
+  }
+});
+
+test("a fork drop mid-workflow (Zed relaunch) re-arms on re-register — no stale blue, no stranded grey (#105)", async () => {
+  const { sessions, registerAcpSession, endAcpSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  const { cwd } = makeAcpWorkflowTree("fork-drop", "acp-wf-fork-drop", [started("k1"), started("k2")]);
+  registerAcpSession({ sessionId: "acp-wf-fork-drop", sdkSessionId: "acp-wf-fork-drop", cwd });
+  const slot = sessions.get("acp-wf-fork-drop");
+  try {
+    assert.deepEqual(slot.agents, { running: 2, done: 0 }, "armed and seeded at first register");
+
+    // The fork's inbox drops (Zed quit): the slot ends, and the next poll tick
+    // goes quiet for it — the bridge stays up, so no restart reconcile runs.
+    endAcpSession("acp-wf-fork-drop", "acp-fork-disconnected");
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.workflowActive, false, "ended slot disarmed the poll");
+
+    // Zed relaunches and the session resumes: the SAME slot re-registers (it
+    // is still within the prune grace). The workflow never stopped running on
+    // disk — the re-register must re-arm and re-seed, or the wrist strands.
+    const before = sseBuffer.length;
+    registerAcpSession({ sessionId: "acp-wf-fork-drop", sdkSessionId: "acp-wf-fork-drop", cwd });
+    assert.equal(slot.workflowActive, true, "re-armed on the surviving slot's re-register");
+    assert.deepEqual(slot.agents, { running: 2, done: 0 });
+    const event = lastSessionEvent(sseBuffer.slice(before), "acp-wf-fork-drop");
+    assert.ok(event, "the re-register running event carried the agents");
+    assert.deepEqual(event.agents, { running: 2, done: 0 });
+  } finally {
+    sessions.delete("acp-wf-fork-drop");
+  }
+});
+
+// Black-box wiring for the launch signal: a real bridge, a real /acp/register,
+// and the teed tool_call exactly as the fork's client tee posts it — proves
+// handleAcpUpdate routes a Workflow tool_call into markWorkflowActivity (and
+// nothing else does) and the indicator reaches the wire.
+test("a teed Workflow tool_call arms the scan for an ACP session — other tools do not (#105)", async (t) => {
+  const sid = "acp-wf-wire";
+  const bridge = await startBridge(t, {
+    env: {
+      CLAUDE_WATCH_WORKFLOW_POLL_MS: "3600000",
+      CLAUDE_WATCH_WORKFLOW_STALE_MS: String(STALE_MS),
+      CLAUDE_WATCH_CLAUDE_PROJECTS_ROOT: projectsRoot,
+    },
+  });
+  const pair = await request(bridge.port, "POST", "/pair", { body: { code: bridge.pairingCode } });
+  assert.equal(pair.status, 200);
+  const sse = connectSse(bridge.port, pair.body.token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+
+  // Registration precedes the workflow (the real order: the session exists
+  // before any turn runs a tool), so register-time reconcile sees nothing.
+  const { cwd, journalPath } = makeAcpWorkflowTree("wire-pre", sid, null);
+  const reg = await request(bridge.port, "POST", "/acp/register", {
+    body: { connection: "conn-wf-wire", sessionId: sid, sdkSessionId: sid, cwd },
+  });
+  assert.equal(reg.status, 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === sid);
+
+  // The workflow journal materializes at the derived location.
+  fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+  fs.writeFileSync(journalPath,
+    [started("k1"), started("k2"), result("k1")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+
+  const teeToolCall = (toolName, toolCallId) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: {
+        connection: "conn-wf-wire", sessionId: sid, kind: "session_update",
+        payload: {
+          sessionId: sid,
+          update: {
+            sessionUpdate: "tool_call", toolCallId, status: "pending", title: toolName,
+            _meta: { claudeCode: { toolName } },
+          },
+        },
+      },
+    });
+
+  // A non-Workflow tool_call must not arm. Proven via the NEXT broadcast (a
+  // title update): had the Bash call armed, its immediate scan would have set
+  // slot.agents and every later session event would carry it.
+  assert.equal((await teeToolCall("Bash", "t1")).status, 200);
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-wf-wire", sessionId: sid, kind: "session_update",
+      payload: { sessionId: sid, update: { sessionUpdate: "session_info_update", title: "wf probe" } },
+    },
+  });
+  const titled = await sse.waitFor((e) => e.event === "session" && e.parsed?.title === "wf probe");
+  assert.ok(!Object.hasOwn(titled.parsed, "agents"), "a Bash tool_call must not arm the workflow scan");
+
+  // The Workflow tool_call arms; the immediate scan sees the journal.
+  assert.equal((await teeToolCall("Workflow", "t2")).status, 200);
+  const armed = await sse.waitFor((e) => e.event === "session" && e.parsed?.agents?.running === 1);
+  assert.deepEqual(armed.parsed.agents, { running: 1, done: 1 });
+});
+
+// End to end on the wire, including the child bridge's REAL poll timer: blue
+// while agents run, the explicit completion zero once the tree goes stale.
+test("ACP workflow on the wire: agents while running, the explicit zero after the staleness window (#105)", async (t) => {
+  const sid = "acp-wf-e2e";
+  const bridge = await startBridge(t, {
+    env: {
+      CLAUDE_WATCH_WORKFLOW_POLL_MS: "200",
+      CLAUDE_WATCH_WORKFLOW_STALE_MS: String(STALE_MS),
+      CLAUDE_WATCH_CLAUDE_PROJECTS_ROOT: projectsRoot,
+    },
+  });
+  const pair = await request(bridge.port, "POST", "/pair", { body: { code: bridge.pairingCode } });
+  assert.equal(pair.status, 200);
+  const sse = connectSse(bridge.port, pair.body.token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+
+  const { cwd, journalPath } = makeAcpWorkflowTree("wire-e2e", sid, null);
+  const reg = await request(bridge.port, "POST", "/acp/register", {
+    body: { connection: "conn-wf-e2e", sessionId: sid, sdkSessionId: sid, cwd },
+  });
+  assert.equal(reg.status, 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === sid);
+
+  fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+  fs.writeFileSync(journalPath,
+    [started("k1"), started("k2"), result("k1")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+  const armed = await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-wf-e2e", sessionId: sid, kind: "session_update",
+      payload: {
+        sessionId: sid,
+        update: {
+          sessionUpdate: "tool_call", toolCallId: "wf1", status: "pending", title: "Workflow",
+          _meta: { claudeCode: { toolName: "Workflow" } },
+        },
+      },
+    },
+  });
+  assert.equal(armed.status, 200);
+  const blue = await sse.waitFor((e) => e.event === "session" && e.parsed?.agents?.running === 1);
+  assert.deepEqual(blue.parsed.agents, { running: 1, done: 1 }, "DELEGATED state on the wire while agents run");
+
+  // The workflow goes quiet: backdate the journal past the stale window and
+  // let the child's own poll discover completion.
+  const old = new Date(Date.now() - 2 * STALE_MS);
+  fs.utimesSync(journalPath, old, old);
+  const cleared = await sse.waitFor((e) => e.event === "session" && e.parsed?.agents?.running === 0);
+  assert.deepEqual(cleared.parsed.agents, { running: 0, done: 1 }, "explicit completion zero, peak done preserved");
 });
