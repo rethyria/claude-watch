@@ -125,6 +125,7 @@ import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./u
 // claude-watch: the fork <-> bridge loopback channel (S3 #77).
 import {
   BridgeChannel, PermissionDecision, createBridgeChannel, teeClientToBridge,
+  guardDetachedClient,
 } from "./bridge-channel.js";
 
 export const CLAUDE_CONFIG_DIR =
@@ -371,6 +372,12 @@ type Session = {
    *  the Session object (e.g. `closeQueryStream`) can deregister it from the
    *  watch bridge. */
   sessionId: string;
+  /** claude-watch: spawned from the watch and not yet attached to any editor
+   *  thread. While set, `guardDetachedClient` suppresses every editor-bound
+   *  call for this session (the watch mirror keeps flowing via the tee) and
+   *  permissions are wrist-only. Cleared by `attachDetachedSession` when a Zed
+   *  thread adopts the session (desk pickup or session load). */
+  detached?: boolean;
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
@@ -1501,6 +1508,23 @@ export class ClaudeAcpAgent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    // claude-watch: desk pickup. A session spawned from the watch for this
+    // project may be waiting with no editor thread; hand it to this New Thread
+    // instead of minting a fresh session, so one click at the desk continues
+    // the wrist conversation. `maybePickupWatchSession` is bounded and
+    // best-effort: no bridge, no pending session, or any failure falls
+    // through to the normal path below untouched.
+    const pickup = await this.maybePickupWatchSession(params);
+    if (pickup) {
+      // History replay must happen AFTER this response is returned: the client
+      // only learns this session id from the response, so updates sent before
+      // it would reference a session the client doesn't know yet (the same
+      // reason sendAvailableCommandsUpdate is deferred below).
+      setTimeout(() => {
+        void this.completeWatchPickup(pickup.sessionId);
+      }, 0);
+      return pickup;
+    }
     const response = await this.createSession(params, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
@@ -1510,6 +1534,139 @@ export class ClaudeAcpAgent {
       this.sendAvailableCommandsUpdate(response.sessionId);
     }, 0);
     return response;
+  }
+
+  /** claude-watch: create a session no editor thread exists for — the watch
+   *  spawn path. Routes through {@link createSession}, so cwd validation,
+   *  project permission mode, store persistence, bridge registration, and the
+   *  title poll all apply exactly as for an editor-created session; the only
+   *  difference is the `detached` flag, which keeps every editor-bound call
+   *  suppressed until a Zed thread adopts it. Deliberately created with no MCP
+   *  servers: there is no client to supply them; the session gains the
+   *  editor's servers on its next natural reload after adoption. */
+  async spawnDetachedSession(params: { cwd: string }): Promise<NewSessionResponse> {
+    return this.createSession({ cwd: params.cwd, mcpServers: [] }, { detached: true });
+  }
+
+  /** claude-watch: whether this session is watch-spawned and not yet adopted by
+   *  any editor thread. The predicate `guardDetachedClient` re-checks on every
+   *  editor-bound call. */
+  isSessionDetached(sessionId: string): boolean {
+    return this.sessions[sessionId]?.detached === true;
+  }
+
+  /** claude-watch: hand a detached session to the editor thread that just
+   *  adopted it. Flipping the flag un-gates the client guard; the re-register
+   *  (without `detached`) tells the bridge the pickup is spoken for, so the
+   *  wrist keeps following the same slot as a normal Zed session. */
+  private attachDetachedSession(sessionId: string, session: Session, via: string): void {
+    session.detached = false;
+    this.logger.log(
+      `claude-watch: watch-spawned session ${sessionId} attached to the editor (${via})`,
+    );
+    this.bridge?.registerSession({ sessionId, sdkSessionId: sessionId, cwd: session.cwd });
+  }
+
+  /** claude-watch: try to satisfy a `session/new` with a pending watch-spawned
+   *  session for the same cwd. Returns the adopted session's response, or null
+   *  for the normal fresh-session path. The bridge claim is atomic-take: once
+   *  claimed, a failure to adopt (session file vanished before its first turn)
+   *  is logged and the claim is forfeited — the user gets the fresh thread
+   *  they asked for rather than an error. */
+  private async maybePickupWatchSession(
+    params: NewSessionRequest,
+  ): Promise<NewSessionResponse | null> {
+    // Optional-chained method check: older/fake bridge channels may predate
+    // the pickup API, and a bridge failure of any shape must fall through to
+    // the normal fresh-session path.
+    if (!this.bridge?.takePendingPickup) return null;
+    let sessionId: string | null = null;
+    try {
+      sessionId = await this.bridge.takePendingPickup(params.cwd);
+    } catch {
+      return null;
+    }
+    if (!sessionId) return null;
+
+    const live = this.sessions[sessionId];
+    if (live && !live.queryClosed) {
+      if (!live.detached) {
+        // Already adopted elsewhere (e.g. opened via session/load after an
+        // import) — a stale pickup entry. Never hand one session to two
+        // threads; fall through to a fresh session.
+        this.logger.error(
+          `claude-watch: pending pickup ${sessionId} is already attached; ignoring the claim`,
+        );
+        return null;
+      }
+      const fingerprint = computeSessionFingerprint(params);
+      if (fingerprint !== live.sessionFingerprint) {
+        this.logger.log(
+          `claude-watch: adopting detached session ${sessionId} despite changed session params ` +
+            `(the editor's MCP servers apply on its next reload)`,
+        );
+      }
+      this.attachDetachedSession(sessionId, live, "new-thread pickup");
+      return {
+        sessionId,
+        modes: live.modes,
+        configOptions: live.configOptions,
+      };
+    }
+
+    // Not live (the fork restarted since the spawn, or the query died):
+    // resume it from the on-disk store under the same id. `createSession`
+    // registers it with the bridge again, reviving the wrist slot.
+    try {
+      if (live) await this.teardownSession(sessionId);
+      const response = await this.createSession(
+        {
+          cwd: params.cwd,
+          mcpServers: params.mcpServers ?? [],
+          additionalDirectories: params.additionalDirectories,
+          _meta: params._meta,
+        },
+        { resume: sessionId },
+      );
+      this.logger.log(
+        `claude-watch: watch-spawned session ${sessionId} resumed from disk for a new-thread pickup`,
+      );
+      return response;
+    } catch (err) {
+      // Most likely: spawned but never prompted, so no store file exists to
+      // resume (the SDK writes it at the first prompt). The claim is forfeit.
+      this.logger.error(
+        `claude-watch: could not resume watch-spawned session ${sessionId}: ${String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  /** claude-watch: the deferred half of a desk pickup — replay the adopted
+   *  session's history into the thread, mark the seam, and send the available
+   *  commands (the same post-return contract as newSession/loadSession). Every
+   *  step is best-effort: a replay failure must not kill a session that is
+   *  otherwise adopted and working. */
+  private async completeWatchPickup(sessionId: string): Promise<void> {
+    try {
+      await this.replaySessionHistory(sessionId);
+    } catch (err) {
+      this.logger.error(
+        `claude-watch: history replay failed for picked-up session ${sessionId}: ${String(err)}`,
+      );
+    }
+    try {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "📱 Continued from your watch." },
+        },
+      });
+    } catch {
+      /* cosmetic; the thread works without the banner */
+    }
+    await this.sendAvailableCommandsUpdate(sessionId);
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
@@ -5247,6 +5404,27 @@ export class ClaudeAcpAgent {
   }): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
     if (existingSession) {
+      // claude-watch: a live DETACHED (watch-spawned) session is adopted as-is,
+      // fingerprint be damned. The usual mismatch path below tears the session
+      // down and resumes it — correct for a dead thread, but for a session
+      // that is live and possibly mid-turn it would SIGKILL running work just
+      // because the editor brought its MCP server list along. Adopt the live
+      // session; the editor's servers apply on the next natural reload.
+      if (existingSession.detached && !existingSession.queryClosed) {
+        const fingerprint = computeSessionFingerprint(params);
+        if (fingerprint !== existingSession.sessionFingerprint) {
+          this.logger.log(
+            `claude-watch: adopting detached session ${params.sessionId} despite changed ` +
+              `session params (the editor's MCP servers apply on its next reload)`,
+          );
+        }
+        this.attachDetachedSession(params.sessionId, existingSession, "session load");
+        return {
+          sessionId: params.sessionId,
+          modes: existingSession.modes,
+          configOptions: existingSession.configOptions,
+        };
+      }
       const fingerprint = computeSessionFingerprint(params);
       if (fingerprint === existingSession.sessionFingerprint) {
         return {
@@ -5312,8 +5490,13 @@ export class ClaudeAcpAgent {
 
   private async createSession(
     params: NewSessionRequest,
-    creationOpts: { resume?: string; forkSession?: boolean } = {},
+    creationOpts: { resume?: string; forkSession?: boolean; detached?: boolean } = {},
   ): Promise<NewSessionResponse> {
+    // claude-watch: `detached` is OUR flag, not an SDK option. It must be
+    // split off before `creationOpts` is spread into the SDK `Options` below —
+    // leaking an unknown key into the query options is the kind of silent
+    // upstream-drift bug a re-pull would never flag (pinned by a test).
+    const { detached = false, ...sdkCreationOpts } = creationOpts;
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
     // this check a session is created against a missing directory and the
@@ -5563,7 +5746,9 @@ export class ClaudeAcpAgent {
           },
         ],
       },
-      ...creationOpts,
+      // claude-watch: sdkCreationOpts, not creationOpts — `detached` was
+      // destructured off at the top and must not reach the SDK.
+      ...sdkCreationOpts,
       abortController,
     };
 
@@ -5826,6 +6011,7 @@ export class ClaudeAcpAgent {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      ...(detached ? { detached: true } : {}),
     };
 
     // claude-watch: announce the live session to the bridge so the watch can see
@@ -5836,7 +6022,12 @@ export class ClaudeAcpAgent {
     // hook events the SDK also fires, letting the bridge bind them to ONE slot
     // instead of minting a hook-twin. Best-effort; never blocks session
     // creation. Covers new/fork/resume/load uniformly (all route through here).
-    this.bridge?.registerSession({ sessionId, sdkSessionId: sessionId, cwd: params.cwd });
+    this.bridge?.registerSession({
+      sessionId,
+      sdkSessionId: sessionId,
+      cwd: params.cwd,
+      ...(detached ? { detached: true } : {}),
+    });
 
     // Pull the title NOW rather than waiting for the first turn to end. The
     // SDK's title poll is wired to turn-end, which is fine while a session runs
@@ -7690,11 +7881,21 @@ export function runAcp() {
   // synchronously below, before `bridge.start()` opens the inbox.
   const bridge = createBridgeChannel(console);
   const baseClient = new ClientConnection(connection.client);
-  agent = new ClaudeAcpAgent(
-    bridge ? teeClientToBridge(baseClient, bridge) : baseClient,
-    undefined,
-    bridge ?? undefined,
-  );
+  // claude-watch: order is load-bearing — tee OUTSIDE, guard INSIDE. The tee
+  // mirrors every sessionUpdate/requestPermission to the bridge BEFORE
+  // delegating, so while a watch-spawned session is detached the wrist keeps
+  // its full feed while the guard drops the editor leg (Zed has no thread for
+  // that session id yet). The `agent` reference the guard's predicate closes
+  // over is assigned synchronously below, before any message can flow.
+  const guardedClient = bridge
+    ? teeClientToBridge(
+        guardDetachedClient(baseClient, (sessionId) =>
+          agent ? agent.isSessionDetached(sessionId) : false,
+        ),
+        bridge,
+      )
+    : baseClient;
+  agent = new ClaudeAcpAgent(guardedClient, undefined, bridge ?? undefined);
   if (bridge) {
     bridge.onInject((sessionId, text, source) => {
       agent.injectUserPrompt(sessionId, text, source).catch((err) => {
