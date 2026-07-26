@@ -125,7 +125,10 @@ import {
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 // claude-watch: the fork <-> bridge loopback channel (S3 #77).
 import {
-  BridgeChannel, PermissionDecision, createBridgeChannel, teeClientToBridge,
+  BridgeChannel,
+  PermissionDecision,
+  createBridgeChannel,
+  teeClientToBridge,
   guardDetachedClient,
 } from "./bridge-channel.js";
 
@@ -2063,7 +2066,9 @@ export class ClaudeAcpAgent {
         },
       });
     } catch (err) {
-      this.logger.error(`claude-watch: failed to echo dictated prompt to the client: ${String(err)}`);
+      this.logger.error(
+        `claude-watch: failed to echo dictated prompt to the client: ${String(err)}`,
+      );
     }
     return this.prompt({ sessionId, prompt: [{ type: "text", text }] });
   }

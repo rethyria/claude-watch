@@ -329,7 +329,11 @@ export class HttpBridgeChannel implements BridgeChannel {
     });
   }
 
-  forwardTurnBoundary(params: { sessionId: string; phase: "start" | "end"; stopReason?: string }): void {
+  forwardTurnBoundary(params: {
+    sessionId: string;
+    phase: "start" | "end";
+    stopReason?: string;
+  }): void {
     const live = this.liveSessions.get(params.sessionId);
     if (live) live.active = params.phase === "start";
     void this.post("/acp/update", {
@@ -490,10 +494,16 @@ export class HttpBridgeChannel implements BridgeChannel {
       } catch {
         return;
       }
-      if (typeof d.sessionId !== "string" || typeof d.toolCallId !== "string" || typeof d.optionId !== "string") {
+      if (
+        typeof d.sessionId !== "string" ||
+        typeof d.toolCallId !== "string" ||
+        typeof d.optionId !== "string"
+      ) {
         return;
       }
-      this.logger.log(`claude-watch: inbox permission decision for ${d.toolCallId} (${d.behavior ?? "?"})`);
+      this.logger.log(
+        `claude-watch: inbox permission decision for ${d.toolCallId} (${d.behavior ?? "?"})`,
+      );
       try {
         this.permissionHandler?.(d as PermissionDecision);
       } catch (err) {

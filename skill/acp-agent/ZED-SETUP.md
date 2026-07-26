@@ -4,7 +4,9 @@ How the watch-dictatable session is hosted: **Zed (unmodified) → our forked `c
 → Claude Agent SDK**, on the **claude.ai subscription**.
 
 ## How Zed launches it
+
 Zed is a flatpak (`dev.zed.Zed`). Its sandbox grants (via `flatpak info --show-permissions`):
+
 - `filesystems=home` → reads `~/.claude` (the `--claudeai` login), `~/.local/bin/node`, the adapter
 - `shared=network` → loopback `127.0.0.1` reaches the host claude-watch bridge
 - `org.freedesktop.Flatpak=talk` → **Zed runs `agent_servers` commands on the HOST**
@@ -15,6 +17,7 @@ wrapping it produced `command not found` / `No such file or directory`). The lau
 against the built adapter, using the host `~/.claude` subscription login and host loopback.
 
 ## Config (already applied)
+
 `~/.var/app/dev.zed.Zed/config/zed/settings.json` gained an `agent_servers` entry (see
 `zed-agent-servers.example.json`); backup at `settings.json.bak-claudewatch`.
 
@@ -27,7 +30,7 @@ against the built adapter, using the host `~/.claude` subscription login and hos
 **Zed rewrites this entry.** On 2026-07-22 23:26 its agent panel replaced the `command` with a
 `{"type": "registry"}` stub, which stops the adapter launching entirely — and Zed logs nothing about
 `agent_servers`, so the only symptom is that claude-watch never connects. The script therefore
-*repairs* rather than refusing: it rewrites only its own key (brace-matched, so other agents,
+_repairs_ rather than refusing: it rewrites only its own key (brace-matched, so other agents,
 comments and trailing commas survive) and refuses to write anything it cannot parse back. Run
 `--check` first whenever Zed "isn't connected".
 
@@ -58,10 +61,11 @@ missing tag was the cause, and the registry stub was the symptom. `--check` veri
 tag as well as the command, so an untagged entry fails the doctor rather than passing it.
 
 ## Billing guard (must-fix from review #74)
+
 Two layers, because a scrub you can walk around is not a guarantee:
 
 1. `launch-claude-watch-acp.sh` **unsets** the provider-routing set before exec and warns on stderr.
-2. `src/index.ts` **refuses to start** (exit 78) if any of them is still set — checked *after* the
+2. `src/index.ts` **refuses to start** (exit 78) if any of them is still set — checked _after_ the
    managed-policy env is applied, so a policy-injected var is caught too. This is the layer that
    holds when the launcher is bypassed: `npm start` execs `dist/index.js` directly, and Zed's
    `command` has silently reverted once already. Override with `CLAUDE_WATCH_ALLOW_API_BILLING=1`.
@@ -73,6 +77,7 @@ Guarded set: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
 the switches above, and failing on them would false-positive on any machine with the AWS CLI set up.
 
 ## `dist/` is what actually runs, and it is not tracked
+
 `.gitignore` excludes `dist/`, so it is only ever whatever this machine last compiled. A fresh
 clone gets one from the `prepare` script — npm runs it on install, so **`npm ci` alone is
 enough** (#82); there is no separate build step to remember. An edit to `src/` with no rebuild
@@ -87,11 +92,13 @@ Deliberately a refusal, not an auto-build: putting `tsc` in Zed's agent-launch p
 failure for a slow, flaky one. Override with `CLAUDE_WATCH_SKIP_BUILD_CHECK=1`.
 
 ## Verified AFK
+
 - Adapter builds (`tsc`), upstream suite passes (652 tests), `--version` → 0.61.0
 - ACP `initialize` over ndjson works; offers **Claude Subscription** + Anthropic Console auth
 - Host is logged in (`~/.claude/.credentials.json`); `ANTHROPIC_API_KEY` unset
 - Faithful replay of Zed's exact spawn (host `/bin/bash -c "<launcher>"`) round-trips `initialize`
 
 ## Remaining (the live go/no-go — needs Zed's UI)
+
 Open Zed → agent panel → new thread with **"Claude (watch)"** → type a prompt → confirm a response.
 Reload/restart Zed first if the failed agent is cached.
