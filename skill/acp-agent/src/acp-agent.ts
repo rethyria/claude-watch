@@ -205,6 +205,11 @@ const TURN_NO_RESULT_MESSAGE =
  *  from polling harder, and turn-end keeps covering it as before. */
 const MID_TURN_TITLE_SCAN_INTERVAL_MS = 1000;
 const MID_TURN_TITLE_SCAN_LIMIT = 30;
+// claude-watch: one delayed re-poll after a turn ends with no title found. The
+// CLI can flush the transcript AFTER the idle that ends the turn, so a short
+// first turn loses every poll race (mid-turn and turn-end alike) and the
+// session sits unlabeled — a raw uuid on the watch — until the next turn.
+const TITLE_RETRY_AFTER_TURN_MS = 5000;
 
 /** Custom (extension) request method a client uses to steer the turn that is
  *  currently running: the message is injected into the in-flight turn rather
@@ -528,6 +533,10 @@ type Session = {
    *  fire-and-forget off the consumer loop, so back-to-back messages would
    *  otherwise overlap reads of the same session file). */
   titleScanInFlight?: boolean;
+  /** claude-watch: the one-shot delayed re-poll armed when a turn ends with no
+   *  title found (see TITLE_RETRY_AFTER_TURN_MS). Unref'd; armed at most once
+   *  at a time. */
+  titleRetryTimer?: ReturnType<typeof setTimeout>;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -1607,6 +1616,11 @@ export class ClaudeAcpAgent {
         );
       }
       this.attachDetachedSession(sessionId, live, "new-thread pickup");
+      // The wrist turn usually ended before the CLI flushed the transcript, so
+      // every earlier title poll lost its race and the session is still
+      // unlabeled ("New Agent Thread" in the editor, a raw uuid on the watch).
+      // By pickup time the store is settled — the deferred pickup half fetches
+      // the title once the editor knows the session (completeWatchPickup).
       return {
         sessionId,
         modes: live.modes,
@@ -1667,6 +1681,15 @@ export class ClaudeAcpAgent {
       /* cosmetic; the thread works without the banner */
     }
     await this.sendAvailableCommandsUpdate(sessionId);
+    // Fetch the title now that the editor knows the session: the wrist turn's
+    // polls all raced the CLI's transcript flush and lost, so the adopted
+    // thread would otherwise sit as "New Agent Thread" / a raw uuid. By pickup
+    // time the store is settled and this poll lands on both surfaces (the tee
+    // mirrors it to the watch).
+    const session = this.sessions[sessionId];
+    if (session) {
+      await this.maybeUpdateSessionTitle(sessionId, session).catch(() => {});
+    }
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
@@ -2952,6 +2975,19 @@ export class ClaudeAcpAgent {
                   // signal, so it's the point at which a new title may have
                   // landed. Push it to the client if it changed.
                   await this.maybeUpdateSessionTitle(params.sessionId, session);
+                  // claude-watch: the CLI can flush the transcript AFTER this
+                  // idle, so a short first turn loses every poll race and the
+                  // session stays unlabeled (raw uuid on the watch) with no
+                  // later poll scheduled. One delayed retry closes the gap;
+                  // guarded so it never stacks and dies with the session.
+                  if (!session.lastTitle && !session.titleSettled && !session.titleRetryTimer) {
+                    session.titleRetryTimer = setTimeout(() => {
+                      session.titleRetryTimer = undefined;
+                      if (this.sessions[params.sessionId] !== session) return;
+                      void this.maybeUpdateSessionTitle(params.sessionId, session).catch(() => {});
+                    }, TITLE_RETRY_AFTER_TURN_MS);
+                    session.titleRetryTimer.unref?.();
+                  }
                 }
                 break;
               }
@@ -5419,6 +5455,10 @@ export class ClaudeAcpAgent {
           );
         }
         this.attachDetachedSession(params.sessionId, existingSession, "session load");
+        // Same post-adoption title fetch as the pickup path: the wrist turn's
+        // polls raced the CLI's transcript flush; the loading editor asked for
+        // this session by id, so the update can go out right away.
+        void this.maybeUpdateSessionTitle(params.sessionId, existingSession).catch(() => {});
         return {
           sessionId: params.sessionId,
           modes: existingSession.modes,

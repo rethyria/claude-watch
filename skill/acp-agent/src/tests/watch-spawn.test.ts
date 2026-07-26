@@ -22,6 +22,13 @@ import { guardDetachedClient, teeClientToBridge } from "../bridge-channel.js";
 
 let capturedOptions: Options | undefined;
 const getSessionMessagesMock = vi.fn(async (_sessionId: string): Promise<unknown[]> => []);
+// The store settles AFTER a short wrist turn ends (the CLI flushes the
+// transcript late), which is why adoption re-polls the title; tests model the
+// settled state.
+const getSessionInfoMock = vi.fn(async (_sessionId: string, _opts?: unknown) => ({
+  summary: "hello from the wrist",
+  lastModified: 1700000000000,
+}));
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -30,6 +37,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   return {
     ...actual,
     getSessionMessages: getSessionMessagesMock,
+    getSessionInfo: getSessionInfoMock,
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
@@ -339,13 +347,20 @@ describe("session/new desk pickup", () => {
     // No fresh SDK session was created.
     expect(capturedOptions).toBeUndefined();
 
-    // The deferred half: history replay, the banner, available commands.
+    // The deferred half: history replay, the banner, available commands, and
+    // the post-adoption title fetch (the wrist turn's polls raced the CLI's
+    // transcript flush and lost — pickup must re-ask).
     const updateSpy = client.sessionUpdate as unknown as ReturnType<typeof vi.fn>;
     await vi.waitFor(() => {
       expect(getSessionMessagesMock).toHaveBeenCalledWith("watch-1");
       const texts = updateSpy.mock.calls.map((c: any[]) => c[0]?.update?.content?.text ?? "");
       expect(texts.some((t: string) => t.includes("Continued from your watch"))).toBe(true);
+      const titles = updateSpy.mock.calls
+        .filter((c: any[]) => c[0]?.update?.sessionUpdate === "session_info_update")
+        .map((c: any[]) => c[0].update.title);
+      expect(titles).toContain("hello from the wrist");
     });
+    expect(bridge.noteSessionTitle).toHaveBeenCalledWith("watch-1", "hello from the wrist");
   });
 
   it("adopts despite a fingerprint mismatch (editor MCP servers must not kill the live session)", async () => {

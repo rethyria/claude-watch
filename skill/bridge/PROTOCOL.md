@@ -335,8 +335,13 @@ adapter's own register announces the session over SSE with the same
 `spawnRequestId`, so the client can attribute the late arrival to the spawn it
 reported as failed. The session appears in Zed either via **New Thread** (the
 adapter adopts the newest unclaimed watch-spawned session for that directory —
-one click, history replayed, live continuation) or Zed's *Import Threads*.
-Codex spawns remain bridge-owned PTYs.
+history replayed, live continuation) or Zed's *Import Threads*. Zed creates
+the underlying ACP session lazily and sometimes swaps to an already-empty
+thread without asking the adapter for anything, so the adoption fires on
+whichever action makes Zed actually request a session — in practice: click
+New Thread, and if the thread comes up empty, click it once more (or just
+type; a sessionless draft materializes on first use). Codex spawns remain
+bridge-owned PTYs.
 
 `cwd` selects the new session's working directory (issue #56):
 
