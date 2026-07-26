@@ -5,6 +5,7 @@
 // them as dp/sp proportionally (450px ≈ the full round display).
 package dev.claudewatch.wear.ui.halo
 
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -107,6 +108,108 @@ object Halo {
         // scroll fully clear of the curve. One knob for all three lists.
         val ListTopInset = 40.dp
         val ListBottomInset = 48.dp
+
+        // ── v2 ring channel (Halo v2, epic #94) ─────────────────────────────
+        // Tokens for the persistent morphing ring. Additive for now: HaloRing
+        // still draws the v1 edge-derived geometry above; the ring-engine
+        // slices flip the renderers over to these. Angles are Canvas degrees
+        // (clockwise-positive, 0° at 3 o'clock); px are at the 450 reference.
+
+        /**
+         * Centreline radius for EVERY ring stroke — solid 9 ([RingStroke]),
+         * dashed 4, hero 10, feed 6. Fixed on purpose: the v2 morphs animate
+         * stroke WIDTH, so the v1 edge-derived radius (which re-centres per
+         * stroke, see [RingEdgeGap]) would make the ring breathe radially
+         * with every weight change. The ring must fatten and thin in place.
+         */
+        const val RingChannel = 214f
+        /** Segment gap; a solo session tightens to [RingGapSoloDeg] so one
+         *  arc still reads as "a segment", not a circle with a glitch. */
+        const val RingGapDeg = 8.5f
+        const val RingGapSoloDeg = 8f
+        /**
+         * Arc k ENDS at this minus k·(360/n): the first segment closes just
+         * left of midnight and the ring winds anticlockwise (design geometry,
+         * replacing v1's −90°-centred slices and 10° gap).
+         */
+        const val RingAnchorDeg = -94f
+
+        // Per-layer stroke weights (the solid layer keeps [RingStroke] = 9).
+        const val RingStrokeDashed = 4f
+        const val RingStrokeHero = 10f
+        const val RingStrokeFeed = 6f
+
+        /**
+         * Dashed session layer: 2.5 on / 11 off. The 13.5 period is CONSTANT
+         * through the split/merge morph — only the on-length grows, so each
+         * dash fuses in place instead of the pattern crawling along the ring.
+         */
+        const val DashOnPx = 2.5f
+        const val DashPeriodPx = 13.5f
+        const val DashedLayerAlpha = 0.65f
+        const val FeedRingAlpha = 0.85f
+        /** A collapsing arc below this sweep is skipped outright: a round cap
+         *  at zero sweep would leave a lit dot outliving its arc. */
+        const val MinDrawSweepDeg = 0.5f
+
+        /**
+         * Page-dot clearance re-based on the channel: the channel's inner
+         * stroke edge ([RingChannel] − [RingStroke]/2) minus where the v1
+         * derivation puts the dot's outer edge (display radius − [RingEdgeGap]
+         * − [RingStroke] − [DotArcGap] = 200). Comes to 9.5, not [DotArcGap]'s
+         * 10, because the fixed channel sits half a ref-px inside the v1
+         * centreline — the dots must NOT follow that half-pixel: expressing
+         * the clearance this way keeps their visual position bit-identical
+         * when PageDots re-derives from the channel.
+         */
+        const val DotChannelClearance =
+            (RingChannel - RingStroke / 2f) - (HALO_REF_PX / 2f - RingEdgeGap - RingStroke - DotArcGap)
+    }
+
+    // ── Motion (Halo v2, epic #94) ──────────────────────────────────────────
+    // The ring's animation vocabulary, verbatim from the design's CSS: paint
+    // and geometry are SEPARATE channels on purpose — colour blends fast and
+    // ease-in-out, geometry follows on a longer decel curve, and when one
+    // update drives both, geometry additionally waits [GeometryDelayMs] so
+    // the recolour reads first (window-gated in HaloRingMath.geometryDelayMs).
+    object Motion {
+        /** Colour/alpha blends: .3s CSS ease-in-out. */
+        const val PaintMs = 300
+        val PaintEasing = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
+
+        /** Geometry (end/sweep) retargets; [GeometryEasing] is also the
+         *  grow/shrink and dash-morph curve — one decel family. */
+        const val GeometryMs = 550
+        val GeometryEasing = CubicBezierEasing(0.4f, 0f, 0.2f, 1f)
+        const val GeometryDelayMs = 220
+        const val GeometryDelayWindowMs = 850L
+
+        /** New arcs snap in pre-coloured and only FADE, drawn beneath the
+         *  settled ring until [NewArcBeneathMs] expires. */
+        const val NewArcFadeMs = 300
+        const val NewArcBeneathMs = 1300L
+
+        /** Pager highlight rotation (shortest-path, accumulated). */
+        const val HighlightMs = 400
+        val HighlightEasing = CubicBezierEasing(0.2f, 0.7f, 0.3f, 1f)
+
+        /** list↔feed: the selected arc grows/shrinks to/from the full circle
+         *  while the hero stroke eases 10↔6 — never its alpha. */
+        const val GrowShrinkMs = 650
+
+        /** page↔list dash split/merge (stroke 9↔4, alpha 1↔.65, hero 9↔10);
+         *  the real solid layer hides during close and swaps back atomically
+         *  once the morph has settled at [MorphSettleMs]. */
+        const val DashMorphMs = 500
+        const val MorphSettleMs = 1000L
+
+        /** Content crossfades inside morphs: out fast, in late — the ring is
+         *  the continuity, content just follows it. */
+        const val ContentFadeOutMs = 250
+        const val ContentFadeInMs = 450
+        const val ContentFadeInDelayMs = 100
+        /** The list→page return fade (the quick path back). */
+        const val ListToPageFadeMs = 300
     }
 
     /** Per-session state that colors a ring segment and a row dot. */
