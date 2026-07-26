@@ -196,6 +196,15 @@ const TURN_NO_RESULT_MESSAGE =
   "The turn ended without a result: the agent went idle while this prompt was still in flight " +
   "(e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.";
 
+/** Bounds for the mid-turn title poll (see maybeAcquireTitleMidTurn): at most
+ *  one `getSessionInfo` a second while the session's title is still unsettled,
+ *  and at most this many polls over the session's lifetime — the SDK generates
+ *  the title within a couple of seconds of the first prompt, so a session that
+ *  is still unsettled after ~30s of streamed messages is not going to settle
+ *  from polling harder, and turn-end keeps covering it as before. */
+const MID_TURN_TITLE_SCAN_INTERVAL_MS = 1000;
+const MID_TURN_TITLE_SCAN_LIMIT = 30;
+
 /** Custom (extension) request method a client uses to steer the turn that is
  *  currently running: the message is injected into the in-flight turn rather
  *  than queued as a separate `session/prompt`. Named `_session/steering` per the
@@ -493,10 +502,25 @@ type Session = {
   taskState: TaskState;
   /** Last session title we pushed to the client via `session_info_update`.
    *  The SDK auto-generates a title in a background task and persists it to the
-   *  session file; we poll it on each turn-end (`session_state_changed: idle`)
-   *  and only notify the client when it actually changes. Undefined until the
-   *  first title is observed. */
+   *  session file; we poll it on each turn-end (`session_state_changed: idle`),
+   *  and — while no settled title exists yet — on messages DURING the turn (see
+   *  maybeAcquireTitleMidTurn), and only notify the client when it actually
+   *  changes. Undefined until the first title is observed. */
   lastTitle?: string;
+  /** True once a poll observed a SETTLED title — `getSessionInfo().customTitle`,
+   *  which the SDK populates from a user `/rename` OR the auto-generated
+   *  aiTitle, as opposed to `summary`'s first-prompt fallback. Permanently
+   *  disarms the mid-turn poll: later title EVOLUTIONS are not urgent and keep
+   *  riding the turn-end poll, exactly as before. */
+  titleSettled?: boolean;
+  /** Timestamp of the last mid-turn title poll (rate limiting). */
+  titleScanAt?: number;
+  /** Lifetime count of mid-turn title polls (hard cap). */
+  titleScanCount?: number;
+  /** A mid-turn poll is in flight; don't start another (the poll is async
+   *  fire-and-forget off the consumer loop, so back-to-back messages would
+   *  otherwise overlap reads of the same session file). */
+  titleScanInFlight?: boolean;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -1562,8 +1586,12 @@ export class ClaudeAcpAgent {
       this.logger.error(`Session ${sessionId}: failed to read session info: ${error}`);
       return;
     }
-    // `customTitle` is a user-set `/rename`; `summary` is the auto-generated
-    // title (or first prompt). Prefer the explicit title when present.
+    // `customTitle` is a user-set `/rename` OR the SDK's auto-generated
+    // aiTitle (the SDK folds both into this field); `summary` falls back to
+    // the first prompt when neither exists yet. Prefer the explicit title.
+    // A present customTitle means the title is SETTLED — record that even
+    // when the text hasn't changed, so the mid-turn poll disarms.
+    if (info?.customTitle) session.titleSettled = true;
     const rawTitle = info?.customTitle ?? info?.summary;
     if (!rawTitle) {
       return;
@@ -1584,6 +1612,43 @@ export class ClaudeAcpAgent {
         updatedAt: new Date(info!.lastModified).toISOString(),
       },
     });
+  }
+
+  /** Poll the title DURING a turn, while the session has none settled yet.
+   *
+   *  The turn-end poll alone leaves a fresh session unlabeled for its entire
+   *  first turn, even though the SDK writes the auto-generated title to the
+   *  session file within a couple of seconds of the first prompt — the label
+   *  sits on disk, readable, while the turn's messages stream past. So the
+   *  consumer calls this on every SDK message, and it polls while the title
+   *  is still unsettled (no customTitle/aiTitle observed).
+   *
+   *  Bounded, because the consumer loop is the hot path: a settled title
+   *  disarms it permanently (evolutions keep riding the turn-end poll), polls
+   *  are rate-limited to one a second with no overlap (fire-and-forget off
+   *  the loop — a message must never wait on a file read), and a hard
+   *  lifetime cap covers sessions whose title never settles. Mirrors the
+   *  bridge's acquireTitleMidTurn (sessions.js), which solves the same
+   *  shape one layer down for the hook path. */
+  private maybeAcquireTitleMidTurn(sessionId: string, session: Session): void {
+    if (session.titleSettled || session.titleScanInFlight) return;
+    const scans = session.titleScanCount ?? 0;
+    if (scans >= MID_TURN_TITLE_SCAN_LIMIT) return;
+    const now = Date.now();
+    if (
+      session.titleScanAt !== undefined &&
+      now - session.titleScanAt < MID_TURN_TITLE_SCAN_INTERVAL_MS
+    ) {
+      return;
+    }
+    session.titleScanAt = now;
+    session.titleScanCount = scans + 1;
+    session.titleScanInFlight = true;
+    void this.maybeUpdateSessionTitle(sessionId, session)
+      .catch(() => {})
+      .finally(() => {
+        session.titleScanInFlight = false;
+      });
   }
 
   async authenticate(_params: AuthenticateRequest): Promise<void> {
@@ -2441,6 +2506,12 @@ export class ClaudeAcpAgent {
             message: message as Record<string, unknown>,
           });
         }
+
+        // While the session's title is unsettled, every message is a chance to
+        // pick it up mid-turn instead of waiting for the turn-end poll (which
+        // left a fresh session unlabeled for its whole first turn). Cheap:
+        // no-ops once settled, rate-limited and capped until then.
+        this.maybeAcquireTitleMidTurn(params.sessionId, session);
 
         // CLIs 2.1.206+ (capability msg_lifecycle_v1) report the fate of every
         // uuid-stamped queued command (queued/started/completed/cancelled/

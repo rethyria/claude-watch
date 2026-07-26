@@ -3311,6 +3311,121 @@ describe("stop reason propagation", () => {
     expect(titleUpdates).toHaveLength(1);
   });
 
+  it("acquires the title MID-turn: a fresh session is labeled before its first turn ends", async () => {
+    const sessionUpdates: any[] = [];
+    // The generator holds the turn OPEN until the title lands, so this test
+    // can only pass if the poll fires mid-turn — without the mid-turn path
+    // the turn-end poll never runs (the turn never ends) and the test times
+    // out instead of silently passing on the old behavior.
+    let resolveTitleSeen!: () => void;
+    const titleSeen = new Promise<void>((resolve) => {
+      resolveTitleSeen = resolve;
+    });
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        sessionUpdates.push(u);
+        if (u.update?.sessionUpdate === "session_info_update") resolveTitleSeen();
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    // The SDK folds the auto-generated aiTitle into `customTitle`, so a fresh
+    // session's title lands there within seconds of the first prompt.
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "Curve navigation dots",
+      customTitle: "Curve navigation dots",
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield userEcho(userMessage);
+      await titleSeen;
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+    const session = agent.sessions["test-session"]!;
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "make the nav dots curve" }],
+    });
+    await agent.sessions["test-session"]?.consumer;
+
+    const titleUpdates = sessionUpdates.filter(
+      (u) => u.update?.sessionUpdate === "session_info_update",
+    );
+    // One push mid-turn; the turn-end poll then sees the same title and does
+    // not re-push.
+    expect(titleUpdates).toHaveLength(1);
+    expect(titleUpdates[0].update.title).toBe("Curve navigation dots");
+    // customTitle settles the title, permanently disarming the mid-turn poll.
+    expect((session as any).titleSettled).toBe(true);
+  });
+
+  it("bounds the mid-turn title poll: rate-limited, disarmed by a settled title but not by the fallback, hard-capped", async () => {
+    const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const acquire = (session: any) =>
+      (agent as any).maybeAcquireTitleMidTurn("test-session", session);
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    // A summary WITHOUT customTitle is the first-prompt fallback: it labels
+    // the session but must not disarm the poll — the real title is still due.
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "make the nav dots curve",
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const session: any = mockSessionState();
+    acquire(session);
+    await flush();
+    expect(getSessionInfo).toHaveBeenCalledTimes(1);
+    expect(session.lastTitle).toBe("make the nav dots curve");
+    expect(session.titleSettled).toBeUndefined();
+
+    // Inside the 1s window: a burst of messages costs one poll, not one each.
+    acquire(session);
+    await flush();
+    expect(getSessionInfo).toHaveBeenCalledTimes(1);
+
+    // Past the window, still unsettled: polls again, and this time the SDK
+    // has the settled (aiTitle-backed) title.
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "Curve navigation dots",
+      customTitle: "Curve navigation dots",
+      lastModified: 1_700_000_000_001,
+    } as any);
+    session.titleScanAt -= 5000;
+    acquire(session);
+    await flush();
+    expect(getSessionInfo).toHaveBeenCalledTimes(2);
+    expect(session.titleSettled).toBe(true);
+
+    // Settled: disarmed for good, even past the rate window.
+    session.titleScanAt -= 5000;
+    acquire(session);
+    await flush();
+    expect(getSessionInfo).toHaveBeenCalledTimes(2);
+
+    // The lifetime cap stops a session whose title never settles.
+    const capped: any = mockSessionState();
+    capped.titleScanCount = 30;
+    acquire(capped);
+    await flush();
+    expect(getSessionInfo).toHaveBeenCalledTimes(2);
+  });
+
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
