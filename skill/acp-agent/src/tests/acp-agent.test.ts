@@ -4728,9 +4728,17 @@ describe("usage_update computation", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
+    // 3, not 2: the switch itself publishes the new window immediately, so the
+    // client stops drawing against the previous model's limit before the next
+    // turn streams. The two after it are the turn's own updates.
+    expect(usageUpdates).toHaveLength(3);
     expect(usageUpdates[0].update.size).toBe(1000000);
+    // A switch changes the window, not the occupancy, so it republishes the
+    // last `used` we told the client rather than inventing one. No turn has
+    // run in this session yet, so that is still the session's initial 0.
+    expect(usageUpdates[0].update.used).toBe(0);
     expect(usageUpdates[1].update.size).toBe(1000000);
+    expect(usageUpdates[2].update.size).toBe(1000000);
   });
 
   it("infers the 1M window from a model's description when the ID lacks a 1m token (issue #596)", async () => {
@@ -4837,9 +4845,13 @@ describe("usage_update computation", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
+    // 3, not 2: the downgrade is published at switch time, so the client stops
+    // drawing against the old 1M limit immediately rather than after the next
+    // turn streams.
+    expect(usageUpdates).toHaveLength(3);
     expect(usageUpdates[0].update.size).toBe(200000);
     expect(usageUpdates[1].update.size).toBe(200000);
+    expect(usageUpdates[2].update.size).toBe(200000);
   });
 
   it("non-usage stream events do not re-emit usage_update", async () => {

@@ -56,6 +56,21 @@ import { handleAdminDevices, handleAdminRevoke, handleAdminPairingOpen } from ".
 // Last-resort safety net: a stray rejection or exception anywhere in the
 // bridge must not kill the process — that would tear down every PTY session
 // and strand every in-flight permission hook. Log loudly and keep serving.
+//
+// FIRST, make the log path itself unable to throw. stdout/stderr are PIPES
+// whenever the bridge is spawned by a parent (the test harness, a supervisor,
+// a shell that pipes it). When that reader goes away the read end closes and
+// every later write fails EPIPE — and an unhandled 'error' on those streams
+// becomes an uncaughtException, which the guards below LOG, which is another
+// failing write, which is another uncaughtException. That loop pegs a core at
+// 100% forever; because each iteration goes through the event loop the HTTP
+// server keeps answering, so the process looks perfectly healthy while burning
+// a CPU. It is exactly how a stranded test bridge once accumulated 28
+// CPU-hours. Losing log lines to a reader that is already gone costs nothing,
+// so swallow the write error and break the cycle at its source.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on("error", () => { /* reader gone: nothing to report, and nowhere to report it */ });
+}
 
 process.on("unhandledRejection", (reason) => {
   log(
@@ -76,11 +91,15 @@ process.on("uncaughtException", (err) => {
 // Test-only fault injection (test/crash-resilience.test.js): fires a stray
 // rejection/exception shortly after startup so the guards above have black-box
 // coverage. Inert unless the env var is set.
+// CLAUDE_WATCH_TEST_FAULT_DELAY_MS pushes the fault past startup, so a test can
+// dismantle something first — the spin regression drops the stdout pipe reader
+// and needs the fault to land after that, not during boot.
 const TEST_FAULT = process.env.CLAUDE_WATCH_TEST_FAULT;
+const TEST_FAULT_DELAY_MS = Number(process.env.CLAUDE_WATCH_TEST_FAULT_DELAY_MS) || 50;
 if (TEST_FAULT === "unhandledRejection") {
-  setTimeout(() => { Promise.reject(new Error("injected test fault: unhandled rejection")); }, 50);
+  setTimeout(() => { Promise.reject(new Error("injected test fault: unhandled rejection")); }, TEST_FAULT_DELAY_MS);
 } else if (TEST_FAULT === "uncaughtException") {
-  setTimeout(() => { throw new Error("injected test fault: uncaught exception"); }, 50);
+  setTimeout(() => { throw new Error("injected test fault: uncaught exception"); }, TEST_FAULT_DELAY_MS);
 }
 
 // Bonjour
@@ -387,6 +406,28 @@ async function startServer() {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  // Orphan watchdog (test-only: CLAUDE_WATCH_EXIT_WHEN_ORPHANED=1). The suite
+  // spawns bridges as child processes and reaps them in t.after (helpers.js).
+  // That covers every path where the runner lives long enough to run it — but
+  // not a runner that dies first: a SIGKILLed or aborted run leaves each bridge
+  // reparented to init, alive indefinitely, squatting a port in the production
+  // range. One aborted run stranded 26 of them on a dev machine, spinning at
+  // ~100% CPU each. Polling process.ppid catches exactly that case: the pid
+  // changes the instant our spawner is gone. Production must NEVER set this —
+  // the live bridge is started with `setsid nohup`, i.e. orphaned by design.
+  if (process.env.CLAUDE_WATCH_EXIT_WHEN_ORPHANED === "1") {
+    const spawnerPid = process.ppid;
+    const orphanWatchdog = setInterval(() => {
+      if (process.ppid === spawnerPid) return;
+      clearInterval(orphanWatchdog);
+      log("warn", `Spawner ${spawnerPid} exited (reparented to ${process.ppid}); shutting down`);
+      shutdown("orphaned");
+    }, 2000);
+    // The listening server already holds the loop open; never let the watchdog
+    // be the reason a process that is otherwise done lingers.
+    orphanWatchdog.unref();
+  }
 
   const agents = [];
   if (CLAUDE_BIN) agents.push("Claude");

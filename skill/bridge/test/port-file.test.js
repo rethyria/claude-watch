@@ -124,12 +124,21 @@ test("installer warns loudly when it falls back to the default port with no port
   // Occupy the default port with a raw TCP decoy: stands in for a non-bridge
   // squatter (Gradio), and proves the reachability probe neither hangs on a
   // server that never responds nor mistakes it for the bridge.
-  await startDecoy(t, 37860);
+  //
+  // The decoy port MUST stay below the kernel's ephemeral range
+  // (/proc/sys/net/ipv4/ip_local_port_range, 32768-60999 by default): a port
+  // inside it can be handed out as the SOURCE port of any outbound connection
+  // on the machine, and listen() then fails EADDRINUSE. This test used 37860
+  // and failed exactly that way against a long-lived SSE connection to the
+  // live bridge (ESTAB 127.0.0.1:37860 -> 127.0.0.1:7860) — invisible to
+  // `ss -tln`, since the squatter is not a listener. Its siblings below chose
+  // 27860/17860 and were never affected.
+  await startDecoy(t, 27861);
 
   const install = await runScript(SETUP_HOOKS, [], {
     HOME: home,
     CLAUDE_WATCH_CREDENTIALS_DIR: "",
-    CLAUDE_WATCH_PORT_RANGE_START: "37860",
+    CLAUDE_WATCH_PORT_RANGE_START: "27861",
   });
   assert.equal(install.code, 0, install.output);
 
@@ -154,7 +163,7 @@ test("installer warns loudly when it falls back to the default port with no port
   assert.ok(urls.length > 0, "installer must still write hook URLs on the fallback path");
   for (const url of urls) {
     assert.ok(
-      url.startsWith("http://127.0.0.1:37860/hooks/"),
+      url.startsWith("http://127.0.0.1:27861/hooks/"),
       `fallback hook URL must use the default port, got: ${url}`,
     );
   }

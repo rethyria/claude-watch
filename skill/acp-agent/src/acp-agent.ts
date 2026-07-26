@@ -86,8 +86,9 @@ import {
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -499,6 +500,12 @@ type Session = {
    *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
    *  and clobbered by a "1m" text match. */
   contextWindowAuthoritative: boolean;
+  /** Occupancy last published to the client via `usage_update`. A model switch
+   *  changes the window but not the occupancy, so re-publishing the new `size`
+   *  needs the old `used` — emitting 0 there would visibly zero the client's
+   *  meter mid-session. Optional: absent means nothing has been published yet
+   *  (a fresh session before its first turn), which reads as 0. */
+  lastReportedUsedTokens?: number;
   /** Stable identifier of the LLM backend this session's query was created
    *  against, derived from the routing-relevant vars of the exact `env` handed
    *  to the SDK at query creation (see {@link providerCacheKeyFor}). The context
@@ -1960,8 +1967,10 @@ export class ClaudeAcpAgent {
     // entitlement is gated per org/tier, and an OAuth re-login is invisible to
     // the env-derived provider cache key, so windows learned under the old
     // login must not seed sessions under the next. Worst case of clearing is
-    // re-learning on each model's next turn.
+    // re-learning on each model's next turn. The cache outlives the process
+    // now, so the on-disk copy has to go with it.
     contextWindowCache.clear();
+    clearPersistedContextWindows();
 
     // For the Claude/Console login methods the credentials live in the native
     // CLI's store (keychain or config dir), which only the binary can clear.
@@ -2870,6 +2879,7 @@ export class ClaudeAcpAgent {
                 const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
                 lastAssistantUsage = null;
                 lastAssistantTotalUsage = usedTokens ?? 0;
+                session.lastReportedUsedTokens = lastAssistantTotalUsage;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -3449,6 +3459,7 @@ export class ClaudeAcpAgent {
 
               // Send usage_update notification
               if (lastAssistantTotalUsage !== null) {
+                session.lastReportedUsedTokens = lastAssistantTotalUsage;
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
@@ -3754,6 +3765,7 @@ export class ClaudeAcpAgent {
               const nextUsage = totalTokens(lastAssistantUsage);
               if (nextUsage !== lastAssistantTotalUsage) {
                 lastAssistantTotalUsage = nextUsage;
+                session.lastReportedUsedTokens = nextUsage;
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
@@ -4087,6 +4099,7 @@ export class ClaudeAcpAgent {
           }
           case "rate_limit_event": {
             if (lastAssistantTotalUsage !== null) {
+              session.lastReportedUsedTokens = lastAssistantTotalUsage;
               await sendUpdate({
                 sessionId: message.session_id,
                 update: {
@@ -5220,6 +5233,25 @@ export class ClaudeAcpAgent {
         const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
         session.contextWindowSize = seeded.size;
         session.contextWindowAuthoritative = seeded.authoritative;
+        // Publish the new window immediately. Switching models changes the
+        // limit the client should be drawing against, but every other
+        // `usage_update` comes from the prompt-turn loop — so without this the
+        // client keeps rendering the PREVIOUS model's window until the next
+        // turn streams (e.g. switch 1M → Sonnet and the meter still claims 1M).
+        // Occupancy is unchanged by a switch, so re-report what we last
+        // published rather than resetting it.
+        void this.client
+          .sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: "usage_update",
+              used: session.lastReportedUsedTokens ?? 0,
+              size: seeded.size,
+            },
+          })
+          .catch(() => {
+            /* best-effort: the next turn re-publishes both numbers anyway */
+          });
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -5867,7 +5899,11 @@ export class ClaudeAcpAgent {
         )
       : initializationResult.models;
 
-    const { modelState: models, resumedContextWindow } = await getAvailableModels(
+    const {
+      modelState: models,
+      resumedContextWindow,
+      resumedUsedTokens,
+    } = await getAvailableModels(
       q,
       allowedModels,
       initializationResult.models,
@@ -6051,6 +6087,7 @@ export class ClaudeAcpAgent {
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize: seededWindow.size,
       contextWindowAuthoritative: seededWindow.authoritative,
+      lastReportedUsedTokens: resumedUsedTokens ?? 0,
       providerCacheKey,
       taskState,
       toolUseCache: {},
@@ -6103,6 +6140,41 @@ export class ClaudeAcpAgent {
         /* best-effort: the turn-end poll remains the fallback */
       });
     }
+
+    // Publish the context window NOW. Every other `usage_update` is emitted
+    // from the prompt-turn message loop, so before a session's first turn the
+    // client has never been told this session's window and falls back to its
+    // own default — Zed renders 200k, which reads as "the 1M model is being
+    // capped" on a session that is nothing of the sort. One notification at
+    // creation replaces that guess with the seeded value (authoritative from
+    // the persisted cache or a resumed session's own report; otherwise the
+    // text heuristic, corrected within one turn as before).
+    //
+    // `used` is only known up front for a resumed session, whose
+    // `getContextUsage` report IS serviced pre-turn. A fresh session's real
+    // occupancy (system prompt + tool schemas + MCP tools) is unknowable
+    // without the control request that stalls ~15s before the first turn
+    // (#886/#880), so report 0 and let the first turn correct it — the window
+    // is the number that was wrong, and it is now right immediately.
+    //
+    // Deferred by a macrotask so it lands AFTER this handler's response: the
+    // client first learns `sessionId` from that response, and a session/update
+    // naming an unknown session is dropped. Best-effort — a failed
+    // notification must never fail session creation.
+    const initialUsage = {
+      used: resumedUsedTokens ?? 0,
+      size: seededWindow.size,
+    } as const;
+    setTimeout(() => {
+      void this.client
+        .sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: "usage_update", ...initialUsage },
+        })
+        .catch(() => {
+          /* best-effort: the first turn emits usage_update regardless */
+        });
+    }, 0);
 
     return {
       sessionId,
@@ -6874,16 +6946,20 @@ async function readResumedLiveModel(
   query: Query,
   models: ModelInfo[],
   logger: Logger,
-): Promise<{ model: ModelInfo | null; contextWindow: number | null }> {
+): Promise<{ model: ModelInfo | null; contextWindow: number | null; usedTokens: number | null }> {
   try {
     const usage = await query.getContextUsage();
     return {
       model: usage.model ? matchResumedModel(models, usage.model) : null,
       contextWindow: usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null,
+      // Real occupancy of the restored transcript (system prompt + tools +
+      // surviving messages), so the initial `usage_update` can report the
+      // session as it actually stands rather than as empty.
+      usedTokens: Number.isFinite(usage.totalTokens) ? usage.totalTokens : null,
     };
   } catch (error) {
     logger.error("Failed to read the resumed session's live model:", error);
-    return { model: null, contextWindow: null };
+    return { model: null, contextWindow: null, usedTokens: null };
   }
 }
 
@@ -6894,7 +6970,11 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
-): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
+): Promise<{
+  modelState: SessionModelState;
+  resumedContextWindow: number | null;
+  resumedUsedTokens: number | null;
+}> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
@@ -6904,6 +6984,8 @@ async function getAvailableModels(
   // (no override, or a failed override re-assert), so the window always
   // describes the model the session actually runs.
   let resumedContextWindow: number | null = null;
+  // Occupancy from that same report, for the initial `usage_update`.
+  let resumedUsedTokens: number | null = null;
 
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
@@ -6935,6 +7017,7 @@ async function getAvailableModels(
     const live = await readResumedLiveModel(query, models, logger);
     currentModel = live.model ?? currentModel;
     resumedContextWindow = live.contextWindow;
+    resumedUsedTokens = live.usedTokens;
   }
 
   // Skip the setModel round-trip when we can prove the SDK has already landed
@@ -6970,6 +7053,7 @@ async function getAvailableModels(
       const live = await readResumedLiveModel(query, models, logger);
       currentModel = live.model ?? currentModel;
       resumedContextWindow = live.contextWindow;
+      resumedUsedTokens = live.usedTokens;
     }
   }
 
@@ -6983,6 +7067,7 @@ async function getAvailableModels(
       currentModelId: currentModel.value,
     },
     resumedContextWindow,
+    resumedUsedTokens,
   };
 }
 
@@ -8022,8 +8107,10 @@ async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<num
  *  can name different context lanes behind different base URLs, routing
  *  headers, or credentials, so the key carries both. Caching it module-level
  *  lets a later session/new or switch that resolves to the same (backend,
- *  model) — in this session or any other, within the adapter's lifetime — seed
- *  the correct window synchronously with no IPC. Keying on the resolved id
+ *  model) — in this session or any other — seed the correct window
+ *  synchronously with no IPC. Persisted to disk (see
+ *  {@link loadPersistedContextWindows}) so it also survives the adapter
+ *  process, which dies with the editor. Keying on the resolved id
  *  (rather than the picker value) means aliases that resolve to the same
  *  concrete model share one entry; the result handler additionally writes the
  *  bare assistant-message spelling so seed-time reads that fall back to a
@@ -8078,18 +8165,175 @@ function providerCacheKeyFor(env: Record<string, string | undefined>): string {
   return PROVIDER_ROUTING_ENV_VARS.map((name) => env[name] ?? "").join("\0");
 }
 
+/** Memoised SHA-256 of a provider cache key. The raw key positionally joins
+ *  {@link PROVIDER_ROUTING_ENV_VARS}, several of which are secrets (API keys,
+ *  auth tokens, custom headers) — hashing it means neither the in-memory Map
+ *  keys nor the on-disk cache ever hold a credential, while preserving the
+ *  "one bucket per backend" scoping exactly (equal keys hash equal). Truncated
+ *  to 128 bits: this is a namespacing tag, not a security boundary, and a
+ *  collision would only mis-scope a context window between two backends. */
+const providerKeyHashes = new Map<string, string>();
+function hashProviderKey(providerCacheKey: string | undefined): string {
+  // Tolerate a missing key rather than throwing from a seed path: it maps to
+  // one stable bucket, the same way `providerCacheKeyFor` yields a stable
+  // "default" bucket when every routing var is unset. (The previous string
+  // interpolation was implicitly total; `createHash().update()` is not.)
+  const raw = typeof providerCacheKey === "string" ? providerCacheKey : "";
+  let hash = providerKeyHashes.get(raw);
+  if (hash === undefined) {
+    hash = createHash("sha256").update(raw).digest("hex").slice(0, 32);
+    providerKeyHashes.set(raw, hash);
+  }
+  return hash;
+}
+
 /** Compose the `contextWindowCache` key from a session's provider key and a
- *  model id. `\0`-joined so the model segment can't collide with a provider
- *  segment. */
+ *  model id. The provider segment is hashed (see {@link hashProviderKey}), so
+ *  the `\0` join is unambiguous — a hex digest contains no `\0` — and the key
+ *  is safe to persist. */
 function contextWindowCacheKey(providerCacheKey: string, modelId: string): string {
-  return `${providerCacheKey}\0${modelId}`;
+  return `${hashProviderKey(providerCacheKey)}\0${modelId}`;
+}
+
+const CONTEXT_WINDOW_CACHE_VERSION = 1;
+/** Bound the persisted file. Entries are tiny, but the map is keyed on
+ *  (backend, model) and a user churning provider config could otherwise grow
+ *  it without limit. Map iteration is insertion-ordered, so keeping the tail
+ *  keeps the most recently learned entries. */
+const CONTEXT_WINDOW_CACHE_MAX_ENTRIES = 256;
+
+export function contextWindowCachePath(): string {
+  const xdg = process.env.XDG_CACHE_HOME;
+  const base = xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), ".cache");
+  return path.join(base, "claude-watch-acp", "context-windows.json");
+}
+
+/** Learned windows survive only as long as the process, and the adapter dies
+ *  with the editor — so before this, every editor restart re-armed the
+ *  `DEFAULT_CONTEXT_WINDOW` heuristic for models whose id/description carry no
+ *  "1m" token (e.g. `sonnet` → claude-sonnet-5, natively 1M), and the first
+ *  turn after each restart streamed `usage_update.size: 200000` until its
+ *  `result.modelUsage` landed. Persisting the cache makes that a once-ever
+ *  cost per (backend, model) instead of once per restart.
+ *
+ *  Read lazily and synchronously: the seed path (`immediateContextWindow`) is
+ *  sync and on the session/new critical path, so there is no await to hang the
+ *  load off. One small JSON read per process. Every failure mode — missing,
+ *  unreadable, corrupt, wrong version — degrades to the in-memory heuristic,
+ *  which is exactly the pre-persistence behaviour. */
+let contextWindowCacheLoaded = false;
+function loadPersistedContextWindows(): void {
+  if (contextWindowCacheLoaded) return;
+  contextWindowCacheLoaded = true;
+  let raw: string;
+  try {
+    raw = readFileSync(contextWindowCachePath(), "utf8");
+  } catch {
+    return; // No cache yet (first run) or unreadable — the heuristic covers it.
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      (parsed as { version?: unknown }).version !== CONTEXT_WINDOW_CACHE_VERSION
+    ) {
+      return;
+    }
+    const entries = (parsed as { entries?: unknown }).entries;
+    if (!Array.isArray(entries)) return;
+    for (const entry of entries) {
+      if (!Array.isArray(entry) || entry.length !== 3) continue;
+      const [providerHash, modelId, window] = entry as [unknown, unknown, unknown];
+      if (typeof providerHash !== "string" || typeof modelId !== "string") continue;
+      // Same `> 0` guard the in-memory writer applies: a non-positive or NaN
+      // window (observed from third-party backends) must never seed a session.
+      if (typeof window !== "number" || !Number.isFinite(window) || window <= 0) continue;
+      const key = `${providerHash}\0${modelId}`;
+      // Never clobber something this process already learned — a live
+      // `result.modelUsage` is fresher than anything on disk.
+      if (!contextWindowCache.has(key)) contextWindowCache.set(key, window);
+    }
+  } catch {
+    // Corrupt file: ignore it. The next successful write replaces it wholesale.
+  }
+}
+
+/** Write via temp-file + rename so a concurrent reader (a second adapter
+ *  process — the editor can run several) never observes a partial file. The
+ *  temp name carries the pid so two writers can't collide on it.
+ *
+ *  Synchronous and un-debounced on purpose. The caller only reaches here when
+ *  a window actually CHANGED, which happens on the first turn of each
+ *  (backend, model) and never again, so this is a handful of sub-kilobyte
+ *  writes per process — not a per-turn cost. A debounced write would be lost
+ *  in exactly the case that matters most: the adapter dies with the editor,
+ *  so a window learned on the last turn before quitting would never reach
+ *  disk, which is the whole point of persisting it. */
+function persistContextWindowsNow(): void {
+  const entries = [...contextWindowCache.entries()]
+    .slice(-CONTEXT_WINDOW_CACHE_MAX_ENTRIES)
+    .map(([key, window]) => {
+      const sep = key.indexOf("\0");
+      return [key.slice(0, sep), key.slice(sep + 1), window];
+    });
+  const file = contextWindowCachePath();
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(tmp, JSON.stringify({ version: CONTEXT_WINDOW_CACHE_VERSION, entries }), {
+      mode: 0o600,
+    });
+    renameSync(tmp, file);
+  } catch {
+    // Best-effort: a cache we couldn't persist just costs re-learning.
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* nothing to clean up */
+    }
+  }
+}
+
+/** Drop the persisted cache alongside the in-memory one on logout. 1M-context
+ *  entitlement is per account/tier, so windows learned under one login must
+ *  not seed sessions under the next — including after a restart. */
+function clearPersistedContextWindows(): void {
+  // Keep the load latch closed: a lazy read after this must not resurrect the
+  // file we just removed (e.g. if the unlink failed).
+  contextWindowCacheLoaded = true;
+  try {
+    unlinkSync(contextWindowCachePath());
+  } catch {
+    /* already gone */
+  }
 }
 
 function cacheContextWindow(modelKey: string, window: number): void {
   if (window > 0) {
+    loadPersistedContextWindows();
+    const previous = contextWindowCache.get(modelKey);
     contextWindowCache.set(modelKey, window);
+    if (previous !== window) persistContextWindowsNow();
   }
 }
+
+/** Test-only surface for the persisted window cache. The cache is module-level
+ *  state read through a one-shot latch, so a test that wants to exercise the
+ *  "fresh adapter process, warm disk cache" path needs to drop that state
+ *  without `vi.resetModules()` (which would also re-instantiate every other
+ *  module-level singleton the agent holds). Not used outside tests. */
+export const __contextWindowCacheTestHooks = {
+  reset(): void {
+    contextWindowCache.clear();
+    providerKeyHashes.clear();
+    contextWindowCacheLoaded = false;
+  },
+  learn: cacheContextWindow,
+  key: contextWindowCacheKey,
+  seed: immediateContextWindow,
+  clearPersisted: clearPersistedContextWindows,
+};
 
 /** The context window to report *right now* for a model, with NO IPC on the
  *  critical path: the cached authoritative value if we've learned it (from a
@@ -8105,6 +8349,7 @@ function immediateContextWindow(
   modelId: string,
   modelInfo?: Pick<ModelInfo, "resolvedModel" | "displayName" | "description">,
 ): { size: number; authoritative: boolean } {
+  loadPersistedContextWindows();
   const cached = contextWindowCache.get(
     contextWindowCacheKey(providerCacheKey, modelInfo?.resolvedModel ?? modelId),
   );
