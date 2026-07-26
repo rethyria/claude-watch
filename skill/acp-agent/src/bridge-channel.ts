@@ -50,6 +50,12 @@ export type PermissionDecision = {
 };
 export type PermissionDecisionHandler = (decision: PermissionDecision) => void;
 
+/** A watch "new session" the bridge routed to this fork (the third inbox frame
+ *  type). The fork creates a detached session for `cwd` and answers with
+ *  {@link BridgeChannel.reportSpawnResult}, echoing the `requestId`. */
+export type SpawnRequest = { requestId: string; cwd: string; agent: string };
+export type SpawnHandler = (request: SpawnRequest) => void;
+
 /** The seam the agent (and its client tee) talk to. A test supplies a fake;
  *  production uses {@link HttpBridgeChannel}. Every method is best-effort and
  *  MUST NOT throw into agent code. */
@@ -106,6 +112,20 @@ export interface BridgeChannel {
   /** Register the handler the inbox calls when the watch answers a permission
    *  request (#80). */
   onPermissionDecision(handler: PermissionDecisionHandler): void;
+  /** Register the handler the inbox calls when the watch asks this fork to
+   *  create a session (the born-in-Zed spawn). */
+  onSpawn(handler: SpawnHandler): void;
+  /** Answer a spawn frame: the explicit ack the bridge correlates by
+   *  `requestId` (never piggybacked on register — a createSession throw must
+   *  surface immediately, and register replay must not re-trigger
+   *  correlation). Best-effort like every uplink POST. */
+  reportSpawnResult(result: {
+    requestId: string;
+    ok: boolean;
+    sessionId?: string;
+    cwd?: string;
+    error?: string;
+  }): void;
   /** Open the inbox SSE and begin its reconnect loop. */
   start(): void;
   /** Stop the inbox loop and release the connection. */
@@ -139,6 +159,7 @@ export class HttpBridgeChannel implements BridgeChannel {
   private readonly connectionId = randomUUID();
   private injectHandler: InjectHandler | null = null;
   private permissionHandler: PermissionDecisionHandler | null = null;
+  private spawnHandler: SpawnHandler | null = null;
   private stopped = false;
   private abort: AbortController | null = null;
 
@@ -190,6 +211,23 @@ export class HttpBridgeChannel implements BridgeChannel {
 
   onPermissionDecision(handler: PermissionDecisionHandler): void {
     this.permissionHandler = handler;
+  }
+
+  onSpawn(handler: SpawnHandler): void {
+    this.spawnHandler = handler;
+  }
+
+  reportSpawnResult(result: {
+    requestId: string;
+    ok: boolean;
+    sessionId?: string;
+    cwd?: string;
+    error?: string;
+  }): void {
+    void this.post("/acp/spawn-result", {
+      connection: this.connectionId,
+      ...result,
+    });
   }
 
   registerSession(info: {
@@ -460,6 +498,25 @@ export class HttpBridgeChannel implements BridgeChannel {
         this.permissionHandler?.(d as PermissionDecision);
       } catch (err) {
         this.logger.error(`claude-watch: permission handler threw: ${String(err)}`);
+      }
+      return;
+    }
+    if (event === "spawn") {
+      let s: Partial<SpawnRequest>;
+      try {
+        s = JSON.parse(dataLines.join("\n"));
+      } catch {
+        return;
+      }
+      if (typeof s.requestId !== "string" || !s.requestId || typeof s.cwd !== "string" || !s.cwd) {
+        return;
+      }
+      const agent = typeof s.agent === "string" && s.agent ? s.agent : "claude";
+      this.logger.log(`claude-watch: inbox spawn request ${s.requestId} (cwd=${s.cwd})`);
+      try {
+        this.spawnHandler?.({ requestId: s.requestId, cwd: s.cwd, agent });
+      } catch (err) {
+        this.logger.error(`claude-watch: spawn handler threw: ${String(err)}`);
       }
       return;
     }

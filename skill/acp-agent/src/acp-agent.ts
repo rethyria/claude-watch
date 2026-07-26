@@ -7902,6 +7902,20 @@ export function runAcp() {
         console.error(`claude-watch: injectUserPrompt failed for ${sessionId}: ${String(err)}`);
       });
     });
+    // Watch spawn (born in Zed): create the detached session and answer with
+    // the explicit ack the bridge correlates by requestId — success or throw,
+    // the bridge must hear SOMETHING, or the wrist stares at the timeout.
+    bridge.onSpawn(({ requestId, cwd }) => {
+      agent
+        .spawnDetachedSession({ cwd })
+        .then((response) =>
+          bridge.reportSpawnResult({ requestId, ok: true, sessionId: response.sessionId, cwd }),
+        )
+        .catch((err) => {
+          console.error(`claude-watch: watch spawn ${requestId} failed: ${String(err)}`);
+          bridge.reportSpawnResult({ requestId, ok: false, error: String(err?.message ?? err) });
+        });
+    });
     bridge.start();
   }
   return { connection, agent };
