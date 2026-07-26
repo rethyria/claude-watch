@@ -2,14 +2,21 @@
 // This module sits at the bottom of the dependency graph and must not import
 // any other bridge module.
 
+// A failed log write must never propagate: the process-level guards in
+// server.js log the exceptions they catch, so a throwing log() turns one fault
+// into an endless log→throw→log cycle. server.js silences the asynchronous
+// EPIPE on stdout/stderr; this catches the synchronous case (a destroyed or
+// already-closed stream throws on write) for every caller.
 export function log(level, msg, ...args) {
   const ts = new Date().toISOString();
   const prefix = `[${ts}] [${level.toUpperCase()}]`;
-  if (args.length) {
-    console.log(prefix, msg, ...args);
-  } else {
-    console.log(prefix, msg);
-  }
+  try {
+    if (args.length) {
+      console.log(prefix, msg, ...args);
+    } else {
+      console.log(prefix, msg);
+    }
+  } catch { /* nowhere to write: dropping the line beats taking the bridge down */ }
 }
 
 export function jsonResponse(res, status, body) {
