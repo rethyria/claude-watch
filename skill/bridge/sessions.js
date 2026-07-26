@@ -19,7 +19,7 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 
 // Multi-session: each entry is a session slot
 // { id, agent, cwd, folderName, ptyProcess, state, createdAt, endedAt?, hookSessionId?, hookCreated?,
-//   title?, titleIsAi?, transcriptPath?, titleCache?,
+//   title?, titleIsAi?, transcriptPath?, titleCache?, titleScanAt?, titleScanCount?,
 //   projectRootVerified?, projectRootAttempt?,
 //   shallowestObservedCwd?, pendingRebindCwd?, pendingRebindCount?,
 //   endedAuthoritatively? } — title is lazily derived
@@ -37,7 +37,7 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 //   the turn-end-idle section below): state stays "running" across a finished
 //   turn, so idle is what tells a connect-time snapshot apart from a session
 //   that is actually producing work.
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, titleScanAt?: number, titleScanCount?: number, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -62,8 +62,10 @@ function bindHookSession(slot, hookSessionId) {
 // Hooks are a hot path, so derivation is lazy and cached per slot keyed on
 // (path, mtime, size): the transcript is only re-read when it changed, and
 // only at opportunistic moments (session creation / first hook binding,
-// Stop, SessionEnd) — never on every hook event. Any failure (missing file,
-// unreadable, malformed lines) silently yields no title.
+// Stop, SessionEnd, plus a rate-limited mid-turn scan for a slot that is
+// still unlabeled — see acquireTitleMidTurn) — never on every hook event.
+// Any failure (missing file, unreadable, malformed lines) silently yields no
+// title.
 
 const TRANSCRIPT_TITLE_MAX_CHARS = 60;
 // Big transcripts are scanned as a head chunk (first user prompt lives at the
@@ -604,6 +606,46 @@ export function refreshHookSessionTitle(sessionId, body) {
   if (!slot) return;
   const transcriptPath = transcriptPathOf(body);
   if (transcriptPath) slot.transcriptPath = transcriptPath;
+  announceMetadataRefresh(slot, slot.transcriptPath);
+}
+
+// The refresh points above are all creation- or turn-END-shaped, which leaves
+// a slot that EXISTED BEFORE ITS FIRST HOOK unlabeled for its whole first turn:
+// an ACP session is registered when Zed creates it, before any turn runs, so
+// every hook of that turn takes the already-bound fast path in
+// resolveHookSession — the one that deliberately never reads the transcript —
+// and the watch showed the bare folder name until Stop. Claude Code writes the
+// `ai-title` record within a couple of seconds of the prompt (before the first
+// tool call in 10 of 11 sampled transcripts), so the label is sitting on disk,
+// readable, from the turn's very first hook. Read it there instead.
+//
+// This also un-sticks a hook-created slot whose creating hook BEAT the
+// ai-title: it was born with the first-prompt fallback and, since only Stop
+// looked again, kept it for the rest of the turn.
+//
+// Bounded three ways, because this IS the hot path (every tool hook, and the
+// blocking permission hook, comes through here):
+//   * one AI title disarms it permanently — later title EVOLUTIONS are not
+//     urgent and keep riding the Stop refresh, exactly as before;
+//   * at most one scan a second, so a burst of parallel tool calls costs one
+//     read, not one per call;
+//   * at most MID_TURN_TITLE_SCAN_LIMIT scans ever, so an agent that never
+//     writes an ai-title (or a transcript that never yields one) cannot turn
+//     this into a permanent once-a-second read of a growing file. Normal
+//     sessions spend one; the cap is ~30s of hook-firing work, after which
+//     Stop is soon enough.
+// A slot with no transcript path is free (no syscall at all) — the Codex
+// wrapper's bodies carry none, so Codex sessions never pay for this.
+const MID_TURN_TITLE_SCAN_INTERVAL_MS = 1000;
+const MID_TURN_TITLE_SCAN_LIMIT = 30;
+function acquireTitleMidTurn(slot) {
+  if (slot.titleIsAi || !slot.transcriptPath) return;
+  const scans = slot.titleScanCount ?? 0;
+  if (scans >= MID_TURN_TITLE_SCAN_LIMIT) return;
+  const now = Date.now();
+  if (slot.titleScanAt !== undefined && now - slot.titleScanAt < MID_TURN_TITLE_SCAN_INTERVAL_MS) return;
+  slot.titleScanAt = now;
+  slot.titleScanCount = scans + 1;
   announceMetadataRefresh(slot, slot.transcriptPath);
 }
 
@@ -1389,13 +1431,15 @@ export function resolveHookSession(body) {
         if (bound.state === "ended" && bound.hookCreated && !bound.endedAuthoritatively) {
           reviveSlotToRunning(bound);
         }
-        // Remember (never read) the transcript path on the hot path; the
-        // stat+read happens only at the opportunistic refresh points.
+        // Remember the transcript path on the hot path; the stat+read happens
+        // only at the opportunistic refresh points — of which this is one, but
+        // ONLY for a slot still missing its AI title (see acquireTitleMidTurn).
         if (transcriptPath) bound.transcriptPath = transcriptPath;
         // Attribution upkeep (issue #51): a later event may verify the
         // project root against the transcript, or reveal an ancestor cwd —
         // cheap string compares only, the ancestor walk is cached per slot.
         updateProjectAttribution(bound, cwd, transcriptPath);
+        acquireTitleMidTurn(bound);
         return bound.id;
       }
       hookSessionIndex.delete(hookSessionId); // slot was pruned

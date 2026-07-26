@@ -520,7 +520,10 @@ The field is absent until a hook event has pointed the bridge at a readable
 transcript that yields a title (external `codex` sessions, unreadable or
 empty transcripts, and PTY sessions that have not emitted a hook yet have
 none). The title is refreshed opportunistically (session creation, `Stop`,
-`SessionEnd` hooks); a mid-session change is broadcast as a re-sent
+`SessionEnd` hooks, plus a rate-limited scan on any hook of a session that
+does not yet have an AI-derived title — so a session the bridge knew about
+BEFORE its first turn, such as an ACP one, is labeled during that turn
+instead of at the end of it); a mid-session change is broadcast as a re-sent
 idempotent `running` event. Per the additive-field rules this does not bump
 the protocol version; clients fall back to their own label when it is
 absent.
