@@ -110,7 +110,7 @@ fun HaloOfflineScreen(
             return@Box
         }
 
-        HaloRing(states = emptyList(), drained = true)
+        HaloDrainedRing()
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,

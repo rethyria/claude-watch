@@ -1,21 +1,28 @@
-// The Halo root: horizontal pager (settings and usage left of home, All, one
-// page per project) with tappable dots, vertical swipes for depth, 300ms directional
-// slide+fade between depths, a decorative (non-tappable) TimeText on inner
-// screens, and the approval/question card as a top overlay chained off the
-// waiting queue.
+// The Halo root: ONE ring host and a fixed clock as app-level chrome over
+// nav-owned pages (settings and usage left of home, All, one page per
+// project). Horizontal swipes and tappable dots change the page and only page
+// CONTENT slides — the v2 shell (epic #94 S3) dropped HorizontalPager because
+// the design has no drag-follow: halo, clock and dots hold still during page
+// navigation. Vertical swipes drive depth with the 300ms directional
+// slide+fade, a decorative (non-tappable) TimeText renders at the root
+// whenever the centre clock is hidden, and the approval/question card rides
+// as a top overlay chained off the waiting queue.
 // Navigation state itself is the pure HaloNavState machine (HaloNav.kt); this
 // file only binds gestures, animation, and the screen composables to it.
 package dev.claudewatch.wear.ui.halo
 
 import android.os.SystemClock
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -23,12 +30,13 @@ import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -40,7 +48,6 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -52,8 +59,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
+import androidx.wear.compose.material.Text
 import androidx.wear.compose.material.TimeText
 import androidx.wear.compose.material.TimeTextDefaults
 import androidx.lifecycle.Lifecycle
@@ -62,7 +72,6 @@ import androidx.lifecycle.repeatOnLifecycle
 import dev.claudewatch.wear.BridgeViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.roundToInt
@@ -159,6 +168,16 @@ private const val SWIPE_THRESHOLD_FRACTION = 60f / HALO_REF_PX
 
 /** A swipe suppresses the synthetic tap that can follow it for this long. */
 private const val TAP_GUARD_MS = 300L
+
+/**
+ * The Answer pill's absolute top edge. The design places it top 238px INSIDE
+ * the 70px-inset face container — 308px from the screen edge — so the pill
+ * clears the centred clock group by the mock's 21px. (The epic's constants
+ * table quotes the container-relative 119dp; measured from the screen that
+ * number would bury the pill in the clock.) Absolute on purpose: the pill is
+ * OUT OF FLOW, so the clock+subtitle group never shifts when it appears.
+ */
+private val ANSWER_PILL_TOP = 154.dp
 
 /**
  * On-page usage auto-poll period: the VM's `usageRateLimitMs` (300_000L)
@@ -295,18 +314,32 @@ private fun HaloAppBody(
             scope is ListScope.Project &&
                 nav.depth != HaloDepth.PAGE &&
                 model.projects.none { it.name == scope.name } -> nav.jumpHome()
+            // A vanished project can also strand the PAGE index past the end:
+            // clamp back to the last page, exactly what the retired pager's
+            // shrinking pageCount used to do.
+            nav.page > model.projects.size -> nav.copy(page = model.projects.size)
             else -> nav
         }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Halo.Palette.Background).testTag("haloRoot")) {
+        // The ONE ring (v2 shell): bottom of the z-order, drawing the current
+        // page's scope. Deeper screens and overlays paint opaque backgrounds,
+        // so nothing else needs to know it exists. Static targets until the
+        // S4 engine animates them.
+        val ringScope = if (nav.page < 0) null else scopeForPage(nav.page, model)
+        HaloRingHost(
+            states = ringScope?.let { s -> model.sessionsIn(s).map { it.state } }.orEmpty(),
+            collapsed = ringScope == null,
+        )
+
         AnimatedContent(
             targetState = layerOf(nav),
             transitionSpec = { depthTransition() },
             label = "haloDepth",
         ) { layer ->
             when (layer) {
-                Layer.Pager -> PagerLayer(
+                Layer.Pager -> PageLayer(
                     model = model,
                     page = nav.page,
                     usage = ui.usage,
@@ -314,16 +347,24 @@ private fun HaloAppBody(
                     // "you are paired" line above its Unpair (the only
                     // connection descriptor on the UiState).
                     status = ui.status,
-                    onPageChange = { nav = nav.copy(page = it) },
+                    onStepPage = { delta ->
+                        lastSwipeAtMs = SystemClock.uptimeMillis()
+                        nav = nav.stepPage(delta, currentModel)
+                    },
+                    onSelectPage = { nav = nav.copy(page = it) },
                     onDrill = {
                         lastSwipeAtMs = SystemClock.uptimeMillis()
                         nav = nav.drillToList(currentModel)
                     },
+                    // The centerpiece tap opens the session list too (v2 nav:
+                    // "tap face or swipe up"); its old jump-to-prompt job
+                    // moved to the Answer pill below.
                     onTapCenter = {
                         if (SystemClock.uptimeMillis() - lastSwipeAtMs > TAP_GUARD_MS) {
-                            nav = nav.openFirstWaiting(currentModel)
+                            nav = nav.drillToList(currentModel)
                         }
                     },
+                    onAnswer = { nav = nav.openFirstWaiting(currentModel) },
                     onUsageOpen = actions.onUsageOpen,
                     onUsageRefresh = actions.onUsageRefresh,
                     // Finally consumed: onUnpair has been declared + VM-wired
@@ -385,6 +426,22 @@ private fun HaloAppBody(
                     )
                 }
             }
+        }
+
+        // The decorative top clock, lifted OUT of the screens (v2 shell): it
+        // shows whenever the centre clock doesn't — the inner depths and the
+        // depth-less glance pages — and, living at the root, it can never
+        // fade or slide with content (the coming morphs animate content
+        // hard; the time must not blink). Still deliberately NOT a tap
+        // target: an invisible hotspot over the time read as an
+        // accidental-jump trap in live testing.
+        if (nav.depth != HaloDepth.PAGE || nav.page < 0) {
+            TimeText(
+                timeTextStyle = TimeTextDefaults.timeTextStyle(
+                    color = Color(0xFF7E7C76),
+                    fontSize = Halo.Type.Min,
+                ),
+            )
         }
 
         // Issue #56: the spawn target picker, over the list that summoned it
@@ -674,7 +731,8 @@ private fun BridgeViewModel.UiState.isOffline(): Boolean =
 
 // ── Depth layers & motion ───────────────────────────────────────────────────
 
-/** What AnimatedContent keys on: page changes animate via the pager instead. */
+/** What AnimatedContent keys on: page changes animate INSIDE the pager layer
+ *  (its own content AnimatedContent), never at this level. */
 private sealed interface Layer {
     val rank: Int
 
@@ -718,54 +776,74 @@ private fun androidx.compose.animation.AnimatedContentTransitionScope<Layer>.dep
     }
 }
 
-// ── The pager (depth = PAGE) ────────────────────────────────────────────────
+// ── The page layer (depth = PAGE) ───────────────────────────────────────────
+
+/**
+ * Horizontal page slide (the pager's replacement): only CONTENT moves — the
+ * ring, clock and dots are chrome outside these AnimatedContents. The offset
+ * is the layer-derived 70px (passed in), NOT a fraction of the entering
+ * content: the centerpiece's subtitle slot and the full-screen page body run
+ * this same spec, and a content-relative offset would make the small subtitle
+ * crawl while the page body slides. Clipping is off for the same reason — the
+ * subtitle must slide out of its slot's bounds, not be sheared at them.
+ */
+private fun androidx.compose.animation.AnimatedContentTransitionScope<Int>.pageTransition(
+    slidePx: Int,
+): ContentTransform {
+    val spec = tween<Float>(TRANSITION_MS, easing = HaloEasing)
+    val slide = tween<androidx.compose.ui.unit.IntOffset>(TRANSITION_MS, easing = HaloEasing)
+    val transform = when {
+        targetState > initialState ->
+            (slideInHorizontally(slide) { slidePx } + fadeIn(spec))
+                .togetherWith(slideOutHorizontally(slide) { -slidePx } + fadeOut(spec))
+        targetState < initialState ->
+            (slideInHorizontally(slide) { -slidePx } + fadeIn(spec))
+                .togetherWith(slideOutHorizontally(slide) { slidePx } + fadeOut(spec))
+        else -> fadeIn(tween(150)).togetherWith(fadeOut(tween(150)))
+    }
+    return transform using SizeTransform(clip = false)
+}
 
 @Composable
-private fun PagerLayer(
+private fun PageLayer(
     model: HaloModel,
     page: Int,
     usage: BridgeViewModel.UsageUi,
     status: String,
-    onPageChange: (Int) -> Unit,
+    onStepPage: (Int) -> Unit,
+    onSelectPage: (Int) -> Unit,
     onDrill: () -> Unit,
     onTapCenter: () -> Unit,
+    onAnswer: () -> Unit,
     onUsageOpen: () -> Unit,
     onUsageRefresh: () -> Unit,
     onUnpair: () -> Unit,
 ) {
-    // Pager slot 0 is SETTINGS, slot 1 is USAGE (issue #57), so pagerIndex =
-    // nav.page + 2: All keeps nav.page 0 (now slot 2, the initial page), usage
-    // keeps nav.page -1 (slot 1) and settings is nav.page -2 (slot 0), so every
-    // existing depth/nav path — jumpHome included — still lands on All untouched.
+    // Dot slot 0 is SETTINGS, slot 1 is USAGE (issue #57), so dotIndex =
+    // nav.page + 2: All keeps nav.page 0 (slot 2, the landing page), usage
+    // keeps nav.page -1 (slot 1) and settings is nav.page -2 (slot 0).
     val pageCount = 3 + model.projects.size
-    // The remembered PagerState outlives this composition's model; the lambda
-    // must read the CURRENT one or the page count freezes at first render.
-    val currentModel by rememberUpdatedState(model)
-    val pagerState = rememberPagerState(
-        initialPage = (page + 2).coerceIn(0, pageCount - 1),
-        pageCount = { 3 + currentModel.projects.size },
-    )
-    val scope = rememberCoroutineScope()
+    val currentPage by rememberUpdatedState(page)
     val usageOpen by rememberUpdatedState(onUsageOpen)
-    LaunchedEffect(pagerState) {
-        snapshotFlow { pagerState.currentPage }.collect { pagerIndex ->
-            onPageChange(pagerIndex - 2)
-            // Fetch-on-open (issue #57): EVERY landing on the usage page (now
-            // slot 1, one right of settings) — swipe, dot tap, re-entry after a
-            // depth round trip — re-fetches. No client cache by design; this
-            // snapshotFlow IS the "page became current" seam. (The
-            // sit-and-watch case is the separate auto-poll loop below.)
-            if (pagerIndex == 1) usageOpen()
+    LaunchedEffect(Unit) {
+        snapshotFlow { currentPage }.collect { p ->
+            // Fetch-on-open (issue #57): EVERY landing on the usage page —
+            // swipe, dot tap, re-entry after a depth round trip (this effect
+            // restarts with the layer and re-emits the current page) —
+            // re-fetches. No client cache by design; this snapshotFlow IS the
+            // "page became current" seam. (The sit-and-watch case is the
+            // separate auto-poll loop below.)
+            if (p == USAGE_PAGE) usageOpen()
         }
     }
     // On-page auto-poll (2026-07-18, user-directed): sitting on the usage
     // page refreshes when the data hits the rate-limit age instead of
     // waiting for a re-navigation. STRICTLY FOREGROUND-ONLY ("only auto-poll
     // if the page is open, don't poll in the background"): being the current
-    // pager page is NOT enough — a backgrounded activity keeps its
-    // composition alive — so the delay loop ALSO gates on the lifecycle
-    // being RESUMED via the standard repeatOnLifecycle idiom. Leaving the
-    // page (collectLatest cancels the inner block), leaving the screen (the
+    // page is NOT enough — a backgrounded activity keeps its composition
+    // alive — so the delay loop ALSO gates on the lifecycle being RESUMED
+    // via the standard repeatOnLifecycle idiom. Leaving the page
+    // (collectLatest cancels the inner block), leaving the screen (the
     // LaunchedEffect dies with the composition), backgrounding the app, or
     // the watch going ambient/inactive (repeatOnLifecycle suspends below
     // RESUMED) all stop the poll; returning restarts the wait from zero —
@@ -774,8 +852,8 @@ private fun PagerLayer(
     // the NON-FORCED onUsageOpen: the VM's limiter still owns the request
     // budget, and the silent-refresh rule makes the swap invisible.
     val lifecycleOwner = LocalLifecycleOwner.current
-    LaunchedEffect(pagerState, lifecycleOwner) {
-        snapshotFlow { pagerState.currentPage == 1 }.collectLatest { onUsagePage ->
+    LaunchedEffect(lifecycleOwner) {
+        snapshotFlow { currentPage == USAGE_PAGE }.collectLatest { onUsagePage ->
             if (onUsagePage) {
                 lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                     while (true) {
@@ -788,13 +866,14 @@ private fun PagerLayer(
     }
 
     val drill by rememberUpdatedState(onDrill)
-    Box(
+    val step by rememberUpdatedState(onStepPage)
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             // Swipe up drills into the list under the current page. Vertical
-            // only — the pager owns horizontal. Threshold per the handoff.
-            // On the settings/usage pages the drill lands in HaloNav's no-op
-            // (#57): both are flat, depth-less glance surfaces.
+            // only — threshold per the handoff. On the settings/usage pages
+            // the drill lands in HaloNav's no-op (#57): both are flat,
+            // depth-less glance surfaces.
             .pointerInput(Unit) {
                 val threshold = size.height * SWIPE_THRESHOLD_FRACTION
                 var total = 0f
@@ -802,35 +881,126 @@ private fun PagerLayer(
                     onDragStart = { total = 0f },
                     onDragEnd = { if (total < -threshold) drill() },
                 ) { _, dragAmount -> total += dragAmount }
+            }
+            // Horizontal swipes step the nav-owned page (no drag-follow by
+            // design). Deltas are CONSUMED so the centerpiece's whole-screen
+            // clickable sees the gesture as claimed and cancels its press —
+            // the tap guard stays as the second line of defence.
+            .pointerInput(Unit) {
+                val threshold = size.width * SWIPE_THRESHOLD_FRACTION
+                var total = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { total = 0f },
+                    onDragEnd = {
+                        when {
+                            // Finger travels right → the page to the LEFT.
+                            total > threshold -> step(-1)
+                            total < -threshold -> step(1)
+                        }
+                    },
+                ) { change, dragAmount ->
+                    total += dragAmount
+                    change.consume()
+                }
             },
     ) {
-        HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { index ->
+        // The shared content-slide offset: 70px at the 450 ref, derived from
+        // the layer (== screen) size once, so every page AnimatedContent
+        // moves in lockstep (see pageTransition).
+        val slidePx = (constraints.maxWidth * SLIDE_FRACTION).roundToInt()
+
+        // The fixed centre clock: home and project pages only — the glance
+        // pages carry the root TimeText instead, so the centerpiece fades
+        // (never slides) across that boundary. Its subtitle SLOT is the one
+        // piece of the group that changes per page, sliding in lockstep with
+        // the page body below.
+        AnimatedVisibility(
+            visible = page >= 0,
+            enter = fadeIn(tween(TRANSITION_MS, easing = HaloEasing)),
+            exit = fadeOut(tween(TRANSITION_MS, easing = HaloEasing)),
+        ) {
+            HaloCenterpiece(onTap = onTapCenter, modifier = Modifier.testTag("haloCenter")) {
+                AnimatedContent(
+                    targetState = page,
+                    transitionSpec = { pageTransition(slidePx) },
+                    label = "haloSubtitle",
+                ) { p ->
+                    when {
+                        p == 0 -> Text(
+                            text = haloCensusText(model.projectCount, model.sessionCount),
+                            fontSize = Halo.Type.Caption,
+                            color = Halo.Palette.TextSecondary,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            modifier = Modifier.testTag("haloCensus"),
+                        )
+                        p >= 1 -> model.projects.getOrNull(p - 1)?.let { project ->
+                            Text(
+                                text = project.name,
+                                fontSize = Halo.Type.Title,
+                                color = Halo.Palette.TextSecondary,
+                                textAlign = TextAlign.Center,
+                                // Folder names are unbounded; the slot is not.
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        // page < 0 only renders mid-fade-out; nothing to say.
+                        else -> {}
+                    }
+                }
+            }
+        }
+
+        AnimatedContent(
+            targetState = page,
+            transitionSpec = { pageTransition(slidePx) },
+            label = "haloPage",
+        ) { p ->
             when {
-                // Slot 0: the settings page — a flat, depth-less surface (like
-                // usage) carrying the confirm-gated destructive Unpair.
-                index == 0 -> HaloSettingsScreen(onUnpair = onUnpair, status = status)
-                // Slot 1: the usage page. No centerpiece and no drill-down:
-                // bars only, retry re-fires the same fetch the entry did; the
-                // freshness label's tap is the forced-refresh seam.
-                index == 1 -> HaloUsageScreen(
+                p == SETTINGS_PAGE -> HaloSettingsScreen(onUnpair = onUnpair, status = status)
+                // The usage page: bars only, retry re-fires the same fetch
+                // the entry did; the freshness label's tap is the
+                // forced-refresh seam.
+                p == USAGE_PAGE -> HaloUsageScreen(
                     usage = usage,
                     onRetry = usageOpen,
                     onRefresh = onUsageRefresh,
                 )
-                index == 2 -> HaloAllPage(model = model, onTapCenter = onTapCenter)
-                else -> {
-                    // The pager can briefly ask for a page past a shrunken model.
-                    val project = model.projects.getOrNull(index - 3) ?: return@HorizontalPager
-                    HaloProjectPage(project = project, onTapCenter = onTapCenter)
+                else -> Box(modifier = Modifier.fillMaxSize()) {
+                    // Home/project body: the clock is chrome, so all that
+                    // slides here is the Answer pill — the jump to the scope's
+                    // first waiting prompt (home = global queue front, a
+                    // project = its own first waiting item), shown only while
+                    // one exists. Absolutely positioned below the clock group
+                    // (out of flow): the clock+subtitle never shift, with or
+                    // without it. `getOrNull` guards the one frame between a
+                    // project vanishing and the self-heal clamping the page.
+                    val scopeWaiting = if (p == 0) {
+                        model.queue.isNotEmpty()
+                    } else {
+                        model.projects.getOrNull(p - 1)
+                            ?.let { project -> model.queue.any { it.projectName == project.name } }
+                            ?: false
+                    }
+                    if (scopeWaiting) {
+                        HaloAnswerPill(
+                            onClick = onAnswer,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = ANSWER_PILL_TOP),
+                        )
+                    }
                 }
             }
         }
+
         // Full-screen, not bottom-aligned: the dots place themselves on an arc
         // measured from the display centre, so they need the whole face.
         PageDots(
             count = pageCount,
-            current = pagerState.currentPage,
-            onSelect = { scope.launch { pagerState.animateScrollToPage(it) } },
+            current = page + 2,
+            onSelect = { onSelectPage(it - 2) },
             modifier = Modifier.fillMaxSize(),
         )
     }
@@ -852,10 +1022,10 @@ private const val DOT_ARC_MAX_DEGREES = 120f
 /**
  * Page dots, curved along the bottom of the face (handoff: current 11px cream,
  * others 8px grey, tappable). They sit on an arc CONCENTRIC with the status
- * ring, [Halo.Geo.DotArcGap] inside its inner stroke edge, so every dot holds
- * the same clearance from the ring however many pages there are — a straight
- * row only clears at 6 o'clock and collides at the ends, where the ring curves
- * down to meet it.
+ * ring, [Halo.Geo.DotChannelClearance] inside its inner stroke edge, so every
+ * dot holds the same clearance from the ring however many pages there are — a
+ * straight row only clears at 6 o'clock and collides at the ends, where the
+ * ring curves down to meet it.
  *
  * Tap targets are deliberately larger than the dots; a full 48dp per dot would
  * overflow the curve with 4+ pages. The TWO LEADING dots are the non-session
@@ -901,15 +1071,18 @@ private fun PageDots(
         val height = constraints.maxHeight
         val slots = measurables.map { it.measure(Constraints()) }
 
-        // Same derivation as HaloRing, one step further in: display radius,
-        // minus the rim gap and the full stroke (radius there is the arc's
-        // CENTRELINE, so the inner edge is another half-stroke in), minus the
-        // clearance token and the dot's own radius — the largest one, so the
-        // current dot growing never eats the gap.
+        // Channel-derived (Halo v2): the ring's inner stroke edge is the fixed
+        // channel centreline minus half the solid stroke; the clearance token
+        // and the dot's own radius — the largest one, so the current dot
+        // growing never eats the gap — come off that. DotChannelClearance is
+        // expressed so this arithmetic lands bit-identical to the old
+        // edge-derived radius (pinned by HaloRingMathTest): the token swap
+        // must not move a dot by a pixel.
         val minDim = minOf(width, height).toFloat()
         val scale = minDim / HALO_REF_PX
-        val ringInner = minDim / 2f - (Halo.Geo.RingEdgeGap + Halo.Geo.RingStroke) * scale
-        val radius = ringInner - Halo.Geo.DotArcGap * scale - DOT_SIZE_CURRENT.toPx() / 2f
+        val dotEdge =
+            (Halo.Geo.RingChannel - Halo.Geo.RingStroke / 2f - Halo.Geo.DotChannelClearance) * scale
+        val radius = dotEdge - DOT_SIZE_CURRENT.toPx() / 2f
 
         // Arc-length pitch → angle, so dot spacing looks identical to the old
         // straight row at 6 o'clock and stays even all the way round.
@@ -939,15 +1112,14 @@ private fun PageDots(
 // ── Inner-screen chrome (depth = LIST / SESSION) ────────────────────────────
 
 /**
- * Wraps every screen below the pager with the shared chrome: a purely
- * decorative top TimeText and the swipe-down-to-go-back gesture. The clock is
- * deliberately NOT a tap target: swipe-down is the one way back up the depth
- * stack (an invisible hotspot over the time read as an accidental-jump trap
- * in live testing, and a clock that navigates surprises more than it helps).
- * The back detector sits UNDER the content, so it only covers screens without
- * a full-screen scrollable: a scrollable child consumes every vertical drag
- * (its leftover goes to nested scroll, never back to pointer input) and must
- * re-provide back itself, as HaloSessionList does.
+ * Wraps every screen below the pager with the shared chrome: an opaque
+ * background (it covers the root ring host) and the swipe-down-to-go-back
+ * gesture. The top clock these screens show is the ROOT TimeText now (v2
+ * shell) — lifted so the coming morphs can fade content without blinking the
+ * time. The back detector sits UNDER the content, so it only covers screens
+ * without a full-screen scrollable: a scrollable child consumes every
+ * vertical drag (its leftover goes to nested scroll, never back to pointer
+ * input) and must re-provide back itself, as HaloSessionList does.
  */
 @Composable
 private fun InnerScreen(
@@ -969,11 +1141,5 @@ private fun InnerScreen(
             },
     ) {
         content()
-        TimeText(
-            timeTextStyle = TimeTextDefaults.timeTextStyle(
-                color = Color(0xFF7E7C76),
-                fontSize = Halo.Type.Min,
-            ),
-        )
     }
 }

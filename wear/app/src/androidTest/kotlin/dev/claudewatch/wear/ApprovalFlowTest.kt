@@ -113,9 +113,13 @@ class ApprovalFlowTest {
         decisionFailureCount = failureCount,
     )
 
-    /** Tap the centerpiece: Halo's way to the first waiting item's card. */
+    /**
+     * Tap the home Answer pill: Halo's jump to the first waiting item's card
+     * (v2 shell — the centerpiece tap opens the session list now, so the
+     * pill is the one prompt-jump affordance on a page).
+     */
     private fun openCard() {
-        compose.onNodeWithTag("haloCenter").performClick()
+        compose.onNodeWithTag("haloAnswerPill").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
         armCard()

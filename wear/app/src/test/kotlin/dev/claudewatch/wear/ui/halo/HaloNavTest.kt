@@ -177,6 +177,36 @@ class HaloNavTest {
         assertEquals(onSettings, onSettings.back())
     }
 
+    // ── The v2 shell's nav-owned page (Halo v2 S3, #98) ──────────────────────
+
+    @Test
+    fun stepPageWalksTheRowWithHardStopsAtBothEnds() {
+        // The full walk: settings ‹ usage ‹ All ‹ alpha ‹ beta, no wrap —
+        // these are the bounds the retired HorizontalPager's pageCount used
+        // to enforce.
+        val home = HaloNavState()
+        assertEquals(USAGE_PAGE, home.stepPage(-1, model()).page)
+        assertEquals(SETTINGS_PAGE, home.stepPage(-1, model()).stepPage(-1, model()).page)
+        // Left end: settings is the hard stop.
+        val settings = HaloNavState(page = SETTINGS_PAGE)
+        assertEquals(settings, settings.stepPage(-1, model()))
+
+        assertEquals(1, home.stepPage(+1, model()).page)
+        assertEquals(2, home.stepPage(+1, model()).stepPage(+1, model()).page)
+        // Right end: the last project is the hard stop.
+        val beta = HaloNavState(page = 2)
+        assertEquals(beta, beta.stepPage(+1, model()))
+    }
+
+    @Test
+    fun stepPageBelowThePageDepthIsANoOp() {
+        // Deeper levels own their own horizontal gestures (the list pager's
+        // step, the feed's swipe-right back): a stray page step from there
+        // must not silently retarget the eventual back-out.
+        val onList = HaloNavState(page = 0).drillToList(model())
+        assertEquals(onList, onList.stepPage(+1, model()))
+    }
+
     // ── The v2 list pager (Halo v2 S1, #95) ──────────────────────────────────
 
     @Test

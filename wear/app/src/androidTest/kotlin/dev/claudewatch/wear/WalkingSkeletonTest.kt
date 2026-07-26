@@ -171,10 +171,10 @@ class WalkingSkeletonTest {
         compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag(tag))
     }
 
-    // Placement-gated existence: HorizontalPager PREFETCHES neighbor pages,
-    // composing them unplaced (semantics bounds anchored at origin), so a bare
-    // fetchSemanticsNodes existence check can match a node that is not in
-    // front. assertIsDisplayed rejects those unplaced nodes.
+    // Placement-gated existence: during transitions AnimatedContent composes
+    // BOTH the entering and exiting layers (and can hold an exiting node
+    // unplaced), so a bare fetchSemanticsNodes existence check can match a
+    // node that is not in front. assertIsDisplayed rejects those.
     private fun tagDisplayed(tag: String): Boolean =
         runCatching { compose.onNodeWithTag(tag).assertIsDisplayed() }.isSuccess
 
@@ -219,9 +219,10 @@ class WalkingSkeletonTest {
     }
 
     /**
-     * Tap the centerpiece until the waiting item's card opens: the prompt
-     * travels bridge → SSE → queue asynchronously, and tapping before it
-     * lands is a spec'd no-op, so poll-click instead of a bare wait.
+     * Tap the Answer pill until the waiting item's card opens: the prompt
+     * travels bridge → SSE → queue asynchronously and the pill only EXISTS
+     * once the scope has a waiting session (v2 shell — the centerpiece tap
+     * opens the session list now), so poll for it instead of a bare wait.
      */
     private fun openFirstWaitingCard(timeoutMs: Long = 30_000) {
         val deadline = System.currentTimeMillis() + timeoutMs
@@ -230,8 +231,8 @@ class WalkingSkeletonTest {
                 armCard()
                 return
             }
-            if (tagDisplayed("haloCenter")) {
-                compose.onNodeWithTag("haloCenter").performClick()
+            if (tagDisplayed("haloAnswerPill")) {
+                compose.onNodeWithTag("haloAnswerPill").performClick()
             }
             compose.waitForIdle()
             Thread.sleep(200)
@@ -409,7 +410,7 @@ class WalkingSkeletonTest {
             JSONObject(hookBody).getJSONObject("hookSpecificOutput").getJSONObject("decision")
 
         try {
-            // Session A asks first: tapping the centerpiece opens ITS card.
+            // Session A asks first: the Answer pill opens ITS card.
             val hookA = permissionHook(
                 JSONObject()
                     .put("tool_name", "Bash")

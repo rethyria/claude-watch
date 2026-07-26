@@ -28,7 +28,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -36,8 +35,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.Text
-import androidx.wear.compose.material.TimeText
-import androidx.wear.compose.material.TimeTextDefaults
 
 // ─── Pure confirm-gate step (plain function so a JVM unit test can pin the ───
 // ─── two-tap contract without composing) ──────────────────────────────────────
@@ -139,13 +136,8 @@ fun HaloSettingsScreen(
                 )
             }
         }
-        // The decorative top clock — the InnerScreen idiom, identical to the
-        // usage page: same style, and deliberately NOT a tap target.
-        TimeText(
-            timeTextStyle = TimeTextDefaults.timeTextStyle(
-                color = Color(0xFF7E7C76),
-                fontSize = Halo.Type.Min,
-            ),
-        )
+        // The decorative top clock is the ROOT TimeText now (HaloApp.kt, v2
+        // shell) — shown whenever the centre clock isn't, so this page draws
+        // none of its own.
     }
 }

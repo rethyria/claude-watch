@@ -2,7 +2,8 @@
 // reports (render-what-you-get: 5-hour session, weekly all-models, weekly
 // model-scoped today — but any entry the wire carries gets a bar, so new
 // upstream windows appear without an app update). Re-skinned per the Halo
-// usage design: a decorative top clock (the InnerScreen TimeText idiom), a
+// usage design: a decorative top clock (the ROOT TimeText since the v2
+// shell — this page draws none of its own), a
 // tappable REMAINING/USED eyebrow (screen-local mode, the wire percent stays
 // USED), chord-fitted row widths that hug the round display, semantic tiers
 // that are SEVERITY-FIRST (the server's own `severity` coding wins when
@@ -60,7 +61,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -72,8 +72,6 @@ import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.LocalTextStyle
 import androidx.wear.compose.material.Text
-import androidx.wear.compose.material.TimeText
-import androidx.wear.compose.material.TimeTextDefaults
 import dev.claudewatch.wear.BridgeViewModel.UsageLimit
 import dev.claudewatch.wear.BridgeViewModel.UsageUi
 import java.time.OffsetDateTime
@@ -365,16 +363,10 @@ fun HaloUsageScreen(
                 nowMs = remember(tick, usage) { nowMs() },
             )
         }
-        // The decorative top clock from the design mock — EXACTLY the
-        // InnerScreen idiom (HaloApp.kt): same style, and deliberately NOT a
-        // tap target (the clock is just a clock — an invisible hotspot over
-        // the time read as an accidental-jump trap in live testing).
-        TimeText(
-            timeTextStyle = TimeTextDefaults.timeTextStyle(
-                color = Color(0xFF7E7C76),
-                fontSize = Halo.Type.Min,
-            ),
-        )
+        // The decorative top clock from the design mock is the ROOT TimeText
+        // now (HaloApp.kt, v2 shell): shown whenever the centre clock isn't,
+        // so this page draws none of its own — a duplicate here would render
+        // two clocks on top of each other.
     }
 }
 

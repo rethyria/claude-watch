@@ -151,7 +151,9 @@ class HaloPreviewScreens {
     fun approvalCard() {
         previewEnabled()
         compose.setContent { HaloApp(ui = uiWithPrompt(), actions = HaloActions()) }
-        compose.onNodeWithTag("haloCenter").performClick()
+        // The Answer pill is the prompt jump now (v2 shell); the centerpiece
+        // tap opens the session list instead.
+        compose.onNodeWithTag("haloAnswerPill").performClick()
         hold()
     }
 }

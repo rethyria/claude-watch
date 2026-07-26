@@ -129,6 +129,19 @@ fun HaloNavState.step(delta: Int, model: HaloModel): HaloNavState {
 }
 
 /**
+ * Horizontal swipe or dot-adjacent step on a MAIN page: move by [delta] pages
+ * with hard stops at both ends — [SETTINGS_PAGE] on the left, the last
+ * project on the right. The nav machine owns the page since the v2 shell
+ * dropped HorizontalPager (epic #94: no drag-follow), so the bounds the
+ * pager's pageCount used to enforce live here, unit-tested. Only meaningful
+ * at PAGE depth: deeper levels own their own horizontal gestures.
+ */
+fun HaloNavState.stepPage(delta: Int, model: HaloModel): HaloNavState {
+    if (depth != HaloDepth.PAGE) return this
+    return copy(page = (page + delta).coerceIn(SETTINGS_PAGE, model.projects.size))
+}
+
+/**
  * True on the FIRST pager slot of the current scope: there the UI maps
  * swipe-right/‹ to [back] instead of a step. With sessions present the spawn
  * card is the END, so a null selection is NOT the start; an empty scope's
