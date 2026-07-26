@@ -576,6 +576,11 @@ export function sessionEventPayload(slot, fields) {
   // Rides `ended` payloads too — meaningless there (clients prune ended
   // sessions outright), but uniformity beats a special case nobody reads.
   if (slot.idle) payload.idle = true;
+  // Additive spawn attribution: echoes the requestId of the watch spawn that
+  // created this session, so a client whose spawn call timed out can match
+  // the late arrival to it ("arrived late", not a mystery session). Clients
+  // that don't know the field ignore it.
+  if (slot.spawnRequestId) payload.spawnRequestId = slot.spawnRequestId;
   return payload;
 }
 
@@ -1552,7 +1557,7 @@ export function endHookSession(body) {
  *  SDK's underlying session_id used for hook correlation; in this fork it equals
  *  `sessionId`, but it is passed explicitly so the binding is correct even if
  *  that ever diverges. Returns the slot. */
-export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title }) {
+export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title, detached }) {
   const boundSdkId = sdkSessionId || sessionId;
   const resolvedCwd = cwd || CLI_CWD || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
@@ -1598,6 +1603,12 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title
     if (typeof title === "string" && title && !slot.title) slot.title = title;
     slot.endedAt = undefined;
     slot.endedAuthoritatively = false;
+    // Watch-spawned pickup state, driven entirely by what the fork announces:
+    // a register WITH the flag (spawn, or the replay after a bridge restart)
+    // marks it; one WITHOUT (adoption's re-register, or any normal session)
+    // clears it — so the wrist-only permission policy ends the moment a Zed
+    // thread owns the session.
+    slot.detached = detached === true;
   } else {
     slot = {
       id: sessionId,
@@ -1617,6 +1628,8 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title
       // CHANGES, so without this the watch shows the raw uuid until the next
       // turn ends.
       ...(typeof title === "string" && title ? { title, titleIsAi: true } : {}),
+      // Watch-spawned, no editor thread yet (see the refresh branch above).
+      ...(detached === true ? { detached: true } : {}),
     };
     sessions.set(sessionId, slot);
   }
