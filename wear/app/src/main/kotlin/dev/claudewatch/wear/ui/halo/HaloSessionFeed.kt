@@ -1,49 +1,59 @@
-// Handoff §4 — the live session feed: ‹ › header cycling through the
-// project's sessions (also horizontal swipe), a bottom-anchored tail of the
-// session's terminal ring, and a bottom slot that is either the terracotta
-// "waiting" banner (tap = open the card) or the Dictate pill. The feed
-// scrolls via ROTARY ONLY, per the handoff's interaction table ("rotary
-// scrolls lists/feeds") — leaving vertical touch drags unconsumed is also
-// what keeps InnerScreen's swipe-down-back reachable under a scrollable.
+// The v2 session feed (Halo v2 S6, epic #94): chrome-free — no header, no
+// arrows, no waiting banner. The terminal tail fills the screen inside a soft
+// circular mask (offscreen compositing + radial DstIn fade, so a line
+// dissolves before it can reach the ring channel at any scroll position) and
+// scrolls by TOUCH and rotary on a reversed list. Navigation is gestural:
+// swipe right = back to the session list (sibling cycling died with the
+// header — position lives in the list pager now), an at-top pull-down = back
+// too, and while the session waits the whole feed surface is the prompt's tap
+// target. The dictate pill (and its honest "unavailable" variant, issue #78)
+// keeps the bottom slot when nothing is waiting. The ring behind the feed
+// stays hidden at this slice — the full-circle feed ring is S7's morph work.
 // px values are at the 450 reference (≈ px/2 in dp, matching HaloTheme).
 package dev.claudewatch.wear.ui.halo
 
+import android.os.SystemClock
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.LocalOverscrollConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
@@ -52,7 +62,6 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
@@ -61,13 +70,32 @@ import androidx.wear.compose.material.Text
 import dev.claudewatch.shared.terminal.TerminalLine
 import dev.claudewatch.shared.terminal.TerminalLineType
 import dev.claudewatch.wear.BridgeViewModel
-import dev.claudewatch.wear.ui.halo.Halo.SessionState
 
-/** Session-cycle swipe threshold ≈60px at the 450 reference (≈ px/2 in dp). */
-private val CYCLE_SWIPE_THRESHOLD = 30.dp
+/** Back-swipe threshold ≈60px at the 450 reference (the app-wide gesture unit). */
+private const val BACK_SWIPE_FRACTION = 60f / HALO_REF_PX
 
-/** Title wrap width ≈230px at the 450 reference. */
-private val TITLE_MAX_WIDTH = 115.dp
+/** A swipe suppresses the synthetic tap that can follow it on-device. */
+private const val TAP_GUARD_MS = 300L
+
+/**
+ * The circular feed mask (epic #94 constants): fully opaque inside 168 ref-px
+ * of centre, faded to transparent by 194 — inside the ring channel's inner
+ * stroke edge (214 − 6/2 = 211), so text can NEVER clip the ring, whatever
+ * the scroll position. Drawn as a radial DstIn over the offscreen-composited
+ * list layer: DstIn against the layer's own alpha, not the black beneath.
+ */
+private const val MASK_OPAQUE_PX = 168f
+private const val MASK_FADE_PX = 194f
+
+/**
+ * v2 feed insets (epic constants): where content RESTS. contentPadding, not
+ * outer padding, on purpose — an outer pad would hard-clip lines at the inset
+ * edge, while resting insets let a mid-scroll line ride through them into the
+ * mask's fade band and dissolve instead of shearing.
+ */
+private val FEED_TOP_INSET = 30.dp
+private val FEED_BOTTOM_INSET = 48.dp
+private val FEED_SIDE_INSET = 31.dp
 
 @Composable
 fun HaloSessionFeed(
@@ -76,7 +104,7 @@ fun HaloSessionFeed(
     ui: BridgeViewModel.UiState,
     onOpenCard: () -> Unit,
     onDictate: () -> Unit,
-    onCycle: (String) -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val session = model.sessions.firstOrNull { it.id == sessionId }
@@ -94,32 +122,31 @@ fun HaloSessionFeed(
         return
     }
 
-    // ‹ › cycle within the project. An orphan prompt's project can be missing
-    // from the model's project list by the time we render; degrade to a
-    // single-session "project" instead of indexing into nothing.
-    val siblings = model.projects.firstOrNull { it.name == session.projectName }
-        ?.sessions ?: listOf(session)
-    val index = siblings.indexOfFirst { it.id == session.id }.coerceAtLeast(0)
     // The swipe detector lives in a pointerInput(Unit) that never restarts;
-    // this keeps it cycling through the CURRENT sibling list, not a stale one.
-    val cycleBy by rememberUpdatedState<(Int) -> Unit> { delta ->
-        if (siblings.size > 1) onCycle(siblings[(index + delta).mod(siblings.size)].id)
-    }
+    // this keeps it calling the current back, not a stale capture.
+    val back by rememberUpdatedState(onBack)
+    var lastSwipeAtMs by remember { mutableLongStateOf(0L) }
 
     Box(
         modifier = modifier
             .fillMaxSize()
-            // Horizontal swipe cycles sessions (handoff §4). Horizontal only:
-            // vertical drags stay unconsumed for InnerScreen's back detector.
+            // Swipe right = back to the list (nav's back() preserves this
+            // session as the pager selection, #95). Horizontal only: vertical
+            // drags belong to the tail's touch scroll (and, on the empty
+            // state, fall through to InnerScreen's swipe-down back). Deltas
+            // are CONSUMED so the tap-to-prompt clickable below sees the
+            // gesture as claimed and cancels its press — the uptime tap
+            // guard stays as the second line of defence.
             .pointerInput(Unit) {
-                val threshold = CYCLE_SWIPE_THRESHOLD.toPx()
+                val threshold = size.width * BACK_SWIPE_FRACTION
                 var total = 0f
                 detectHorizontalDragGestures(
                     onDragStart = { total = 0f },
                     onDragEnd = {
-                        // Swipe left = next session (content follows finger).
-                        if (total < -threshold) cycleBy(1)
-                        else if (total > threshold) cycleBy(-1)
+                        if (total > threshold) {
+                            lastSwipeAtMs = SystemClock.uptimeMillis()
+                            back()
+                        }
                     },
                 ) { change, dragAmount ->
                     total += dragAmount
@@ -128,123 +155,41 @@ fun HaloSessionFeed(
             }
             .testTag("haloFeed-${session.id}"),
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            FeedHeader(
-                session = session,
-                position = index + 1,
-                count = siblings.size,
-                onPrev = { cycleBy(-1) },
-                onNext = { cycleBy(1) },
-            )
-            val bridgeSession = ui.bridge.sessions[sessionId]
+        // Tap-to-prompt: while THIS session waits, the whole feed surface is
+        // the prompt's tap target (the waiting banner's successor), routed
+        // through the same prompt-pinning onOpenCard. No pending → no click
+        // handler AT ALL, not a disabled one — an inert target would still
+        // announce a click action the session cannot honour.
+        val feedTap = if (session.pending != null) {
+            Modifier
+                .clickable {
+                    if (SystemClock.uptimeMillis() - lastSwipeAtMs > TAP_GUARD_MS) onOpenCard()
+                }
+                .testTag("haloFeedTap")
+        } else {
+            Modifier
+        }
+        val bridgeSession = ui.bridge.sessions[sessionId]
+        Box(modifier = Modifier.fillMaxSize().then(feedTap)) {
             FeedTail(
                 lines = bridgeSession?.terminal?.items ?: emptyList(),
                 thinking = bridgeSession?.thinking == true,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
+                onBack = back,
+                modifier = Modifier.fillMaxSize(),
             )
-            if (session.pending != null) {
-                WaitingBanner(state = session.state, onOpenCard = onOpenCard)
-            } else if (session.dictatable) {
-                DictatePill(onDictate = onDictate)
+        }
+        if (session.pending == null) {
+            if (session.dictatable) {
+                DictatePill(
+                    onDictate = onDictate,
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                )
             } else {
                 // Honest affordance (issue #78): a session the bridge can't
                 // reach live (a PTY-less hook session) shows WHY there's no
                 // Dictate, instead of a pill that would silently do nothing.
-                DictateUnavailablePill()
+                DictateUnavailablePill(modifier = Modifier.align(Alignment.BottomCenter))
             }
-        }
-    }
-}
-
-// ── Header: ‹ dot + wrapping title / "n of m · project" › ───────────────────
-
-@Composable
-private fun FeedHeader(
-    session: HaloSession,
-    position: Int,
-    count: Int,
-    onPrev: () -> Unit,
-    onNext: () -> Unit,
-) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            // Clears the TimeText strip; the row's sides stay inside the curve
-            // because the arrows are narrow and the title is width-capped.
-            .padding(top = 26.dp),
-    ) {
-        CycleArrow(glyph = "‹", visible = count > 1, onClick = onPrev)
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.weight(1f),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(6.dp) // 12px state dot, as on list rows
-                        .background(Halo.colorFor(session.state), CircleShape),
-                )
-                Spacer(modifier = Modifier.width(5.dp))
-                Text(
-                    text = session.title,
-                    fontSize = 12.sp, // 24px / 1.15
-                    fontWeight = FontWeight.Medium,
-                    lineHeight = 14.sp,
-                    color = Halo.Palette.TextPrimary,
-                    textAlign = TextAlign.Center,
-                    // Wraps by design; the cap stops a pathological label.
-                    maxLines = 3,
-                    modifier = Modifier.widthIn(max = TITLE_MAX_WIDTH),
-                )
-            }
-            Text(
-                text = "$position of $count · ${session.projectName}",
-                fontSize = Halo.Type.Min,
-                color = Halo.Palette.TextSecondary,
-                maxLines = 1,
-            )
-            // ⎇ branch badge (issue #54) and workflow-agents indicator
-            // (issue #55) share one faint ellipsized line under the title
-            // area — glanceability first on the round screen. The agents
-            // indicator shows ONLY while subagents are running; it is an
-            // indicator, not a control (a watch cannot stop a workflow). No
-            // branch and nothing running = no line (back-compat).
-            val details = listOfNotNull(
-                session.branchLabel,
-                session.agentsRunning.takeIf { it > 0 }?.let { n ->
-                    if (n == 1) "⚙ 1 agent" else "⚙ $n agents"
-                },
-            )
-            if (details.isNotEmpty()) {
-                Text(
-                    text = details.joinToString(" · "),
-                    fontSize = Halo.Type.Min,
-                    color = Halo.Palette.TextSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        CycleArrow(glyph = "›", visible = count > 1, onClick = onNext)
-    }
-}
-
-/**
- * The ‹/› glyphs are small by design, so the touch target is the full 48dp
- * cell. A single-session project hides them but keeps the cells, so the title
- * stays centered and doesn't jump when a sibling appears.
- */
-@Composable
-private fun CycleArrow(glyph: String, visible: Boolean, onClick: () -> Unit) {
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .size(Halo.Geo.TouchMin)
-            .clickable(enabled = visible, onClick = onClick),
-    ) {
-        if (visible) {
-            Text(text = glyph, fontSize = 16.sp, color = Halo.Palette.TextSecondary)
         }
     }
 }
@@ -255,6 +200,7 @@ private fun CycleArrow(glyph: String, visible: Boolean, onClick: () -> Unit) {
 private fun FeedTail(
     lines: List<TerminalLine>,
     thinking: Boolean,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // The empty state composes INSTEAD of the LazyColumn below, so it must be
@@ -299,38 +245,75 @@ private fun FeedTail(
         if (atTail) listState.requestScrollToItem(0)
     }
 
-    // Bottom-anchored via reverseLayout: index 0 is the NEWEST line pinned to
-    // the bottom edge. Touch scrolling is off (rotary-only per the handoff),
-    // which leaves vertical drags to the screen's swipe-down-back.
-    LazyColumn(
-        state = listState,
-        reverseLayout = true,
-        userScrollEnabled = false,
-        modifier = modifier
-            .rotaryScrollable(
-                behavior = RotaryScrollableDefaults.behavior(listState),
-                focusRequester = focusRequester,
-                // The rotary behavior drives scrollBy toward higher indices,
-                // which reverseLayout renders UPWARD — reversed here so the
-                // crown direction matches the session list's.
-                reverseDirection = true,
-            )
-            .padding(horizontal = Halo.Geo.SafeInset)
-            .padding(vertical = 4.dp),
-    ) {
-        if (thinking) {
-            item(key = "thinking") {
-                Box(modifier = Modifier.testTag("haloThinking")) {
-                    FeedLine(TerminalLine("…", TerminalLineType.SYSTEM))
+    // No stretch-overscroll (the API 31+ trap, third bite pre-empted): the
+    // platform stretch effect would consume every post-bound drag delta
+    // before nested scroll sees the leftovers, making the at-top pull-down
+    // back below unreachable by a real finger while synthetic taps stay green.
+    @OptIn(ExperimentalFoundationApi::class)
+    CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
+        // Bottom-anchored via reverseLayout: index 0 is the NEWEST line pinned
+        // to the bottom edge, and touch scrolling (v2) runs the reversed axis —
+        // dragging down walks into history. The visual TOP of the feed is
+        // therefore the list's FORWARD bound: that is the predicate handed to
+        // the pull-down back connection — the direction inversion that bit
+        // twice, encoded once here.
+        LazyColumn(
+            state = listState,
+            reverseLayout = true,
+            contentPadding = PaddingValues(
+                start = FEED_SIDE_INSET,
+                end = FEED_SIDE_INSET,
+                top = FEED_TOP_INSET,
+                bottom = FEED_BOTTOM_INSET,
+            ),
+            modifier = modifier
+                // The mask: composite the whole list offscreen, then keep only
+                // what the radial gradient covers (DstIn) — opaque well inside
+                // the ring channel, gone before the stroke. Layer alpha, not
+                // the black background, is what the blend erases into.
+                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                .drawWithCache {
+                    val scale = size.minDimension / HALO_REF_PX
+                    val mask = Brush.radialGradient(
+                        MASK_OPAQUE_PX / MASK_FADE_PX to Color.White,
+                        1f to Color.Transparent,
+                        center = Offset(size.width / 2f, size.height / 2f),
+                        radius = MASK_FADE_PX * scale,
+                    )
+                    onDrawWithContent {
+                        drawContent()
+                        drawRect(brush = mask, blendMode = BlendMode.DstIn)
+                    }
+                }
+                .nestedScroll(
+                    rememberAtTopBackConnection(
+                        atTop = { !listState.canScrollForward },
+                        onBack = onBack,
+                    ),
+                )
+                .rotaryScrollable(
+                    behavior = RotaryScrollableDefaults.behavior(listState),
+                    focusRequester = focusRequester,
+                    // The rotary behavior drives scrollBy toward higher indices,
+                    // which reverseLayout renders UPWARD — reversed here so the
+                    // crown direction matches the session list's.
+                    reverseDirection = true,
+                ),
+        ) {
+            if (thinking) {
+                item(key = "thinking") {
+                    Box(modifier = Modifier.testTag("haloThinking")) {
+                        FeedLine(TerminalLine("…", TerminalLineType.SYSTEM))
+                    }
                 }
             }
+            // Newest-first to match reverseLayout's index order; keys count from
+            // the base so a line keeps its key as older lines fall off the ring.
+            items(
+                count = lines.size,
+                key = { i -> keyState.base + (lines.size - 1 - i) },
+            ) { i -> FeedLine(lines[lines.size - 1 - i]) }
         }
-        // Newest-first to match reverseLayout's index order; keys count from
-        // the base so a line keeps its key as older lines fall off the ring.
-        items(
-            count = lines.size,
-            key = { i -> keyState.base + (lines.size - 1 - i) },
-        ) { i -> FeedLine(lines[lines.size - 1 - i]) }
     }
 }
 
@@ -440,50 +423,16 @@ private fun highlightPassCounts(text: String): AnnotatedString = buildAnnotatedS
     }
 }
 
-// ── Bottom slot: waiting banner / dictate pill ──────────────────────────────
-
-/**
- * Persistent while the session is waiting: a terracotta gradient rising from
- * the bottom edge with the call to action. Tap opens this session's card.
- */
-@Composable
-private fun WaitingBanner(state: SessionState, onOpenCard: () -> Unit) {
-    val label =
-        if (state == SessionState.WAITING_Q) "has a question →" else "waiting for permission →"
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(Halo.Geo.TouchMin)
-            .background(
-                Brush.verticalGradient(
-                    0f to Color.Transparent,
-                    1f to Halo.Palette.WaitingForYou.copy(alpha = 0.30f),
-                ),
-            )
-            .clickable(onClick = onOpenCard)
-            .testTag("haloWaitingBanner"),
-    ) {
-        Text(
-            text = label,
-            fontSize = 11.5.sp, // 23px medium
-            fontWeight = FontWeight.Medium,
-            color = Halo.Palette.WaitingForYou,
-            maxLines = 1,
-            // Lifts the text off the screen curve; the tap target stays 48dp.
-            modifier = Modifier.padding(bottom = 8.dp),
-        )
-    }
-}
+// ── Bottom slot: dictate pill ───────────────────────────────────────────────
 
 @Composable
-private fun DictateUnavailablePill() {
+private fun DictateUnavailablePill(modifier: Modifier = Modifier) {
     // Same footprint as DictatePill but non-interactive and muted: the bridge
     // cannot deliver dictation into this session live (issue #78), so we say so
     // rather than offer a pill that does nothing.
     Box(
         contentAlignment = Alignment.Center,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .height(Halo.Geo.TouchMin)
             .testTag("haloDictateUnavailable"),
@@ -508,10 +457,10 @@ private fun DictateUnavailablePill() {
 }
 
 @Composable
-private fun DictatePill(onDictate: () -> Unit) {
+private fun DictatePill(onDictate: () -> Unit, modifier: Modifier = Modifier) {
     Box(
         contentAlignment = Alignment.Center,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .height(Halo.Geo.TouchMin)
             .clickable(onClick = onDictate)

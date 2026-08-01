@@ -217,14 +217,53 @@ class ApprovalFlowTest {
         assertEquals(0, cardCount())
         assertEquals("no gesture may send a decision", emptyList<Pair<String, String>>(), answers)
 
-        // The prompt is intact and re-openable: the session's feed still
-        // carries the waiting banner, and the reopened card is answerable.
-        compose.onNodeWithTag("haloWaitingBanner").assertIsDisplayed().performClick()
+        // The prompt is intact and re-openable: while the session waits its
+        // whole feed surface is the prompt's tap target (v2 — the waiting
+        // banner's successor), and the reopened card is answerable.
+        compose.onNodeWithTag("haloFeedTap").assertIsDisplayed().performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
         armCard()
         compose.onNodeWithTag("haloApprove").performClick()
         assertEquals(listOf("perm-bash" to "allow"), answers)
+    }
+
+    /**
+     * The v2 feed's tap-to-prompt (S6 — the waiting banner's successor):
+     * while the session waits, tapping its feed surface opens its OWN card;
+     * once nothing is pending there is NO click target at all — not a
+     * disabled one that would still announce and swallow taps.
+     */
+    @Test
+    fun feedSurfaceOpensTheCardOnlyWhileTheSessionWaits() {
+        var state by mutableStateOf(ui(listOf(bashPrompt)))
+        compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
+
+        // Home → pager (s-1 is the scope's first card) → s-1's feed.
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloPagerCard-s-1").performClick()
+        compose.waitForIdle()
+
+        // Waiting: the whole feed surface is the tap target, opening the card
+        // pinned to THIS session's prompt.
+        compose.onNodeWithTag("haloFeedTap").assertIsDisplayed().performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloCard").assertIsDisplayed()
+        compose.onNodeWithText("$ rm -rf ./build").assertIsDisplayed()
+
+        // Decide later, then the prompt resolves elsewhere: the feed stays,
+        // but the click target is GONE with the pending prompt.
+        compose.onNodeWithTag("haloCard").performTouchInput { swipeDown() }
+        compose.waitForIdle()
+        state = ui(emptyList())
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloFeed-s-1").assertIsDisplayed()
+        assertEquals(
+            "no pending prompt → no feed click target",
+            0,
+            compose.onAllNodes(hasTestTag("haloFeedTap")).fetchSemanticsNodes().size,
+        )
     }
 
     @Test
@@ -553,12 +592,13 @@ class ApprovalFlowTest {
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
 
         // Swipe down = "answer later": nothing sent, prompt intact, and the
-        // reopened card starts the walk again — no half-buffered ghost state.
+        // reopened card (feed tap — the waiting session's whole surface)
+        // starts the walk again — no half-buffered ghost state.
         compose.onNodeWithTag("haloCard").performTouchInput { swipeDown() }
         compose.waitForIdle()
         assertEquals(0, cardCount())
         assertEquals("no gesture may submit answers", 0, sent.size)
-        compose.onNodeWithTag("haloWaitingBanner").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("haloFeedTap").assertIsDisplayed().performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
         armCard()

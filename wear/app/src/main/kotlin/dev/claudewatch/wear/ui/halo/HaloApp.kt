@@ -431,7 +431,7 @@ private fun HaloAppBody(
                         model = model,
                         sessionId = layer.sessionId,
                         ui = ui,
-                        // The banner belongs to THIS session: pin its own
+                        // The feed tap belongs to THIS session: pin its own
                         // prompt, not whatever sits at the global queue front.
                         onOpenCard = {
                             val pending = currentModel.sessions
@@ -440,7 +440,9 @@ private fun HaloAppBody(
                         },
                         // Dictation from a feed goes to THAT session.
                         onDictate = { dictate(layer.sessionId) },
-                        onCycle = { nav = nav.copy(sessionId = it) },
+                        // Swipe-right and the at-top pull-down both land here;
+                        // back() keeps the session as the pager selection (#95).
+                        onBack = { nav = nav.back() },
                     )
                 }
             }
@@ -1137,9 +1139,10 @@ private fun PageDots(
  * time. The back detector sits UNDER the content, so it only covers screens
  * without a full-screen scrollable: a scrollable child consumes every
  * vertical drag (its leftover goes to nested scroll, never back to pointer
- * input) and would have to re-provide back itself, as the retired session
- * list did — the v2 pager and the rotary-only feed deliberately leave
- * vertical touch drags unconsumed, so this one detector serves both.
+ * input) and has to re-provide back itself — the touch-scrolling feed (v2
+ * S6) does, via its at-top pull-down connection, exactly as the retired
+ * session list did. The v2 pager (and the feed's empty state) has no
+ * scrollable, so vertical drags there fall through to this one detector.
  */
 @Composable
 private fun InnerScreen(
