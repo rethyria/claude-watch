@@ -218,6 +218,32 @@ class HaloSessionPagerTest {
     }
 
     @Test
+    fun answerPillOutranksTheKillCellInTheirOverlapBand() {
+        val kills = mutableListOf<String>()
+        compose.setContent {
+            HaloApp(ui = ui(), actions = HaloActions(onKill = { kills += it }))
+        }
+        drill()
+        next()
+        compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
+
+        // The epic's numbers physically overlap on a waiting card: the pill's
+        // bottom band (154dp + 25dp) sits inside the ✕ cell's hit area (the
+        // 72dp-radius arc). The pill is the pager's TOPMOST layer exactly so
+        // a finger aiming at Answer's lower half can never kill the session —
+        // this tap targets the contested pixels BY COORDINATE, not by node.
+        val pill = compose.onNodeWithTag("haloAnswerPill").fetchSemanticsNode().boundsInRoot
+        compose.onNodeWithTag("haloRoot").performTouchInput {
+            down(Offset(pill.center.x, pill.bottom - 2f))
+            up()
+        }
+        compose.waitForIdle()
+        assertEquals("a tap on the pill must never reach the ✕ cell", 0, kills.size)
+        compose.onNodeWithTag("haloCard").assertIsDisplayed()
+        compose.onNodeWithText("Write notes.txt").assertIsDisplayed()
+    }
+
+    @Test
     fun actionArcCloseKillsOwnedSessionsAndHidesExternalOnes() {
         val kills = mutableListOf<String>()
         val hides = mutableListOf<String>()

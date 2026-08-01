@@ -39,14 +39,15 @@ class HaloPreviewScreens {
 
     private fun fixtureFrames(): List<SseFrame> = listOf(
         SseFrame("1", "session", """{"state":"connected"}"""),
-        // Alpha carries the #54/#55 metadata so the pager card's detail line
-        // ("⎇ main · ⚙ 2 agents") is on the reference capture; activity stays
-        // WORKING, so the two running subagents do NOT flip it DELEGATED.
+        // Alpha carries the #54 branch so the pager card's detail line
+        // ("⎇ main") is on the reference capture — branch alone, because
+        // agents.running > 0 would flip the card DELEGATED (blue outranks
+        // green by design) and this capture is the RUNNING reference.
         SseFrame(
             "2",
             "session",
             """{"state":"running","agent":"claude","cwd":"/home/dev/projects/claude-watch","folderName":"claude-watch",""" +
-                """"branch":"main","agents":{"running":2,"done":1},"sessionId":"$alpha"}""",
+                """"branch":"main","sessionId":"$alpha"}""",
         ),
         SseFrame(
             "3",
@@ -78,10 +79,13 @@ class HaloPreviewScreens {
             "tool-output",
             """{"source":"codex","tool_name":"Bash","tool_input":{"command":"npm test"},"tool_output":null,"sessionId":"$beta"}""",
         ),
+        // Gamma carries the #55 workflow fleet: DELEGATED blue on the home
+        // ring (agents outrank the working main loop — issue #67's ranking).
         SseFrame(
             "8",
             "session",
-            """{"state":"running","agent":"claude","cwd":"/home/dev/projects/bridge","folderName":"bridge","sessionId":"$gamma"}""",
+            """{"state":"running","agent":"claude","cwd":"/home/dev/projects/bridge","folderName":"bridge",""" +
+                """"agents":{"running":2,"done":1},"sessionId":"$gamma"}""",
         ),
         // Enough tail that the masked feed capture (v2 S6) shows lines
         // dissolving into the circular fade band rather than a short stub.

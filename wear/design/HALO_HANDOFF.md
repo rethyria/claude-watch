@@ -720,6 +720,19 @@ tween.
    `sessionDetailLine` JVM-pinned in `HaloSubheadingTest`; tag
    `haloCardDetails`.
 6. **#102's live-ACP check** — PENDING ON THE WRIST (see below).
+7. **(New, from the capture compare) Answer pill vs ✕ kill cell** — the
+   epic's own numbers overlap on a waiting card: the pill (154dp top, 25dp
+   tall) and the action arc's upper cells (72dp radius, 33dp cells) share a
+   band, and with the pill inside the card the later-composed arc WON those
+   taps — a finger aiming at Answer's lower half killed the session. FIXED
+   by hoisting the pill to the pager's topmost layer (same AnimatedContent
+   key + spec as the card, so it still slides in lockstep); every epic
+   number is kept — the visual grazing is the design's own geometry, flagged
+   for the user's design pass. Instrumented regression:
+   `answerPillOutranksTheKillCellInTheirOverlapBand` taps the contested
+   pixels BY COORDINATE. Related capture note: on the feed, the inset clock
+   sits over the mask's fade band at 12 o'clock — lines there are already
+   dissolving, and the ring stays clear; also left to the design pass.
 
 ### Pending on-wrist live checks (post-epic, user steps)
 

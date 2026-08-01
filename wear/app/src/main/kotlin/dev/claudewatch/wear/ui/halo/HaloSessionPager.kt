@@ -257,7 +257,6 @@ fun HaloSessionPager(
                     session = session,
                     swipedAtMs = { lastSwipeAtMs },
                     onOpen = { onOpenSession(session.id) },
-                    onAnswer = { onAnswer(session) },
                 )
             }
         }
@@ -291,6 +290,36 @@ fun HaloSessionPager(
                 modifier = Modifier.fillMaxSize(),
             )
         }
+
+        // The Answer pill, LAST so it wins the contested pixels (#104, found
+        // in the capture compare): at the epic's shared 154dp the pill's
+        // bottom band and the arc's upper cells physically overlap, and while
+        // the pill lived inside the card the later-composed arc took those
+        // taps — a finger aiming at Answer's lower half hit the ✕ KILL cell.
+        // The card OVER the list must out-rank killing under it. Same
+        // AnimatedContent key + spec as the card, so the pill still slides in
+        // exact lockstep; the wrapper Box takes no input of its own, so
+        // everything outside the pill still reaches the arc and the card.
+        AnimatedContent(
+            targetState = selectedIndex,
+            transitionSpec = { stepTransition() },
+            label = "haloPagerPill",
+        ) { index ->
+            Box(modifier = Modifier.fillMaxSize()) {
+                slots.getOrNull(index)?.let { session ->
+                    if (session.pending != null) {
+                        // The shared pill, exactly where the main pages put it
+                        // (S3's measured 154dp — see ANSWER_PILL_TOP).
+                        HaloAnswerPill(
+                            onClick = { onAnswer(session) },
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = ANSWER_PILL_TOP),
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -318,7 +347,6 @@ private fun SessionCard(
     /** Read at tap time — the guard must see the LATEST swipe, not a capture. */
     swipedAtMs: () -> Long,
     onOpen: () -> Unit,
-    onAnswer: () -> Unit,
 ) {
     Box(
         modifier = Modifier
@@ -385,17 +413,9 @@ private fun SessionCard(
             }
         }
 
-        // The shared Answer pill, exactly where the main pages put it (S3's
-        // measured 154dp — see ANSWER_PILL_TOP): its own click target ABOVE
-        // the card's, so answering can never fall through into the feed.
-        if (session.pending != null) {
-            HaloAnswerPill(
-                onClick = onAnswer,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = ANSWER_PILL_TOP),
-            )
-        }
+        // The waiting card's Answer pill is NOT here: it renders as the
+        // pager's topmost layer (see the call site) so its click target
+        // out-ranks both this card's and the action arc's contested cells.
     }
 }
 
