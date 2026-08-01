@@ -41,7 +41,9 @@ class ApprovalOptionCardTest {
     @get:Rule
     val compose = createComposeRule()
 
-    /** The adapter's ExitPlanMode option list, as the bridge forwards it. */
+    /** The adapter's ExitPlanMode option list, as the bridge forwards it —
+     *  bypass FIRST (the adapter unshifts it), the worst-case wire order the
+     *  card must defuse. */
     private val planOptions = listOf(
         AgentPermissionOption("bypassPermissions", "Yes, and bypass permissions", "allow_always"),
         AgentPermissionOption("auto", "Yes, and use \"auto\" mode", "allow_always"),
@@ -117,12 +119,14 @@ class ApprovalOptionCardTest {
 
         // Every one of the agent's options is on the card, and the reading
         // order is the canonical card's own progression: reject first,
-        // allow_once next, the standing grants LAST — a bypassPermissions-
-        // grade mode switch never sits under the first stray tap. Stable
-        // within a kind, so the agent's own allow_always order is kept.
+        // allow_once next, the standing grants LAST — and bypassPermissions
+        // DEAD last among them, despite the agent listing it first: keeping
+        // agent order would seat a session-wide bypass one 48dp row below the
+        // everyday "manually approve" target. Stable within a rank otherwise,
+        // so the agent's auto/acceptEdits order is kept.
         // (Tree order, not pixel bounds: below-the-fold pills clip.)
         assertEquals(
-            listOf("plan", "default", "bypassPermissions", "auto", "acceptEdits")
+            listOf("plan", "default", "auto", "acceptEdits", "bypassPermissions")
                 .map { "haloAgentOption-$it" },
             compose.onAllNodes(anyAgentOption).fetchSemanticsNodes()
                 .map { it.config[SemanticsProperties.TestTag] },

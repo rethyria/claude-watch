@@ -434,13 +434,19 @@ private fun DecisionLayer(
     }
 }
 
-/** Reading rank per behavior: the canonical card's own progression (Deny,
- *  Approve, then always-allow below), applied to N options. Standing grants —
- *  up to and including a bypassPermissions mode switch — land LAST, at the
- *  far end of the scroll, never under the first stray tap. */
-private fun agentOptionRank(option: AgentPermissionOption): Int = when (option.behavior) {
-    "deny" -> 0
-    "allow" -> 1
+/** Reading rank: the canonical card's own progression (Deny, Approve, then
+ *  always-allow below), applied to N options — standing grants land LAST, at
+ *  the far end of the scroll, never under the first stray tap. Within them a
+ *  bypassPermissions mode switch ranks below its allow-always peers: the
+ *  agent's own order leads the group with bypass (the adapter unshifts it
+ *  first), which would seat a session-wide bypass DIRECTLY under the everyday
+ *  allow_once target — a one-row mis-tap from granting everything. The id is
+ *  Claude's permission-mode id, forwarded verbatim, so it is the one weight
+ *  signal the wire carries; an id we don't know keeps its group's order. */
+private fun agentOptionRank(option: AgentPermissionOption): Int = when {
+    option.behavior == "deny" -> 0
+    option.behavior == "allow" -> 1
+    option.optionId == "bypassPermissions" -> 3
     else -> 2
 }
 
@@ -450,7 +456,9 @@ private fun agentOptionRank(option: AgentPermissionOption): Int = when (option.b
  * emphasised in the waiting accent — a standing grant must never look like
  * just another row. Grouped by rank (stable sort keeps the agent's order
  * within a group) with extra air between groups: a fat-finger between
- * "manually approve" and "bypass permissions" is a decision-grade mis-tap.
+ * "manually approve" and any standing grant is a decision-grade mis-tap —
+ * and bypassPermissions, a rank of its own at the very bottom, gets its own
+ * gap even from the grants above it.
  */
 @Composable
 private fun AgentOptionList(
