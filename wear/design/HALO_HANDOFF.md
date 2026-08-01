@@ -795,3 +795,12 @@ decision in this document:
   While there: eyeball the morph walk, the re-derived pill clearances
   (clock-group + card-group anchoring), the re-centred centerpiece, the mic
   icon states and the TimeText inset on real glass.
+- **Renaming a Zed thread, wrist edition (#112)**: a manual rename in Zed's
+  sidebar/title editor never crosses ACP — Zed persists it purely in its own
+  thread store (verified in Zed's source; upstream limitation, no protocol
+  method exists) — so the wrist keeps the transcript title after a UI
+  rename. The rename that DOES reach the wrist is the in-thread `/rename`
+  slash command (transcript `customTitle` → adapter poll →
+  `session_info_update` → bridge re-announce; pinned by adapter + bridge
+  tests). Worth one live confidence pass: `/rename` in a Zed thread, watch
+  the pager card re-label at the turn's end.

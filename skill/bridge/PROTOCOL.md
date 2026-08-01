@@ -566,6 +566,22 @@ idempotent `running` event. Per the additive-field rules this does not bump
 the protocol version; clients fall back to their own label when it is
 absent.
 
+For **ACP** (Zed-hosted) sessions the transcript-scan derivation above is
+never fed — the title arrives from the adapter instead, which polls the CLI
+transcript's `customTitle` (the SDK folds a user `/rename` and its
+auto-generated title into that one field) and pushes `session_info_update`;
+the bridge re-announces on every change, mid-session included. A manual
+thread rename in **Zed's UI** never reaches this path: nothing crosses ACP
+on a UI rename — Zed persists it purely in its own thread-metadata store
+(`title_override` in `crates/agent_ui/src/thread_metadata_store.rs`; its
+external-agent connection implements no `set_title`, and the ACP protocol
+has no client→agent title method at all — issue #112's wire investigation).
+So Zed's local label and the wrist's can diverge after a UI rename, in that
+direction only; the reverse is safe, because Zed's `title_override` outranks
+agent-pushed titles in its own UI. The wrist-visible rename for a Zed thread
+is the in-thread **`/rename`** slash command, which lands in `customTitle`
+and propagates on the next turn end.
+
 **`external`** (boolean, **optional, additive**): `true` for a HOOK-CREATED
 (external, PTY-less) session the bridge does not own the process of — it was
 observed via hooks, not spawned into a bridge PTY. Carried uniformly on

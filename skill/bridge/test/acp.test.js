@@ -506,6 +506,54 @@ test("ACP session_info_update sets the slot title and announces it (#79)", { tim
   assert.equal((await statusEntry(bridge, token, "acp-title")).title, "Fix the flaky auth tests");
 });
 
+// A rename in Zed's UI never crosses ACP (#112: Zed keeps it in its own
+// thread store), so the wrist-visible rename is the in-thread /rename
+// command: the adapter's turn-end poll sees the changed transcript title and
+// pushes a fresh session_info_update. A CHANGED title must behave exactly
+// like the first one — update the slot and re-announce — or the wrist keeps
+// the stale label until a bridge restart.
+test("a mid-session title change re-announces the slot (#112)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "rename");
+
+  const inbox = connectInbox(bridge, "conn-rename");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-rename", sessionId: "acp-rename", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-rename");
+
+  const pushTitle = (title) =>
+    request(bridge.port, "POST", "/acp/update", {
+      body: {
+        connection: "conn-rename",
+        sessionId: "acp-rename",
+        kind: "session_update",
+        payload: {
+          sessionId: "acp-rename",
+          update: { sessionUpdate: "session_info_update", title },
+        },
+      },
+    });
+
+  await pushTitle("Curve navigation dots");
+  await sse.waitFor(
+    (e) => e.event === "session" && e.parsed?.title === "Curve navigation dots",
+  );
+
+  // The user runs /rename; the next turn-end poll pushes the new title.
+  await pushTitle("Watch bug hunt");
+  const renamed = await sse.waitFor(
+    (e) => e.event === "session" && e.parsed?.title === "Watch bug hunt",
+  );
+  assert.equal(renamed.parsed.sessionId, "acp-rename");
+  assert.equal((await statusEntry(bridge, token, "acp-rename")).title, "Watch bug hunt");
+});
+
 // Re-registration happens on every Zed restart / session resume and on every
 // fork reconnect. It is a re-ANNOUNCEMENT, not new work: an idle session that
 // gets re-announced has not started a turn, so forcing it back to "working"

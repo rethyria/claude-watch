@@ -3422,6 +3422,82 @@ describe("stop reason propagation", () => {
     expect(getSessionInfo).toHaveBeenCalledTimes(2);
   });
 
+  it("propagates a mid-session /rename: a changed customTitle re-pushes and re-notes the title (#112)", async () => {
+    // A manual rename in Zed's UI never crosses ACP — Zed persists it purely
+    // in its own thread-metadata store (title_override), and its external
+    // AcpConnection has no set_title implementation — so the ONLY
+    // wrist-visible rename is the in-thread /rename command, which the SDK
+    // folds into the transcript's customTitle. This pins that path at the
+    // adapter: a customTitle CHANGE after the title has settled must reach
+    // both legs on the next turn-end poll — the client push (teed to the
+    // bridge, which re-announces the slot) and noteSessionTitle (the bridge
+    // channel's restart-replay copy).
+    const sessionUpdates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        sessionUpdates.push(u);
+      },
+    } as unknown as AcpClient;
+    const bridge = {
+      noteSessionTitle: vi.fn(),
+      forwardTurnBoundary: vi.fn(),
+    } as unknown as BridgeChannel;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
+
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "make the nav dots curve",
+      customTitle: "Curve navigation dots",
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      // Two turns; the transcript's customTitle changes between them (the
+      // user typed /rename during or after turn one).
+      for (let i = 0; i < 2; i++) {
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: false,
+        });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "one" }] });
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "make the nav dots curve",
+      customTitle: "Watch bug hunt",
+      lastModified: 1_700_000_000_001,
+    } as any);
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "two" }] });
+    await agent.sessions["test-session"]?.consumer;
+
+    const titles = sessionUpdates
+      .filter((u) => u.update?.sessionUpdate === "session_info_update")
+      .map((u) => u.update.title);
+    // The settled first title must not suppress the /rename: the turn-end
+    // poll stays live for title EVOLUTIONS even after titleSettled disarms
+    // the mid-turn poll.
+    expect(titles).toEqual(["Curve navigation dots", "Watch bug hunt"]);
+    expect(bridge.noteSessionTitle).toHaveBeenNthCalledWith(
+      1,
+      "test-session",
+      "Curve navigation dots",
+    );
+    expect(bridge.noteSessionTitle).toHaveBeenNthCalledWith(2, "test-session", "Watch bug hunt");
+  });
+
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
