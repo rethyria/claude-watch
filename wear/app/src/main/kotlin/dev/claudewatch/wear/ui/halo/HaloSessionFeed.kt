@@ -127,6 +127,7 @@ fun HaloSessionFeed(
     // this keeps it calling the current back, not a stale capture.
     val back by rememberUpdatedState(onBack)
     var lastSwipeAtMs by remember { mutableLongStateOf(0L) }
+    val systemBackInFlight = LocalHaloSystemBackInFlight.current
 
     Box(
         modifier = modifier
@@ -140,16 +141,24 @@ fun HaloSessionFeed(
             // guard stays as the second line of defence.
             .pointerInput(Unit) {
                 val threshold = size.width * BACK_SWIPE_FRACTION
+                // #109: a system back gesture's edge swipe reads here as a
+                // rightward drag — stand down; the root handler's completion
+                // is the one back (SystemBackDragClaim).
+                val claim = SystemBackDragClaim(systemBackInFlight)
                 var total = 0f
                 detectHorizontalDragGestures(
-                    onDragStart = { total = 0f },
+                    onDragStart = {
+                        claim.start()
+                        total = 0f
+                    },
                     onDragEnd = {
-                        if (total > threshold) {
+                        if (!claim.owns && total > threshold) {
                             lastSwipeAtMs = SystemClock.uptimeMillis()
                             back()
                         }
                     },
                 ) { change, dragAmount ->
+                    claim.update()
                     total += dragAmount
                     change.consume()
                 }

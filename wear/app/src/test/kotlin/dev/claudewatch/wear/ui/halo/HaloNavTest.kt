@@ -434,9 +434,10 @@ class HaloNavTest {
     }
 
     // ── System back routing (issue #109) ─────────────────────────────────────
-    // The root BackHandler derives its enabled flag AND its action from
+    // The root PredictiveBackHandler routes every completion through
     // systemBack, so these pin the whole priority order: overlay ≻ card ≻
-    // depth ≻ non-home page ≻ fall through (null = the system exit stands).
+    // depth ≻ non-home page ≻ null (home at rest — the handler's own
+    // deliberate finish, the one exit).
 
     @Test
     fun systemBackDismissesTheTopmostOverlayBeforeAnythingElse() {
@@ -499,9 +500,10 @@ class HaloNavTest {
 
     @Test
     fun systemBackAtTheHomeRestingStateDoesNotIntercept() {
-        // Null = the BackHandler disables itself: nothing registered, the
-        // system's own back (exit to the watch face) stands — the ONLY state
-        // where the edge swipe may leave the app.
+        // Null = nothing left to route: home at rest, the ONLY state where
+        // back may leave the app. Round 2 (#109): the handler stays
+        // registered even here and finishes the activity ITSELF — the system
+        // never gets to commit its own back.
         assertNull(systemBack(HaloNavState(), overlayOpen = false))
     }
 }

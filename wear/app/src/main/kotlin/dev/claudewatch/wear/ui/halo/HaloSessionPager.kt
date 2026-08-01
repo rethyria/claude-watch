@@ -204,6 +204,7 @@ fun HaloSessionPager(
     val rotaryAccumulated = remember { floatArrayOf(0f) }
     LaunchedEffect(selectedId) { rotaryAccumulated[0] = 0f }
 
+    val systemBackInFlight = LocalHaloSystemBackInFlight.current
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -214,11 +215,19 @@ fun HaloSessionPager(
             // second line of defence against on-device synthetic taps.
             .pointerInput(Unit) {
                 val threshold = size.width * STEP_SWIPE_FRACTION
+                // #109: a system back gesture's edge swipe reads here as a
+                // rightward drag — stand down; the root handler's completion
+                // is the one back (SystemBackDragClaim).
+                val claim = SystemBackDragClaim(systemBackInFlight)
                 var total = 0f
                 detectHorizontalDragGestures(
-                    onDragStart = { total = 0f },
+                    onDragStart = {
+                        claim.start()
+                        total = 0f
+                    },
                     onDragEnd = {
                         when {
+                            claim.owns -> Unit
                             total > threshold -> {
                                 lastSwipeAtMs = SystemClock.uptimeMillis()
                                 if (currentAtStart) back() else step(-1)
@@ -230,6 +239,7 @@ fun HaloSessionPager(
                         }
                     },
                 ) { change, dragAmount ->
+                    claim.update()
                     total += dragAmount
                     change.consume()
                 }

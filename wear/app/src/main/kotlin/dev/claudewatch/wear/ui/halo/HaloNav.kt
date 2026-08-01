@@ -252,15 +252,16 @@ sealed interface SystemBack {
 
 /**
  * The system back gesture's ONE route through the IA (issue #109): the root
- * BackHandler derives both its enabled flag (`!= null`) and its action from
- * this, so the priority order is pinned here on the JVM instead of living in
- * a gesture callback. Overlay first, then the card (closing it restores the
- * exact prior position — [back]'s card branch), then one depth step
- * (feed → list keeps the selection, list → page clears it), then any
- * non-home page — projects, usage, settings — jumps straight home rather
- * than walking the row. Null means DO NOT INTERCEPT: the app is at the home
- * resting state, the handler disables itself, and the system's own back
- * (exit to the watch face) stands — the only place it may.
+ * PredictiveBackHandler routes every gesture completion through this, so the
+ * priority order is pinned here on the JVM instead of living in a gesture
+ * callback. Overlay first, then the card (closing it restores the exact
+ * prior position — [back]'s card branch), then one depth step (feed → list
+ * keeps the selection, list → page clears it), then any non-home page —
+ * projects, usage, settings — jumps straight home rather than walking the
+ * row. Null means HOME AT REST: nothing left to route, and the handler —
+ * which stays registered even here (round 2's always-enabled invariant: an
+ * enabled flag that drops mid-gesture lets the system commit its own back)
+ * — finishes the activity itself, the one deliberate exit.
  */
 fun systemBack(nav: HaloNavState, overlayOpen: Boolean): SystemBack? = when {
     overlayOpen -> SystemBack.DismissOverlay

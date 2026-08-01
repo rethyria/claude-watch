@@ -1,6 +1,7 @@
 package dev.claudewatch.wear
 
 import android.os.ParcelFileDescriptor
+import androidx.activity.BackEventCompat
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,12 +32,13 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * The SYSTEM back route (issue #109): one root BackHandler, enabled off the
- * pure systemBack (HaloNav.kt), so the left-bezel edge swipe — Wear's system
- * back gesture — means BACK everywhere and exits only from home. Driven with
- * fixture UiStates — no bridge, no network. Instrumented injections never
- * start at the bezel (that is how the exit shipped unnoticed), so these tests
- * attack the DISPATCH seams instead:
+ * The SYSTEM back route (issue #109, round 2): one root ALWAYS-ENABLED
+ * PredictiveBackHandler routing completions through the pure systemBack
+ * (HaloNav.kt), so the left-bezel edge swipe — Wear's system back gesture —
+ * means BACK everywhere and exits only from home, as the handler's OWN
+ * deliberate finish. Driven with fixture UiStates — no bridge, no network.
+ * Instrumented injections never start at the bezel (that is how the exit
+ * shipped unnoticed), so these tests attack the DISPATCH seams instead:
  *
  *  - Espresso.pressBack / pressBackUnconditionally inject a real system
  *    KEYCODE_BACK, which the opted-in app (manifest
@@ -45,17 +47,20 @@ import org.junit.runner.RunWith
  *  - onBackPressedDispatcher.onBackPressed() drives the androidx seam the
  *    system callback is bridged into (what the SM-L330's hardware back
  *    button commits);
+ *  - dispatchOnBackStarted/-Progressed drive the PREDICTIVE half of that
+ *    same seam — exactly what the API-34 OnBackAnimationCallback feeds it —
+ *    which is how the mid-gesture race test holds a system gesture in
+ *    flight while injecting the app-surface drag that killed round 1;
  *  - one test shell-injects a true LEFT-EDGE swipe (system-level input, the
  *    gesture the compose harness cannot make) and pins the measured Wear
- *    dispatch's stable half: an armed handler suppresses the system
- *    swipe-dismiss — no more mid-session exits. (The disarmed half, edge
- *    swipe at home = system dismiss, is too injection-racy to gate on; see
- *    that test's comment.)
+ *    dispatch's stable half: a registered handler suppresses the system
+ *    swipe-dismiss — no more mid-session exits.
  *
- * Priority and fall-through: overlays first (voice, spawn picker), then the
- * card (position under it preserved), then depth, then non-home pages jump
- * home — and at the home resting state NOTHING is registered, so the system
- * exit stands (the one place the app may close).
+ * Priority: overlays first (voice, spawn picker), then the card (position
+ * under it preserved), then depth, then non-home pages jump home — and the
+ * handler stays REGISTERED at the home resting state (round 2's invariant:
+ * an enabled flag that could drop mid-gesture was the round-1 exit), where
+ * a completed back is the one deliberate activity.finish().
  */
 @RunWith(AndroidJUnit4::class)
 class HaloSystemBackTest {
@@ -164,9 +169,10 @@ class HaloSystemBackTest {
         compose.waitForIdle()
         assertAtHome()
 
-        // At the home resting state the handler has disabled itself: nothing
-        // is registered, so the NEXT back is the system's — the app may exit.
-        assertFalse(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
+        // Home reached — and the handler is STILL registered (round 2's
+        // always-enabled invariant): the NEXT back is OURS too, a deliberate
+        // finish, never the system's own commit.
+        assertTrue(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
     }
 
     @Test
@@ -184,7 +190,9 @@ class HaloSystemBackTest {
 
         dispatchSystemBack()
         assertAtHome()
-        assertFalse(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
+        // Registered at home too (round 2): landing home must never blink
+        // the callback off — that blink was the round-1 exit.
+        assertTrue(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
     }
 
     @Test
@@ -245,17 +253,21 @@ class HaloSystemBackTest {
     }
 
     @Test
-    fun backAtHomeIsNotInterceptedAndTheAppMayExit() {
+    fun backAtHomeFinishesThroughTheAlwaysRegisteredHandler() {
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         assertAtHome()
 
-        // The fall-through contract itself: at the home resting state the
-        // enabled flag is false, so NOTHING is registered on the dispatcher —
-        // under the opted-in manifest that also unregisters the system-side
-        // OnBackInvokedCallback, restoring the default dismiss-and-exit.
-        assertFalse(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
+        // Round 2's registration invariant, asserted at the exact state
+        // round 1 used to unregister in: the handler stays on the dispatcher
+        // even at home, so the system-side OnBackInvokedCallback never drops
+        // and the system can never commit its own back (nor run the
+        // home-preview face-peek) — anywhere.
+        assertTrue(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
 
-        // And end-to-end: an uninterception system back closes the activity.
+        // End-to-end: KEYCODE_BACK routes INTO the handler, systemBack
+        // routes null (home at rest), and the handler finishes the activity
+        // ITSELF — the one deliberate exit, guarded to fire exactly once
+        // (finish() flips isFinishing synchronously on the main thread).
         Espresso.pressBackUnconditionally()
         val deadline = System.currentTimeMillis() + 10_000
         while (
@@ -265,7 +277,7 @@ class HaloSystemBackTest {
             Thread.sleep(50)
         }
         assertEquals(
-            "back at home must fall through to the system exit",
+            "back at home must finish the activity via the handler",
             Lifecycle.State.DESTROYED,
             compose.activityRule.scenario.state,
         )
@@ -307,10 +319,12 @@ class HaloSystemBackTest {
      * run-to-run on the emulator, so no landing state is asserted. A dropped
      * injection would pass vacuously, which is why this is a TRIPWIRE (it
      * can only fail for real — a dismissal — never falsely) rather than the
-     * whole proof; the disarmed half (edge swipe at home = system dismiss)
-     * dismisses reliably by hand on both images but races emulator SysUI
-     * state too erratically under instrumentation to gate on, so it lives in
-     * the keyevent exit test above plus the on-wrist checklist.
+     * whole proof. Since round 2 the handler never unregisters, so there is
+     * no disarmed state left ANYWHERE: the home edge swipe is now the
+     * handler's own deliberate finish, pinned by the keyevent exit test
+     * above (a shell edge injection at home races emulator SysUI too
+     * erratically under instrumentation to gate on) plus the on-wrist
+     * checklist.
      */
     @Test
     fun edgeSwipeWithTheHandlerArmedNeverDismissesTheActivity() {
@@ -326,5 +340,72 @@ class HaloSystemBackTest {
         assertFalse("the edge swipe must not dismiss the activity", compose.activity.isFinishing)
         assertTrue(compose.activityRule.scenario.state.isAtLeast(Lifecycle.State.STARTED))
         compose.onNodeWithTag("haloRoot").assertExists()
+    }
+
+    /**
+     * THE round-1 killer, replayed deterministically (#109 round 2): a
+     * predictive system back gesture goes in flight — the androidx test
+     * dispatch seam (dispatchOnBackStarted/-Progressed) drives
+     * handleOnBackStarted exactly as the API-34 OnBackAnimationCallback
+     * does — and MID-GESTURE the gesture's touches arrive at the app
+     * surface as an ordinary rightward drag. On the SM-L330 that drag
+     * stepped a project page to home-at-rest, the enabled-flag BackHandler
+     * unregistered itself while the gesture was in flight, and the release
+     * committed the SYSTEM's own back — activity dead ('app-request', zero
+     * crashes in ApplicationExitInfo). This pins both halves of the round-2
+     * fix: the drag is suppressed (SystemBackDragClaim — nav must NOT move
+     * mid-gesture, so alpha is still on screen before the commit), and the
+     * completion routes the pure systemBack from where the app really is —
+     * alpha jumps home, the activity SURVIVES, the handler stays registered.
+     */
+    @Test
+    fun midGestureSurfaceDragCannotCommitAnExitOrDoubleNavigate() {
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        // One page right of home: alpha (same injection as the jump-home
+        // test above).
+        compose.onNodeWithTag("haloRoot").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(-width / 12f, 0f), delayMillis = 16L) }
+            up()
+        }
+        compose.waitForIdle()
+        compose.onNodeWithText("alpha").assertIsDisplayed()
+
+        // The system gesture starts and progresses: the handler is now
+        // collecting and the in-flight flag is up. waitForIdle after the
+        // start dispatch matters — the onBack coroutine launches on the
+        // composition dispatcher and must run before the drag begins.
+        val dispatcher = compose.activity.onBackPressedDispatcher
+        compose.runOnUiThread {
+            dispatcher.dispatchOnBackStarted(
+                BackEventCompat(2f, 200f, 0f, BackEventCompat.EDGE_LEFT),
+            )
+        }
+        compose.waitForIdle()
+        compose.runOnUiThread {
+            dispatcher.dispatchOnBackProgressed(
+                BackEventCompat(80f, 200f, 0.4f, BackEventCompat.EDGE_LEFT),
+            )
+        }
+        compose.waitForIdle()
+
+        // Mid-gesture, the gesture's touches reach the surface layer: the
+        // rightward drag that would step alpha → home (round 1's fatal nav
+        // mutation). The claim must eat it — still on alpha.
+        compose.onNodeWithTag("haloRoot").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(width / 12f, 0f), delayMillis = 16L) }
+            up()
+        }
+        compose.waitForIdle()
+        compose.onNodeWithText("alpha").assertIsDisplayed()
+
+        // The release commits: completion routes systemBack(alpha) — the
+        // jump home — and the activity survives the exact frame round 1
+        // died on, with the handler still registered for the next gesture.
+        compose.runOnUiThread { dispatcher.onBackPressed() }
+        compose.waitForIdle()
+        assertAtHome()
+        assertTrue(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
     }
 }
