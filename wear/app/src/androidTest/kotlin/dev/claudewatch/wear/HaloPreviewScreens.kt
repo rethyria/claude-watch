@@ -235,4 +235,54 @@ class HaloPreviewScreens {
         compose.onNodeWithTag("haloAnswerPill").performClick()
         hold()
     }
+
+    @Test
+    fun feedDictateMic() {
+        previewEnabled()
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drillToList()
+        // Alpha is bridge-owned (dictatable): the bottom slot carries the
+        // microphone-icon Dictate pill (#104 user feedback).
+        compose.onNodeWithTag("haloPagerCard-$alpha").performClick()
+        hold()
+    }
+
+    /** A lone EXTERNAL hook session (dictatable = false): the reference for
+     *  the muted mic + ⊘ unavailable affordance. Its own fixture, so the
+     *  main captures' three-session ring stays untouched. */
+    @Test
+    fun feedDictateUnavailable() {
+        previewEnabled()
+        val delta = "d2f8c4a7-1b3e-4d6f-8a9c-7e5b2c4d8f22"
+        val frames = listOf(
+            SseFrame("1", "session", """{"state":"connected"}"""),
+            SseFrame(
+                "2",
+                "session",
+                """{"state":"running","agent":"claude","cwd":"/home/dev/projects/claude-watch","folderName":"claude-watch",""" +
+                    """"external":true,"sessionId":"$delta"}""",
+            ),
+            SseFrame(
+                "3",
+                "tool-output",
+                """{"tool_name":"Read","tool_input":{"file_path":"/home/dev/projects/claude-watch/README.md"},""" +
+                    """"tool_output":"file contents here","cwd":"/home/dev/projects/claude-watch","source":"claude","sessionId":"$delta"}""",
+            ),
+            SseFrame(
+                "4",
+                "tool-output",
+                """{"tool_name":"Bash","tool_input":{"command":"git log --oneline -3"},""" +
+                    """"tool_output":"46f8489 wear: the Answer pill outranks the kill cell","cwd":"/home/dev/projects/claude-watch","source":"claude","sessionId":"$delta"}""",
+            ),
+        )
+        val state = BridgeViewModel.UiState(
+            status = "paired, stream open",
+            paired = true,
+            bridge = fold(frames),
+        )
+        compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
+        drillToList()
+        compose.onNodeWithTag("haloPagerCard-$delta").performClick()
+        hold()
+    }
 }

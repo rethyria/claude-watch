@@ -45,12 +45,14 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -86,6 +88,16 @@ private val CARD_TOP = 44.dp
 private val CARD_INSET = 52.dp
 private val SUBHEADING_GAP = 6.dp
 private val SUBHEADING_DOT = 1.5.dp
+
+/**
+ * Answer-pill clearance below the card's text stack (the prototype's own
+ * pager geometry: a 7px column gap + the pill's 15px margin). On this screen
+ * the pill rides IN FLOW under the card group — the #104 user feedback
+ * superseding S5's reuse of the main pages' screen-absolute slot, which
+ * planted the pill squarely on the ✕ kill cell: the arc's top cells begin at
+ * 284 ref-px, far below where the group + this clearance puts the pill.
+ */
+private val PILL_CARD_CLEARANCE = 11.dp
 
 /** Chevron cells: 48dp hit targets hugging the sides, glyphs 36px Light. */
 private val ChevronCell = Halo.Geo.TouchMin
@@ -291,15 +303,18 @@ fun HaloSessionPager(
             )
         }
 
-        // The Answer pill, LAST so it wins the contested pixels (#104, found
-        // in the capture compare): at the epic's shared 154dp the pill's
-        // bottom band and the arc's upper cells physically overlap, and while
-        // the pill lived inside the card the later-composed arc took those
-        // taps — a finger aiming at Answer's lower half hit the ✕ KILL cell.
-        // The card OVER the list must out-rank killing under it. Same
-        // AnimatedContent key + spec as the card, so the pill still slides in
-        // exact lockstep; the wrapper Box takes no input of its own, so
-        // everything outside the pill still reaches the arc and the card.
+        // The Answer pill, LAST so it wins any contested pixels (the 46f8489
+        // hoist, kept as defence-in-depth): while the pill lived inside the
+        // card, the later-composed arc took its taps — a finger aiming at
+        // Answer's lower half hit the ✕ KILL cell. Its POSITION follows the
+        // prototype's own pager geometry (#104 user feedback, superseding
+        // S5's reuse of the main pages' screen-absolute slot that overlapped
+        // the arc): in flow below the card's text stack, laid out here
+        // against an unseen twin of that stack so the two layers can never
+        // drift. Same AnimatedContent key + spec as the card, so the pill
+        // still slides in exact lockstep; the wrapper Box takes no input of
+        // its own, so everything outside the pill still reaches the arc and
+        // the card.
         AnimatedContent(
             targetState = selectedIndex,
             transitionSpec = { stepTransition() },
@@ -308,14 +323,25 @@ fun HaloSessionPager(
             Box(modifier = Modifier.fillMaxSize()) {
                 slots.getOrNull(index)?.let { session ->
                     if (session.pending != null) {
-                        // The shared pill, exactly where the main pages put it
-                        // (S3's measured 154dp — see ANSWER_PILL_TOP).
-                        HaloAnswerPill(
-                            onClick = { onAnswer(session) },
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
-                                .padding(top = ANSWER_PILL_TOP),
-                        )
+                                .padding(start = CARD_INSET, end = CARD_INSET, top = CARD_TOP),
+                        ) {
+                            // The twin: laid out, never drawn, absent from
+                            // semantics — only its measured height is wanted.
+                            SessionCardText(
+                                session = session,
+                                modifier = Modifier
+                                    .alpha(0f)
+                                    .clearAndSetSemantics {},
+                            )
+                            HaloAnswerPill(
+                                onClick = { onAnswer(session) },
+                                modifier = Modifier.padding(top = PILL_CARD_CLEARANCE),
+                            )
+                        }
                     }
                 }
             }
@@ -356,66 +382,82 @@ private fun SessionCard(
             }
             .testTag("haloPagerCard-${session.id}"),
     ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
+        SessionCardText(
+            session = session,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(start = CARD_INSET, end = CARD_INSET, top = CARD_TOP),
-        ) {
-            Text(
-                text = session.title,
-                fontSize = 17.sp, // 34px Medium
-                fontWeight = FontWeight.Medium,
-                lineHeight = 19.4.sp, // 1.14
-                color = Halo.Palette.TextPrimary,
-                textAlign = TextAlign.Center,
-                // Wraps by design; the cap only stops a pathological title.
-                maxLines = 4,
-            )
-            val parts = sessionSubheading(session.modelName, session.modeName, session.usePercent)
-            if (parts.isNotEmpty()) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(top = SUBHEADING_GAP),
-                ) {
-                    parts.forEachIndexed { i, part ->
-                        if (i > 0) {
-                            Box(
-                                modifier = Modifier
-                                    .padding(horizontal = 4.dp)
-                                    .size(SUBHEADING_DOT)
-                                    .background(Halo.Palette.DotOther, CircleShape),
-                            )
-                        }
-                        Text(
-                            text = part.text,
-                            fontSize = 9.5.sp,
-                            color = if (part.hot) Halo.Palette.WaitingForYou else Halo.Palette.TextSecondary,
-                            maxLines = 1,
-                        )
-                    }
-                }
-            }
-            // The #54/#55 line, rehomed from the retired FeedHeader (see
-            // sessionDetailLine). Below the subheading: identity first, then
-            // configuration, then working state.
-            sessionDetailLine(session.branchLabel, session.agentsRunning)?.let { details ->
-                Text(
-                    text = details,
-                    fontSize = Halo.Type.Min,
-                    color = Halo.Palette.TextSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier
-                        .padding(top = if (parts.isEmpty()) SUBHEADING_GAP else 2.dp)
-                        .testTag("haloCardDetails"),
-                )
-            }
-        }
+        )
 
         // The waiting card's Answer pill is NOT here: it renders as the
-        // pager's topmost layer (see the call site) so its click target
-        // out-ranks both this card's and the action arc's contested cells.
+        // pager's topmost layer (see the call site), positioned in flow
+        // below an unseen twin of the text stack above, so its click target
+        // out-ranks both this card's and the action arc's.
+    }
+}
+
+/**
+ * The card's text stack — wrapping title over the S9 `model · mode · use%`
+ * subheading over the #54/#55 detail line. One composable for the two places
+ * that must agree on its height: the visible card, and the pill layer's
+ * invisible twin that gives the hoisted Answer pill the prototype's in-flow
+ * position (same inputs + same constraints ⇒ same layout, by construction).
+ */
+@Composable
+private fun SessionCardText(session: HaloSession, modifier: Modifier = Modifier) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier,
+    ) {
+        Text(
+            text = session.title,
+            fontSize = 17.sp, // 34px Medium
+            fontWeight = FontWeight.Medium,
+            lineHeight = 19.4.sp, // 1.14
+            color = Halo.Palette.TextPrimary,
+            textAlign = TextAlign.Center,
+            // Wraps by design; the cap only stops a pathological title.
+            maxLines = 4,
+        )
+        val parts = sessionSubheading(session.modelName, session.modeName, session.usePercent)
+        if (parts.isNotEmpty()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(top = SUBHEADING_GAP),
+            ) {
+                parts.forEachIndexed { i, part ->
+                    if (i > 0) {
+                        Box(
+                            modifier = Modifier
+                                .padding(horizontal = 4.dp)
+                                .size(SUBHEADING_DOT)
+                                .background(Halo.Palette.DotOther, CircleShape),
+                        )
+                    }
+                    Text(
+                        text = part.text,
+                        fontSize = 9.5.sp,
+                        color = if (part.hot) Halo.Palette.WaitingForYou else Halo.Palette.TextSecondary,
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+        // The #54/#55 line, rehomed from the retired FeedHeader (see
+        // sessionDetailLine). Below the subheading: identity first, then
+        // configuration, then working state.
+        sessionDetailLine(session.branchLabel, session.agentsRunning)?.let { details ->
+            Text(
+                text = details,
+                fontSize = Halo.Type.Min,
+                color = Halo.Palette.TextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .padding(top = if (parts.isEmpty()) SUBHEADING_GAP else 2.dp)
+                    .testTag("haloCardDetails"),
+            )
+        }
     }
 }
 

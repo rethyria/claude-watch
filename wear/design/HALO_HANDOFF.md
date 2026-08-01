@@ -572,7 +572,8 @@ of truth. Reference captures: `wear/design/halo-v2-current-*.png`
   shearing). Touch scrolling joins rotary on the reversed list; swipe right
   = back, at-top pull-down = back; while the session waits the WHOLE feed
   surface is the prompt's tap target (no pending → no click handler at
-  all). Dictate pill/unavailable variant keep the bottom slot.
+  all). Dictate pill/unavailable variant keep the bottom slot (microphone
+  icon; unavailable = same icon struck ⊘ — see the #104 feedback section).
 - **ONE persistent ring** (`HaloRingHost` + `HaloRingState` + `HaloRingMath`,
   S2/S4/S7): fixed channel radius 214 ref-px for every stroke; arc k ENDS at
   −94° − k·(360/n), winds anticlockwise, gaps 8.5° (8° solo). Paint and
@@ -593,11 +594,14 @@ of truth. Reference captures: `wear/design/halo-v2-current-*.png`
   face or swipe up → the scope's session list; feed: swipe right → list;
   no wrap. The centerpiece tap's old jump-to-prompt job moved to the Answer
   pill.
-- **Main screens** (S3): Answer pill (25dp tall, terracotta, "Answer" 11sp
-  SemiBold on `#1A0F0A`) whenever the scope has a prompting session — out of
-  flow at 154dp from the screen top (see deviations), so the clock+subtitle
-  group NEVER shifts; "↑ sessions" hint removed; clock group identical on
-  All and project pages.
+- **Main screens** (S3, re-derived in the #104 feedback round): Answer pill
+  (25dp tall, terracotta, "Answer" 11sp SemiBold on `#1A0F0A`) whenever the
+  scope has a prompting session — out of flow, its top DERIVED as the
+  re-centred clock group's bottom + the prototype's 21px clearance
+  (`Halo.Geo.AnswerPillTopPx`, ≈153dp; supersedes S3's screen-absolute
+  154dp), so the clock+subtitle group NEVER shifts; "↑ sessions" hint
+  removed; clock group identical on All and project pages and centred on its
+  VISUAL extent (see the feedback section below).
 - **Wire** (S8/S9, #97/#102): the adapter's `usage_update` /
   `current_mode_update` / `config_option_update` tee lands on `session`
   events as the additive `model` / `mode` / `contextPct` trio (ACP sessions
@@ -667,10 +671,10 @@ tween.
 
 | Deviation | Rationale |
 |---|---|
-| Answer pill top = **154dp** screen-absolute | The epic table's "119dp absolute" is a verified mislabel: 119dp is the prototype's coordinate INSIDE its 70px-inset face container (238px + 70px = 308px ⇒ 154dp). 119dp screen-absolute buries the pill in the clock. Corrected in a #94 comment; S3 shipped 154dp and the pager card reuses the same `ANSWER_PILL_TOP`. |
+| Answer pill top **DERIVED per surface** (was 154dp screen-absolute) | The epic table's "119dp absolute" is a verified mislabel: 119dp is the prototype's coordinate INSIDE its 70px-inset face container (238px + 70px = 308px ⇒ 154dp), and that absolute number is itself just "clock-group bottom + 21px" in the prototype's box-centred geometry. The #104 user feedback re-based both surfaces on their anchor groups: main pages = re-centred clock-group bottom + 21px (`Halo.Geo.AnswerPillTopPx` ≈ 306 ref-px ⇒ ≈153dp — the group bottom itself sits higher than the mock's 287px because Compose gives the lone clock line the full font box, see `Halo.Geo.ClockLineBoxPx`); pager = IN FLOW below the card's text stack + 22px (`PILL_CARD_CLEARANCE`, the prototype's own pager geometry — its 7px column gap + 15px pill margin), which is what clears the action arc. S5's "reuse the main pages' 154dp on the card" is retired: consulted against the prototype, the pager never shared the home slot. |
 | Fixed ring channel **214** ref-px (design: 205) | The v1 outer-edge-derived radius re-centres per stroke; morphs animate stroke WIDTH, so a per-stroke radius would breathe radially. One channel, ring fattens/thins in place. |
 | Anchor **−94°**, gaps **8.5°/8°** (was −90°-centred/10°) | Design geometry adopted verbatim. |
-| Mic-glyph dictate pill | Pre-v2 user direction, kept. |
+| Microphone-ICON dictate pill (was: hand-drawn mic glyph) | SUPERSEDED by the 2026-08-01 #104 user feedback (which also supersedes the design's text "Dictate" pill): available = a real microphone icon (`drawable/halo_mic`, the Material mic path, TextPrimary); unavailable = the SAME icon muted (TextFaint) with a ⊘ crossed-circle overlay, non-interactive — #78's honest-unavailability semantics and the `haloDictate`/`haloDictateUnavailable` tags kept. |
 | Curved page dots (+ outlined settings/usage dots at slots 0/1) | Pre-v2 user direction, kept; settings page at slot −2, usage at −1. |
 | 200-line feed buffer (design demo: 30) | Pre-v2 user direction, kept. |
 | Swipe-down-back on list + feed | Kept as the app-wide secondary back (design has none). |
@@ -721,18 +725,62 @@ tween.
    `haloCardDetails`.
 6. **#102's live-ACP check** — PENDING ON THE WRIST (see below).
 7. **(New, from the capture compare) Answer pill vs ✕ kill cell** — the
-   epic's own numbers overlap on a waiting card: the pill (154dp top, 25dp
-   tall) and the action arc's upper cells (72dp radius, 33dp cells) share a
-   band, and with the pill inside the card the later-composed arc WON those
-   taps — a finger aiming at Answer's lower half killed the session. FIXED
-   by hoisting the pill to the pager's topmost layer (same AnimatedContent
-   key + spec as the card, so it still slides in lockstep); every epic
-   number is kept — the visual grazing is the design's own geometry, flagged
-   for the user's design pass. Instrumented regression:
-   `answerPillOutranksTheKillCellInTheirOverlapBand` taps the contested
-   pixels BY COORDINATE. Related capture note: on the feed, the inset clock
+   pager pill at the shared 154dp sat squarely on the ✕ kill cell and grazed
+   its neighbours, and with the pill inside the card the later-composed arc
+   WON those taps — a finger aiming at Answer's lower half killed the
+   session. The first fix hoisted the pill to the pager's topmost layer at
+   the SAME 154dp ("every epic number is kept — the visual grazing is the
+   design's own geometry, flagged for the user's design pass"). That stance
+   is SUPERSEDED by the 2026-08-01 binding user feedback: the grazing was a
+   deviation, not the design — consulted directly, the prototype's pager
+   places the pill IN FLOW inside the card column (15px margin under the
+   subheading), far above the arc; only the home/project pages use the
+   absolute slot, and there it is "clock-group bottom + 21px". Both
+   derivations are now implemented (see the feedback section below); the
+   topmost-layer hoist is KEPT as defence-in-depth (same AnimatedContent
+   key + spec, so the pill still slides in lockstep), with
+   `answerPillOutranksTheKillCellInTheirOverlapBand` still tapping the
+   pill's bottom band BY COORDINATE and the new
+   `answerPillRidesTheCardGroupAndClearsTheActionArc` pinning the geometric
+   clearance itself. Related capture note: on the feed, the inset clock
    sits over the mask's fade band at 12 o'clock — lines there are already
-   dissolving, and the ring stays clear; also left to the design pass.
+   dissolving, and the ring stays clear; left to the design pass.
+
+### #104 user design feedback (2026-08-01, binding) — as built
+
+Three items arrived mid-sweep and supersede any conflicting earlier
+decision in this document:
+
+1. **Compact clock (root TimeText): inset, not hidden** — brought DOWN off
+   the rim so it stops clipping the halo: `Halo.Geo.ClockRingClearance`
+   (18 ref-px = 9dp outer arc padding: past the channel's deepest inner
+   reach — the hero's stroke-10 inner edge — plus 2 ref-px), applied at
+   every non-page depth. Direction per the feedback: an inward offset, not
+   removal (the ambient contract needs this clock at every depth anyway).
+2. **Main centerpiece clock: centre line computed over clock + subheading
+   AS A GROUP** — `Arrangement.Center` centres layout BOXES, and the
+   clock's line box (the full ascent+descent font box ≈103 ref-px — a lone
+   line never trims to its 88px/1 line height) hides ~19 ref-px of dead
+   leading above the digit caps (Roboto ascent − cap height — derivation on
+   `Halo.Geo.ClockDeadLeadingPx`), so box-centring rendered the visible
+   mass low. The centerpiece now centres the group's VISUAL extent (digit
+   cap tops → subtitle slot bottom) via a phantom spacer mirroring the
+   dead band — the clock rides ~9.5 ref-px higher. Knock-on, also per the
+   feedback: the Answer pill's offsets are re-derived from their anchor
+   groups instead of screen-absolute 154dp — main pages = re-centred
+   clock-group bottom + 21px (`Halo.Geo.AnswerPillTopPx`); pager = in flow
+   below the card's text stack + 22px (the prototype's own pager geometry,
+   verified against the prototype file), which clears the action arc.
+   Pinned by `clockGroupCentresOnItsVisualExtentAndThePillHangsThePrototype-
+   ClearanceBelowIt` and `answerPillRidesTheCardGroupAndClearsTheActionArc`.
+3. **Dictation affordance: a real microphone ICON** — `drawable/halo_mic`
+   (the Material mic path) replaces the hand-drawn Canvas glyph in the
+   Dictate pill; the unavailable state (#78) is the SAME icon muted with a
+   ⊘ crossed-circle overlay (`haloDictateMicOff`), non-interactive — no
+   click action at all, keeping the honesty semantics. Supersedes the
+   "mic glyph kept" ledger row (updated above). Reference captures:
+   `halo-v2-current-08-dictate-mic.png` /
+   `halo-v2-current-09-dictate-unavailable.png`.
 
 ### Pending on-wrist live checks (post-epic, user steps)
 
@@ -744,5 +792,6 @@ tween.
   not a gate.
 - **v2 install on the physical watch**: the SM-L330 still runs the v1 APK;
   install runbook in the project memory (physical-watch-adb-connection).
-  While there: eyeball the morph walk, the 154dp pill clearance and the
-  TimeText inset on real glass.
+  While there: eyeball the morph walk, the re-derived pill clearances
+  (clock-group + card-group anchoring), the re-centred centerpiece, the mic
+  icon states and the TimeText inset on real glass.

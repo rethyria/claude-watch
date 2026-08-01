@@ -172,16 +172,18 @@ private const val SWIPE_THRESHOLD_FRACTION = 60f / HALO_REF_PX
 private const val TAP_GUARD_MS = 300L
 
 /**
- * The Answer pill's absolute top edge. The design places it top 238px INSIDE
- * the 70px-inset face container — 308px from the screen edge — so the pill
- * clears the centred clock group by the mock's 21px. (The epic's constants
- * table quotes the container-relative 119dp; measured from the screen that
- * number would bury the pill in the clock.) Absolute on purpose: the pill is
- * OUT OF FLOW, so the clock+subtitle group never shifts when it appears.
- * Internal because the session pager's cards (S5) reuse the pill at this
- * exact position — one number, so the two renditions can never drift.
+ * The Answer pill's top edge on the main pages, DERIVED from the clock group
+ * (#104 user feedback, superseding S3's screen-absolute 154dp): the
+ * re-centred group's bottom plus the prototype's 21px clearance — the same
+ * derivation that produced the design's own "top 238px inside the 70px-inset
+ * face container" (= 308px = box-centred group bottom + 21px), re-based on
+ * the group's computed centre line so the pill follows the clock up. Still
+ * OUT OF FLOW on purpose: the clock+subtitle group never shifts when the
+ * pill appears. The session pager does NOT share this number any more — its
+ * pill rides the card group per the prototype's own pager geometry (see
+ * HaloSessionPager's pill layer).
  */
-internal val ANSWER_PILL_TOP = 154.dp
+internal val ANSWER_PILL_TOP = (Halo.Geo.AnswerPillTopPx / 2f).dp
 
 /**
  * On-page usage auto-poll period: the VM's `usageRateLimitMs` (300_000L)

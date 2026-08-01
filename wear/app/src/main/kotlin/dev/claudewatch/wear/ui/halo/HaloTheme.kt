@@ -94,10 +94,15 @@ object Halo {
         val CardRadius = 17.dp               // cards/wells 16–18px
         val RowRadius = 13.dp                // session rows 26px
         val TouchMin = 48.dp
-        /** The dictate pill's microphone. Tuned on the real 454px watch rather
-         *  than derived: at the caption cap-height it replaced (17dp) the glyph
-         *  was too small for the cradle and body to read as one object. */
+        /** The dictate pill's microphone icon. Tuned on the real 454px watch
+         *  rather than derived: at the caption cap-height it replaced (17dp)
+         *  the mic was too small to read as one object. Sized the hand-drawn
+         *  glyph before the #104 feedback swapped in the real icon. */
         val MicGlyph = 20.dp
+        /** The ⊘ struck over the muted mic when dictation is unavailable:
+         *  wide enough to ENCLOSE the icon's ink — a slash alone would read
+         *  as part of the microphone at this size. */
+        val MicOffOverlay = 24.dp
         // Top-anchored lists (session list, spawn picker, discover list) start
         // their scrollable content this far below the top edge, in place of
         // ScalingLazyColumn's default autoCentering — which reserves ~half a
@@ -179,6 +184,63 @@ object Halo {
          */
         const val ClockRingClearance =
             HALO_REF_PX / 2f - (RingChannel - RingStrokeHero / 2f) + 2f
+
+        // ── Centerpiece group centring + Answer pill (#104 user feedback) ───
+        // Roboto's vertical metrics as em fractions (hhea table, 2048 upem:
+        // ascent 1900, descent 500, cap height 1456) — the numbers that say
+        // where glyphs actually paint inside a line box whose height equals
+        // the font size (the centerpiece clock's 88px/1).
+        const val FontAscentEm = 1900f / 2048f
+        const val FontDescentEm = 500f / 2048f
+        const val FontCapHeightEm = 1456f / 2048f
+
+        /** The centerpiece clock's font size == line height at the 450 ref. */
+        const val ClockFontPx = 88f
+        /** Clock → subtitle spacing (design 2px flex gap + 4px margin) and
+         *  the fixed subtitle slot (30px line box) — see HaloCenterpiece. */
+        const val ClockSubtitleGapPx = 6f
+        const val ClockSubtitleSlotPx = 30f
+
+        /**
+         * The clock Text's measured line box: ascent + descent ≈ 103 ref-px,
+         * NOT the 88px/1 line height — Compose does not trim a lone line to
+         * its lineHeight (that takes an explicit LineHeightStyle), so the
+         * single-line clock always measures the full font box. Verified on
+         * the emulator (the box came out ~102.5 device-px at 44sp/density 2;
+         * hhea metrics put it at 103.1 — sub-px rounding).
+         */
+        const val ClockLineBoxPx = (FontAscentEm + FontDescentEm) * ClockFontPx
+        /** The clock + gap + subtitle-slot column, in layout boxes. */
+        const val ClockGroupPx = ClockLineBoxPx + ClockSubtitleGapPx + ClockSubtitleSlotPx
+
+        /**
+         * Dead leading above the clock digits: the baseline sits [FontAscentEm]
+         * below the line box's top, and digits are cap-height tall with no
+         * descenders, so everything above their cap tops — (ascent − cap) ≈
+         * 19 ref-px — is invisible box. Box-centring the clock+subtitle
+         * column (Arrangement.Center) counts that dead band as clock and
+         * sinks the visible mass; the #104 user feedback pins the fix: the
+         * vertical centre line is computed over the clock + subheading as a
+         * GROUP, i.e. over its VISUAL extent (digit cap tops → subtitle slot
+         * bottom), which rides the group [ClockDeadLeadingPx]/2 higher than
+         * box-centring puts it. (The slot's own bottom is honest mass — the
+         * caption's descenders reach it — so only the top band corrects.)
+         */
+        const val ClockDeadLeadingPx =
+            (FontAscentEm - FontCapHeightEm) * ClockFontPx
+
+        /**
+         * The re-centred clock group's bottom edge (the subtitle slot's
+         * bottom): box-centred bottom, lifted by half the dead leading.
+         */
+        const val ClockGroupBottomPx =
+            (HALO_REF_PX - ClockGroupPx - ClockDeadLeadingPx) / 2f + ClockGroupPx
+
+        /** The prototype's Answer-pill clearance below the clock group (the
+         *  epic's "308px = clock-group bottom + 21px" derivation, re-based
+         *  on the re-centred group instead of a screen-absolute number). */
+        const val AnswerPillClearancePx = 21f
+        const val AnswerPillTopPx = ClockGroupBottomPx + AnswerPillClearancePx
     }
 
     // ── Motion (Halo v2, epic #94) ──────────────────────────────────────────

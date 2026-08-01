@@ -43,9 +43,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -56,6 +54,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -66,10 +65,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
 import androidx.wear.compose.foundation.rotary.rotaryScrollable
+import androidx.wear.compose.material.Icon
 import androidx.wear.compose.material.Text
 import dev.claudewatch.shared.terminal.TerminalLine
 import dev.claudewatch.shared.terminal.TerminalLineType
 import dev.claudewatch.wear.BridgeViewModel
+import dev.claudewatch.wear.R
 
 /** Back-swipe threshold ≈60px at the 450 reference (the app-wide gesture unit). */
 private const val BACK_SWIPE_FRACTION = 60f / HALO_REF_PX
@@ -427,9 +428,13 @@ private fun highlightPassCounts(text: String): AnnotatedString = buildAnnotatedS
 
 @Composable
 private fun DictateUnavailablePill(modifier: Modifier = Modifier) {
-    // Same footprint as DictatePill but non-interactive and muted: the bridge
-    // cannot deliver dictation into this session live (issue #78), so we say so
-    // rather than offer a pill that does nothing.
+    // Same footprint and the SAME microphone icon as DictatePill, struck with
+    // a ⊘ and muted (#104 user feedback, superseding #78's text pill — the
+    // crossed mic says "no dictation here" without words). The honest-
+    // unavailability semantics survive intact: the bridge cannot deliver
+    // dictation into this session live (issue #78), so the pill carries NO
+    // click handler at all — a disabled-looking target that still announced
+    // a click action would lie to a screen reader.
     Box(
         contentAlignment = Alignment.Center,
         modifier = modifier
@@ -445,14 +450,43 @@ private fun DictateUnavailablePill(modifier: Modifier = Modifier) {
                 .defaultMinSize(minWidth = 88.dp)
                 .padding(horizontal = 14.dp, vertical = 5.dp),
         ) {
-            Text(
-                text = "Dictation unavailable here",
-                fontSize = Halo.Type.Caption,
-                fontWeight = FontWeight.Medium,
-                color = Halo.Palette.TextFaint,
-                maxLines = 1,
+            Icon(
+                painter = painterResource(R.drawable.halo_mic),
+                contentDescription = "Dictation unavailable",
+                tint = Halo.Palette.TextFaint,
+                modifier = Modifier.size(Halo.Geo.MicGlyph),
             )
+            MicOffOverlay()
         }
+    }
+}
+
+/** The crossed circle over the muted mic: ⊘ in the app's own idiom (the
+ *  external-session hide glyph), drawn to enclose the icon's ink. Solidus
+ *  orientation matches the ⊘ character the action arc renders. */
+@Composable
+private fun MicOffOverlay() {
+    Canvas(modifier = Modifier.size(Halo.Geo.MicOffOverlay).testTag("haloDictateMicOff")) {
+        val stroke = 1.5.dp.toPx()
+        val r = size.minDimension / 2f - stroke / 2f
+        val c = Offset(size.width / 2f, size.height / 2f)
+        drawCircle(
+            color = Halo.Palette.TextFaint,
+            radius = r,
+            center = c,
+            style = Stroke(width = stroke),
+        )
+        // The slash's endpoints sit ON the circle (r/√2 out from centre), so
+        // circle and solidus read as one struck-through glyph, not a line
+        // taped over a ring.
+        val d = r * 0.7071f
+        drawLine(
+            color = Halo.Palette.TextFaint,
+            start = Offset(c.x - d, c.y + d),
+            end = Offset(c.x + d, c.y - d),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
     }
 }
 
@@ -475,72 +509,14 @@ private fun DictatePill(onDictate: () -> Unit, modifier: Modifier = Modifier) {
                 .defaultMinSize(minWidth = 88.dp)
                 .padding(horizontal = 14.dp, vertical = 5.dp),
         ) {
-            MicGlyph()
+            // A real microphone icon (#104 user feedback, superseding the
+            // hand-drawn Canvas glyph that held this slot pre-v2).
+            Icon(
+                painter = painterResource(R.drawable.halo_mic),
+                contentDescription = "Dictate",
+                tint = Halo.Palette.TextPrimary,
+                modifier = Modifier.size(Halo.Geo.MicGlyph).testTag("haloDictateMic"),
+            )
         }
-    }
-}
-
-/**
- * A microphone, drawn rather than imported: the app carries no icon library and
- * every other glyph here is a Canvas (see HaloRing), so a dependency for one
- * shape would be the odd one out.
- *
- * Three parts, all derived from the canvas size so it scales with the type
- * ramp: the capsule (the mic body), the arc cradling it, and the stem. Stroked
- * rather than filled — at this size a filled mic reads as an ink blot on an
- * OLED watch face.
- */
-@Composable
-private fun MicGlyph() {
-    Canvas(modifier = Modifier.size(Halo.Geo.MicGlyph).testTag("haloDictateMic")) {
-        val s = size.minDimension
-        val stroke = s * 0.09f
-        val cx = size.width / 2f
-
-        // Body: FILLED, not outlined. An outlined capsule this small reads as a
-        // hollow ring — the first attempt looked like a face because of it.
-        val bodyW = s * 0.30f
-        val bodyTop = s * 0.06f
-        val bodyH = s * 0.46f
-        drawRoundRect(
-            color = Halo.Palette.TextPrimary,
-            topLeft = Offset(cx - bodyW / 2f, bodyTop),
-            size = Size(bodyW, bodyH),
-            cornerRadius = CornerRadius(bodyW / 2f),
-        )
-
-        // Cradle: a U that OVERLAPS the body's lower half rather than sitting
-        // below it. Its open ends land above the body's bottom edge, which is
-        // what makes the two read as one object instead of a bowl under a dot.
-        val r = s * 0.28f
-        val cradleCy = bodyTop + bodyH * 0.78f
-        drawArc(
-            color = Halo.Palette.TextPrimary,
-            startAngle = 0f,
-            sweepAngle = 180f,
-            useCenter = false,
-            topLeft = Offset(cx - r, cradleCy - r),
-            size = Size(r * 2f, r * 2f),
-            style = Stroke(width = stroke, cap = StrokeCap.Round),
-        )
-
-        // Stem from the cradle's base down to the foot.
-        val footY = s * 0.95f
-        drawLine(
-            color = Halo.Palette.TextPrimary,
-            start = Offset(cx, cradleCy + r),
-            end = Offset(cx, footY),
-            strokeWidth = stroke,
-            cap = StrokeCap.Round,
-        )
-
-        // Foot bar: short, but it is what stops the stem reading as a stray tick.
-        drawLine(
-            color = Halo.Palette.TextPrimary,
-            start = Offset(cx - s * 0.17f, footY),
-            end = Offset(cx + s * 0.17f, footY),
-            strokeWidth = stroke,
-            cap = StrokeCap.Round,
-        )
     }
 }

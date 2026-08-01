@@ -17,6 +17,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.state.BridgeState
 import dev.claudewatch.shared.state.SessionState
+import dev.claudewatch.wear.ui.halo.Halo
 import dev.claudewatch.wear.ui.halo.HaloActions
 import dev.claudewatch.wear.ui.halo.HaloApp
 import org.junit.Assert.assertEquals
@@ -109,6 +110,44 @@ class HaloAnswerPillTest {
         compose.waitForIdle()
         compose.onNodeWithTag("haloAnswerPill").assertIsDisplayed()
         assertEquals("the clock must hold its place when the pill appears", before, clockBounds())
+    }
+
+    @Test
+    fun clockGroupCentresOnItsVisualExtentAndThePillHangsThePrototypeClearanceBelowIt() {
+        compose.setContent { HaloApp(ui = ui(queue = listOf(betaPrompt)), actions = HaloActions()) }
+        val density = compose.density.density
+        val clock = clockBounds()
+        val root = compose.onNodeWithTag("haloRoot").fetchSemanticsNode().boundsInRoot
+
+        // The clock's line box is MEASURED (Compose gives a lone line the
+        // full ascent+descent font box, not the 88px/1 line height); only
+        // the fixed gap + slot + phantom come from the tokens.
+        val gapAndSlotPx = ((Halo.Geo.ClockSubtitleGapPx + Halo.Geo.ClockSubtitleSlotPx) / 2f) * density
+        val phantomPx = (Halo.Geo.ClockDeadLeadingPx / 2f) * density
+        val groupHeightPx = clock.height + gapAndSlotPx
+
+        // The #104 mechanism, half one: the group's centre line is computed
+        // over its VISUAL extent — the phantom spacer mirrors the clock's
+        // dead leading below the group, so the group's layout boxes ride
+        // half of it above dead centre.
+        assertEquals(
+            "the clock group must centre on its visual extent, riding the lift",
+            (root.height - groupHeightPx - phantomPx) / 2f,
+            clock.top,
+            2f,
+        )
+
+        // Half two: the Answer pill hangs the prototype's 21 ref-px below
+        // the re-centred group's bottom — derived, never screen-absolute.
+        // Tolerance 3px: the constant is exact at the 450 reference, this
+        // glass is 454 and the platform font box rounds sub-pixel.
+        val pill = compose.onNodeWithTag("haloAnswerPill").fetchSemanticsNode().boundsInRoot
+        assertEquals(
+            "the pill must hang the prototype clearance below the clock group",
+            clock.top + groupHeightPx + (Halo.Geo.AnswerPillClearancePx / 2f) * density,
+            pill.top,
+            3f,
+        )
     }
 
     @Test

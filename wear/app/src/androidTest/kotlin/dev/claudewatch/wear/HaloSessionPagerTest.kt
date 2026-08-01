@@ -24,6 +24,7 @@ import dev.claudewatch.shared.state.SessionState
 import dev.claudewatch.wear.ui.halo.HaloActions
 import dev.claudewatch.wear.ui.halo.HaloApp
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -227,11 +228,11 @@ class HaloSessionPagerTest {
         next()
         compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
 
-        // The epic's numbers physically overlap on a waiting card: the pill's
-        // bottom band (154dp + 25dp) sits inside the ✕ cell's hit area (the
-        // 72dp-radius arc). The pill is the pager's TOPMOST layer exactly so
-        // a finger aiming at Answer's lower half can never kill the session —
-        // this tap targets the contested pixels BY COORDINATE, not by node.
+        // The #104 in-flow position no longer overlaps the arc, but the pill
+        // stays the pager's TOPMOST layer as defence-in-depth: whatever the
+        // card group's height puts under the pill's lower edge, a finger
+        // aiming at Answer must never kill the session — this tap targets
+        // the pill's bottom band BY COORDINATE, not by node.
         val pill = compose.onNodeWithTag("haloAnswerPill").fetchSemanticsNode().boundsInRoot
         compose.onNodeWithTag("haloRoot").performTouchInput {
             down(Offset(pill.center.x, pill.bottom - 2f))
@@ -241,6 +242,25 @@ class HaloSessionPagerTest {
         assertEquals("a tap on the pill must never reach the ✕ cell", 0, kills.size)
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
         compose.onNodeWithText("Write notes.txt").assertIsDisplayed()
+    }
+
+    @Test
+    fun answerPillRidesTheCardGroupAndClearsTheActionArc() {
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drill()
+        next()
+        compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
+
+        // #104 user feedback: the pill follows the prototype's own pager
+        // geometry — in flow below the card's text stack — instead of the
+        // main pages' screen-absolute slot, which planted it squarely on the
+        // ✕ kill cell and grazing its neighbours. Geometric acceptance: no
+        // arc cell shares a pixel with the pill.
+        val pill = compose.onNodeWithTag("haloAnswerPill").fetchSemanticsNode().boundsInRoot
+        for (tag in listOf("haloArc-model", "haloArc-mode", "haloRowClose", "haloArc-compact", "haloArc-handover")) {
+            val cell = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
+            assertFalse("the pill must clear the $tag cell", pill.overlaps(cell))
+        }
     }
 
     @Test

@@ -2,6 +2,7 @@ package dev.claudewatch.wear
 
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.test.assertHasNoClickAction
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -301,6 +302,9 @@ class DictationFlowTest {
         openFeed("s-acp")
 
         compose.onNodeWithTag("haloDictate").assertIsDisplayed()
+        // The affordance is the real microphone icon (#104 user feedback,
+        // superseding the hand-drawn glyph).
+        compose.onNodeWithTag("haloDictateMic", useUnmergedTree = true).assertExists()
         assertEquals("a dictatable session shows no 'unavailable' affordance", 0, nodeCount("haloDictateUnavailable"))
     }
 
@@ -320,7 +324,11 @@ class DictationFlowTest {
         openFeed("s-ext")
 
         waitForNode("haloDictateUnavailable")
-        compose.onNodeWithTag("haloDictateUnavailable").assertIsDisplayed()
+        // #104 user feedback: the unavailable state is the SAME microphone
+        // icon struck with the ⊘ overlay — muted and truly non-interactive
+        // (no click action AT ALL, not a dead one), keeping #78's honesty.
+        compose.onNodeWithTag("haloDictateUnavailable").assertIsDisplayed().assertHasNoClickAction()
+        compose.onNodeWithTag("haloDictateMicOff", useUnmergedTree = true).assertExists()
         assertEquals("no Dictate pill on a non-dictatable session", 0, nodeCount("haloDictate"))
         assertNull("a non-dictatable session sends nothing", server.takeRequest(1, TimeUnit.SECONDS))
     }
