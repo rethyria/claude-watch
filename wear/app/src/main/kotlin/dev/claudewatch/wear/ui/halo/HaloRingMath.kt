@@ -3,8 +3,8 @@
 // plain values. No Compose, no clocks, no Animatables — colours stay
 // Halo.SessionState keys and timestamps are parameters — so the entire v2
 // motion spec is pinned by fast JVM tests BEFORE any drawing changes. The
-// ring engine (S4) will own the per-slot Animatables and feed them from these
-// plans; until it lands, nothing consumes this file.
+// ring engine (HaloRingState, S4) owns the per-slot Animatables and feeds
+// them from these plans.
 //
 // Angle convention throughout: Canvas degrees (clockwise-positive, 0° at
 // 3 o'clock), and every pose angle is ACCUMULATED — full loops keep adding
@@ -142,7 +142,7 @@ object HaloRingMath {
     // ── Reconciliation ──────────────────────────────────────────────────────
 
     /**
-     * Signed shortest rotation from [from] to [to] in (−180, 180], with the
+     * Signed shortest rotation from [from] to [to] in [−180, 180), with the
      * exact-opposite tie resolving to −180 (anticlockwise — the ring's native
      * winding). Both inputs may be arbitrarily accumulated; only their
      * difference matters.

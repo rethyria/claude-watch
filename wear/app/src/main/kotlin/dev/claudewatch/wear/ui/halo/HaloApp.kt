@@ -348,8 +348,8 @@ private fun HaloAppBody(
     Box(modifier = Modifier.fillMaxSize().background(Halo.Palette.Background).testTag("haloRoot")) {
         // The ONE ring (v2 shell): bottom of the z-order, drawing the current
         // page's scope. Deeper screens and overlays paint opaque backgrounds,
-        // so nothing else needs to know it exists. Static targets until the
-        // S4 engine animates them.
+        // so nothing else needs to know it exists. Live since S4: the host's
+        // engine animates between scope targets.
         val ringScope = if (nav.page < 0) null else scopeForPage(nav.page, model)
         HaloRingHost(
             states = ringScope?.let { s -> model.sessionsIn(s).map { it.state } }.orEmpty(),

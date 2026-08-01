@@ -111,9 +111,9 @@ object Halo {
 
         // ── v2 ring channel (Halo v2, epic #94) ─────────────────────────────
         // Tokens for the persistent morphing ring, drawn from the root by
-        // HaloRingHost (static targets since S3; the S4 engine animates
-        // between them). Angles are Canvas degrees (clockwise-positive, 0° at
-        // 3 o'clock); px are at the 450 reference.
+        // HaloRingHost (the S3 seam; live since S4 — HaloRingState animates
+        // between targets). Angles are Canvas degrees (clockwise-positive, 0°
+        // at 3 o'clock); px are at the 450 reference.
 
         /**
          * Centreline radius for EVERY ring stroke — solid 9 ([RingStroke]),
