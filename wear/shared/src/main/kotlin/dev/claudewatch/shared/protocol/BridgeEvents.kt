@@ -153,6 +153,25 @@ data class SessionEvent(
     val repoRoot: String? = null,
     /** Workflow activity (issue #55) — see [AgentsActivity]; absent preserves. */
     val agents: AgentsActivity? = null,
+    /**
+     * Additive session-meta trio (issue #97, Halo v2): the pager subheading's
+     * `model · mode · use%`. Only ACP (Zed-hosted) sessions ever carry them —
+     * the hook and PTY paths have no equivalent signal — and a slot that has
+     * them carries them on EVERY session event. Absence preserves what the
+     * client knew, exactly like [title].
+     *
+     * [model] is the HUMAN DISPLAY name, `default`-alias already resolved
+     * adapter-side (third-party backends can yield a raw id; the bridge
+     * passes it verbatim rather than guessing). [mode] is the ACP
+     * permission-mode id VERBATIM (`default`/`plan`/`acceptEdits`/... — the
+     * vocabulary is the agent's and may grow, so no enum here). [contextPct]
+     * is integer percent 0–100 of the context window USED, re-announced only
+     * when the integer changes; 0 is a REAL value (a fresh session), so
+     * consumers key on presence, never truthiness.
+     */
+    val model: String? = null,
+    val mode: String? = null,
+    val contextPct: Int? = null,
     val reason: String? = null,
     val exitCode: Int? = null,
     val signal: String? = null,

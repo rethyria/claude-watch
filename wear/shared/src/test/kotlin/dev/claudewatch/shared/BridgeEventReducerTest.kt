@@ -434,6 +434,58 @@ class BridgeEventReducerTest {
     }
 
     @Test
+    fun sessionMetaPreservesOnAbsenceAndUpdatesOnChange() {
+        // Issue #97 (Halo v2): an ACP session's register seeds the trio.
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","kind":"acp","model":"Claude Opus 4.6","mode":"default","contextPct":37,"sessionId":"A"}"""),
+            ),
+        )
+        val a = state.sessions.getValue("A")
+        assertEquals("Claude Opus 4.6", a.model)
+        assertEquals("default", a.mode)
+        assertEquals(37, a.contextPct)
+
+        // A meta-less resend (connect-time sync, title refresh, older bridge)
+        // must not erase any of the trio — title's exact doctrine, and in
+        // particular absence must never rewind the use meter to a guess.
+        val bare = SseFrame(null, "session", """{"state":"running","agent":"claude","sessionId":"A"}""")
+        val afterSync = (BridgeEventReducer.reduce(state, bare, 1_002_000L) as BridgeEventReducer.Applied).state
+        val synced = afterSync.sessions.getValue("A")
+        assertEquals("Claude Opus 4.6", synced.model)
+        assertEquals("default", synced.mode)
+        assertEquals(37, synced.contextPct)
+
+        // A change broadcasts as an idempotent re-sent `running` carrying the
+        // fields that moved: present replaces, the untouched model preserves.
+        val flipped = SseFrame("2", "session", """{"state":"running","mode":"plan","contextPct":61,"sessionId":"A"}""")
+        val afterFlip = (BridgeEventReducer.reduce(afterSync, flipped, 1_003_000L) as BridgeEventReducer.Applied).state
+        assertEquals("plan", afterFlip.sessions.getValue("A").mode)
+        assertEquals(61, afterFlip.sessions.getValue("A").contextPct)
+        assertEquals("Claude Opus 4.6", afterFlip.sessions.getValue("A").model)
+
+        // First sight with an explicit contextPct 0 (a fresh session): 0 is a
+        // value and lands — presence, never truthiness.
+        val freshSeed = fold(
+            listOf(
+                SseFrame("3", "session", """{"state":"running","agent":"claude","cwd":"/b","folderName":"b","kind":"acp","model":"Sonnet","mode":"plan","contextPct":0,"sessionId":"B"}"""),
+            ),
+        )
+        assertEquals(0, freshSeed.sessions.getValue("B").contextPct)
+
+        // A session with none of the fields (PTY/hook slot) stays bare: no
+        // subheading data is ever invented for the paths that lack the signal.
+        val pty = fold(
+            listOf(
+                SseFrame("4", "session", """{"state":"running","agent":"claude","cwd":"/c","folderName":"c","sessionId":"C"}"""),
+            ),
+        )
+        assertNull(pty.sessions.getValue("C").model)
+        assertNull(pty.sessions.getValue("C").mode)
+        assertNull(pty.sessions.getValue("C").contextPct)
+    }
+
+    @Test
     fun agentsActivityPreservesOnAbsenceAndClearsOnlyByExplicitZero() {
         // Issue #55: workflow activity lands on the session state.
         val state = fold(
