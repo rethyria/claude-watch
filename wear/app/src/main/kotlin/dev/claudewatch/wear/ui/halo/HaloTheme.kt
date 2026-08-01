@@ -164,6 +164,21 @@ object Halo {
          */
         const val DotChannelClearance =
             (RingChannel - RingStroke / 2f) - (HALO_REF_PX / 2f - RingEdgeGap - RingStroke - DotArcGap)
+
+        /**
+         * Outer arc padding for the root TimeText: display edge to the clock
+         * glyphs' OUTER edge, sized so the platform-curved time sits INSIDE
+         * the ring channel with 2 ref-px to spare against the channel's
+         * deepest inner reach (the hero's stroke 10 — the widest stroke any
+         * regime draws on the fixed channel). The platform default (2dp) hugs
+         * the rim, which is exactly where the list's dotted ring and the feed
+         * circle live: at 12 o'clock the clock printed straight through them
+         * (#104 carry-over from the #103 morph recordings). One inset for
+         * every depth, so the fixed clock never shifts when the ring morphs
+         * under it or collapses away on the glance pages.
+         */
+        const val ClockRingClearance =
+            HALO_REF_PX / 2f - (RingChannel - RingStrokeHero / 2f) + 2f
     }
 
     // ── Motion (Halo v2, epic #94) ──────────────────────────────────────────

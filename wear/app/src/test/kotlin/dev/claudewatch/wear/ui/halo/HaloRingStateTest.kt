@@ -511,6 +511,75 @@ class HaloRingStateTest {
         assertEquals(1f, engine.dashAlpha.value, 0f)
     }
 
+    // ── The dashed layer's presence fades (#104 carry-over from #103) ───────
+
+    @Test
+    fun listArrivalFadesTheDashedPresenceIn() = engineTest { clock, scope, engine ->
+        val two = listOf(SessionState.RUNNING, SessionState.IDLE)
+        engine.snapTo(plist(two, selected = 0))
+        engine.slots.forEach { assertEquals(1f, it.presence.value, 0f) }
+
+        engine.retarget(scope, plist(two + SessionState.RUNNING, selected = 0), nowMs = clock.nowMs)
+        start(clock)
+        // The newcomer snaps in at final geometry pre-coloured (the S2 rule),
+        // but under solidHidden its ALPHA pins at 0 — presence is the channel
+        // that carries the arrival fade to the dashed layer.
+        val fresh = engine.slots[2]
+        assertEquals(0f, fresh.presence.value, 0f)
+        assertEquals(0f, fresh.alpha.value, 0f)
+
+        pump(clock, 150)
+        assertTrue(fresh.presence.value > 0f && fresh.presence.value < 1f)
+        assertEquals(0f, fresh.alpha.value, 0f)
+
+        pump(clock, 200)
+        assertEquals(1f, fresh.presence.value, 0f)
+        // The settled neighbours never moved off full presence.
+        assertEquals(1f, engine.slots[0].presence.value, 0f)
+    }
+
+    @Test
+    fun listDepartureFadesTheDashedPresenceOut() = engineTest { clock, scope, engine ->
+        val three = listOf(SessionState.RUNNING, SessionState.IDLE, SessionState.RUNNING)
+        engine.snapTo(plist(three, selected = 0))
+
+        engine.retarget(scope, plist(three.take(2), selected = 0), nowMs = clock.nowMs)
+        start(clock)
+        pump(clock, 150)
+        // Mid-collapse the dying dash is fading out on the paint spec — the
+        // vanishing arc's "alpha→0" — alongside its blend to black.
+        val dying = engine.slots[2]
+        assertTrue(dying.presence.value > 0f && dying.presence.value < 1f)
+
+        pump(clock, 200)
+        assertEquals(0f, dying.presence.value, 0f)
+    }
+
+    @Test
+    fun arrivalMidCloseLandsSettledAtTheSwap() = engineTest { clock, scope, engine ->
+        val states = listOf(SessionState.RUNNING, SessionState.IDLE)
+        engine.snapTo(plist(states, selected = 0))
+        engine.retarget(scope, page(states), nowMs = clock.nowMs)
+        start(clock)
+
+        // 800ms into the close a session arrives: its presence fade (300ms)
+        // cannot finish before the 1s settle, so the swap must land it.
+        pump(clock, 800)
+        engine.retarget(scope, page(states + SessionState.WAITING_PERM), nowMs = clock.nowMs)
+        runCurrent()
+        val fresh = engine.slots[2]
+        pump(clock, 100)
+        assertTrue(fresh.presence.value < 1f)
+        assertEquals(0f, fresh.alpha.value, 0f)
+
+        // One frame past the settle: alpha AND presence snap up together —
+        // the swap stays one settled frame, newcomer included.
+        pump(clock, 130)
+        assertEquals(1f, fresh.alpha.value, 0f)
+        assertEquals(1f, fresh.presence.value, 0f)
+        assertEquals(0f, engine.dashAlpha.value, 0f)
+    }
+
     // ── The hero: step rotation and retrace ─────────────────────────────────
 
     @Test

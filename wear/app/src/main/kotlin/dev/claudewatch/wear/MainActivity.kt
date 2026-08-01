@@ -46,8 +46,11 @@ private var notificationPermissionAsked = false
 /**
  * Entry point: the Halo UI (see ui/halo/HaloApp.kt) — ring home, per-project
  * pages, drill-down lists/feeds, approval cards — rendered from the shared
- * reducer's state. The previous pager (ui/SessionPagerScreen.kt) is kept
- * compiling for the instrumented tests until they migrate to Halo.
+ * reducer's state. The pre-Halo pager (ui/SessionPagerScreen.kt) has no live
+ * references left — the instrumented tests all migrated to Halo — and is
+ * retained only as the wave-2 reference implementation; retiring it (and
+ * ui/PermissionSheet.kt around the still-consumed LOCAL_DISMISS_AFTER_FAILURES
+ * constant) is deliberately outside the Halo v2 sweep's scope (#104).
  *
  * The activity is a THIN attachment point since issue #24: the engine lives
  * in [BridgeViewModel.singleton] with process lifetime, held open by

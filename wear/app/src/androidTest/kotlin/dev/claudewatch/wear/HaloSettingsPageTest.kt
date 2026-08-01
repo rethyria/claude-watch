@@ -52,10 +52,11 @@ class HaloSettingsPageTest {
     )
 
     /**
-     * Pager swipes as a real finger drags them: frame-by-frame moves (a batched
+     * Page swipes as a real finger drags them: frame-by-frame moves (a batched
      * swipe collapses into one frame-sized delta and can behave nothing like a
-     * finger on API 31+ surfaces). Each call settles the HorizontalPager one
-     * page RIGHT (toward the lower indices — usage, then settings).
+     * finger on API 31+ surfaces). Each call steps the nav-owned page (the v2
+     * shell's swipe detector — HorizontalPager is gone) one RIGHT, toward the
+     * lower indices: usage, then settings.
      */
     private fun onePageRight() {
         compose.onNodeWithTag("haloRoot").performTouchInput {

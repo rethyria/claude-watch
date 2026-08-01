@@ -136,12 +136,15 @@ fun HaloRingHost(
         // ── Dashed layer (same slot geometry, dash paint) ───────────────────
         // Everything about it is the ONE merge fraction: interval, stroke and
         // alpha move together (HaloRingMath), so at fraction 1 it is
-        // pixel-identical to the solid layer — round caps included — and the
-        // close-swap cannot flash. Per-arc presence rides the geometry and
-        // colour channels (a dying segment collapses blending to black), not
-        // slot alpha, which belongs to the hidden solid layer here.
-        val dashPresence = engine.dashAlpha.value
-        if (dashPresence > 0f) {
+        // pixel-identical to the solid layer — Round caps included, which is
+        // LOAD-BEARING: the close-swap's atomicity rests on merge-1 dashes
+        // rendering exactly as the solid stroke, cap shape and all. Per-arc
+        // lifecycle rides the geometry and colour channels (a dying segment
+        // collapses blending to black) PLUS the slot's presence fade —
+        // arrivals and departures fade here just as slot alpha fades them on
+        // the solid layer, which itself stays alpha-0 under this one.
+        val dashLayer = engine.dashAlpha.value
+        if (dashLayer > 0f) {
             val mergeF = engine.merge.value
             val d = HaloRingMath.dashIntervals(mergeF)
             val dashStyle = Stroke(
@@ -156,13 +159,14 @@ fun HaloRingHost(
                     null
                 },
             )
-            val layerAlpha = HaloRingMath.dashLayerAlpha(mergeF) * dashPresence
+            val layerAlpha = HaloRingMath.dashLayerAlpha(mergeF) * dashLayer
             for (slot in engine.slots) {
                 val sweep = slot.sweep.value
-                if (sweep < Halo.Geo.MinDrawSweepDeg) continue
+                val presence = slot.presence.value
+                if (sweep < Halo.Geo.MinDrawSweepDeg || presence <= 0f) continue
                 val color = slotColor(slot, ambient)
                 drawArc(
-                    color = color.copy(alpha = color.alpha * layerAlpha),
+                    color = color.copy(alpha = color.alpha * layerAlpha * presence),
                     startAngle = slot.end.value - sweep,
                     sweepAngle = sweep,
                     useCenter = false,

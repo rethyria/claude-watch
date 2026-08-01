@@ -48,4 +48,27 @@ class HaloSubheadingTest {
         assertTrue(sessionSubheading(null, null, 80).single().hot)
         assertTrue(sessionSubheading(null, null, 97).single().hot)
     }
+
+    // ── The #54/#55 detail line, rehomed on the card (#104) ─────────────────
+    // Same derivation the retired FeedHeader ran: branch badge and agents
+    // indicator share one line, each part only when present, joined " · ".
+
+    @Test
+    fun detailLineJoinsBranchAndAgentsWithHonestSingular() {
+        assertEquals("⎇ main · ⚙ 1 agent", sessionDetailLine("⎇ main", 1))
+        assertEquals("⎇ fix-53 · wt · ⚙ 3 agents", sessionDetailLine("⎇ fix-53 · wt", 3))
+    }
+
+    @Test
+    fun detailLinePartsDropOutIndependently() {
+        assertEquals("⎇ main", sessionDetailLine("⎇ main", 0))
+        assertEquals("⚙ 2 agents", sessionDetailLine(null, 2))
+    }
+
+    @Test
+    fun noBranchAndNothingRunningMeansNoLineAtAll() {
+        // The back-compat rule: a PTY/hook session with neither signal keeps
+        // today's clean card — null, not an empty row holding blank space.
+        assertEquals(null, sessionDetailLine(null, 0))
+    }
 }

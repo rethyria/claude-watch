@@ -533,3 +533,203 @@ plain-JVM-tabled in `GlanceModelTest`.
   issue's adb/screenshot wording: the carousel isn't automatable on the e2e
   image, and the layout proto IS what the tile says — honesty is the
   load-bearing acceptance, rendering protos is the platform's contract.
+
+## Halo v2 (epic #94) — pager list, chrome-free feed, persistent morphing ring
+
+_The second design iteration (claude.ai/design project `095874f5-…`, file
+"Claude Watch Halo.dc.html"), ported across slices #95–#105 and closed out by
+the #104 finish sweep. Where this section contradicts anything above, THIS
+section wins — the epic's constants table (issue #94) is the numeric source
+of truth. Reference captures: `wear/design/halo-v2-current-*.png`
+(uncommitted, from the HaloPreviewScreens harness); morph recordings:
+`wear/design/halo-v2-morph-*.mp4`._
+
+### The changelog as built
+
+- **Session list → fullscreen pager** (`HaloSessionPager.kt`, S5): one
+  session per screen — wrapping title (17sp/1.14 Medium, 52dp insets, top
+  44dp) over a `model · mode · use%` subheading (9.5sp, 1.5dp dot
+  separators, use ≥ 80 terracotta; parts render only when present, so
+  PTY/hook sessions keep a clean card). Position halo: the scope's sessions
+  as a DASHED ring (stroke 4, dash 2.5/11, alpha .65, state-coloured) with a
+  solid hero highlight (stroke 10) on the selected card. ‹ › chevrons in
+  48dp cells (18sp Light, TextSecondary per the #61 rule — implementer's
+  call the epic left open); ‹/right-swipe on the first card is BACK, › is
+  alpha-0 (cell kept) on the true end. Five-icon action arc along the bottom
+  (26dp circles, centres r=72dp at 144/117/90/63/36°): centre ✕ kill / ⊘
+  honest-hide live with today's exact semantics (ACP close-frame limits stay
+  #88's scope), ◇ ◐ ▤ ⇄ disabled stubs at 0.35 alpha. Rotary steps cards
+  (40px detent). Selection lives in the pure `HaloNavState`; the pager only
+  renders `nav.sessionId` — every edge (spawn slot, empty scope, at-start
+  back, kill-under-cursor self-heal via `healListSelection`) is JVM-pinned.
+- **Feed → chrome-free** (`HaloSessionFeed.kt`, S6): header, state dot, ‹ ›
+  sibling cycling, "n of m · project" meta and the waiting banner all
+  removed. The terminal tail fills the screen inside a soft circular mask
+  (offscreen compositing + radial DstIn: opaque to 168 ref-px, transparent
+  by 194 — inside the ring channel's inner edge, so text can never clip the
+  ring at any scroll position) with resting insets top 30 / bottom 48 /
+  sides 31dp as contentPadding (lines dissolve in the fade band instead of
+  shearing). Touch scrolling joins rotary on the reversed list; swipe right
+  = back, at-top pull-down = back; while the session waits the WHOLE feed
+  surface is the prompt's tap target (no pending → no click handler at
+  all). Dictate pill/unavailable variant keep the bottom slot.
+- **ONE persistent ring** (`HaloRingHost` + `HaloRingState` + `HaloRingMath`,
+  S2/S4/S7): fixed channel radius 214 ref-px for every stroke; arc k ENDS at
+  −94° − k·(360/n), winds anticlockwise, gaps 8.5° (8° solo). Paint and
+  geometry are separate channels (.3s ease-in-out vs .55s decel, +220ms
+  geometry delay when one update does both, 850ms window); vanishing arcs
+  collapse onto their own start blending to black; new arcs snap in
+  pre-coloured, fade .3s, drawn beneath the settled ring for 1300ms. Level
+  morphs: dash split/merge (page↔list, .5s, stroke 9↔4, alpha 1↔.65, hero
+  9↔10, close-swap at 1000ms), grow/shrink (list↔feed, .65s, sweep↔360°
+  symmetric, stroke 10↔6), highlight rotation .4s shortest-path accumulated
+  with the 2-session backstep retrace. Content crossfades ride the morphs
+  (out .25s, in .45s delayed .1s; list→page return .3s). Non-adjacent jumps
+  (Answer-pill page→feed, jump-home) snap — they happen under the opaque
+  card. Ambient snaps to targets, never freezes a mid-morph frame.
+- **Navigation** (S1/S3): nav owns the page — `HorizontalPager` is GONE from
+  the main pages (the design has no drag-follow); horizontal swipes/dot taps
+  change `nav.page` and only content slides (300ms/70px/HaloEasing). Tap
+  face or swipe up → the scope's session list; feed: swipe right → list;
+  no wrap. The centerpiece tap's old jump-to-prompt job moved to the Answer
+  pill.
+- **Main screens** (S3): Answer pill (25dp tall, terracotta, "Answer" 11sp
+  SemiBold on `#1A0F0A`) whenever the scope has a prompting session — out of
+  flow at 154dp from the screen top (see deviations), so the clock+subtitle
+  group NEVER shifts; "↑ sessions" hint removed; clock group identical on
+  All and project pages.
+- **Wire** (S8/S9, #97/#102): the adapter's `usage_update` /
+  `current_mode_update` / `config_option_update` tee lands on `session`
+  events as the additive `model` / `mode` / `contextPct` trio (ACP sessions
+  only; absence preserves, presence-keyed — 0 is a real contextPct), and the
+  watch maps them onto `HaloSession.modelName/modeName/usePercent` for the
+  pager subheading (display rules: "Claude " prefix stripped; mode ids
+  through the short-label map — default→manual, acceptEdits→edits,
+  bypassPermissions→bypass, dontAsk→no-ask, unknown verbatim).
+
+### The ring engine as landed (architecture)
+
+One set of per-slot geometry Animatables (`end`/`sweep`/`color`/`alpha`/
+`presence`), rendered up to three ways from the SAME numbers:
+
+- **Solid layer** — the page ring. Slot `alpha` carries lifecycle here
+  (arrivals fade in, corpses hold 0); under every non-PAGE level and through
+  the whole close it is pinned 0 by `planRetarget(solidHidden = true)`.
+- **Dashed layer** — same slot geometry, dash paint. Everything about it is
+  the ONE merge fraction: `dashIntervals`/`dashStroke`/`dashLayerAlpha` are
+  all functions of it, so interval, stroke and alpha cannot desync — and at
+  fraction 1 it is pixel-identical to the solid layer by construction. Slot
+  `presence` (the #104 carry-over fix) multiplies in per arc: arrivals and
+  departures fade on the dashed layer exactly as slot alpha fades them on
+  the solid layer (`alpha` itself can't serve — it is pinned 0 under
+  solidHidden, which is why S4-era dash arrivals popped).
+- **Hero arc** — the list highlight AND the feed ring, one set of channels.
+  OPEN snaps it onto the selected segment (deliberate divergence from the
+  prototype, whose stale rotation would visibly spin in) then thickens 9→10;
+  steps rotate shortest-path on ACCUMULATED angles (winding history
+  preserved; 2-session backstep forces the +180° retrace); GROW expands both
+  ways into the full circle from its ACTUAL pose (interrupt-safe); SHRINK is
+  the exact reverse with a nearest-coterminal correction onto the real
+  segment. The hero never fades in morphs — only stroke weight and the .85
+  feed alpha ease. The one sanctioned hero fade is the spawn-card selection.
+
+**The close-swap**: list→page merges the dashes 0→1 while the hero thins
+10→9; the REAL solid layer stays hidden throughout; at the 1000ms settle the
+swap lands in ONE frame — solid alphas (and presences) snap up, dashed layer
+and hero vanish. Plans are computed from COMMITTED targets, never mid-flight
+values (settled poses reproduce bit-exactly — the zero-motion contract);
+interruptions retarget from current values via the Animatable mutex; the
+settle waits on the FRAME clock, so JVM manual-clock tests drive it
+deterministically.
+
+**⚠ Round-caps invariant (LOAD-BEARING — do not "clean up")**: the dashed
+layer draws with `StrokeCap.Round`, and at merge fraction 1 its zero
+off-interval is drawn as a CONTINUOUS stroke (`pathEffect = null`, never a
+degenerate dash pattern). Both halves exist so that merge-1 dashes render
+EXACTLY as the solid stroke — width, endpoints, and cap shape included.
+The close-swap's atomicity (hide real solid layer → swap at settle) is
+pixel-invisible only because of this identity: switch the dashed cap to Butt
+(or draw merge-1 through the dash path-effect) and every list→page return
+flashes at the seam. `HaloRingMorphTest` pins the swap on the emulator;
+the cap identity itself is a draw-time property only eyes (and this note)
+protect.
+
+**The trigger**: `snapshotFlow` over a value-comparable `RingInputs`
+snapshot (level, scope states, selection index, step direction, feed state,
+empty style) — clock ticks and streaming feed lines rebuild an EQUAL
+snapshot, so they provably cannot restart animations (the design
+prototype's clock-tick bug, the reason v2 exists). Morph phase lives inside
+the engine and is never exposed as snapshot state for content to key on.
+Equal inputs launch nothing; unrelated updates never retime an in-flight
+tween.
+
+### Deviations ledger (v2, all deliberate)
+
+| Deviation | Rationale |
+|---|---|
+| Answer pill top = **154dp** screen-absolute | The epic table's "119dp absolute" is a verified mislabel: 119dp is the prototype's coordinate INSIDE its 70px-inset face container (238px + 70px = 308px ⇒ 154dp). 119dp screen-absolute buries the pill in the clock. Corrected in a #94 comment; S3 shipped 154dp and the pager card reuses the same `ANSWER_PILL_TOP`. |
+| Fixed ring channel **214** ref-px (design: 205) | The v1 outer-edge-derived radius re-centres per stroke; morphs animate stroke WIDTH, so a per-stroke radius would breathe radially. One channel, ring fattens/thins in place. |
+| Anchor **−94°**, gaps **8.5°/8°** (was −90°-centred/10°) | Design geometry adopted verbatim. |
+| Mic-glyph dictate pill | Pre-v2 user direction, kept. |
+| Curved page dots (+ outlined settings/usage dots at slots 0/1) | Pre-v2 user direction, kept; settings page at slot −2, usage at −1. |
+| 200-line feed buffer (design demo: 30) | Pre-v2 user direction, kept. |
+| Swipe-down-back on list + feed | Kept as the app-wide secondary back (design has none). |
+| Platform-curved non-tappable TimeText, **inset inside the ring channel** | Platform TimeText instead of a custom clock (pre-v2); the v2 sweep added `ClockRingClearance` outer padding — at the platform's 2dp rim padding the clock printed through the list/feed edge ring at 12 o'clock. |
+| DELEGATED `#6BA8D8` + ERROR states | App-side state model is richer than the design's; luminance-matched blue, see the v1 data-mapping notes. |
+| Spawn as trailing "+ new session" pager card | The prototype has no spawn affordance; the card is the All scope's true end (› hidden there) and the empty-scope content; ring highlight fades while it's selected. Same `haloSpawn` tag/picker as v1. |
+| All-ring order **project-grouped** | Ring order must equal pager order (#95); user-visible change for interleaved projects. |
+| ⊘ honest-hide for external sessions | #53 semantics ported into the action arc unchanged. |
+| `#54/#55` detail line on the **pager card** | The chrome-free feed killed the FeedHeader that carried the ⎇ branch badge and ⚙ agents line; the pager card is their new home (see adjudications). |
+| Chevrons/controls at TextSecondary (mock: `#3A3C42`) | The #61 readability rule applied to controls — the epic explicitly left the tint to the implementer. |
+
+### #104 finish-sweep adjudications (carried from #101/#102/#103)
+
+1. **TimeText vs the dotted ring at 12 o'clock (list/feed)** — FIXED by
+   insetting, not hiding: the root TimeText now takes
+   `Halo.Geo.ClockRingClearance` as outer arc padding (edge → glyph outer
+   edge = 18 ref-px = 9dp: past the channel's deepest inner reach, the
+   hero's stroke-10 inner edge at 209 ref-px, plus 2 ref-px clearance).
+   Hiding was rejected because the ambient contract needs this TimeText as
+   the wrist-down clock at EVERY depth, and ambient still draws the
+   list/feed ring — the collision had to be solved geometrically anyway.
+   One inset at all depths: the fixed clock never shifts when the ring
+   morphs under it or collapses away on the glance pages. (The prototype's
+   decoded copy was no longer available to consult; the epic carries no
+   list/feed clock spec, so this is implementer's-call, documented here.)
+2. **Dashed-layer arrival fade** — FIXED: new-session arrivals at LIST
+   level now fade in on the dashed layer via the per-slot `presence`
+   channel (0→1 on the 300ms new-arc spec; departures fade 1→0 on the
+   paint spec — the vanishing-arc "alpha→0" the dashed layer previously
+   had no channel to honour). JVM-pinned in `HaloRingStateTest`
+   (arrival/departure fades + the mid-close arrival landing settled at the
+   swap).
+3. **list→page return fade = 300ms** — DOCUMENTED, no change: the epic's
+   ".3s fast fade" IS 300ms (`Halo.Motion.ListToPageFadeMs`), applied to
+   the ENTERING page content; the exiting list keeps the general .25s
+   content fade-out. The prototype was unavailable to double-check the
+   out-fade split; the epic's numbers win and are what shipped.
+4. **Round-caps invariant** — documented above (the ⚠ block).
+5. **Branch badge / agents line (#54/#55)** — REHOMED on the pager card:
+   one faint ellipsized line under the subheading, exactly the retired
+   FeedHeader's derivation (`⎇ branch[ · wt] · ⚙ N agent[s]`, agents only
+   while > 0, null line when neither — PTY/hook sessions keep a clean
+   card). Ring-blue alone was rejected as the answer: DELEGATED says
+   "subagents somewhere", never which branch or how many, and it hides
+   entirely while the main loop still runs. The feed stays chrome-free —
+   the card is where session identity lives in v2. Pure seam
+   `sessionDetailLine` JVM-pinned in `HaloSubheadingTest`; tag
+   `haloCardDetails`.
+6. **#102's live-ACP check** — PENDING ON THE WRIST (see below).
+
+### Pending on-wrist live checks (post-epic, user steps)
+
+- **Subheading on a live ACP session** (#102's deferred criterion): with the
+  real bridge (port 7860) and a Zed-born session, the pager card shows
+  `model · mode · use%` live, the mode flips when Zed's mode changes, and
+  use% tracks the context window. Fixture/e2e-level verification is done;
+  the wire path is the same one the e2e drives — this is a confidence pass,
+  not a gate.
+- **v2 install on the physical watch**: the SM-L330 still runs the v1 APK;
+  install runbook in the project memory (physical-watch-adb-connection).
+  While there: eyeball the morph walk, the 154dp pill clearance and the
+  TimeText inset on real glass.

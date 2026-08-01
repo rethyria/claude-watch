@@ -80,11 +80,11 @@ class HaloUsagePageTest {
         )
 
     /**
-     * Pager swipes as a real finger drags them: frame-by-frame moves (the
+     * Page swipes as a real finger drags them: frame-by-frame moves (the
      * same injection discipline as the swipe-threshold gestures — a batched
      * swipe collapses into one frame-sized delta and can behave nothing like
-     * a finger on API 31+ surfaces). ~0.8 of the width at fling speed settles
-     * the HorizontalPager one page over.
+     * a finger on API 31+ surfaces). ~0.8 of the width steps the nav-owned
+     * page (the v2 shell's swipe detector — HorizontalPager is gone) one over.
      */
     private fun swipeToUsage() {
         compose.onNodeWithTag("haloRoot").performTouchInput {

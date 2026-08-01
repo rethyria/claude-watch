@@ -68,12 +68,27 @@ class HaloRingState {
         plan: SlotPlan,
         initialColor: Color,
         initialAlpha: Float,
+        initialPresence: Float,
         appearedAt: Long?,
     ) {
         val end = Animatable(plan.end)
         val sweep = Animatable(plan.sweep)
         val color = Animatable(initialColor)
         val alpha = Animatable(initialAlpha)
+
+        /**
+         * The slot's LIFECYCLE opacity, read by the dashed layer only (#104
+         * carry-over from #103). [alpha] cannot serve there: under
+         * solidHidden every shown slot's alpha targets 0, so a session
+         * arriving at LIST depth popped in with no fade while the same
+         * arrival at PAGE faded through [alpha]. Presence is the layer-blind
+         * truth — 1 shown, 0 vanished, faded on the same paint/new-arc specs
+         * — and multiplying it into the dashed draw gives dash arrivals and
+         * departures the fade the solid layer always had. The solid layer
+         * deliberately does NOT read it: alpha already carries the same
+         * lifecycle there, and multiplying both would square the ramp.
+         */
+        val presence = Animatable(initialPresence)
 
         var targetEnd: Float = plan.end
             internal set
@@ -82,6 +97,8 @@ class HaloRingState {
         var targetState: Halo.SessionState? = plan.state
             internal set
         var targetAlpha: Float = plan.alpha
+            internal set
+        var targetPresence: Float = if (plan.state != null) 1f else 0f
             internal set
 
         /** Last [SlotPlan.isNew] render, for [drawOrder]; null = never new. */
@@ -93,6 +110,7 @@ class HaloRingState {
             targetSweep = plan.sweep
             targetState = plan.state
             targetAlpha = plan.alpha
+            targetPresence = if (plan.state != null) 1f else 0f
         }
     }
 
@@ -257,16 +275,19 @@ class HaloRingState {
                 slot == null -> {
                     // Born at its final geometry, pre-coloured, and only then
                     // faded in — beneath the settled ring (appearedAt feeds
-                    // drawOrder) so it can't flash over its neighbours.
-                    val born = Slot(sp, color, initialAlpha = 0f, appearedAt = nowMs)
+                    // drawOrder) so it can't flash over its neighbours. The
+                    // presence fade is the same arrival on the dashed layer.
+                    val born = Slot(sp, color, initialAlpha = 0f, initialPresence = 0f, appearedAt = nowMs)
                     trackedSlots += born
                     jobs += scope.launch { born.alpha.animateTo(sp.alpha, newArcFade()) }
+                    jobs += scope.launch { born.presence.animateTo(1f, newArcFade()) }
                 }
                 sp.isNew -> {
                     // Reborn over a collapsed corpse: snap geometry and colour
                     // to the final pose (the S2 rule — never grow out of the
                     // death spot), then fade from the CURRENT alpha, which is
-                    // mid-fade-out when a kill is undone within 300ms.
+                    // mid-fade-out when a kill is undone within 300ms —
+                    // presence rides the same rule for the dashed layer.
                     slot.appearedAt = nowMs
                     slot.commit(sp)
                     jobs += scope.launch {
@@ -275,8 +296,10 @@ class HaloRingState {
                         slot.color.snapTo(color)
                         slot.alpha.animateTo(sp.alpha, newArcFade())
                     }
+                    jobs += scope.launch { slot.presence.animateTo(1f, newArcFade()) }
                 }
                 else -> {
+                    val presence = if (sp.state != null) 1f else 0f
                     if (sp.end != slot.targetEnd) {
                         jobs += scope.launch { slot.end.animateTo(sp.end, geometry) }
                     }
@@ -288,6 +311,12 @@ class HaloRingState {
                     }
                     if (sp.alpha != slot.targetAlpha) {
                         jobs += scope.launch { slot.alpha.animateTo(sp.alpha, paint()) }
+                    }
+                    if (presence != slot.targetPresence) {
+                        // A vanishing dash fades out on the paint spec — the
+                        // epic's "alpha→0" half of the collapse, which the
+                        // dashed layer had no channel to honour before this.
+                        jobs += scope.launch { slot.presence.animateTo(presence, paint()) }
                     }
                     slot.commit(sp)
                 }
@@ -381,6 +410,10 @@ class HaloRingState {
                 val alpha = if (slot.targetState != null) 1f else 0f
                 slot.alpha.snapTo(alpha)
                 slot.targetAlpha = alpha
+                // Presence settles with it: a newborn still mid-fade lands
+                // exactly like its alpha does — the swap is one settled frame.
+                slot.presence.snapTo(alpha)
+                slot.targetPresence = alpha
                 slot.appearedAt = null
             }
             dashAlpha.snapTo(0f)
@@ -563,14 +596,22 @@ class HaloRingState {
 
         val plan = planFor(inputs.states, solidHidden = inputs.level != RingLevel.PAGE)
         plan.slots.forEachIndexed { k, sp ->
+            val presence = if (sp.state != null) 1f else 0f
             val slot = trackedSlots.getOrNull(k)
             if (slot == null) {
-                trackedSlots += Slot(sp, colorOf(sp.state), initialAlpha = sp.alpha, appearedAt = null)
+                trackedSlots += Slot(
+                    sp,
+                    colorOf(sp.state),
+                    initialAlpha = sp.alpha,
+                    initialPresence = presence,
+                    appearedAt = null,
+                )
             } else {
                 slot.end.snapTo(sp.end)
                 slot.sweep.snapTo(sp.sweep)
                 slot.color.snapTo(colorOf(sp.state))
                 slot.alpha.snapTo(sp.alpha)
+                slot.presence.snapTo(presence)
                 slot.commit(sp)
                 // A snapped ring has no "new" arcs: everything is settled, so
                 // nothing needs the beneath-the-ring paint order.

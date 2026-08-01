@@ -39,10 +39,14 @@ class HaloPreviewScreens {
 
     private fun fixtureFrames(): List<SseFrame> = listOf(
         SseFrame("1", "session", """{"state":"connected"}"""),
+        // Alpha carries the #54/#55 metadata so the pager card's detail line
+        // ("⎇ main · ⚙ 2 agents") is on the reference capture; activity stays
+        // WORKING, so the two running subagents do NOT flip it DELEGATED.
         SseFrame(
             "2",
             "session",
-            """{"state":"running","agent":"claude","cwd":"/home/dev/projects/claude-watch","folderName":"claude-watch","sessionId":"$alpha"}""",
+            """{"state":"running","agent":"claude","cwd":"/home/dev/projects/claude-watch","folderName":"claude-watch",""" +
+                """"branch":"main","agents":{"running":2,"done":1},"sessionId":"$alpha"}""",
         ),
         SseFrame(
             "3",
@@ -61,10 +65,13 @@ class HaloPreviewScreens {
             """{"tool_name":"Bash","tool_input":{"command":"./gradlew test"},""" +
                 """"tool_output":"BUILD SUCCESSFUL — 42 passed","cwd":"/home/dev/projects/claude-watch","source":"claude","sessionId":"$alpha"}""",
         ),
+        // Beta carries the S9 session-meta trio (#97/#102), so the pager
+        // card's `model · mode · use%` subheading is on the capture too.
         SseFrame(
             "6",
             "session",
-            """{"state":"running","agent":"codex","cwd":"/home/dev/projects/bridge","folderName":"bridge","sessionId":"$beta"}""",
+            """{"state":"running","agent":"codex","cwd":"/home/dev/projects/bridge","folderName":"bridge",""" +
+                """"model":"Claude Opus 4.6","mode":"acceptEdits","contextPct":57,"sessionId":"$beta"}""",
         ),
         SseFrame(
             "7",
@@ -75,6 +82,26 @@ class HaloPreviewScreens {
             "8",
             "session",
             """{"state":"running","agent":"claude","cwd":"/home/dev/projects/bridge","folderName":"bridge","sessionId":"$gamma"}""",
+        ),
+        // Enough tail that the masked feed capture (v2 S6) shows lines
+        // dissolving into the circular fade band rather than a short stub.
+        SseFrame(
+            "9",
+            "tool-output",
+            """{"tool_name":"Bash","tool_input":{"command":"git status --short"},""" +
+                """"tool_output":" M wear/app/src/main/kotlin/HaloApp.kt","cwd":"/home/dev/projects/claude-watch","source":"claude","sessionId":"$alpha"}""",
+        ),
+        SseFrame(
+            "10",
+            "tool-output",
+            """{"tool_name":"Read","tool_input":{"file_path":"/home/dev/projects/claude-watch/wear/design/HALO_HANDOFF.md"},""" +
+                """"tool_output":"1183 lines","cwd":"/home/dev/projects/claude-watch","source":"claude","sessionId":"$alpha"}""",
+        ),
+        SseFrame(
+            "11",
+            "tool-output",
+            """{"tool_name":"Bash","tool_input":{"command":"./gradlew :app:testDebugUnitTest"},""" +
+                """"tool_output":"BUILD SUCCESSFUL — 298 passed, 3 skipped","cwd":"/home/dev/projects/claude-watch","source":"claude","sessionId":"$alpha"}""",
         ),
     )
 
@@ -121,6 +148,20 @@ class HaloPreviewScreens {
         Thread.sleep(8_000)
     }
 
+    /** Drill home → session list, settling on the scope's first card. */
+    private fun drillToList() {
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+    }
+
+    /** Step the pager [times] cards forward via the › chevron. */
+    private fun stepForward(times: Int) {
+        repeat(times) {
+            compose.onNodeWithTag("haloNext").performClick()
+            compose.waitForIdle()
+        }
+    }
+
     @Test
     fun homeAllPage() {
         previewEnabled()
@@ -129,10 +170,44 @@ class HaloPreviewScreens {
     }
 
     @Test
-    fun sessionList() {
+    fun homeAnswerPill() {
+        previewEnabled()
+        // A queued prompt puts the terracotta Answer pill on the home page
+        // (out of flow — the clock group must sit exactly as on homeAllPage).
+        compose.setContent { HaloApp(ui = uiWithPrompt(), actions = HaloActions()) }
+        hold()
+    }
+
+    @Test
+    fun pagerRunning() {
         previewEnabled()
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        // Alpha is the drill's resolved selection: a RUNNING card with the
+        // #54/#55 detail line, the dotted position ring and the action arc.
+        drillToList()
+        hold()
+    }
+
+    @Test
+    fun pagerWaiting() {
+        previewEnabled()
+        compose.setContent { HaloApp(ui = uiWithPrompt(), actions = HaloActions()) }
+        drillToList()
+        // Beta (All order is project-grouped: alpha, beta, gamma, spawn) is
+        // the WAITING card: Answer pill over the card, subheading from the
+        // S9 wire trio, hero highlight in terracotta.
+        stepForward(1)
+        hold()
+    }
+
+    @Test
+    fun pagerSpawn() {
+        previewEnabled()
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drillToList()
+        // The trailing "+ new session" card — the All scope's true end: ›
+        // hidden, ring highlight faded, dashed ring carrying the screen.
+        stepForward(3)
         hold()
     }
 
@@ -140,9 +215,9 @@ class HaloPreviewScreens {
     fun sessionFeed() {
         previewEnabled()
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
-        compose.waitForIdle()
-        // Alpha is the drill's resolved selection (the scope's first card).
+        drillToList()
+        // Alpha is the drill's resolved selection (the scope's first card):
+        // the chrome-free masked feed inside the full-circle state ring.
         compose.onNodeWithTag("haloPagerCard-$alpha").performClick()
         hold()
     }

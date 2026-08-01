@@ -53,6 +53,7 @@ import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -121,6 +122,25 @@ internal fun sessionSubheading(
     modeName?.let { add(SubheadingPart(it)) }
     usePercent?.let { add(SubheadingPart("$it%", hot = it >= 80)) }
 }
+
+/**
+ * The card's second meta line: ⎇ branch badge (issue #54) and workflow-agents
+ * indicator (issue #55) sharing one faint ellipsized row, exactly the pairing
+ * the retired FeedHeader carried — its death in the chrome-free feed (v2 S6)
+ * left both without ANY textual surface, and the ring's DELEGATED blue says
+ * "subagents somewhere", never which branch or how many. The pager card is
+ * their v2 home (#104 adjudication): it is where a session's identity lives
+ * now. The agents part shows ONLY while > 0 — an indicator, not a control (a
+ * watch cannot stop a workflow); no branch and nothing running = null = no
+ * row, so PTY/hook sessions keep today's clean card.
+ */
+internal fun sessionDetailLine(branchLabel: String?, agentsRunning: Int): String? =
+    listOfNotNull(
+        branchLabel,
+        agentsRunning.takeIf { it > 0 }?.let { n ->
+            if (n == 1) "⚙ 1 agent" else "⚙ $n agents"
+        },
+    ).joinToString(" · ").ifEmpty { null }
 
 /**
  * One session per screen. [selectedId] is nav's LIST selection verbatim —
@@ -347,6 +367,21 @@ private fun SessionCard(
                         )
                     }
                 }
+            }
+            // The #54/#55 line, rehomed from the retired FeedHeader (see
+            // sessionDetailLine). Below the subheading: identity first, then
+            // configuration, then working state.
+            sessionDetailLine(session.branchLabel, session.agentsRunning)?.let { details ->
+                Text(
+                    text = details,
+                    fontSize = Halo.Type.Min,
+                    color = Halo.Palette.TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .padding(top = if (parts.isEmpty()) SUBHEADING_GAP else 2.dp)
+                        .testTag("haloCardDetails"),
+                )
             }
         }
 

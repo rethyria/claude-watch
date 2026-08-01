@@ -34,6 +34,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -465,13 +466,19 @@ private fun HaloAppBody(
         // fade or slide with content (the coming morphs animate content
         // hard; the time must not blink). Still deliberately NOT a tap
         // target: an invisible hotspot over the time read as an
-        // accidental-jump trap in live testing.
+        // accidental-jump trap in live testing. Padded off the rim into the
+        // ring channel's clear interior (ClockRingClearance): the list's
+        // dotted ring and the feed circle own the edge band the platform
+        // default hugs, and the ambient clock contract (handoff §Ambient)
+        // keeps this TimeText on those depths — hiding it was not an option.
         if (nav.depth != HaloDepth.PAGE || nav.page < 0) {
             TimeText(
                 timeTextStyle = TimeTextDefaults.timeTextStyle(
                     color = Color(0xFF7E7C76),
                     fontSize = Halo.Type.Min,
                 ),
+                // top → the curved row's OUTER arc padding on round screens.
+                contentPadding = PaddingValues(top = (Halo.Geo.ClockRingClearance / 2f).dp),
             )
         }
 
