@@ -8,6 +8,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.wear.ambient.AmbientLifecycleObserver
+import dev.claudewatch.wear.ui.halo.EmptyRingStyle
 import dev.claudewatch.wear.ui.halo.Halo
 import dev.claudewatch.wear.ui.halo.HaloActions
 import dev.claudewatch.wear.ui.halo.HaloApp
@@ -15,6 +16,9 @@ import dev.claudewatch.wear.ui.halo.HaloRingHost
 import dev.claudewatch.wear.ui.halo.HaloRingMath
 import dev.claudewatch.wear.ui.halo.HaloRingState
 import dev.claudewatch.wear.ui.halo.LocalHaloAmbient
+import dev.claudewatch.wear.ui.halo.RingInputs
+import dev.claudewatch.wear.ui.halo.RingLevel
+import dev.claudewatch.wear.ui.halo.StepDir
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -89,7 +93,17 @@ class AmbientTest {
         compose.mainClock.autoAdvance = false
         compose.setContent {
             CompositionLocalProvider(LocalHaloAmbient provides ambient) {
-                HaloRingHost(states = states, collapsed = false, engine = engine)
+                HaloRingHost(
+                    inputs = RingInputs(
+                        level = RingLevel.PAGE,
+                        states = states,
+                        emptyStyle = EmptyRingStyle.IDLE_CIRCLE,
+                        selectedIndex = -1,
+                        stepDir = StepDir.NONE,
+                        feedState = null,
+                    ),
+                    engine = engine,
+                )
             }
         }
         compose.mainClock.advanceTimeBy(500)

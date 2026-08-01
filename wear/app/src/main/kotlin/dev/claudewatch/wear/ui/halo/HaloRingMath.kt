@@ -304,6 +304,48 @@ object HaloRingMath {
     }
 
     /**
+     * Dashed-layer stroke at [mergeFraction]: 4 (list) ↔ 9 (solid). The same
+     * ONE fraction that drives [dashIntervals] and [dashLayerAlpha] — the
+     * three are functions of it by construction, so they cannot desync, and
+     * at fraction 1 the layer is pixel-identical to the solid ring (stroke 9,
+     * alpha 1, zero off-interval): what makes the close-swap atomic.
+     */
+    fun dashStroke(mergeFraction: Float): Float {
+        val f = mergeFraction.coerceIn(0f, 1f)
+        return Halo.Geo.RingStrokeDashed + (Halo.Geo.RingStroke - Halo.Geo.RingStrokeDashed) * f
+    }
+
+    /** Dashed-layer alpha at [mergeFraction]: .65 (list) ↔ 1 (solid). */
+    fun dashLayerAlpha(mergeFraction: Float): Float {
+        val f = mergeFraction.coerceIn(0f, 1f)
+        return Halo.Geo.DashedLayerAlpha + (1f - Halo.Geo.DashedLayerAlpha) * f
+    }
+
+    /**
+     * The grown hero's END for an arc currently at ([end], [sweep]) — the
+     * end-anchored form of [growTargets], because the engine tracks slot
+     * geometry by END. Fed the hero's ACTUAL pose (mid-flight included, per
+     * the S7 spec — this is a morph target, not a [planRetarget] prevPose),
+     * so a grow interrupted mid-rotation still expands symmetrically about
+     * wherever the arc really is.
+     */
+    fun growEndTarget(end: Float, sweep: Float): Float =
+        growTargets(end - sweep, sweep).start + 360f
+
+    /**
+     * The shrunk hero's END: the exact reverse of [growEndTarget] — back off
+     * by half the vanishing sweep — then corrected by [shortestDelta] onto the
+     * REAL slot end [targetBaseEnd] (nearest coterminal representation). When
+     * nothing changed while the feed was open the correction is zero and the
+     * shrink retraces the grow exactly; when the scope re-sliced underneath,
+     * the hero lands on the segment's new place with minimal extra rotation.
+     */
+    fun shrinkEndTarget(currentEnd: Float, targetSweep: Float, targetBaseEnd: Float): Float {
+        val natural = currentEnd - (360f - targetSweep) / 2f
+        return natural + shortestDelta(natural, targetBaseEnd)
+    }
+
+    /**
      * The morph a level transition plays, or null to snap. Only the four
      * adjacent transitions animate; anything else (jumpHome from a feed,
      * self-heal after a scope vanishes) lands instantly — a morph between

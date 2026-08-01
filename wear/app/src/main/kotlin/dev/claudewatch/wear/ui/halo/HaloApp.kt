@@ -3,10 +3,11 @@
 // project). Horizontal swipes and tappable dots change the page and only page
 // CONTENT slides — the v2 shell (epic #94 S3) dropped HorizontalPager because
 // the design has no drag-follow: halo, clock and dots hold still during page
-// navigation. Vertical swipes drive depth with the 300ms directional
-// slide+fade, a decorative (non-tappable) TimeText renders at the root
-// whenever the centre clock is hidden, and the approval/question card rides
-// as a top overlay chained off the waiting queue.
+// navigation. Vertical swipes drive depth with content FADES (S7: the ring's
+// morphs are the spatial continuity, content follows), a decorative
+// (non-tappable) TimeText renders at the root whenever the centre clock is
+// hidden, and the approval/question card rides as a top overlay chained off
+// the waiting queue.
 // Navigation state itself is the pure HaloNavState machine (HaloNav.kt); this
 // file only binds gestures, animation, and the screen composables to it.
 package dev.claudewatch.wear.ui.halo
@@ -17,13 +18,12 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.LocalOverscrollConfiguration
@@ -306,6 +306,13 @@ private fun HaloAppBody(
     // position the CURRENT model can no longer answer.
     var lastListIndex by remember { mutableIntStateOf(0) }
 
+    // The last pager step's direction, for the ring engine's 2-session
+    // backstep retrace (RingInputs.stepDir): with two sessions every step is
+    // an exact half turn, and only this tells the highlight to retrace
+    // instead of orbiting. Reset on each list entry so a stale BACK from a
+    // previous visit can never flip a fresh drill's first rotation.
+    var lastStepDir by remember { mutableStateOf(StepDir.NONE) }
+
     // The model can shrink under the navigation (session killed, project's
     // last session gone, queue resolved elsewhere): back out to something
     // that still exists rather than rendering a ghost.
@@ -346,15 +353,14 @@ private fun HaloAppBody(
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Halo.Palette.Background).testTag("haloRoot")) {
-        // The ONE ring (v2 shell): bottom of the z-order, drawing the current
-        // page's scope. Deeper screens and overlays paint opaque backgrounds,
-        // so nothing else needs to know it exists. Live since S4: the host's
-        // engine animates between scope targets.
-        val ringScope = if (nav.page < 0) null else scopeForPage(nav.page, model)
-        HaloRingHost(
-            states = ringScope?.let { s -> model.sessionsIn(s).map { it.state } }.orEmpty(),
-            collapsed = ringScope == null,
-        )
+        // The ONE ring (v2 shell, S7 morphs): the PERSISTENT bottom layer,
+        // fed the full nav-derived snapshot — page arcs, the list's dotted
+        // ring + hero highlight, the feed's full circle, and the morphs
+        // between them all live in the host's engine. The depth layers above
+        // stopped painting opaque backgrounds (InnerScreen) so it shows
+        // through; only true overlays (cards, voice, spawn picker, offline)
+        // still cover it.
+        HaloRingHost(inputs = HaloRingMath.ringInputs(nav, model, lastStepDir))
 
         AnimatedContent(
             targetState = layerOf(nav),
@@ -377,6 +383,7 @@ private fun HaloAppBody(
                     onSelectPage = { nav = nav.copy(page = it) },
                     onDrill = {
                         lastSwipeAtMs = SystemClock.uptimeMillis()
+                        lastStepDir = StepDir.NONE
                         nav = nav.drillToList(currentModel)
                     },
                     // The centerpiece tap opens the session list too (v2 nav:
@@ -384,6 +391,7 @@ private fun HaloAppBody(
                     // moved to the Answer pill below.
                     onTapCenter = {
                         if (SystemClock.uptimeMillis() - lastSwipeAtMs > TAP_GUARD_MS) {
+                            lastStepDir = StepDir.NONE
                             nav = nav.drillToList(currentModel)
                         }
                     },
@@ -408,7 +416,10 @@ private fun HaloAppBody(
                         // The at-start-goes-back rule stays the nav's pinned
                         // predicate; the pager only obeys it.
                         atStart = nav.atListStart(model),
-                        onStep = { delta -> nav = nav.step(delta, currentModel) },
+                        onStep = { delta ->
+                            lastStepDir = if (delta < 0) StepDir.BACK else StepDir.FORWARD
+                            nav = nav.step(delta, currentModel)
+                        },
                         onBack = { nav = nav.back() },
                         onOpenSession = { nav = nav.drillToSession(it) },
                         // The Answer pill: the card OVER the list, pinned to
@@ -778,20 +789,31 @@ private fun layerOf(nav: HaloNavState): Layer = when (nav.depth) {
 }
 
 /**
- * Directional slide+fade: drilling slides the new screen up from below,
- * backing out reverses it; same-rank changes (cycling sessions) and
- * non-spatial jumps (tap-time home) get a fast fade.
+ * Depth transitions are FADES since the S7 morphs: the persistent ring is the
+ * spatial continuity now — content just follows it (out fast, in late), so a
+ * slide would fight the dash split happening beneath. The adjacent
+ * transitions use the morph windows (out .25s / in .45s delayed .1s), the
+ * list→page return is the quick fade home, and the rank-2 jumps (Answer-pill
+ * page→feed, jump-home from a resolved card) SNAP — they happen under the
+ * opaque card, where an animation would be unseen theatre and the ring snaps
+ * with them. Same-rank changes (cycling feed sessions) keep the fast fade.
  */
 private fun androidx.compose.animation.AnimatedContentTransitionScope<Layer>.depthTransition(): ContentTransform {
-    val spec = tween<Float>(TRANSITION_MS, easing = HaloEasing)
-    val slide = tween<androidx.compose.ui.unit.IntOffset>(TRANSITION_MS, easing = HaloEasing)
+    val ranks = targetState.rank - initialState.rank
     return when {
-        targetState.rank > initialState.rank ->
-            (slideInVertically(slide) { (it * SLIDE_FRACTION).roundToInt() } + fadeIn(spec))
-                .togetherWith(slideOutVertically(slide) { -(it * SLIDE_FRACTION).roundToInt() } + fadeOut(spec))
-        targetState.rank < initialState.rank ->
-            (slideInVertically(slide) { -(it * SLIDE_FRACTION).roundToInt() } + fadeIn(spec))
-                .togetherWith(slideOutVertically(slide) { (it * SLIDE_FRACTION).roundToInt() } + fadeOut(spec))
+        ranks > 1 || ranks < -1 ->
+            fadeIn(snap()).togetherWith(fadeOut(snap()))
+        ranks < 0 && targetState is Layer.Pager ->
+            fadeIn(tween(Halo.Motion.ListToPageFadeMs, easing = HaloEasing))
+                .togetherWith(fadeOut(tween(Halo.Motion.ContentFadeOutMs, easing = HaloEasing)))
+        ranks != 0 ->
+            fadeIn(
+                tween(
+                    Halo.Motion.ContentFadeInMs,
+                    delayMillis = Halo.Motion.ContentFadeInDelayMs,
+                    easing = HaloEasing,
+                ),
+            ).togetherWith(fadeOut(tween(Halo.Motion.ContentFadeOutMs, easing = HaloEasing)))
         else -> fadeIn(tween(150)).togetherWith(fadeOut(tween(150)))
     }
 }
@@ -1132,17 +1154,20 @@ private fun PageDots(
 // ── Inner-screen chrome (depth = LIST / SESSION) ────────────────────────────
 
 /**
- * Wraps every screen below the pager with the shared chrome: an opaque
- * background (it covers the root ring host) and the swipe-down-to-go-back
- * gesture. The top clock these screens show is the ROOT TimeText now (v2
- * shell) — lifted so the coming morphs can fade content without blinking the
- * time. The back detector sits UNDER the content, so it only covers screens
- * without a full-screen scrollable: a scrollable child consumes every
- * vertical drag (its leftover goes to nested scroll, never back to pointer
- * input) and has to re-provide back itself — the touch-scrolling feed (v2
- * S6) does, via its at-top pull-down connection, exactly as the retired
- * session list did. The v2 pager (and the feed's empty state) has no
- * scrollable, so vertical drags there fall through to this one detector.
+ * Wraps every screen below the pager with the shared chrome: the
+ * swipe-down-to-go-back gesture — and, since the S7 morphs, NO background:
+ * the root ring host is the persistent bottom layer, and the dash split /
+ * grow morphs play through these screens' content fades (the feed's mask and
+ * the pager's insets already keep content off the ring channel). The top
+ * clock these screens show is the ROOT TimeText (v2 shell) — lifted so the
+ * morphs can fade content without blinking the time. The back detector sits
+ * UNDER the content, so it only covers screens without a full-screen
+ * scrollable: a scrollable child consumes every vertical drag (its leftover
+ * goes to nested scroll, never back to pointer input) and has to re-provide
+ * back itself — the touch-scrolling feed (v2 S6) does, via its at-top
+ * pull-down connection, exactly as the retired session list did. The v2
+ * pager (and the feed's empty state) has no scrollable, so vertical drags
+ * there fall through to this one detector.
  */
 @Composable
 private fun InnerScreen(
@@ -1153,7 +1178,6 @@ private fun InnerScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Halo.Palette.Background)
             .pointerInput(Unit) {
                 val threshold = size.height * SWIPE_THRESHOLD_FRACTION
                 var total = 0f

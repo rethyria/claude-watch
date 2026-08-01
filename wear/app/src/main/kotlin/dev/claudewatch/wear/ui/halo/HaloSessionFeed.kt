@@ -7,8 +7,8 @@
 // header — position lives in the list pager now), an at-top pull-down = back
 // too, and while the session waits the whole feed surface is the prompt's tap
 // target. The dictate pill (and its honest "unavailable" variant, issue #78)
-// keeps the bottom slot when nothing is waiting. The ring behind the feed
-// stays hidden at this slice — the full-circle feed ring is S7's morph work.
+// keeps the bottom slot when nothing is waiting. The full-circle feed ring
+// (S7) shows through from the root host — the mask keeps text off it.
 // px values are at the 450 reference (≈ px/2 in dp, matching HaloTheme).
 package dev.claudewatch.wear.ui.halo
 

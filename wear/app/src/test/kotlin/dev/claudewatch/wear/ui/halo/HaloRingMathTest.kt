@@ -342,6 +342,45 @@ class HaloRingMathTest {
     }
 
     @Test
+    fun dashStrokeAndAlphaRideTheOneMergeFraction() {
+        // Interval, stroke and alpha are all functions of the ONE fraction —
+        // the structural can't-desync guarantee — and fraction 1 is the solid
+        // layer's exact paint (stroke 9, alpha 1), what makes the close-swap
+        // pixel-identical by construction.
+        assertEquals(Halo.Geo.RingStrokeDashed, m.dashStroke(0f), 0f)
+        assertEquals(Halo.Geo.RingStroke, m.dashStroke(1f), 0f)
+        assertEquals(Halo.Geo.DashedLayerAlpha, m.dashLayerAlpha(0f), 0f)
+        assertEquals(1f, m.dashLayerAlpha(1f), 0f)
+        // Clamped like dashIntervals — no negative strokes off the ends.
+        assertEquals(Halo.Geo.RingStrokeDashed, m.dashStroke(-1f), 0f)
+        assertEquals(1f, m.dashLayerAlpha(2f), 0f)
+    }
+
+    @Test
+    fun growEndTargetIsTheEndAnchoredFormOfGrowTargets() {
+        val n = 3
+        val end = m.endAngle(1, n)
+        val sweep = m.sweepDegrees(n)
+        val grown = m.growTargets(end - sweep, sweep)
+        assertEquals(grown.start + 360f, m.growEndTarget(end, sweep), 1e-4f)
+        assertEquals(end + (360f - sweep) / 2f, m.growEndTarget(end, sweep), 1e-4f)
+    }
+
+    @Test
+    fun shrinkEndTargetInvertsGrowExactlyAndCorrectsOntoARealSlot() {
+        val n = 4
+        val end = m.endAngle(2, n)
+        val sweep = m.sweepDegrees(n)
+        val grown = m.growEndTarget(end, sweep)
+        // Nothing changed while the feed was open: the exact reverse.
+        assertEquals(end, m.shrinkEndTarget(grown, sweep, m.endAngle(2, n)), 1e-3f)
+        // The scope re-sliced underneath (4 → 3): land coterminal with the
+        // REAL slot end — minimal extra rotation, correct segment.
+        val resliced = m.shrinkEndTarget(grown, m.sweepDegrees(3), m.endAngle(1, 3))
+        assertEquals(0f, m.shortestDelta(resliced, m.endAngle(1, 3)), 1e-3f)
+    }
+
+    @Test
     fun morphForAnimatesTheFourAdjacentTransitionsOnly() {
         assertEquals(RingMorph.OPEN, m.morphFor(RingLevel.PAGE, RingLevel.PLIST))
         assertEquals(RingMorph.CLOSE, m.morphFor(RingLevel.PLIST, RingLevel.PAGE))
