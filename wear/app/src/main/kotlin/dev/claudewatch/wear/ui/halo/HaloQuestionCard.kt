@@ -45,17 +45,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
@@ -214,26 +209,12 @@ private fun QuestionLayer(
 
     // Same scroll + pull-down-to-exit chrome as the approval card: the
     // options can outgrow a round display, and verticalScroll starves the
-    // overlay's swipe-down detector (see HaloApprovalCard for the mechanics).
+    // overlay's swipe-down detector (see HaloApprovalCard for the mechanics,
+    // including the #109 system-back stand-down the shared connection carries).
     val scrollState = rememberScrollState()
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
-    val answerLater by rememberUpdatedState(onAnswerLater)
-    val exitThresholdPx = with(LocalDensity.current) { 30.dp.toPx() }
-    val overscrollExit = remember(exitThresholdPx) {
-        object : NestedScrollConnection {
-            private var overscroll = 0f
-            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                if (source == NestedScrollSource.UserInput && available.y > 0f) overscroll += available.y
-                return Offset.Zero
-            }
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                if (overscroll > exitThresholdPx) answerLater()
-                overscroll = 0f
-                return Velocity.Zero
-            }
-        }
-    }
+    val overscrollExit = rememberOverscrollExitConnection(onAnswerLater)
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,

@@ -28,26 +28,19 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
 import androidx.wear.compose.foundation.rotary.rotaryScrollable
@@ -77,25 +70,13 @@ fun HaloVoiceScreen(
     // vertical drag (starving HaloApp's swipe-down detector — see
     // HaloApprovalCard's DecisionLayer for the mechanics), so the Cancel exit
     // is re-provided from the nested-scroll leftovers, plus rotary support.
+    // The shared connection carries the #109 system-back stand-down: a system
+    // gesture's droop firing Cancel here races the root handler's completion
+    // — which, over home, routes the deliberate exit (HaloGestures.kt).
     val scrollState = rememberScrollState()
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
-    val cancel by rememberUpdatedState(onCancel)
-    val exitThresholdPx = with(LocalDensity.current) { 30.dp.toPx() }
-    val overscrollExit = remember(exitThresholdPx) {
-        object : NestedScrollConnection {
-            private var overscroll = 0f
-            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                if (source == NestedScrollSource.UserInput && available.y > 0f) overscroll += available.y
-                return Offset.Zero
-            }
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                if (overscroll > exitThresholdPx) cancel()
-                overscroll = 0f
-                return Velocity.Zero
-            }
-        }
-    }
+    val overscrollExit = rememberOverscrollExitConnection(onCancel)
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,

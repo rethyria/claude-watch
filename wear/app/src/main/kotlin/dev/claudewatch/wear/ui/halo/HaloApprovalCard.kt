@@ -52,18 +52,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
@@ -243,22 +238,10 @@ private fun DecisionLayer(
     // the overlay's swipe-down detector in HaloApp. This restores that exit
     // from the leftovers: dragging down past the threshold with the column
     // already at its top is "decide later" — same ~60px-at-450 threshold.
-    val decideLater by rememberUpdatedState(onDecideLater)
-    val exitThresholdPx = with(LocalDensity.current) { 30.dp.toPx() }
-    val overscrollExit = remember(exitThresholdPx) {
-        object : NestedScrollConnection {
-            private var overscroll = 0f
-            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                if (source == NestedScrollSource.UserInput && available.y > 0f) overscroll += available.y
-                return Offset.Zero
-            }
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                if (overscroll > exitThresholdPx) decideLater()
-                overscroll = 0f
-                return Velocity.Zero
-            }
-        }
-    }
+    // The shared connection carries the #109 system-back stand-down: a system
+    // gesture's droop firing decide-later here would race the root handler's
+    // completion into a double-navigate (HaloGestures.kt).
+    val overscrollExit = rememberOverscrollExitConnection(onDecideLater)
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,

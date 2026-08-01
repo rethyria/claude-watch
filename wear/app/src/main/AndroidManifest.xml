@@ -56,14 +56,21 @@
              routes through the OnBackInvokedDispatcher into the registered
              callback, or falls through to the system exit when none is.
 
-         So the BackHandler's enabled flag is the whole switch: exits happen
-         ONLY from the home resting state. Pinned by HaloSystemBackTest —
-         keyevent walks end-to-end, plus a real edge-swipe injection for the
-         armed suppression half (the disarmed dismiss half was verified by
-         hand on both images; under instrumentation it races SysUI too
-         erratically to gate on). See the BackHandler in HaloApp.kt for the
-         routing itself. Below API 33 the attribute is ignored and the
-         legacy dismiss-from-anywhere stands. -->
+         Round 2 (the SM-L330 22:47 log race): the callback is now ALWAYS
+         registered — HaloApp's PredictiveBackHandler — because an enabled
+         flag that drops MID-GESTURE (the app's own surface gesture
+         navigating to home while the system gesture is in flight) lets the
+         release commit the system's own back, and a plain non-animation
+         callback leaves the system running its home-preview (the watch-face
+         peek flash). Exits still happen ONLY from the home resting state,
+         now as the handler's own deliberate activity.finish(). Pinned by
+         HaloSystemBackTest — keyevent walks end-to-end, the always-
+         registered invariant, the mid-gesture race, plus a real edge-swipe
+         injection for the suppression half (the system-dismiss half of the
+         old measured story is unreachable now by construction). See the
+         PredictiveBackHandler in HaloApp.kt for the routing itself. Below
+         API 33 the attribute is ignored and the legacy dismiss-from-anywhere
+         stands. -->
     <application
         android:label="@string/app_name"
         android:icon="@android:drawable/sym_def_app_icon"

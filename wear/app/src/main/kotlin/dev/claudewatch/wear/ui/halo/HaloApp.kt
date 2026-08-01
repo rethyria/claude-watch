@@ -12,8 +12,11 @@
 // file only binds gestures, animation, and the screen composables to it.
 package dev.claudewatch.wear.ui.halo
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.os.SystemClock
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ContentTransform
@@ -43,8 +46,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.State
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -59,8 +65,10 @@ import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -168,6 +176,23 @@ data class HaloActions(
  */
 internal val LocalHaloAmbient = compositionLocalOf { false }
 
+/**
+ * True while a SYSTEM predictive back gesture is in flight (issue #109 round
+ * 2): set by the root PredictiveBackHandler the moment the system dispatches
+ * back-started, dropped on completion or cancellation. Every surface drag
+ * detector — page/pager steps, feed swipe-right, the swipe-down backs, the
+ * at-top pull connections, the modal surfaces' overscroll exits — reads it
+ * (through [SystemBackDragClaim] or the poison inside the shared connections
+ * in HaloGestures.kt) to stand down for the drag: the system gesture's
+ * touches also arrive in-window as an ordinary drag, and acting on them is
+ * the double-consumption race the SM-L330 logs pinned. A [State] (not a
+ * value) because the consumers live in pointerInput(Unit) closures that
+ * never restart — they must read the live flag, not a composition-time
+ * capture.
+ */
+internal val LocalHaloSystemBackInFlight =
+    compositionLocalOf<State<Boolean>> { mutableStateOf(false) }
+
 /** Handoff motion: 300ms cubic-bezier(0.2,0.7,0.3,1), 70px slide at 450 ref. */
 private val HaloEasing = CubicBezierEasing(0.2f, 0.7f, 0.3f, 1f)
 private const val TRANSITION_MS = 300
@@ -175,6 +200,16 @@ private const val SLIDE_FRACTION = 70f / HALO_REF_PX
 
 /** Swipe threshold ≈60px at the 450 reference. */
 private const val SWIPE_THRESHOLD_FRACTION = 60f / HALO_REF_PX
+
+/**
+ * Predictive-back polish: at full gesture progress the app's CONTENT recedes
+ * to 96% (the background stays full-bleed — see the root Box). Deliberately
+ * subtle: the ring shrinking a few pixels reads as "the app is yielding",
+ * which is all the affordance a committed-back-means-one-step model needs.
+ * On API 33 the system sends no progress events, so the recede simply never
+ * engages there.
+ */
+private const val SYSTEM_BACK_RECEDE_MAX = 0.04f
 
 /** A swipe suppresses the synthetic tap that can follow it for this long. */
 private const val TAP_GUARD_MS = 300L
@@ -213,8 +248,20 @@ fun HaloApp(
     // The flag also rides a CompositionLocal so DEEP consumers (the usage
     // skeleton's pulse) can read it without a parameter chain through every
     // screen composable; the body itself takes it as a plain parameter.
-    CompositionLocalProvider(LocalHaloAmbient provides ambient) {
-        HaloAppBody(ui = ui, actions = actions, ambient = ambient)
+    // The system-back flag follows the same pattern: the body's handler is
+    // the single WRITER (hence the MutableState parameter), the gesture
+    // detectors down in the pager/feed/list composables are the readers.
+    val systemBackInFlight = remember { mutableStateOf(false) }
+    CompositionLocalProvider(
+        LocalHaloAmbient provides ambient,
+        LocalHaloSystemBackInFlight provides systemBackInFlight,
+    ) {
+        HaloAppBody(
+            ui = ui,
+            actions = actions,
+            ambient = ambient,
+            systemBackInFlight = systemBackInFlight,
+        )
     }
 }
 
@@ -223,6 +270,7 @@ private fun HaloAppBody(
     ui: BridgeViewModel.UiState,
     actions: HaloActions,
     ambient: Boolean,
+    systemBackInFlight: MutableState<Boolean>,
 ) {
     val model = HaloModel.from(ui)
     var nav by remember { mutableStateOf(HaloNavState()) }
@@ -363,53 +411,90 @@ private fun HaloAppBody(
         }
     }
 
-    // Issue #109: the SYSTEM back — one BackHandler at the root, enabled off
-    // the pure systemBack (HaloNav.kt), which owns routing and priority:
-    // topmost overlay first, then the card, then a depth step, then non-home
-    // pages jump home; null disables the handler so the system's own exit
-    // stands. The in-app surface gestures are untouched — they never reach
-    // this dispatcher.
+    // Issue #109 round 2: the SYSTEM back — one ALWAYS-ENABLED
+    // PredictiveBackHandler at the root, routing through the pure systemBack
+    // (HaloNav.kt), which owns priority: topmost overlay first, then the
+    // card, then a depth step, then non-home pages jump home — and at the
+    // home resting state (null route) the handler finishes the activity
+    // ITSELF, the one deliberate exit.
     //
-    // Predictive-back finding (do not remove the manifest opt-in): Wear
-    // never TRANSLATES the left-bezel edge swipe into this callback.
-    // Measured on the API 33 AND API 34 (Wear OS 5, the SM-L330's
-    // generation) emulator images, the flag-gated dispatch is a SUPPRESSION
-    // switch instead: while this handler is enabled, androidx registers a
-    // window OnBackInvokedCallback and the system leaves the edge swipe
-    // alone — the activity CANNOT be swiped away mid-session, and the
-    // swipe's touches reach the app like any drag, where the surface
-    // gestures (feed swipe-right = back, pager step, page step) own it (the
-    // manifest flag's comment holds the full measured story); while it is
-    // disabled (home at rest) nothing is registered and the system
-    // swipe-dismiss exits to the watch face. What lands HERE is KEYCODE_BACK —
-    // the watch's hardware back button and Espresso's pressBack — routed
-    // through the OnBackInvokedDispatcher when enabled, falling through to
-    // the system exit when not. Without the flag the system dismisses from
-    // ANYWHERE without consulting any dispatcher — the #109 mid-session
-    // exit. HaloSystemBackTest pins the keyevent walks end-to-end and the
-    // armed suppression half with a real shell-injected bezel swipe; the
-    // live wrist walk on the SM-L330 is the issue's remaining checklist
-    // item.
-    val backRoute = systemBack(nav, overlayOpen = voiceOpen || spawnPickerOpen)
-    BackHandler(enabled = backRoute != null) {
-        when (backRoute) {
-            SystemBack.DismissOverlay -> when {
-                // The voice overlay renders ABOVE the picker (both can be up:
-                // an armed send can fail while the picker is open), so it
-                // dismisses first — under the overlay's own modality rule: a
-                // FAILED send keeps it up (Retry/Discard are the only exits,
-                // same as its swipe-down), yet back stays intercepted — it
-                // must not navigate the hierarchy under a modal overlay.
-                voiceOpen -> if (currentUi.commandError == null) voiceOpen = false
-                else -> spawnPickerOpen = false
+    // Always-enabled is LOAD-BEARING, not a simplification (the SM-L330
+    // 22:47 log race that killed round 1's enabled-flag BackHandler): the
+    // system back gesture's touches ALSO reach the app window as an ordinary
+    // drag, and when a surface gesture navigated nav to home-at-rest
+    // MID-GESTURE the enabled flag flipped off and unregistered the callback
+    // while the gesture was in flight ("updateDecorViewGestureInterception
+    // intercepted=false" mid-gesture) — the release then committed the
+    // SYSTEM's own back ("ShellBackPreview onGestureFinished
+    // mTriggerBack==true") and the activity died, the 'random exit'. A
+    // permanently registered callback means hasEnabledCallbacks can never
+    // blink false: the system can never commit its own back, from anywhere,
+    // ever. Predictive (animation-capable) rather than the plain BackHandler
+    // for the log's second defect: behind a plain OnBackInvokedCallback the
+    // system still ran its home-preview ("CoreBackPreview
+    // launcher-task-behind" — the watch face peeking through as a ~1s exit
+    // flash even when the intercept held); an animation-capable callback
+    // keeps the preview off and hands the gesture's progress here instead.
+    //
+    // While the gesture is in flight, systemBackInFlight is up and every
+    // surface drag detector stands down for the drag (SystemBackDragClaim in
+    // HaloGestures.kt) — the double-consumption dies at the source. The
+    // route is computed at COMPLETION off live state (delegated snapshot
+    // reads, never a start-time capture): the gesture means ONE step from
+    // wherever the app actually is when the finger commits. A cancelled
+    // gesture (collect throws CancellationException) changes nothing.
+    // KEYCODE_BACK — the hardware back button, Espresso's pressBack —
+    // arrives as an immediately-completed flow and routes identically. The
+    // manifest's enableOnBackInvokedCallback comment carries the measured
+    // Wear dispatch story; HaloSystemBackTest pins the keyevent walks, the
+    // always-registered invariant, the deliberate home finish and the
+    // mid-gesture race itself.
+    val context = LocalContext.current
+    var systemBackProgress by remember { mutableFloatStateOf(0f) }
+    PredictiveBackHandler { progress ->
+        systemBackInFlight.value = true
+        try {
+            progress.collect { event -> systemBackProgress = event.progress }
+            when (val route = systemBack(nav, overlayOpen = voiceOpen || spawnPickerOpen)) {
+                SystemBack.DismissOverlay -> when {
+                    // The voice overlay renders ABOVE the picker (both can be
+                    // up: an armed send can fail while the picker is open), so
+                    // it dismisses first — under the overlay's own modality
+                    // rule: a FAILED send keeps it up (Retry/Discard are the
+                    // only exits, same as its swipe-down), yet back stays
+                    // consumed — it must not navigate the hierarchy under a
+                    // modal overlay.
+                    voiceOpen -> if (currentUi.commandError == null) voiceOpen = false
+                    else -> spawnPickerOpen = false
+                }
+                is SystemBack.Navigate -> nav = route.nav
+                // Home at rest: the ONE deliberate exit — fired at most once
+                // (finish() flips isFinishing synchronously on this thread,
+                // so a second gesture completing behind it is a no-op).
+                null -> context.findActivity()?.takeIf { !it.isFinishing }?.finish()
             }
-            is SystemBack.Navigate -> nav = backRoute.nav
-            // Unreachable: a null route disables the handler above.
-            null -> Unit
+        } finally {
+            systemBackInFlight.value = false
+            systemBackProgress = 0f
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Halo.Palette.Background).testTag("haloRoot")) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Halo.Palette.Background)
+            // The predictive-back recede, driven straight from the gesture's
+            // progress flow. graphicsLayer sits RIGHT of background in the
+            // chain on purpose: the content shrinks, the background stays
+            // full-bleed — no hole to the window behind. A draw-phase state
+            // read, so progress never recomposes anything.
+            .graphicsLayer {
+                val recede = 1f - SYSTEM_BACK_RECEDE_MAX * systemBackProgress
+                scaleX = recede
+                scaleY = recede
+            }
+            .testTag("haloRoot"),
+    ) {
         // The ONE ring (v2 shell, S7 morphs): the PERSISTENT bottom layer,
         // fed the full nav-derived snapshot — page arcs, the list's dotted
         // ring + hero highlight, the feed's full circle, and the morphs
@@ -642,11 +727,18 @@ private fun HaloAppBody(
                     // later" exit.
                     .pointerInput(Unit) {
                         val threshold = size.height * SWIPE_THRESHOLD_FRACTION
+                        // #109: a system back gesture owns its drag — stand
+                        // down (the handler's completion is the one back).
+                        val claim = SystemBackDragClaim(systemBackInFlight)
                         var total = 0f
                         detectVerticalDragGestures(
-                            onDragStart = { total = 0f },
-                            onDragEnd = { if (total > threshold) nav = nav.back() },
+                            onDragStart = {
+                                claim.start()
+                                total = 0f
+                            },
+                            onDragEnd = { if (!claim.owns && total > threshold) nav = nav.back() },
                         ) { change, dragAmount ->
+                            claim.update()
                             total += dragAmount
                             change.consume()
                         }
@@ -735,11 +827,18 @@ private fun HaloAppBody(
                     .background(Halo.Palette.Background)
                     .pointerInput(Unit) {
                         val threshold = size.height * SWIPE_THRESHOLD_FRACTION
+                        // #109: a system back gesture owns its drag — stand
+                        // down (the handler's completion is the one back).
+                        val claim = SystemBackDragClaim(systemBackInFlight)
                         var total = 0f
                         detectVerticalDragGestures(
-                            onDragStart = { total = 0f },
-                            onDragEnd = { if (total > threshold) cancelVoice() },
+                            onDragStart = {
+                                claim.start()
+                                total = 0f
+                            },
+                            onDragEnd = { if (!claim.owns && total > threshold) cancelVoice() },
                         ) { change, dragAmount ->
+                            claim.update()
                             total += dragAmount
                             change.consume()
                         }
@@ -822,6 +921,17 @@ private fun HaloAppBody(
 /** True when the bridge cannot currently receive commands or answers. */
 private fun BridgeViewModel.UiState.isOffline(): Boolean =
     !paired || status.contains("reconnecting")
+
+/**
+ * The activity behind composition's (possibly wrapped) context — the finish
+ * target for the home-at-rest back completion. Null only in hosted/preview
+ * compositions, where there is nothing to finish anyway.
+ */
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
 
 
 // ── Depth layers & motion ───────────────────────────────────────────────────
@@ -973,6 +1083,7 @@ private fun PageLayer(
 
     val drill by rememberUpdatedState(onDrill)
     val step by rememberUpdatedState(onStepPage)
+    val systemBackInFlight = LocalHaloSystemBackInFlight.current
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
@@ -982,11 +1093,19 @@ private fun PageLayer(
             // depth-less glance surfaces.
             .pointerInput(Unit) {
                 val threshold = size.height * SWIPE_THRESHOLD_FRACTION
+                // #109: a system back gesture owns its drag — stand down.
+                val claim = SystemBackDragClaim(systemBackInFlight)
                 var total = 0f
                 detectVerticalDragGestures(
-                    onDragStart = { total = 0f },
-                    onDragEnd = { if (total < -threshold) drill() },
-                ) { _, dragAmount -> total += dragAmount }
+                    onDragStart = {
+                        claim.start()
+                        total = 0f
+                    },
+                    onDragEnd = { if (!claim.owns && total < -threshold) drill() },
+                ) { _, dragAmount ->
+                    claim.update()
+                    total += dragAmount
+                }
             }
             // Horizontal swipes step the nav-owned page (no drag-follow by
             // design). Deltas are CONSUMED so the centerpiece's whole-screen
@@ -994,17 +1113,27 @@ private fun PageLayer(
             // the tap guard stays as the second line of defence.
             .pointerInput(Unit) {
                 val threshold = size.width * SWIPE_THRESHOLD_FRACTION
+                // #109: THE race's surface — an in-flight system back's edge
+                // swipe reads here as a rightward drag, and step(-1) from
+                // page 1 lands the nav at home MID-GESTURE. Stand down; the
+                // handler's completion routes the one true step.
+                val claim = SystemBackDragClaim(systemBackInFlight)
                 var total = 0f
                 detectHorizontalDragGestures(
-                    onDragStart = { total = 0f },
+                    onDragStart = {
+                        claim.start()
+                        total = 0f
+                    },
                     onDragEnd = {
                         when {
+                            claim.owns -> Unit
                             // Finger travels right → the page to the LEFT.
                             total > threshold -> step(-1)
                             total < -threshold -> step(1)
                         }
                     },
                 ) { change, dragAmount ->
+                    claim.update()
                     total += dragAmount
                     change.consume()
                 }
@@ -1239,16 +1368,25 @@ private fun InnerScreen(
     content: @Composable () -> Unit,
 ) {
     val back by rememberUpdatedState(onBack)
+    val systemBackInFlight = LocalHaloSystemBackInFlight.current
     Box(
         modifier = Modifier
             .fillMaxSize()
             .pointerInput(Unit) {
                 val threshold = size.height * SWIPE_THRESHOLD_FRACTION
+                // #109: a system back gesture owns its drag — stand down.
+                val claim = SystemBackDragClaim(systemBackInFlight)
                 var total = 0f
                 detectVerticalDragGestures(
-                    onDragStart = { total = 0f },
-                    onDragEnd = { if (total > threshold) back() },
-                ) { _, dragAmount -> total += dragAmount }
+                    onDragStart = {
+                        claim.start()
+                        total = 0f
+                    },
+                    onDragEnd = { if (!claim.owns && total > threshold) back() },
+                ) { _, dragAmount ->
+                    claim.update()
+                    total += dragAmount
+                }
             },
     ) {
         content()
