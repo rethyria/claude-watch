@@ -899,6 +899,7 @@ function scanAndAnnounceWorkflowActivity(slot, now) {
   const prev = slot.agents;
   if (prev && prev.running === counts.running && prev.done === done) return;
   slot.agents = { running: counts.running, done };
+  log("info", `Workflow activity: session ${slot.id} running=${counts.running} done=${done}`);
   if (slot.state !== "running") return;
   pushSseEvent(
     "session",
@@ -913,6 +914,7 @@ function scanAndAnnounceWorkflowActivity(slot, now) {
 export function markWorkflowActivity(sessionId) {
   const slot = sessions.get(sessionId);
   if (!slot) return;
+  log("info", `Workflow launch signal: armed scanner for session ${sessionId}`);
   slot.workflowActive = true;
   slot.workflowActivatedAt = Date.now();
   // Each arming must observe ITS workflow before a zero-running scan may
@@ -960,6 +962,7 @@ function reconcileWorkflowActivity(slot, now = Date.now()) {
     slot.workflowSawRunning = true;
     slot.workflowDone = counts.done;
     anyWorkflowActive = true;
+    log("info", `Workflow reconcile: live journal for session ${slot.id} — re-armed (running=${counts.running})`);
     // Publish only an UNAMBIGUOUS count. running > 0 re-seeds a truthful blue.
     // running === 0 on a live tree is indeterminate — the between-phases gap
     // (#70) or a live journal the scan could not read (oversized / racing I/O,
