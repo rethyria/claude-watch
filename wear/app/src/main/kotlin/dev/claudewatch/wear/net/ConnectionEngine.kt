@@ -536,13 +536,18 @@ class ConnectionEngine(
     suspend fun sendCommand(sessionId: String, command: String): BridgeClient.ApiResult? =
         authedCall { c, t -> c.sendCommand(t, sessionId, command) }
 
-    /** Answer a pending permission. Null when not paired. 404 = prompt expired. */
+    /**
+     * Answer a pending permission. Null when not paired. 404 = prompt
+     * expired. [optionId] names the tapped agent option on a rich ACP prompt
+     * (issue #110); null on canonical cards.
+     */
     suspend fun answerPermission(
         permissionId: String,
         behavior: String,
         message: String? = null,
+        optionId: String? = null,
     ): BridgeClient.ApiResult? =
-        authedCall { c, t -> c.answerPermission(t, permissionId, behavior, message) }
+        authedCall { c, t -> c.answerPermission(t, permissionId, behavior, message, optionId) }
 
     /**
      * Answer a pending AskUserQuestion prompt with one positional answer per

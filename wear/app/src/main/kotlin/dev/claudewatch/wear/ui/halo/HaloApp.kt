@@ -72,6 +72,7 @@ import androidx.wear.compose.material.TimeTextDefaults
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import dev.claudewatch.shared.protocol.AgentPermissionOption
 import dev.claudewatch.wear.BridgeViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -117,6 +118,12 @@ data class HaloActions(
      */
     val onDictateAnswer: (onResult: (String) -> Unit) -> Unit = {},
     val onAnswerPermission: (permissionId: String, behavior: String) -> Unit = { _, _ -> },
+    /**
+     * Answer a rich ACP prompt with the agent's own option (issue #110): the
+     * tapped optionId travels verbatim to the agent, so a plan card's mode
+     * choice is exactly the one the user picked — never a behavior election.
+     */
+    val onAnswerOption: (permissionId: String, option: AgentPermissionOption) -> Unit = { _, _ -> },
     val onAnswerQuestions: (permissionId: String, answers: List<String>) -> Unit = { _, _ -> },
     val onDismissPermission: (permissionId: String) -> Unit = {},
     /** Voice-overlay Discard: drop the failed draft AND its error together. */
@@ -698,6 +705,7 @@ private fun HaloAppBody(
                                 model = model,
                                 ui = ui,
                                 onAnswer = actions.onAnswerPermission,
+                                onAnswerOption = actions.onAnswerOption,
                                 onDismiss = actions.onDismissPermission,
                                 onDone = { finishCard(card) },
                             )

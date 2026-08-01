@@ -517,6 +517,70 @@ class BridgeViewModelTest {
     }
 
     /**
+     * Issue #110: a rich ACP prompt's `agentOptions` surface on the rendered
+     * card verbatim, and answering with one posts a decision naming that
+     * option's exact optionId (plus its kind-derived behavior) — never a
+     * behavior-keyed election among same-behavior options.
+     */
+    @Test
+    fun agentOptionsRenderVerbatimAndTheAnswerCarriesTheOptionId() {
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: permission-request\n")
+            append(
+                """data: {"permissionId":"perm-plan","tool_name":"ExitPlanMode","tool_input":{"plan":"the plan"},""" +
+                    // The guarded canonical menu: ambiguous allow-always dropped.
+                    """"options":[{"behavior":"allow","label":"Yes, and manually approve edits"},""" +
+                    """{"behavior":"deny","label":"No, keep planning"}],""" +
+                    """"agentOptions":[""" +
+                    """{"optionId":"auto","label":"Yes, and use auto mode","kind":"allow_always"},""" +
+                    """{"optionId":"acceptEdits","label":"Yes, and auto-accept edits","kind":"allow_always"},""" +
+                    """{"optionId":"default","label":"Yes, and manually approve edits","kind":"allow_once"},""" +
+                    """{"optionId":"plan","label":"No, keep planning","kind":"reject_once"}],"sessionId":"s-1"}""",
+            )
+            append("\n\n")
+            append(":pad\n\n".repeat(80))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/ping (pair preflight)
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/pair
+        server.takeRequest(10, TimeUnit.SECONDS) // /v1/events
+
+        val state = awaitState { it.permissionQueue.isNotEmpty() }
+        val rendered = state.permissionQueue.first()
+        assertEquals(
+            "the agent's own list must reach the card verbatim, order included",
+            listOf("auto", "acceptEdits", "default", "plan"),
+            rendered.agentOptions.map { it.optionId },
+        )
+
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+        viewModel.answerAgentOption("perm-plan", rendered.agentOptions[1])
+        val request = server.takeRequest(10, TimeUnit.SECONDS)
+            ?: throw AssertionError("no decision request")
+        val body = JSONObject(request.body.readUtf8())
+        assertEquals("perm-plan", body.getString("permissionId"))
+        assertEquals(
+            "the tapped option's exact id is the decision",
+            "acceptEdits",
+            body.getJSONObject("decision").getString("optionId"),
+        )
+        assertEquals("allow-always", body.getJSONObject("decision").getString("behavior"))
+        awaitState { it.permissionQueue.isEmpty() }
+    }
+
+    /**
      * Regression: answering a permission that no longer exists on the bridge
      * (resolved by another paired device, or timed out server-side) returns
      * 404 and no permission-cleared event ever arrives for it. The client

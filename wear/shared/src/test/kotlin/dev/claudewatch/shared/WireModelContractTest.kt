@@ -158,6 +158,46 @@ class WireModelContractTest {
     }
 
     // ------------------------------------------------------------------
+    // Rich ACP option lists (issue #110): agentOptions, strict
+    // ------------------------------------------------------------------
+
+    @Test
+    fun agentOptionsParseVerbatimWithDerivedBehaviors() {
+        val event = BridgeEventParser.parse(
+            "permission-request",
+            """{"permissionId":"p-plan","tool_name":"ExitPlanMode",""" +
+                """"options":[{"behavior":"allow","label":"Yes, and manually approve edits"},""" +
+                """{"behavior":"deny","label":"No, keep planning"}],""" +
+                """"agentOptions":[""" +
+                """{"optionId":"auto","label":"Yes, and use auto mode","kind":"allow_always"},""" +
+                """{"optionId":"default","label":"Yes, and manually approve edits","kind":"allow_once"},""" +
+                """{"optionId":"plan","label":"No, keep planning","kind":"reject_once"}]}""",
+        ) as PermissionRequestEvent
+        // The agent's list verbatim — order included — plus the kind-derived
+        // canonical behavior (the bridge's behaviorForAcpOption mapping).
+        assertEquals(listOf("auto", "default", "plan"), event.agentOptions.map { it.optionId })
+        assertEquals(listOf("allow-always", "allow", "deny"), event.agentOptions.map { it.behavior })
+        // The guarded canonical menu still rides for behavior-keyed surfaces
+        // (notifications, older rendering paths).
+        assertEquals(listOf("allow", "deny"), event.options.map { it.behavior })
+    }
+
+    @Test
+    fun agentOptionsAreStrictBridgeNormalizedContract() {
+        // Like a behavior-less canonical option, an agent option with an
+        // unknown kind (or no optionId — the id IS the answer) is a contract
+        // violation that fails the frame, never a guess.
+        assertFailsLoudly(
+            "permission-request",
+            """{"permissionId":"p-1","agentOptions":[{"optionId":"x","label":"X","kind":"maybe_later"}]}""",
+        )
+        assertFailsLoudly(
+            "permission-request",
+            """{"permissionId":"p-1","agentOptions":[{"optionId":"","label":"X","kind":"allow_once"}]}""",
+        )
+    }
+
+    // ------------------------------------------------------------------
     // Tolerant: unknown fields and unknown event types
     // ------------------------------------------------------------------
 

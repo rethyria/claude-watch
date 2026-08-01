@@ -377,6 +377,17 @@ to the auto-spawn of action 4.
 → `200 { "ok": true }`; unknown/expired id → `404 {"error": "No pending
 permission with that ID"}`.
 
+When the prompt carried `agentOptions` (a rich ACP request — see the ACP
+`permission-request` notes), the decision SHOULD also name the tapped option:
+
+```json
+{ "permissionId": "<uuid>", "decision": { "behavior": "allow-always", "optionId": "acceptEdits" } }
+```
+
+`optionId` is taken verbatim from the tapped `agentOptions` entry and wins
+over `behavior` when both are present; `behavior` still rides along (derived
+from the option's `kind`) so logs and behavior-keyed consumers stay honest.
+
 **4. Send text to a session** — `{ "command": "fix the tests\n",
 "sessionId"?: "<uuid>", "agent"?: "claude", "cwd"?: "/path" }`:
 
@@ -696,6 +707,32 @@ Two behaviours are specific to ACP and worth knowing:
 - **A prompt is only raised if a client is connected**, and only if at least
   one of the agent's options maps to a machine-readable `behavior`. An
   unmappable option is dropped rather than guessed at.
+- **Rich option lists (#110).** The canonical `options` menu is
+  behavior-keyed, and an agent may offer SEVERAL options with the same
+  behavior (Zed's ExitPlanMode approval carries up to three `allow_always`
+  mode switches). Electing one silently would make the canonical button a
+  roulette, so an ambiguous behavior's canonical button is **dropped**
+  (absence beats roulette; unambiguous behaviors keep exact buttons) and the
+  agent's own list rides alongside, additively:
+
+  ```json
+  "agentOptions": [
+    { "optionId": "acceptEdits", "label": "Yes, and auto-accept edits", "kind": "allow_always" },
+    { "optionId": "default", "label": "Yes, and manually approve edits", "kind": "allow_once" },
+    { "optionId": "plan", "label": "No, keep planning", "kind": "reject_once" }
+  ]
+  ```
+
+  Present EXACTLY when the canonical flattening is lossy (some behavior had
+  more than one option); a simple allow/deny prompt keeps today's wire shape,
+  so clients that predate the field keep today's card everywhere. Entries are
+  the agent's options verbatim — agent order, label + `optionId` + ACP `kind`
+  (`allow_once` / `allow_always` / `reject_once` / `reject_always`; options
+  with other kinds or no `optionId` are dropped, never guessed at). A client
+  that renders `agentOptions` answers with the tapped entry's `optionId` on
+  the decision (see `POST /v1/command` action 3), which the bridge forwards
+  to the agent verbatim; a client that ignores the field still answers safely
+  through the surviving canonical buttons.
 
 Expiry keeps the hook path's no-decision semantics: nothing is sent back to
 the agent, so Zed's own dialog keeps the answer. The bridge never fabricates a
@@ -771,6 +808,9 @@ Decision request (`POST /v1/command`):
 
 - `decision.behavior` — required, one of the table above. Echo the behavior
   of the option the user chose; never send a behavior that was not offered.
+- `decision.optionId` — the tapped `agentOptions` entry's id, when the prompt
+  carried that list (#110 — see the ACP `permission-request` notes). Wins
+  over `behavior` for the option forwarded to the agent; never invent one.
 - `decision.message` — optional, forwarded to the agent on `deny`.
 - **AskUserQuestion answers:** send `answers` (top-level or inside
   `decision`) as an array aligned with `tool_input.questions` — or an object

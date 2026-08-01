@@ -705,6 +705,163 @@ test("answering in Zed retracts the wrist prompt (#80)", { timeout: 60_000 }, as
   assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
 });
 
+// --- Rich ACP option lists (#110) -------------------------------------------
+// The canonical menu is behavior-keyed, so ExitPlanMode's several allow_always
+// mode switches cannot all keep a button. The guard drops an ambiguous
+// behavior's button instead of electing one silently, and the agent's real
+// list rides alongside as `agentOptions` so a capable client renders it and
+// answers with the exact optionId.
+
+// The adapter's ExitPlanMode shape verbatim (acp-agent.ts): three allow_always
+// mode switches, one allow_once, one reject_once.
+const EXIT_PLAN_OPTIONS = [
+  { optionId: "bypassPermissions", name: "Yes, and bypass permissions", kind: "allow_always" },
+  { optionId: "auto", name: 'Yes, and use "auto" mode', kind: "allow_always" },
+  { optionId: "acceptEdits", name: "Yes, and auto-accept edits", kind: "allow_always" },
+  { optionId: "default", name: "Yes, and manually approve edits", kind: "allow_once" },
+  { optionId: "plan", name: "No, keep planning", kind: "reject_once" },
+];
+
+async function raisePlanPermission(bridge, { connection, sessionId, toolCallId }) {
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection, sessionId, kind: "permission",
+      payload: {
+        sessionId,
+        toolCall: { toolCallId, title: "ExitPlanMode", rawInput: { plan: "the plan" } },
+        options: EXIT_PLAN_OPTIONS,
+      },
+    },
+  });
+}
+
+test("a rich option list rides the prompt verbatim and the tapped optionId comes back exact (#110)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "permrich");
+
+  const inbox = connectInbox(bridge, "conn-permrich");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-permrich", sessionId: "acp-permrich", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-permrich");
+
+  await raisePlanPermission(bridge, {
+    connection: "conn-permrich", sessionId: "acp-permrich", toolCallId: "tc-plan",
+  });
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+
+  // The agent's list, VERBATIM: same options, same order, label + id + kind.
+  assert.deepEqual(
+    prompt.parsed.agentOptions,
+    EXIT_PLAN_OPTIONS.map(({ optionId, name, kind }) => ({ optionId, label: name, kind })),
+  );
+
+  // Answering with the tapped optionId names that exact option to the agent —
+  // never one elected from its behavior.
+  const answer = await request(bridge.port, "POST", "/command", {
+    token,
+    body: {
+      permissionId: prompt.parsed.permissionId,
+      decision: { behavior: "allow-always", optionId: "acceptEdits" },
+    },
+  });
+  assert.equal(answer.status, 200);
+  const frame = await inbox.waitFor((e) => e.event === "permission-decision");
+  assert.equal(frame.parsed.toolCallId, "tc-plan");
+  assert.equal(frame.parsed.optionId, "acceptEdits");
+  assert.equal(frame.parsed.behavior, "allow-always");
+});
+
+test("an ambiguous behavior loses its canonical button; unambiguous ones survive exact (#110)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "permguard");
+
+  const inbox = connectInbox(bridge, "conn-permguard");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-permguard", sessionId: "acp-permguard", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-permguard");
+
+  await raisePlanPermission(bridge, {
+    connection: "conn-permguard", sessionId: "acp-permguard", toolCallId: "tc-guard",
+  });
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+
+  // Three options map to allow-always: that button is GONE (absence beats
+  // roulette), while the sole allow and deny keep their buttons.
+  assert.deepEqual(prompt.parsed.options.map((o) => o.behavior), ["allow", "deny"]);
+
+  // A canonical-button answer (an app without agentOptions support) still
+  // resolves through the surviving unambiguous behaviors, exactly.
+  const answer = await request(bridge.port, "POST", "/command", {
+    token,
+    body: { permissionId: prompt.parsed.permissionId, decision: { behavior: "allow" } },
+  });
+  assert.equal(answer.status, 200);
+  const frame = await inbox.waitFor((e) => e.event === "permission-decision");
+  assert.equal(frame.parsed.optionId, "default", "allow must resolve to the sole allow_once option");
+  assert.equal(frame.parsed.behavior, "allow");
+});
+
+// The behavior fallback must key on the behavior the user CHOSE: commands.js
+// rewrites allow-always to allow for the hook response, and keying the echo on
+// the rewritten value sent a wrist "Always Allow" to the agent as its
+// allow_once option — an allow-once masquerading as a standing grant.
+test("a behavior-only allow-always answer names the agent's allow_always option (#110)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "permalways");
+
+  const inbox = connectInbox(bridge, "conn-permalways");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-permalways", sessionId: "acp-permalways", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-permalways");
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-permalways", sessionId: "acp-permalways", kind: "permission",
+      payload: {
+        sessionId: "acp-permalways",
+        toolCall: { toolCallId: "tc-aa", title: "Bash", rawInput: { command: "ls" } },
+        options: [
+          { optionId: "once", name: "Allow", kind: "allow_once" },
+          { optionId: "always", name: "Always allow", kind: "allow_always" },
+          { optionId: "no", name: "Reject", kind: "reject_once" },
+        ],
+      },
+    },
+  });
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+  // One option per behavior: nothing is ambiguous, nothing rides as
+  // agentOptions — the canonical wire shape is unchanged for simple prompts.
+  assert.deepEqual(prompt.parsed.options.map((o) => o.behavior), ["allow", "allow-always", "deny"]);
+  assert.equal("agentOptions" in prompt.parsed, false);
+
+  const answer = await request(bridge.port, "POST", "/command", {
+    token,
+    body: { permissionId: prompt.parsed.permissionId, decision: { behavior: "allow-always" } },
+  });
+  assert.equal(answer.status, 200);
+  const frame = await inbox.waitFor((e) => e.event === "permission-decision");
+  assert.equal(frame.parsed.optionId, "always");
+  assert.equal(frame.parsed.behavior, "allow-always");
+});
+
 // A bridge restart rebuilds the slot from the fork's re-announce. Without the
 // title on that payload the watch showed the raw uuid until the NEXT turn end,
 // because the adapter only pushes session_info_update when the title CHANGES.

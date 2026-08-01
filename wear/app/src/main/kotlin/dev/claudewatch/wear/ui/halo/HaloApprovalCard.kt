@@ -5,11 +5,17 @@
 // is read here ONLY as the resolution signal (the ack drops the prompt from
 // the queue), never to choose what to render. onAnswer(permissionId, behavior)
 // answers with a canonical machine-readable behavior string — never option
-// position or label wording. onDismiss(permissionId) is the local no-decision
-// escape hatch, offered only after repeated failed answer attempts. onDone
-// tells HaloApp the user is finished here: "decide later" (exits WITHOUT
-// answering, queue intact) or the result flash completed (HaloApp then chains
-// to the next queued prompt, or returns home on an empty queue).
+// position or label wording. A rich ACP prompt (card.agentOptions non-empty,
+// issue #110) swaps the canonical buttons for the AGENT's own option list —
+// kind-styled pills in the question card's pattern — and answers through
+// onAnswerOption with the tapped option's exact optionId: the canonical trio
+// cannot say WHICH of several same-behavior options was meant, and on a plan
+// card that election was a silent session-mode switch. onDismiss(permissionId)
+// is the local no-decision escape hatch, offered only after repeated failed
+// answer attempts. onDone tells HaloApp the user is finished here: "decide
+// later" (exits WITHOUT answering, queue intact) or the result flash completed
+// (HaloApp then chains to the next queued prompt, or returns home on an empty
+// queue).
 package dev.claudewatch.wear.ui.halo
 
 import android.os.SystemClock
@@ -63,6 +69,7 @@ import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
 import androidx.wear.compose.foundation.rotary.rotaryScrollable
 import androidx.wear.compose.material.Text
+import dev.claudewatch.shared.protocol.AgentPermissionOption
 import dev.claudewatch.wear.BridgeViewModel
 import dev.claudewatch.wear.ui.LOCAL_DISMISS_AFTER_FAILURES
 import kotlinx.coroutines.delay
@@ -87,6 +94,7 @@ fun HaloApprovalCard(
     model: HaloModel,
     ui: BridgeViewModel.UiState,
     onAnswer: (String, String) -> Unit,
+    onAnswerOption: (String, AgentPermissionOption) -> Unit = { _, _ -> },
     onDismiss: (String) -> Unit,
     onDone: () -> Unit,
     modifier: Modifier = Modifier,
@@ -149,6 +157,18 @@ fun HaloApprovalCard(
         onAnswer(card.permissionId, behavior)
     }
 
+    // The agent-option twin of decide(): same guards, but the decision is the
+    // tapped option itself — its optionId travels verbatim (#110). `sent`
+    // latches the kind-derived behavior so the result flash reads the same
+    // approved/denied truth either way.
+    fun decideOption(option: AgentPermissionOption) {
+        if (inFlight || resolved) return
+        if (SystemClock.uptimeMillis() < armAtMs) return
+        attemptError = null
+        sent = option.behavior
+        onAnswerOption(card.permissionId, option)
+    }
+
     Crossfade(
         targetState = showFlash,
         label = "approvalResolve",
@@ -165,6 +185,7 @@ fun HaloApprovalCard(
                 attemptError = attemptError,
                 resolved = resolved,
                 onDecide = ::decide,
+                onDecideOption = ::decideOption,
                 onDismissLocally = {
                     dismissedLocally = true
                     onDismiss(card.permissionId)
@@ -188,6 +209,7 @@ private fun DecisionLayer(
     attemptError: String?,
     resolved: Boolean,
     onDecide: (String) -> Unit,
+    onDecideOption: (AgentPermissionOption) -> Unit,
     onDismissLocally: () -> Unit,
     onDecideLater: () -> Unit,
 ) {
@@ -330,43 +352,55 @@ private fun DecisionLayer(
         }
         Spacer(Modifier.height(8.dp))
 
-        // Deny / Approve, both single-tap (the arm-delay is the only guard).
-        // Approve is wider — it is the common action; Deny stays big enough
-        // to never be a precision target.
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(7.dp),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            if (denyOption != null) {
-                DecisionPill(
-                    label = "Deny",
-                    filled = false,
-                    weight = 0.42f,
-                    enabled = buttonsEnabled,
-                    tag = "haloDeny",
-                    onClick = { onDecide(denyOption.behavior) },
-                )
-            }
-            if (approveOption != null) {
-                DecisionPill(
-                    label = "Approve",
-                    filled = true,
-                    weight = if (denyOption != null) 0.58f else 1f,
-                    enabled = buttonsEnabled,
-                    tag = "haloApprove",
-                    onClick = { onDecide(approveOption.behavior) },
-                )
-            }
-        }
-
-        if (alwaysOption != null) {
-            TextAction(
-                label = "always allow ›",
-                color = Halo.Palette.TextSecondary,
-                tag = "haloAlwaysAllow",
+        if (card.agentOptions.isNotEmpty()) {
+            // Rich ACP prompt (#110): the agent's OWN options, verbatim — the
+            // canonical trio cannot name which of several same-behavior
+            // options was meant, and on a plan card that election is a
+            // session-mode switch. The question card's full-width pill list.
+            AgentOptionList(
+                options = card.agentOptions,
                 enabled = buttonsEnabled,
-                onClick = { onDecide(alwaysOption.behavior) },
+                onDecideOption = onDecideOption,
             )
+        } else {
+            // Deny / Approve, both single-tap (the arm-delay is the only
+            // guard). Approve is wider — it is the common action; Deny stays
+            // big enough to never be a precision target.
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (denyOption != null) {
+                    DecisionPill(
+                        label = "Deny",
+                        filled = false,
+                        weight = 0.42f,
+                        enabled = buttonsEnabled,
+                        tag = "haloDeny",
+                        onClick = { onDecide(denyOption.behavior) },
+                    )
+                }
+                if (approveOption != null) {
+                    DecisionPill(
+                        label = "Approve",
+                        filled = true,
+                        weight = if (denyOption != null) 0.58f else 1f,
+                        enabled = buttonsEnabled,
+                        tag = "haloApprove",
+                        onClick = { onDecide(approveOption.behavior) },
+                    )
+                }
+            }
+
+            if (alwaysOption != null) {
+                TextAction(
+                    label = "always allow ›",
+                    color = Halo.Palette.TextSecondary,
+                    tag = "haloAlwaysAllow",
+                    enabled = buttonsEnabled,
+                    onClick = { onDecide(alwaysOption.behavior) },
+                )
+            }
         }
 
         if (statusLine != null) {
@@ -396,6 +430,80 @@ private fun DecisionLayer(
             color = Halo.Palette.TextSecondary,
             tag = "haloDecideLater",
             onClick = onDecideLater,
+        )
+    }
+}
+
+/** Reading rank per behavior: the canonical card's own progression (Deny,
+ *  Approve, then always-allow below), applied to N options. Standing grants —
+ *  up to and including a bypassPermissions mode switch — land LAST, at the
+ *  far end of the scroll, never under the first stray tap. */
+private fun agentOptionRank(option: AgentPermissionOption): Int = when (option.behavior) {
+    "deny" -> 0
+    "allow" -> 1
+    else -> 2
+}
+
+/**
+ * The agent's own options as full-width pills (the question card's list
+ * pattern), kind-styled: reject red, allow_once neutral, allow_always
+ * emphasised in the waiting accent — a standing grant must never look like
+ * just another row. Grouped by rank (stable sort keeps the agent's order
+ * within a group) with extra air between groups: a fat-finger between
+ * "manually approve" and "bypass permissions" is a decision-grade mis-tap.
+ */
+@Composable
+private fun AgentOptionList(
+    options: List<AgentPermissionOption>,
+    enabled: Boolean,
+    onDecideOption: (AgentPermissionOption) -> Unit,
+) {
+    val ordered = options.sortedBy(::agentOptionRank)
+    ordered.forEachIndexed { index, option ->
+        if (index > 0 && agentOptionRank(option) != agentOptionRank(ordered[index - 1])) {
+            Spacer(Modifier.height(5.dp))
+        }
+        AgentOptionPill(
+            option = option,
+            enabled = enabled,
+            onClick = { onDecideOption(option) },
+        )
+    }
+}
+
+/** One agent option: ≥ TouchMin tall like every decision target here. */
+@Composable
+private fun AgentOptionPill(
+    option: AgentPermissionOption,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val emphasised = option.behavior == "allow-always"
+    val textColor = when (option.behavior) {
+        "deny" -> Halo.Palette.Error
+        "allow-always" -> Halo.Palette.WaitingForYou
+        else -> Halo.Palette.TextPrimary
+    }
+    val shape = RoundedCornerShape(50)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .heightIn(min = Halo.Geo.TouchMin)
+            .alpha(if (enabled) 1f else 0.55f)
+            .clip(shape)
+            .background(if (emphasised) Halo.Palette.Surface2 else Halo.Palette.Surface, shape)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .testTag("haloAgentOption-${option.optionId}"),
+    ) {
+        Text(
+            text = option.label,
+            fontSize = Halo.Type.Body,
+            fontWeight = if (emphasised) FontWeight.Medium else FontWeight.Normal,
+            color = textColor,
+            textAlign = TextAlign.Center,
         )
     }
 }

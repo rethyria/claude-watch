@@ -261,6 +261,44 @@ data class PermissionOption(
 }
 
 /**
+ * One of the AGENT's own permission options, forwarded verbatim on a rich ACP
+ * prompt (issue #110): [optionId] is the literal decision sent back, [kind]
+ * is the ACP option kind that drives styling and the derived [behavior].
+ * Bridge-normalized contract content, so strict like [PermissionOption]: the
+ * bridge promises a known kind and non-blank id/label (an option that IS the
+ * answer cannot be anonymous), and anything else is a contract violation.
+ */
+@Serializable
+data class AgentPermissionOption(
+    val optionId: String,
+    val label: String,
+    val kind: String,
+) {
+    init {
+        require(optionId.isNotEmpty()) { "agent option without an optionId" }
+        require(label.isNotEmpty()) { "agent option without a label" }
+        require(kind in KINDS) { "agent option with unknown kind: $kind" }
+    }
+
+    /**
+     * The canonical behavior this option's kind maps to — the same mapping as
+     * the bridge's `behaviorForAcpOption()`, so the decision POST's `behavior`
+     * (and the card's ✓/✕ flash) agree with what the bridge would say.
+     */
+    val behavior: String
+        get() = when (kind) {
+            "allow_once" -> "allow"
+            "allow_always" -> "allow-always"
+            else -> "deny"
+        }
+
+    companion object {
+        /** Mirrors the kinds behaviorForAcpOption() maps in skill/bridge/acp.js. */
+        val KINDS: Set<String> = setOf("allow_once", "allow_always", "reject_once", "reject_always")
+    }
+}
+
+/**
  * One choice offered by an [AskUserQuestion]; [label] is both what the watch
  * renders and the literal answer string sent back for the question.
  */
@@ -288,6 +326,10 @@ data class AskUserQuestion(
  * is mandatory. [options] is the canonical top-level list; AskUserQuestion
  * prompts carry none (their per-question lists live in `tool_input.questions`,
  * forwarded verbatim in [toolInput] and surfaced typed via [questions]).
+ * [agentOptions] is the agent's OWN option list (issue #110), present exactly
+ * when the canonical flattening was lossy — a rich ACP prompt whose ambiguous
+ * behaviors lost their canonical buttons; absence means today's canonical
+ * card, presence means render these verbatim and answer with the optionId.
  */
 @Serializable
 data class PermissionRequestEvent(
@@ -298,6 +340,7 @@ data class PermissionRequestEvent(
     val cwd: String? = null,
     val source: String? = null,
     val options: List<PermissionOption> = emptyList(),
+    val agentOptions: List<AgentPermissionOption> = emptyList(),
 ) : BridgeEvent {
     init {
         require(permissionId.isNotEmpty()) { "permission-request must carry a permissionId" }

@@ -1,6 +1,7 @@
 package dev.claudewatch.wear
 
 import android.content.Context
+import dev.claudewatch.shared.protocol.AgentPermissionOption
 import dev.claudewatch.shared.protocol.AskUserQuestion
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
@@ -63,7 +64,11 @@ class BridgeViewModel(
      * [questions] is non-empty exactly for AskUserQuestion prompts (which
      * carry no canonical options): EVERY question of the payload, each with
      * its own option list, rendered by the question card and answered
-     * per-question via [answerQuestions].
+     * per-question via [answerQuestions]. [agentOptions] is the agent's OWN
+     * option list, present exactly when a rich ACP prompt could not be
+     * flattened onto the canonical behaviors (issue #110): the approval card
+     * renders it verbatim and answers via [answerAgentOption]; empty means
+     * the canonical card.
      */
     data class PendingPermission(
         val permissionId: String,
@@ -73,6 +78,7 @@ class BridgeViewModel(
         val sessionLabel: String,
         val options: List<PermissionOption>,
         val questions: List<AskUserQuestion> = emptyList(),
+        val agentOptions: List<AgentPermissionOption> = emptyList(),
     )
 
     /**
@@ -834,6 +840,21 @@ class BridgeViewModel(
     }
 
     /**
+     * Answer a rich ACP prompt with the agent's own [option] (issue #110):
+     * the tapped optionId is the decision, sent verbatim — the bridge
+     * forwards it to the agent unmapped, so a five-option plan card lands as
+     * exactly the mode the user picked, never a behavior-keyed election. The
+     * kind-derived behavior rides along for logs and behavior-keyed
+     * consumers. Same ack-gated dismissal and failure semantics as
+     * [answerPermission].
+     */
+    fun answerAgentOption(permissionId: String, option: AgentPermissionOption) {
+        sendDecision(permissionId) {
+            engine.answerPermission(permissionId, option.behavior, optionId = option.optionId)
+        }
+    }
+
+    /**
      * Answer the queued AskUserQuestion prompt [permissionId] with an answer
      * for EVERY question — [answers] is positional, one entry per question in
      * the prompt's question order (a selected option's label or free typed
@@ -1026,6 +1047,9 @@ class BridgeViewModel(
                 )
             },
             questions = askQuestions,
+            // The agent's own list rides only where the approval card renders
+            // (a question prompt's options live inside its questions).
+            agentOptions = if (askQuestions.isNotEmpty()) emptyList() else agentOptions,
         )
     }
 

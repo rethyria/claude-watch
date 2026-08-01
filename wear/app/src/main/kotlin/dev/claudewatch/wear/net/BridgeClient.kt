@@ -127,15 +127,24 @@ open class BridgeClient(
     fun sendCommand(token: String, sessionId: String, command: String): ApiResult =
         postJson("/v1/command", token, JSONObject().put("sessionId", sessionId).put("command", command))
 
-    /** POST /v1/command — resolve a pending permission with an allow/deny decision. */
+    /**
+     * POST /v1/command — resolve a pending permission with an allow/deny
+     * decision. [optionId] names the tapped `agentOptions` entry on a rich
+     * ACP prompt (issue #110): the bridge forwards it to the agent VERBATIM,
+     * which is what keeps a five-option plan card from collapsing into a
+     * behavior-keyed guess. Omitted on canonical cards, where behavior is the
+     * whole decision.
+     */
     fun answerPermission(
         token: String,
         permissionId: String,
         behavior: String,
         message: String? = null,
+        optionId: String? = null,
     ): ApiResult {
         val decision = JSONObject().put("behavior", behavior)
         if (message != null) decision.put("message", message)
+        if (optionId != null) decision.put("optionId", optionId)
         return postJson("/v1/command", token, JSONObject().put("permissionId", permissionId).put("decision", decision))
     }
 

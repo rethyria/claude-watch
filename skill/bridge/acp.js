@@ -595,9 +595,25 @@ function raiseAcpPermission(sessionId, payload) {
   const options = [];
   for (const option of payload?.options ?? []) {
     const behavior = behaviorForAcpOption(option);
-    if (behavior) options.push({ behavior, label: String(option.name ?? ""), optionId: option.optionId });
+    // The optionId IS the decision on the way back — an option without one is
+    // unanswerable and dropped with the unmappable kinds. An unnamed option
+    // borrows its optionId as the label rather than rendering a blank pill.
+    if (!behavior || typeof option.optionId !== "string" || !option.optionId) continue;
+    const label = String(option.name ?? "") || option.optionId;
+    options.push({ behavior, kind: option.kind, label, optionId: option.optionId });
   }
   if (options.length === 0) return; // nothing answerable — leave it to Zed
+
+  // #110: the canonical menu is BEHAVIOR-keyed, so two options sharing a
+  // behavior (ExitPlanMode offers up to three allow_always mode switches)
+  // cannot both keep a button — and silently electing one made "Always Allow"
+  // a mode-switch roulette. An ambiguous behavior LOSES its canonical button
+  // (absence beats roulette; the surviving buttons stay exact), and the
+  // agent's own list rides alongside as `agentOptions` so a client that can
+  // render it lets the user pick the real option.
+  const countByBehavior = new Map();
+  for (const o of options) countByBehavior.set(o.behavior, (countByBehavior.get(o.behavior) ?? 0) + 1);
+  const unambiguous = options.filter((o) => countByBehavior.get(o.behavior) === 1);
 
   const permissionId = crypto.randomUUID();
   acpPermissionsByToolCall.set(toolCallId, permissionId);
@@ -606,11 +622,19 @@ function raiseAcpPermission(sessionId, payload) {
     sessionId,
     tool_name: payload?.toolCall?.title ?? "tool",
     tool_input: payload?.toolCall?.rawInput ?? null,
-    options: canonicalPermissionOptions(options.map(({ behavior, label }) => ({ behavior, label }))),
+    options: canonicalPermissionOptions(unambiguous.map(({ behavior, label }) => ({ behavior, label }))),
   };
+  // Additive, and only when the canonical flattening is LOSSY: a simple
+  // allow/deny prompt keeps today's exact wire shape (and today's card on
+  // every client), while a rich prompt hands the full list to clients that
+  // understand it — old apps just see the guarded canonical buttons.
+  if (unambiguous.length < options.length) {
+    eventPayload.agentOptions = options.map(({ optionId, label, kind }) => ({ optionId, label, kind }));
+  }
   // Carry the ACP optionIds alongside, so the decision we send back names the
   // option the AGENT offered rather than one we invented from its behavior.
-  const optionIdByBehavior = new Map(options.map((o) => [o.behavior, o.optionId]));
+  const optionsById = new Map(options.map((o) => [o.optionId, o]));
+  const optionByBehavior = new Map(unambiguous.map((o) => [o.behavior, o]));
 
   log("info", `ACP permission ${permissionId} raised on the wrist (session ${sessionId}, tool ${eventPayload.tool_name})`);
   const decision = waitForPermission(permissionId, { sessionId, payload: eventPayload });
@@ -622,9 +646,20 @@ function raiseAcpPermission(sessionId, payload) {
     // nothing and let Zed's own prompt keep the decision, exactly as the hook
     // path does. Fabricating a deny here would cancel the dialog on screen.
     if (!answer || answer.noDecision) return;
-    const optionId = optionIdByBehavior.get(answer.behavior);
-    if (!optionId) return;
-    writeAcpFrame(sessionId, "permission-decision", { sessionId, toolCallId, optionId, behavior: answer.behavior });
+    // A decision naming one of THIS request's optionIds is exact — take it
+    // verbatim (#110). Otherwise fall back to the behavior map, keyed on the
+    // behavior the user actually CHOSE: commands.js rewrites allow-always to
+    // allow for the hook path (recording the original in requestedBehavior),
+    // and keying on the rewritten value sent the wrist's "Always Allow" to
+    // the agent as its allow_once option. Behaviors the guard dropped have no
+    // entry, so an unnamed ambiguous answer stays unsent rather than guessed.
+    const chosen =
+      (typeof answer.optionId === "string" ? optionsById.get(answer.optionId) : undefined) ??
+      optionByBehavior.get(answer.requestedBehavior ?? answer.behavior);
+    if (!chosen) return;
+    writeAcpFrame(sessionId, "permission-decision", {
+      sessionId, toolCallId, optionId: chosen.optionId, behavior: chosen.behavior,
+    });
   });
 }
 

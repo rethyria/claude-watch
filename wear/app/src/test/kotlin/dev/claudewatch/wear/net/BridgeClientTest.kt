@@ -119,6 +119,26 @@ class BridgeClientTest {
         assertEquals("perm-9", body.getString("permissionId"))
         assertEquals("deny", body.getJSONObject("decision").getString("behavior"))
         assertEquals("Denied from the watch", body.getJSONObject("decision").getString("message"))
+        // A canonical decision names no optionId: the key is genuinely absent
+        // (issue #110's field is additive both ways on the wire).
+        assertEquals(false, body.getJSONObject("decision").has("optionId"))
+    }
+
+    @Test
+    fun answerPermissionCarriesTheTappedAgentOptionId() {
+        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
+
+        // Issue #110: a rich ACP prompt's answer names the agent's own option
+        // verbatim — the optionId IS the decision, behavior rides for logs.
+        val result = client.answerPermission(
+            "tok-123", "perm-plan", "allow-always", optionId = "acceptEdits",
+        )
+
+        assertEquals(200, result.status)
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+        assertEquals("perm-plan", body.getString("permissionId"))
+        assertEquals("allow-always", body.getJSONObject("decision").getString("behavior"))
+        assertEquals("acceptEdits", body.getJSONObject("decision").getString("optionId"))
     }
 
     @Test

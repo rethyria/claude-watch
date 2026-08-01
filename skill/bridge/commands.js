@@ -286,6 +286,11 @@ export async function handleCommand(req, res) {
       if (allowAlways) {
         decision.behavior = "allow";
         decision.updatedPermissions = pendingPermissionBodies.get(permissionId) || [];
+        // The rewrite is the HOOK response's contract, but the resolved
+        // decision also reaches the ACP echo (acp.js), which must map the
+        // behavior the user CHOSE — keyed on the rewritten value, a wrist
+        // "Always Allow" landed on the agent as its allow_once option (#110).
+        decision.requestedBehavior = requestedBehavior;
       }
       pendingPermissionBodies.delete(permissionId);
 

@@ -245,6 +245,7 @@ fun WatchApp(
                 launchRecognizer("Answer the agent's question")
             },
             onAnswerPermission = viewModel::answerPermission,
+            onAnswerOption = viewModel::answerAgentOption,
             onAnswerQuestions = viewModel::answerQuestions,
             onDismissPermission = viewModel::dismissPermissionLocally,
             onDiscardCommand = viewModel::discardCommand,
