@@ -3,16 +3,13 @@ package dev.claudewatch.wear
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -149,11 +146,13 @@ class DictationFlowTest {
         compose.onNodeWithTag("haloDictate").assertIsDisplayed().performClick()
     }
 
-    /** Home → all-sessions list → the named session's feed (no dictation). */
+    /** Home → the session pager → the named session's feed (no dictation).
+     *  These fixtures stream ONE session, so the drill's resolved selection
+     *  IS its card — tap it, no stepping needed. */
     private fun openFeed(sessionId: String) {
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
         compose.waitForIdle()
-        compose.onNodeWithTag("haloRow-$sessionId").performScrollTo().performClick()
+        compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()
         compose.waitForIdle()
     }
 
@@ -327,41 +326,36 @@ class DictationFlowTest {
     }
 
     /**
-     * Issue #78 / #53, through HaloSessionList: an ACP session is external
-     * (Zed's process, not one the bridge owns), so its row's trailing quick
-     * action must HIDE it (⊘ "hide" → onHide, local) — never a fake Kill (✕
-     * "close") that pretends to stop a process the bridge cannot. Drives the
-     * real list row: swipe to reveal the action strip and assert the label.
+     * Issue #78 / #53, through the session pager's action arc: an ACP session
+     * is external (Zed's process, not one the bridge owns), so its card's
+     * close action must HIDE it (⊘ → onHide, local) — never a fake Kill (✕)
+     * that pretends to stop a process the bridge cannot. The arc is unlabelled
+     * (v2 design), so the semantics are asserted by glyph on the stable close
+     * tag. ACP close-frame limits are #88's scope — this pins today's exact
+     * kill/hide split, ported unchanged from the retired row strip.
      */
     @Test
-    fun anAcpRowOffersHideNotAFakeKill() {
+    fun anAcpCardsCloseActionIsHideNotAFakeKill() {
         setAppContent()
         pairStreamingSession(
             """{"state":"running","agent":"claude","cwd":"/tmp/acp","folderName":"acp","external":true,"kind":"acp","dictatable":true,"sessionId":"s-acp"}""",
             "s-acp",
         )
-        // All-sessions list, then swipe the ACP row to reveal its action strip.
+        // The pager: the lone ACP session is the resolved selection, its
+        // action arc already on screen — no reveal swipe in v2.
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
         compose.waitForIdle()
-        compose.onNodeWithTag("haloRow-s-acp").performScrollTo().performTouchInput { swipeLeft() }
-        compose.waitForIdle()
+        compose.onNodeWithTag("haloPagerCard-s-acp").assertIsDisplayed()
 
         waitForNode("haloRowClose")
-        // The trailing action is the honest Hide, scoped to the ACP row.
-        compose.onNode(
-            hasTestTag("haloRowClose") and
-                hasAnyAncestor(hasTestTag("haloRow-s-acp")) and
-                hasText("hide", substring = true),
-        ).assertIsDisplayed()
+        // The close cell is the honest Hide glyph…
+        compose.onNode(hasTestTag("haloRowClose") and hasText("⊘")).assertIsDisplayed()
         // …and never the fake Kill.
         assertEquals(
-            "an ACP row must not offer a fake Kill",
+            "an ACP card must not offer a fake Kill",
             0,
-            compose.onAllNodes(
-                hasTestTag("haloRowClose") and
-                    hasAnyAncestor(hasTestTag("haloRow-s-acp")) and
-                    hasText("close", substring = true),
-            ).fetchSemanticsNodes().size,
+            compose.onAllNodes(hasTestTag("haloRowClose") and hasText("✕"))
+                .fetchSemanticsNodes().size,
         )
     }
 

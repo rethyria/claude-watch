@@ -51,6 +51,17 @@ data class HaloSession(
      * sessions), in which case this session contributes no spawn target.
      */
     val spawnRoot: String? = null,
+    /**
+     * The pager card's `model · mode · use%` subheading parts (Halo v2 S5).
+     * All three are null until S9 (#102) maps the bridge's session-meta wire
+     * fields onto them — the card renders each part only when present and
+     * omits the whole row when all are absent, so the UI is already correct
+     * against today's bridge.
+     */
+    val modelName: String? = null,
+    val modeName: String? = null,
+    /** Context-window use, 0–100; ≥80 renders terracotta (running hot). */
+    val usePercent: Int? = null,
 ) {
     /**
      * The ⎇ badge text — "⎇ main", "⎇ issue-53-fix · wt" for a worktree — or

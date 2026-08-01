@@ -43,6 +43,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -176,8 +177,10 @@ private const val TAP_GUARD_MS = 300L
  * table quotes the container-relative 119dp; measured from the screen that
  * number would bury the pill in the clock.) Absolute on purpose: the pill is
  * OUT OF FLOW, so the clock+subtitle group never shifts when it appears.
+ * Internal because the session pager's cards (S5) reuse the pill at this
+ * exact position — one number, so the two renditions can never drift.
  */
-private val ANSWER_PILL_TOP = 154.dp
+internal val ANSWER_PILL_TOP = 154.dp
 
 /**
  * On-page usage auto-poll period: the VM's `usageRateLimitMs` (300_000L)
@@ -296,11 +299,22 @@ private fun HaloAppBody(
         voiceWatched = false
     }
 
+    // The pager selection's last RESOLVED slot index, for the kill-under-
+    // cursor self-heal below: when the selected session vanishes, the session
+    // now sitting at this index is the dead one's next-door neighbour. Plain
+    // Int state (not derived) because the whole point is remembering a
+    // position the CURRENT model can no longer answer.
+    var lastListIndex by remember { mutableIntStateOf(0) }
+
     // The model can shrink under the navigation (session killed, project's
     // last session gone, queue resolved elsewhere): back out to something
     // that still exists rather than rendering a ghost.
     LaunchedEffect(model, nav) {
         val scope = nav.listScope
+        if (nav.depth == HaloDepth.LIST) {
+            val at = model.sessionsIn(scope).indexOfFirst { it.id == nav.sessionId }
+            if (at >= 0) lastListIndex = at
+        }
         nav = when {
             // Empty queue returns home (spec) — but not while a resolved
             // card's result flash is still playing; its onDone navigates.
@@ -314,6 +328,15 @@ private fun HaloAppBody(
             scope is ListScope.Project &&
                 nav.depth != HaloDepth.PAGE &&
                 model.projects.none { it.name == scope.name } -> nav.jumpHome()
+            // The LIST-depth self-heal (S5): back-from-a-vanished-feed parks
+            // the dead id as the pager selection and step/atListStart
+            // deliberately dead-end on it — re-resolve to the remembered-index
+            // neighbour (or All's spawn card) before the pager strands on a
+            // ghost with ‹/›/step all no-ops. Ordered AFTER the vanished-
+            // project branch: an emptied project scope backs out above.
+            nav.depth == HaloDepth.LIST && nav.sessionId != null &&
+                model.sessionsIn(scope).none { it.id == nav.sessionId } ->
+                nav.healListSelection(model, lastListIndex)
             // A vanished project can also strand the PAGE index past the end:
             // clamp back to the last page, exactly what the retired pager's
             // shrinking pageCount used to do.
@@ -375,36 +398,31 @@ private fun HaloAppBody(
                 is Layer.SessionList -> InnerScreen(
                     onBack = { nav = nav.back() },
                 ) {
-                    // Same API 31+ trap as the card overlay below: once the
-                    // stretch-overscroll starts (first overpull frame), it
-                    // consumes every subsequent drag delta BEFORE the list's
-                    // nested-scroll chain sees it, so the list's rebuilt
-                    // swipe-down-back accumulates only the first frame's few
-                    // px and never crosses its threshold — a real finger can
-                    // never swipe back, only the synthetic single-delta test
-                    // swipe could. The list sits on a round watch with edge
-                    // fades, not a stretchy phone surface: drop the effect so
-                    // the pull-down leftovers reach the back detector.
-                    @OptIn(ExperimentalFoundationApi::class)
-                    CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
-                        HaloSessionList(
-                            model = model,
-                            scope = layer.scope,
-                            onOpenSession = { nav = nav.drillToSession(it) },
-                            onKill = actions.onKill,
-                            onHide = actions.onHide,
-                            // Issue #56: the row summons the target picker
-                            // overlay; the actual onSpawn fires from a pick.
-                            onSpawn = { spawnPickerOpen = true },
-                            // The list's scrollable eats every vertical drag, so
-                            // InnerScreen's back detector can't fire under it; the
-                            // list re-triggers back itself via nested scroll.
-                            onBack = { nav = nav.back() },
-                            // Reclaim the bezel when the picker closes (its
-                            // rotary node stole focus and is now disposed).
-                            rotaryActive = !spawnPickerOpen,
-                        )
-                    }
+                    // The v2 pager (S5) has no scrollable: vertical drags fall
+                    // straight through to InnerScreen's back detector — the
+                    // app-wide swipe-down-back, kept by approved deviation.
+                    HaloSessionPager(
+                        model = model,
+                        scope = layer.scope,
+                        selectedId = nav.sessionId,
+                        // The at-start-goes-back rule stays the nav's pinned
+                        // predicate; the pager only obeys it.
+                        atStart = nav.atListStart(model),
+                        onStep = { delta -> nav = nav.step(delta, currentModel) },
+                        onBack = { nav = nav.back() },
+                        onOpenSession = { nav = nav.drillToSession(it) },
+                        // The Answer pill: the card OVER the list, pinned to
+                        // this session's own prompt — never a feed drill.
+                        onAnswer = { session -> nav = nav.openCardForListSession(session) },
+                        onKill = actions.onKill,
+                        onHide = actions.onHide,
+                        // Issue #56: the spawn card summons the target picker
+                        // overlay; the actual onSpawn fires from a pick.
+                        onSpawn = { spawnPickerOpen = true },
+                        // Reclaim the bezel when the picker closes (its
+                        // rotary node stole focus and is now disposed).
+                        rotaryActive = !spawnPickerOpen,
+                    )
                 }
                 is Layer.Feed -> InnerScreen(
                     onBack = { nav = nav.back() },
@@ -1119,7 +1137,9 @@ private fun PageDots(
  * time. The back detector sits UNDER the content, so it only covers screens
  * without a full-screen scrollable: a scrollable child consumes every
  * vertical drag (its leftover goes to nested scroll, never back to pointer
- * input) and must re-provide back itself, as HaloSessionList does.
+ * input) and would have to re-provide back itself, as the retired session
+ * list did — the v2 pager and the rotary-only feed deliberately leave
+ * vertical touch drags unconsumed, so this one detector serves both.
  */
 @Composable
 private fun InnerScreen(

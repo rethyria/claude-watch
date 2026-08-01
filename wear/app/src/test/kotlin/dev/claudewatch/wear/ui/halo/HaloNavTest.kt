@@ -95,7 +95,7 @@ class HaloNavTest {
     }
 
     @Test
-    fun drillToListFromHomeAndProjectPagesIsUnchanged() {
+    fun drillToListResolvesTheScopeFromHomeAndProjectPages() {
         val fromHome = HaloNavState(page = 0).drillToList(model())
         assertEquals(HaloDepth.LIST, fromHome.depth)
         assertEquals(ListScope.All, fromHome.listScope)
@@ -351,6 +351,70 @@ class HaloNavTest {
         // No prompt to pin: opening anyway would fall back to the global
         // front and float beta's prompt over alpha's pager card.
         assertEquals(onIdle, onIdle.openCardForListSession(m.sessions.single { it.id == "s-a1" }))
+    }
+
+    // ── The LIST-depth self-heal (Halo v2 S5, #99) ───────────────────────────
+    // step/atListStart deliberately dead-end on a vanished selection and
+    // back-from-feed parks the dead id at LIST depth; the pager heals it
+    // before rendering — these pin what the heal may and may not touch.
+
+    @Test
+    fun healReselectsTheRememberedIndexNeighbourWhenTheSelectionVanishes() {
+        // The selection sat at slot 1 and died: the session NOW at slot 1 is
+        // its next-door neighbour, and that is where the heal must land.
+        val shrunk = HaloModel(
+            projects = listOf(
+                HaloProject("alpha", listOf(session("s-a1", "alpha"))),
+                HaloProject("beta", listOf(session("s-b1", "beta"))),
+            ),
+            sessions = listOf(session("s-a1", "alpha"), session("s-b1", "beta")),
+            queue = emptyList(),
+        )
+        val stale = HaloNavState(depth = HaloDepth.LIST, sessionId = "s-gone")
+        val healed = stale.healListSelection(shrunk, 1)
+        assertEquals(HaloDepth.LIST, healed.depth)
+        assertEquals("s-b1", healed.sessionId)
+        // The END was killed: the remembered index clamps to the new last.
+        assertEquals("s-b1", stale.healListSelection(shrunk, 5).sessionId)
+        assertEquals("s-a1", stale.healListSelection(shrunk, 0).sessionId)
+    }
+
+    @Test
+    fun healLandsOnTheSpawnCardWhenTheAllScopeEmpties() {
+        val stale = HaloNavState(depth = HaloDepth.LIST, sessionId = "s-gone")
+        val healed = stale.healListSelection(emptyModel, 0)
+        // The spawn card — All's sole remaining slot — not a back-out: the
+        // user was IN the list and the list still has something to show.
+        assertEquals(HaloDepth.LIST, healed.depth)
+        assertNull(healed.sessionId)
+    }
+
+    @Test
+    fun healBacksOutOfAnEmptiedProjectScope() {
+        // A project scope with no sessions has NO slots (no spawn card
+        // outside All): nothing to select, so the heal backs all the way out.
+        val stale = HaloNavState(
+            depth = HaloDepth.LIST,
+            listScope = ListScope.Project("gone"),
+            sessionId = "s-gone",
+        )
+        val healed = stale.healListSelection(model(), 0)
+        assertEquals(HaloDepth.PAGE, healed.depth)
+        assertNull(healed.sessionId)
+    }
+
+    @Test
+    fun healPassesThroughEverythingThatIsNotAVanishedListSelection() {
+        val m = model()
+        // An in-scope selection needs no repair.
+        val fine = HaloNavState(page = 0).drillToList(m)
+        assertEquals(fine, fine.healListSelection(m, 3))
+        // The spawn card's null selection is not a vanished session.
+        val spawn = fine.copy(sessionId = null)
+        assertEquals(spawn, spawn.healListSelection(m, 0))
+        // Other depths own their own vanish handling (the feed backs out).
+        val feed = HaloNavState(depth = HaloDepth.SESSION, sessionId = "s-gone")
+        assertEquals(feed, feed.healListSelection(m, 0))
     }
 
     @Test

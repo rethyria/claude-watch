@@ -150,6 +150,31 @@ fun HaloNavState.stepPage(delta: Int, model: HaloModel): HaloNavState {
 fun HaloNavState.atListStart(model: HaloModel): Boolean =
     sessionId == model.sessionsIn(listScope).firstOrNull()?.id
 
+/**
+ * The LIST-depth self-heal (Halo v2 S5): repairs a selection that vanished
+ * under the cursor. [step]/[atListStart] deliberately dead-end on a stale id
+ * (a swipe must not guess) and [back] from a vanished feed parks the dead id
+ * as the LIST selection — so the pager, the one reader of the LIST selection,
+ * heals it before rendering. [rememberedIndex] is the slot the selection LAST
+ * resolved to (tracked by the UI): the session now at that index is the dead
+ * one's next-door neighbour, clamped to the last slot when the end was killed.
+ * An emptied All scope lands on the spawn card (the sole remaining slot); an
+ * emptied project scope has NO slots at all — its project just vanished from
+ * the model — so it backs all the way out. In-scope selections, other depths
+ * and the spawn card itself pass through untouched.
+ */
+fun HaloNavState.healListSelection(model: HaloModel, rememberedIndex: Int): HaloNavState {
+    if (depth != HaloDepth.LIST || sessionId == null) return this
+    val inScope = model.sessionsIn(listScope)
+    if (inScope.any { it.id == sessionId }) return this
+    return when {
+        inScope.isNotEmpty() ->
+            copy(sessionId = inScope[rememberedIndex.coerceIn(0, inScope.size - 1)].id)
+        listScope == ListScope.All -> copy(sessionId = null)
+        else -> jumpHome()
+    }
+}
+
 /** Tap a session row: into its live feed. */
 fun HaloNavState.drillToSession(sessionId: String): HaloNavState =
     copy(depth = HaloDepth.SESSION, sessionId = sessionId, cardOpen = false, cardPermissionId = null)

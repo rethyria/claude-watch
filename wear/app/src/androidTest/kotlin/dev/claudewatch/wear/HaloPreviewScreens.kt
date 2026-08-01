@@ -3,7 +3,6 @@ package dev.claudewatch.wear
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -143,7 +142,8 @@ class HaloPreviewScreens {
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
         compose.waitForIdle()
-        compose.onNodeWithTag("haloRow-$alpha").performScrollTo().performClick()
+        // Alpha is the drill's resolved selection (the scope's first card).
+        compose.onNodeWithTag("haloPagerCard-$alpha").performClick()
         hold()
     }
 

@@ -14,11 +14,9 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
-import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -49,7 +47,8 @@ import java.util.concurrent.TimeUnit
  * the full loop — pair with the code scraped from bridge stdout, watch an SSE
  * event render in a session feed, answer blocking permission hooks (single,
  * queued, allow-always) so each unblocks with the chosen decision, answer an
- * AskUserQuestion payload, and spawn + kill a real PTY session from the list.
+ * AskUserQuestion payload, and spawn + kill a real PTY session from the
+ * session pager (the v2 one-session-per-screen list).
  *
  * The old control-page command box has no Halo equivalent (commands are
  * dictation-only and the recognizer cannot run headlessly); the ack-gated
@@ -160,17 +159,6 @@ class WalkingSkeletonTest {
     private fun tagExists(tag: String): Boolean =
         compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().isNotEmpty()
 
-    /**
-     * Bring a lazy session-list item (a row, or the trailing spawn row) into
-     * view. The list is a ScalingLazyColumn, which only composes items near
-     * the viewport, so an offscreen item is not a node yet — performScrollTo
-     * (needs an existing node) can't reach it; performScrollToNode on the
-     * scrollable scrolls until it composes.
-     */
-    private fun scrollListTo(tag: String) {
-        compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag(tag))
-    }
-
     // Placement-gated existence: during transitions AnimatedContent composes
     // BOTH the entering and exiting layers (and can hold an exiting node
     // unplaced), so a bare fetchSemanticsNodes existence check can match a
@@ -183,39 +171,58 @@ class WalkingSkeletonTest {
             node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith(prefix) == true
         }
 
-    /** The session ids of the rows CURRENTLY composed (the lazy viewport). */
-    private fun rowIds(): Set<String> =
-        compose.onAllNodes(hasTestTagPrefix("haloRow-")).fetchSemanticsNodes()
-            .mapNotNull { it.config.getOrNull(SemanticsProperties.TestTag)?.removePrefix("haloRow-") }
+    /** The session ids of the pager cards CURRENTLY composed — at rest that
+     *  is exactly one (one session per screen); mid-step it can briefly be
+     *  the exiting card too, which the enumeration below tolerates. */
+    private fun pagerCardIds(): Set<String> =
+        compose.onAllNodes(hasTestTagPrefix("haloPagerCard-")).fetchSemanticsNodes()
+            .mapNotNull { it.config.getOrNull(SemanticsProperties.TestTag)?.removePrefix("haloPagerCard-") }
             .toSet()
 
     /**
-     * Every session id in the list, not just the composed viewport. The list
-     * is a ScalingLazyColumn — [rowIds] only sees the rows near the viewport,
-     * so diffing two viewport reads at different scroll offsets is meaningless
-     * (a scroll alone changes the set). Page top→bottom by item index, ending
-     * once the trailing spawn row composes, unioning the rows revealed.
+     * Every session id in the pager, enumerated by STEPPING: one session per
+     * screen now, so walking ›-wards from the current card to the trailing
+     * spawn card — the All scope's true end — visits every slot. Chevron
+     * clicks, not swipes, so the card-tap swipe guard never arms. Leaves the
+     * pager parked on the spawn card.
      */
-    private fun allRowIds(): Set<String> {
-        val list = compose.onNode(hasScrollAction())
-        val ids = rowIds().toMutableSet()
-        var i = 1
-        while (i <= 60 && !tagExists("haloSpawn")) {
-            val scrolled = runCatching {
-                list.performScrollToIndex(i)
-                compose.waitForIdle()
-            }.isSuccess
-            if (!scrolled) break
-            ids += rowIds()
-            i++
+    private fun allPagerIds(): Set<String> {
+        val ids = mutableSetOf<String>()
+        var steps = 0
+        while (steps <= 60 && !tagDisplayed("haloSpawn")) {
+            ids += pagerCardIds()
+            compose.onNodeWithTag("haloNext").performClick()
+            compose.waitForIdle()
+            steps++
         }
         return ids
     }
 
-    /** Swipe up from home into the all-sessions list. */
+    /** Swipe up from home into the All-scope session pager. */
     private fun drillToList() {
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
         compose.waitForIdle()
+    }
+
+    /** Pager → home: the app-wide swipe-down back (InnerScreen's detector). */
+    private fun pagerBackToHome() {
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeDown() }
+        compose.waitForIdle()
+    }
+
+    /** Step the pager to [sessionId]'s card, from wherever it is parked: back
+     *  out to the page and drill again (re-resolving to the first slot), then
+     *  walk ›-wards until the card is in front. */
+    private fun openPagerCard(sessionId: String) {
+        pagerBackToHome()
+        drillToList()
+        var steps = 0
+        while (steps <= 60 && !tagDisplayed("haloPagerCard-$sessionId")) {
+            compose.onNodeWithTag("haloNext").performClick()
+            compose.waitForIdle()
+            steps++
+        }
+        compose.onNodeWithTag("haloPagerCard-$sessionId").assertIsDisplayed()
     }
 
     /**
@@ -383,17 +390,17 @@ class WalkingSkeletonTest {
         ).use { assertEquals(200, it.code) }
         waitForText("haloCensus", "1 session")
         drillToList()
-        val markerSession = rowIds().single()
-        compose.onNodeWithTag("haloRow-$markerSession").performScrollTo().performClick()
+        // The lone session is the pager's resolved selection: its card is up.
+        val markerSession = pagerCardIds().single()
+        compose.onNodeWithTag("haloPagerCard-$markerSession").performClick()
         compose.waitUntil(30_000) {
             compose.onAllNodes(hasText(marker, substring = true)).fetchSemanticsNodes().isNotEmpty()
         }
-        // Back home the way a user does: swipe down twice (feed → list →
+        // Back home the way a user does: swipe down twice (feed → pager →
         // page). The clock is deliberately not a tap target anymore.
         compose.onNodeWithTag("haloFeed-$markerSession").performTouchInput { swipeDown() }
         compose.waitForIdle()
-        compose.onNode(hasScrollAction()).performTouchInput { swipeDown() }
-        compose.waitForIdle()
+        pagerBackToHome()
         waitForText("haloCensus", "session")
 
         // --- Concurrent blocking permission hooks (issue #17) -------------
@@ -566,24 +573,24 @@ class WalkingSkeletonTest {
             executor.shutdownNow()
         }
 
-        // --- Spawn a session from the list, watch its feed, kill it -------
+        // --- Spawn a session from the pager, watch its feed, kill it ------
         // The real bridge PTY-spawns the stubbed `claude` binary (see
         // .github/scripts/wear-e2e.sh); its ready line arrives as pty-output.
         drillToList()
-        // Enumerate the WHOLE list, not the viewport: the spawn adds one
-        // session and we must tell its row from every pre-existing one, even
-        // those the lazy list hasn't composed yet.
-        val before = allRowIds()
-        scrollListTo("haloSpawn")
+        // Enumerate the WHOLE pager by stepping to the trailing spawn card:
+        // the spawn adds one session and we must tell its card from every
+        // pre-existing one. The walk conveniently parks on the spawn card —
+        // the very affordance the leg taps next.
+        val before = allPagerIds()
         compose.onNodeWithTag("haloSpawn").performClick()
-        // Issue #56: the spawn row opens the TARGET picker instead of firing
+        // Issue #56: the spawn card opens the TARGET picker instead of firing
         // blind. The skeleton takes the "no project" home entry — the "~"
         // sentinel the bridge resolves to its own user's home, always a valid
-        // spawn directory on the real bridge under test. The picker overlays
-        // the still-composed session list, so its scrollable must be
-        // addressed BY ANCESTOR (a bare hasScrollAction() now matches both);
-        // the home entry trails the per-project entries and may need the
-        // scroll to compose (lazy list).
+        // spawn directory on the real bridge under test. The picker's
+        // scrollable stays ancestor-scoped (the pager itself has none, but
+        // scoping keeps this leg honest if one ever returns); the home entry
+        // trails the per-project entries and may need the scroll to compose
+        // (lazy list).
         compose.waitForIdle()
         compose.onNode(
             hasScrollAction() and hasAnyAncestor(hasTestTag("haloSpawnPicker")),
@@ -593,7 +600,12 @@ class WalkingSkeletonTest {
         val deadline = System.currentTimeMillis() + 30_000
         var found: String? = null
         while (System.currentTimeMillis() < deadline && found == null) {
-            val fresh = allRowIds() - before
+            // Each poll re-enumerates from the pager's start: back out to the
+            // page and drill again (the drill re-resolves the selection to
+            // the scope's first slot), then step to the end.
+            pagerBackToHome()
+            drillToList()
+            val fresh = allPagerIds() - before
             when {
                 fresh.size == 1 -> found = fresh.single()
                 fresh.size > 1 -> throw AssertionError("spawn added more than one row: $fresh")
@@ -608,8 +620,8 @@ class WalkingSkeletonTest {
         // The spawned PTY's stub output reaches THIS session's feed. Scope
         // the match to the feed subtree so text from another (prefetched or
         // composed) surface can't satisfy it.
-        scrollListTo("haloRow-$spawnedId")
-        compose.onNodeWithTag("haloRow-$spawnedId").performClick()
+        openPagerCard(spawnedId)
+        compose.onNodeWithTag("haloPagerCard-$spawnedId").performClick()
         compose.waitUntil(60_000) {
             compose.onAllNodes(
                 hasText("stub-claude", substring = true) and
@@ -617,18 +629,17 @@ class WalkingSkeletonTest {
             ).fetchSemanticsNodes().isNotEmpty()
         }
 
-        // Back to the list; the row's quick-action strip (horizontal swipe)
-        // carries close, which kills the session via /v1/command. The bridge
-        // pushes `session ended killed:true`, which prunes the row.
+        // Back to the pager — the selection survives the feed round trip, so
+        // the spawned card is up with its action arc's close, which kills the
+        // session via /v1/command. The bridge pushes `session ended
+        // killed:true`; the kill-under-cursor self-heal re-selects a
+        // neighbour and the pager stays steppable.
         compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeDown() }
         compose.waitForIdle()
-        scrollListTo("haloRow-$spawnedId")
-        compose.onNodeWithTag("haloRow-$spawnedId").performTouchInput { swipeLeft() }
-        compose.waitForIdle()
-        compose.onNode(
-            hasTestTag("haloRowClose") and hasAnyAncestor(hasTestTag("haloRow-$spawnedId")),
-        ).assertIsDisplayed().performClick()
-        compose.waitUntil(30_000) { !tagExists("haloRow-$spawnedId") }
-        assertTrue("the list must stay usable after the kill", tagExists("haloSpawn"))
+        compose.onNodeWithTag("haloPagerCard-$spawnedId").assertIsDisplayed()
+        compose.onNodeWithTag("haloRowClose").assertIsDisplayed().performClick()
+        compose.waitUntil(30_000) { !tagExists("haloPagerCard-$spawnedId") }
+        allPagerIds()
+        assertTrue("the pager must stay usable after the kill", tagDisplayed("haloSpawn"))
     }
 }

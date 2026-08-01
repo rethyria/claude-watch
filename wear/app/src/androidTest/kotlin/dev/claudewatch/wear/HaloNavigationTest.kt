@@ -5,14 +5,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.swipeUp
@@ -29,13 +27,13 @@ import org.junit.runner.RunWith
 
 /**
  * Halo navigation over live sessions (successor of the old SessionPagerTest:
- * page-per-session coverage became ring-home → list → feed nav coverage),
- * fed by fixture events reduced through the shared reducer — the same
- * `{id, event, data}` frames the bridge buffers. Every session is reachable
- * from home (swipe up → its list row → its live feed with human-readable,
- * ANSI-stripped lines), the thinking indicator renders from per-session
- * state, and a killed session's feed backs out instead of ghosting. Pure UI
- * test — no bridge, no network.
+ * page-per-session coverage became ring-home → list pager → feed nav
+ * coverage), fed by fixture events reduced through the shared reducer — the
+ * same `{id, event, data}` frames the bridge buffers. Every session is
+ * reachable from home (swipe up → its pager card → its live feed with
+ * human-readable, ANSI-stripped lines), the thinking indicator renders from
+ * per-session state, and a killed session's feed backs out onto the healed
+ * pager instead of ghosting. Pure UI test — no bridge, no network.
  *
  * Page order (issue #57): settings (slot 0) | usage (slot 1) | home/All (slot
  * 2, the landing page) | one page per project. The session-drill tests below
@@ -95,25 +93,32 @@ class HaloNavigationTest {
     private fun ui(bridge: BridgeState) =
         BridgeViewModel.UiState(status = "paired, stream open", paired = true, bridge = bridge)
 
-    /** Home → the all-sessions list (swipe up = drill, per the handoff IA). */
+    /** Home → the session list pager (swipe up = drill, per the handoff IA). */
     private fun drillToList() {
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
         compose.waitForIdle()
     }
 
     /**
-     * Bring a session's list row into view. The list is a ScalingLazyColumn,
-     * which only composes rows near the viewport, so an offscreen row does not
-     * exist as a node yet — performScrollTo (needs an existing node) can't
-     * reach it; performScrollToNode on the scrollable scrolls until it composes.
+     * Step the pager to a session's card. One session per screen now: an
+     * out-of-view session isn't a lazy-list row to scroll to but a slot to
+     * STEP to — chevron clicks, so the card-tap swipe guard never arms.
      */
-    private fun scrollToRow(sessionId: String) {
-        compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag("haloRow-$sessionId"))
+    private fun stepToCard(sessionId: String) {
+        var steps = 0
+        while (
+            steps < 10 &&
+            compose.onAllNodes(hasTestTag("haloPagerCard-$sessionId")).fetchSemanticsNodes().isEmpty()
+        ) {
+            compose.onNodeWithTag("haloNext").performClick()
+            compose.waitForIdle()
+            steps++
+        }
     }
 
     private fun openFeed(sessionId: String) {
-        scrollToRow(sessionId)
-        compose.onNodeWithTag("haloRow-$sessionId").performClick()
+        stepToCard(sessionId)
+        compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()
         compose.waitForIdle()
     }
 
@@ -130,11 +135,9 @@ class HaloNavigationTest {
         compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithText("2 projects · 2 sessions").assertIsDisplayed()
 
-        // Swipe up: the all-sessions list. Alpha sits below the title on entry,
-        // so open its feed first — from there its row is comfortably in view,
-        // clear of the top "jump home" strip that overlays the list's top edge.
+        // Swipe up: the pager lands on the scope's first card (alpha).
         drillToList()
-        compose.onNodeWithTag("haloRow-$alpha").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
 
         // Alpha's feed — human-readable, ANSI-stripped lines, no
         // cross-contamination from beta.
@@ -147,41 +150,34 @@ class HaloNavigationTest {
             compose.onAllNodes(hasText("npm test", substring = true)).fetchSemanticsNodes().size,
         )
 
-        // Swipe down steps back to the list; beta is reachable by scrolling the
-        // list down (its own row, below alpha's), and its feed renders ITS lines.
+        // Swipe down steps back to the pager — WITH the selection preserved
+        // (back-from-feed keeps the session, #95), so alpha's own card is up
+        // and beta is one step away; beta's feed renders ITS lines.
         compose.onNodeWithTag("haloFeed-$alpha").performTouchInput { swipeDown() }
         compose.waitForIdle()
-        scrollToRow(beta)
-        compose.onNodeWithTag("haloRow-$beta").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
         openFeed(beta)
         compose.onNodeWithTag("haloFeed-$beta").assertIsDisplayed()
         compose.onNode(hasText("npm test", substring = true)).assertIsDisplayed()
     }
 
     /**
-     * Swipe down ON THE LIST steps back to home. This is the OTHER back path:
-     * the feed's swipe-down (tested above) reaches the screen-level detector
-     * directly, but the list's scrollable owns every vertical drag, so its
-     * back is rebuilt from nested-scroll leftovers — the path the API 31+
-     * stretch-overscroll used to eat (only the first overpull frame reached
-     * the detector; a real finger could never cross the 60px threshold, while
-     * anything asserting via the feed path stayed green). The multi-frame
-     * drag swipeDown() injects exercises exactly that stretch interaction.
+     * Swipe down ON THE PAGER steps back to home. The v2 pager has no
+     * scrollable, so this rides InnerScreen's plain back detector — but the
+     * injection stays a real finger's frame-by-frame drag: the detector
+     * accumulates per-delta, and a batched swipe crossing the threshold in
+     * one event would green a path no real finger exercises.
      */
     @Test
-    fun listSwipeDownStepsBackToHome() {
+    fun pagerSwipeDownStepsBackToHome() {
         val bridge = fold(fixtureFrames())
         compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
         drillToList()
-        compose.onNode(hasScrollAction()).assertIsDisplayed() // sanity: we are on the list
+        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed() // sanity: on the pager
 
         // A real finger's drag: ~30px per 16ms frame, as DISTINCT timestamped
-        // moves. swipeDown() would batch its path into one frame-sized delta
-        // that crosses the back threshold before the stretch-overscroll ever
-        // engages — the exact false-green that let this regression ship while
-        // every real finger was broken. Frame-by-frame moves reproduce the
-        // per-delta consumption the stretch does on API 31+.
-        compose.onNode(hasScrollAction()).performTouchInput {
+        // moves.
+        compose.onNodeWithTag("haloRoot").performTouchInput {
             down(center)
             repeat(10) { moveBy(Offset(0f, 30f), delayMillis = 16L) }
             up()
@@ -275,7 +271,7 @@ class HaloNavigationTest {
     }
 
     @Test
-    fun killedSessionsFeedBacksOutAndItsRowIsPruned() {
+    fun killedSessionsFeedBacksOutOntoTheHealedPager() {
         var bridge by mutableStateOf(fold(fixtureFrames()))
         compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
         drillToList()
@@ -295,11 +291,15 @@ class HaloNavigationTest {
         )
         compose.waitForIdle()
 
-        // The dead feed backs out to the list; alpha's row is gone, beta's
-        // survives — no ghost screens over a pruned session.
+        // The dead feed backs out to the pager, which parks the dead id as
+        // the LIST selection (#95) — and the self-heal re-resolves it to the
+        // remembered-index neighbour: beta's card, not a ghost with every
+        // step a no-op.
         assertEquals(0, compose.onAllNodes(hasTestTag("haloFeed-$alpha")).fetchSemanticsNodes().size)
-        assertEquals(0, compose.onAllNodes(hasTestTag("haloRow-$alpha")).fetchSemanticsNodes().size)
-        scrollToRow(beta)
-        compose.onNodeWithTag("haloRow-$beta").assertIsDisplayed()
+        assertEquals(
+            0,
+            compose.onAllNodes(hasTestTag("haloPagerCard-$alpha")).fetchSemanticsNodes().size,
+        )
+        compose.onNodeWithTag("haloPagerCard-$beta").assertIsDisplayed()
     }
 }

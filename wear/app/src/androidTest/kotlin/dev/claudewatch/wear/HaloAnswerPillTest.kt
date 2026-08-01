@@ -6,7 +6,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -155,13 +154,12 @@ class HaloAnswerPillTest {
     @Test
     fun centerpieceTapOpensTheSessionListNotTheCard() {
         // The retargeted centerpiece (v2 nav: tap face → session list): even
-        // with a waiting prompt queued, the tap drills to the list — the
-        // prompt jump belongs to the pill alone.
+        // with a waiting prompt queued, the tap drills to the list pager —
+        // the prompt jump belongs to the pill alone.
         compose.setContent { HaloApp(ui = ui(queue = listOf(betaPrompt)), actions = HaloActions()) }
         compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
-        compose.onNode(hasScrollAction()).assertIsDisplayed()
-        compose.onNodeWithTag("haloRow-s-1").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-s-1").assertIsDisplayed()
         assertEquals(
             "a centerpiece tap must never raise the card",
             0,

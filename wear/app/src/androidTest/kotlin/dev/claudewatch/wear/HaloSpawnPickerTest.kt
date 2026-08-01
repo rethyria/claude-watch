@@ -8,10 +8,8 @@ import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.claudewatch.shared.state.BridgeState
@@ -26,12 +24,12 @@ import org.junit.runner.RunWith
 
 /**
  * The spawn target picker (issue #56), driven with fixture UiStates — no
- * bridge, no network. The list's "+ new claude session" row opens the picker
- * instead of spawning blind; picking a project fires onSpawn with THAT
- * project's root (the MAIN checkout for a worktree-only project), "no
- * project" fires the "~" home sentinel, and the swipe-down cancel spawns
- * NOTHING — with the underlying list's own gestures (row strip, rebuilt
- * swipe-down-back) intact afterwards.
+ * bridge, no network. The pager's trailing "+ new session" card (the v2
+ * rendition of the old list row, same testTag) opens the picker instead of
+ * spawning blind; picking a project fires onSpawn with THAT project's root
+ * (the MAIN checkout for a worktree-only project), "no project" fires the "~"
+ * home sentinel, and the swipe-down cancel spawns NOTHING — with the pager
+ * underneath keeping its own gestures afterwards.
  */
 @RunWith(AndroidJUnit4::class)
 class HaloSpawnPickerTest {
@@ -79,20 +77,28 @@ class HaloSpawnPickerTest {
         }
     }
 
-    /** Home → All list → tap the spawn row → the picker overlay is up. */
+    /** Home → pager → step to the trailing spawn card → tap → picker up. */
     private fun openPicker() {
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
         compose.waitForIdle()
-        // Only the session list scrolls at this point, so the bare matcher
-        // is unambiguous; once the picker is up there are TWO scrollables
-        // and every further scroll must be ancestor-scoped.
-        compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag("haloSpawn"))
+        // The spawn card is the All pager's true end: step ›-wards until it
+        // is the current card (chevron clicks, so no swipe tap-guard arms).
+        var steps = 0
+        while (
+            steps < 10 &&
+            compose.onAllNodes(hasTestTag("haloSpawn")).fetchSemanticsNodes().isEmpty()
+        ) {
+            compose.onNodeWithTag("haloNext").performClick()
+            compose.waitForIdle()
+            steps++
+        }
         compose.onNodeWithTag("haloSpawn").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloSpawnPicker").assertIsDisplayed()
     }
 
-    /** Scroll the PICKER's lazy list until [tag] composes (see [openPicker]). */
+    /** Scroll the PICKER's lazy list until [tag] composes (offscreen entries
+     *  aren't nodes yet; ancestor-scoped because the pager sits underneath). */
     private fun scrollPickerTo(tag: String) {
         compose.onNode(
             hasScrollAction() and hasAnyAncestor(hasTestTag("haloSpawnPicker")),
@@ -133,16 +139,16 @@ class HaloSpawnPickerTest {
     }
 
     @Test
-    fun swipeDownCancelsWithoutSpawningAndTheListKeepsItsGestures() {
+    fun swipeDownCancelsWithoutSpawningAndThePagerKeepsItsGestures() {
         val spawns = mutableListOf<Pair<String, String?>>()
         setContent(spawns)
         openPicker()
 
         // A real finger's pull-down: frame-by-frame moves, never a batched
-        // swipe — the picker's cancel is rebuilt from nested-scroll leftovers
-        // exactly like the list's back, the very interaction the API 31+
-        // stretch-overscroll used to eat (a batched swipe crosses the
-        // threshold in one delta and false-greens over the broken finger path).
+        // swipe — the picker's cancel is rebuilt from nested-scroll leftovers,
+        // the very interaction the API 31+ stretch-overscroll used to eat (a
+        // batched swipe crosses the threshold in one delta and false-greens
+        // over the broken finger path).
         compose.onNodeWithTag("haloSpawnPicker").performTouchInput {
             down(center)
             repeat(10) { moveBy(Offset(0f, 30f), delayMillis = 16L) }
@@ -153,24 +159,18 @@ class HaloSpawnPickerTest {
         assertEquals("cancel spawns nothing", 0, spawns.size)
         assertEquals("cancel closes the picker", 0, pickerCount())
 
-        // The list underneath is intact: a row swipe still reveals the
-        // action strip…
-        compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag("haloRow-s-b"))
-        compose.onNodeWithTag("haloRow-s-b").performTouchInput { swipeLeft() }
+        // The pager underneath is intact, still on the spawn card it was
+        // summoned from: ‹ steps back to the last session card with its
+        // action arc live…
+        compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
+        compose.onNodeWithTag("haloPrev").performClick()
         compose.waitForIdle()
-        compose.onNode(
-            hasTestTag("haloRowClose") and hasAnyAncestor(hasTestTag("haloRow-s-b")),
-        ).assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-s-b").assertIsDisplayed()
+        compose.onNodeWithTag("haloRowClose").assertIsDisplayed()
 
-        // …and the rebuilt swipe-down-back still steps home. Back fires only
-        // from the list's TOP BOUND, and openPicker() scrolled to the bottom
-        // (the spawn row): scroll explicitly to item 0 (the title — the true
-        // bound; scrolling to a ROW leaves backward room that eats the pull).
-        // Frame-by-frame for the same stretch-overscroll reason, with enough
-        // travel to cover any residual pre-bound scroll.
-        compose.onNode(hasScrollAction()).performScrollToIndex(0)
-        compose.waitForIdle()
-        compose.onNode(hasScrollAction()).performTouchInput {
+        // …and the app-wide swipe-down-back still steps home. Frame-by-frame
+        // for the same real-finger injection discipline.
+        compose.onNodeWithTag("haloRoot").performTouchInput {
             down(center)
             repeat(14) { moveBy(Offset(0f, 30f), delayMillis = 16L) }
             up()
