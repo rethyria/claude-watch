@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -11,6 +12,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performRotaryScrollInput
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.swipeUp
@@ -186,6 +188,113 @@ class HaloNavigationTest {
         // Unmerged: the census sits inside the centerpiece's mergeDescendants
         // clickable (same gotcha WalkingSkeletonTest documents for this tag).
         compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
+    }
+
+    /** A real finger's frame-by-frame drag on [tag]: distinct timestamped
+     *  moves, because per-delta detectors and nested scroll must see what a
+     *  finger produces — a batched swipe crosses everything in deltas no
+     *  finger makes and has greened broken gesture paths before. */
+    private fun fingerDrag(tag: String, step: Offset) {
+        compose.onNodeWithTag(tag).performTouchInput {
+            down(center)
+            repeat(10) { moveBy(step, delayMillis = 16L) }
+            up()
+        }
+        compose.waitForIdle()
+    }
+
+    /**
+     * The v2 feed (S6) scrolls by TOUCH on its reversed list, and an at-top
+     * pull-down goes back to the pager. "Top" on a reverseLayout list is the
+     * FORWARD bound — the direction inversion the epic flags as twice-bitten,
+     * pinned here with real per-frame drags on the emulator.
+     */
+    @OptIn(ExperimentalTestApi::class)
+    @Test
+    fun feedTouchScrollsHistoryAndAtTopPullDownGoesBack() {
+        val history = (0 until 60).map { i ->
+            SseFrame("${10 + i}", "pty-output", """{"text":"history-line-$i\r\n","sessionId":"$alpha"}""")
+        }
+        val bridge = fold(fixtureFrames() + history)
+        compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
+        drillToList()
+        openFeed(alpha)
+
+        // At the tail: the newest line is on screen, the oldest is not even
+        // composed (lazy) — the feed rests bottom-anchored.
+        compose.onNodeWithText("history-line-59").assertIsDisplayed()
+        assertEquals(0, compose.onAllNodes(hasText("$ claude")).fetchSemanticsNodes().size)
+
+        // Touch-scroll into history: content follows the finger DOWN
+        // (reverseLayout renders older lines upward) until the oldest line —
+        // the visual top — arrives.
+        var drags = 0
+        while (drags < 40 && compose.onAllNodes(hasText("$ claude")).fetchSemanticsNodes().isEmpty()) {
+            fingerDrag("haloFeed-$alpha", Offset(0f, 45f))
+            drags++
+        }
+        compose.onNodeWithText("$ claude").assertIsDisplayed()
+
+        // Rotary still scrolls too (kept verbatim from the rotary-only v1
+        // feed): positive detents walk back toward the tail — the crown
+        // direction that matches the session list's. Loop until the newest
+        // line recomposes, then a few bound-absorbed extras so "composed a
+        // screen away" has settled into "resting at the tail".
+        var spins = 0
+        while (
+            spins < 20 &&
+            compose.onAllNodes(hasText("history-line-59")).fetchSemanticsNodes().isEmpty()
+        ) {
+            compose.onNodeWithTag("haloFeed-$alpha")
+                .performRotaryScrollInput { rotateToScrollVertically(800f) }
+            compose.waitForIdle()
+            spins++
+        }
+        repeat(3) {
+            compose.onNodeWithTag("haloFeed-$alpha")
+                .performRotaryScrollInput { rotateToScrollVertically(800f) }
+            compose.waitForIdle()
+        }
+        compose.onNodeWithText("history-line-59").assertIsDisplayed()
+
+        // Touch-scroll back to the visual top for the pull-down leg.
+        drags = 0
+        while (drags < 40 && compose.onAllNodes(hasText("$ claude")).fetchSemanticsNodes().isEmpty()) {
+            fingerDrag("haloFeed-$alpha", Offset(0f, 45f))
+            drags++
+        }
+        compose.onNodeWithText("$ claude").assertIsDisplayed()
+
+        // Pull down again from the top: a pull that BEGINS at the bound is
+        // back (the first may only settle the last few pixels of scroll —
+        // reaching the top mid-gesture must not spill into a back).
+        var pulls = 0
+        while (
+            pulls < 5 &&
+            compose.onAllNodes(hasTestTag("haloPagerCard-$alpha")).fetchSemanticsNodes().isEmpty()
+        ) {
+            fingerDrag("haloFeed-$alpha", Offset(0f, 45f))
+            pulls++
+        }
+        // Back on the pager, selection preserved (#95).
+        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
+    }
+
+    /** Swipe right on the feed = back to the pager on the SAME session (v2:
+     *  sibling cycling died with the feed header — position lives in the
+     *  list pager now, so the gesture that used to cycle now goes back). */
+    @Test
+    fun feedSwipeRightReturnsToThePagerOnTheSameSession() {
+        val bridge = fold(fixtureFrames())
+        compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
+        drillToList()
+        openFeed(beta)
+        compose.onNodeWithTag("haloFeed-$beta").assertIsDisplayed()
+
+        fingerDrag("haloFeed-$beta", Offset(30f, 0f))
+        // Not the first card of the scope: landing on beta's own card proves
+        // swipe-right is BACK-preserving-selection, not a sibling cycle.
+        compose.onNodeWithTag("haloPagerCard-$beta").assertIsDisplayed()
     }
 
     @Test
