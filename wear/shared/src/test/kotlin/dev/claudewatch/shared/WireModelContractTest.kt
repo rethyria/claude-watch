@@ -276,6 +276,39 @@ class WireModelContractTest {
     }
 
     @Test
+    fun sessionMetaParsesWhenPresentAndIsNullWhenOmitted() {
+        // Issue #97 (Halo v2): an ACP session carries the subheading trio —
+        // model display name, ACP mode id verbatim, integer context percent.
+        val acp = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-1","kind":"acp",""" +
+                """"model":"Claude Opus 4.6","mode":"acceptEdits","contextPct":42}""",
+        ) as SessionEvent
+        assertEquals("Claude Opus 4.6", acp.model)
+        assertEquals("acceptEdits", acp.mode)
+        assertEquals(42, acp.contextPct)
+
+        // contextPct keys on PRESENCE, never truthiness: a fresh session's
+        // explicit 0 is a real value and must parse as one, not fold to null.
+        val fresh = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-1","contextPct":0}""",
+        ) as SessionEvent
+        assertEquals(0, fresh.contextPct)
+
+        // A PTY/hook session has no equivalent signal and omits all three:
+        // absence stays null (the reducer's preserve-on-absence input) and
+        // never fails the frame.
+        val plain = BridgeEventParser.parse(
+            "session",
+            """{"state":"running","sessionId":"s-2"}""",
+        ) as SessionEvent
+        assertNull(plain.model)
+        assertNull(plain.mode)
+        assertNull(plain.contextPct)
+    }
+
+    @Test
     fun agentsActivityParsesWhenPresentAndIsNullWhenOmitted() {
         // Issue #55: workflow activity arrives as a nested {running, done}
         // object once the bridge has observed any.

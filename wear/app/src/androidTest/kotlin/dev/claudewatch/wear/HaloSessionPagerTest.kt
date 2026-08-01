@@ -294,6 +294,60 @@ class HaloSessionPagerTest {
         compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
     }
 
+    /**
+     * The S9 subheading (#102), fixture-fed end to end through HaloModel: an
+     * ACP session's wire meta renders as `model · mode · use%` in display
+     * form (prefix-stripped, short-labelled), and a session without the wire
+     * fields — every PTY/hook session — renders no subheading at all rather
+     * than an empty row or invented values. The ≥80 terracotta threshold
+     * itself is pinned by HaloSubheadingTest; here 85% proves the hot part
+     * still renders as text.
+     */
+    @Test
+    fun subheadingRendersWireMetaInDisplayFormAndStaysAbsentWithoutIt() {
+        val bridge = BridgeState(
+            sessions = mapOf(
+                "s-acp" to SessionState(
+                    sessionId = "s-acp",
+                    agent = "claude",
+                    cwd = "/home/dev/alpha",
+                    folderName = "alpha",
+                    external = true,
+                    kind = "acp",
+                    model = "Claude Opus 4.6",
+                    mode = "acceptEdits",
+                    contextPct = 85,
+                ),
+                "s-pty" to SessionState(
+                    sessionId = "s-pty",
+                    agent = "claude",
+                    cwd = "/home/dev/alpha",
+                    folderName = "alpha",
+                ),
+            ),
+        )
+        compose.setContent {
+            HaloApp(
+                ui = BridgeViewModel.UiState(status = "paired, stream open", paired = true, bridge = bridge),
+                actions = HaloActions(),
+            )
+        }
+        drill()
+
+        // The ACP card: "Opus 4.6 · edits · 85%", each part its own node.
+        compose.onNodeWithTag("haloPagerCard-s-acp").assertIsDisplayed()
+        compose.onNodeWithText("Opus 4.6").assertIsDisplayed()
+        compose.onNodeWithText("edits").assertIsDisplayed()
+        compose.onNodeWithText("85%").assertIsDisplayed()
+
+        // The meta-less PTY card: no subheading parts at all.
+        next()
+        compose.onNodeWithTag("haloPagerCard-s-pty").assertIsDisplayed()
+        assertEquals(0, textCount("Opus 4.6"))
+        assertEquals(0, textCount("edits"))
+        assertEquals(0, textCount("85%"))
+    }
+
     @Test
     fun emptyAllScopeIsTheSpawnCardWithBackAndPickerBothLive() {
         compose.setContent { HaloApp(ui = ui(ids = emptyList()), actions = HaloActions()) }

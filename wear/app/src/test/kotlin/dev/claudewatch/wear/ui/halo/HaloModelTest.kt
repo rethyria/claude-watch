@@ -33,6 +33,9 @@ class HaloModelTest {
         worktree: Boolean = false,
         repoRoot: String? = null,
         agents: AgentsActivity? = null,
+        model: String? = null,
+        mode: String? = null,
+        contextPct: Int? = null,
     ) = SessionState(
         sessionId = id,
         agent = agent,
@@ -46,6 +49,9 @@ class HaloModelTest {
         worktree = worktree,
         repoRoot = repoRoot,
         agents = agents,
+        model = model,
+        mode = mode,
+        contextPct = contextPct,
         activity = SessionActivity.WORKING,
         activeSinceMs = 1_000L,
     )
@@ -426,6 +432,62 @@ class HaloModelTest {
             model.projects.single { it.name == "beta" }.sessions,
             model.sessionsIn(ListScope.Project("beta")),
         )
+    }
+
+    /** Halo v2 S9 (#102): the session-meta trio reaches the HaloSession in
+     *  DISPLAY form — model prefix-stripped, mode through the short-label
+     *  map, use% copied by presence — so the S5 subheading just prints. */
+    @Test
+    fun sessionMetaIsThreadedOntoTheHaloSessionInDisplayForm() {
+        val model = HaloModel.from(
+            uiState(
+                session("s-acp", kind = "acp", model = "Claude Opus 4.6", mode = "acceptEdits", contextPct = 85),
+                session("s-fresh", kind = "acp", model = "Sonnet", mode = "default", contextPct = 0),
+                session("s-pty"),
+            ),
+        )
+        val acp = model.sessions.single { it.id == "s-acp" }
+        assertEquals("Opus 4.6", acp.modelName)
+        assertEquals("edits", acp.modeName)
+        assertEquals(85, acp.usePercent)
+
+        // Presence, never truthiness: a fresh session's real 0% survives to
+        // the card instead of vanishing as falsy.
+        val fresh = model.sessions.single { it.id == "s-fresh" }
+        assertEquals("Sonnet", fresh.modelName)
+        assertEquals("manual", fresh.modeName)
+        assertEquals(0, fresh.usePercent)
+
+        // No wire fields (PTY/hook session): all three stay null, so the card
+        // renders a clean empty row — absence never becomes a guess.
+        val pty = model.sessions.single { it.id == "s-pty" }
+        assertEquals(null, pty.modelName)
+        assertEquals(null, pty.modeName)
+        assertEquals(null, pty.usePercent)
+    }
+
+    /** Halo v2 S9 (#102): the mode label table, id → wrist word. */
+    @Test
+    fun modeLabelMapsTheKnownAcpIdsAndPassesUnknownOnesVerbatim() {
+        assertEquals("manual", modeLabel("default"))
+        assertEquals("plan", modeLabel("plan"))
+        assertEquals("edits", modeLabel("acceptEdits"))
+        assertEquals("bypass", modeLabel("bypassPermissions"))
+        assertEquals("no-ask", modeLabel("dontAsk"))
+        // The vocabulary is the agent's and may grow: an unknown id shows
+        // itself rather than hiding the mode.
+        assertEquals("yolo", modeLabel("yolo"))
+    }
+
+    /** Halo v2 S9 (#102): only a LEADING "Claude " strips; everything else —
+     *  short names, raw third-party ids — renders verbatim. */
+    @Test
+    fun modelDisplayNameStripsOnlyALeadingClaudePrefix() {
+        assertEquals("Opus 4.6", modelDisplayName("Claude Opus 4.6"))
+        assertEquals("Opus", modelDisplayName("Opus"))
+        assertEquals("Default", modelDisplayName("Default"))
+        assertEquals("gpt-5o-mini", modelDisplayName("gpt-5o-mini"))
+        assertEquals("Not Claude Model", modelDisplayName("Not Claude Model"))
     }
 
     @Test

@@ -100,6 +100,18 @@ data class SessionState(
      * done: N}` — a present value always replaces, absence always preserves.
      */
     val agents: AgentsActivity? = null,
+    /**
+     * The session-meta trio behind the pager's `model · mode · use%`
+     * subheading (issue #97, Halo v2): model display name, ACP permission-
+     * mode id verbatim, integer percent of the context window used. Only ACP
+     * sessions ever report them, so all three stay null for PTY/hook slots
+     * and the subheading simply omits the missing parts. [contextPct] keys
+     * on PRESENCE — 0 is a real value (a fresh session) — and absence never
+     * becomes a guess. Preserve-on-absence, exactly like [title].
+     */
+    val model: String? = null,
+    val mode: String? = null,
+    val contextPct: Int? = null,
     val activity: SessionActivity = SessionActivity.WORKING,
     val activeSinceMs: Long? = null,
     val frozenElapsedMs: Long? = null,
@@ -392,6 +404,15 @@ object BridgeEventReducer {
                     worktree = if (event.branch != null) event.worktree ?: false else existing.worktree,
                     repoRoot = if (event.branch != null) event.repoRoot else existing.repoRoot,
                     agents = event.agents ?: existing.agents,
+                    // Session meta (issue #97): a slot that has the trio
+                    // carries it on every event and re-announces on change, so
+                    // present replaces and absence preserves — title's exact
+                    // doctrine. The Elvis is presence-based, not truthy-based,
+                    // which is what lets an explicit contextPct 0 (a fresh
+                    // session) land instead of vanishing as falsy.
+                    model = event.model ?: existing.model,
+                    mode = event.mode ?: existing.mode,
+                    contextPct = event.contextPct ?: existing.contextPct,
                 )?.let { known ->
                     // ONE-WAY IDLE LATCH (issue #60). `idle: true` is honoured
                     // for a session we already track; its ABSENCE is not —
@@ -457,6 +478,9 @@ object BridgeEventReducer {
                     worktree = event.worktree ?: false,
                     repoRoot = event.repoRoot,
                     agents = event.agents,
+                    model = event.model,
+                    mode = event.mode,
+                    contextPct = event.contextPct,
                     // FIRST SIGHT: the case `idle` was added for (issue #60). A
                     // session whose turn ended before this client connected has
                     // no `stop` left in the replay ring to correct a guess, so

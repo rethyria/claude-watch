@@ -108,8 +108,9 @@ internal data class SubheadingPart(val text: String, val hot: Boolean = false)
  * The pager card's subheading, as data: each part only when present, in
  * model → mode → use% order, so the composable renders separators exactly
  * between present parts and omits the whole row when the list is empty.
- * Pure — the S9 wire fields land later (#102) and today's all-null sessions
- * must already produce a correct (empty) row.
+ * Pure — the S9 wire fields (#102) arrive pre-labelled on the HaloSession,
+ * and only ACP sessions carry them, so all-null PTY/hook sessions must keep
+ * producing a correct (empty) row.
  */
 internal fun sessionSubheading(
     modelName: String?,

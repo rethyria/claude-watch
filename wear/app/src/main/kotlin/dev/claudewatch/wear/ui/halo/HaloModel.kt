@@ -52,11 +52,12 @@ data class HaloSession(
      */
     val spawnRoot: String? = null,
     /**
-     * The pager card's `model · mode · use%` subheading parts (Halo v2 S5).
-     * All three are null until S9 (#102) maps the bridge's session-meta wire
-     * fields onto them — the card renders each part only when present and
-     * omits the whole row when all are absent, so the UI is already correct
-     * against today's bridge.
+     * The pager card's `model · mode · use%` subheading parts (Halo v2
+     * S5/S9), already in DISPLAY form: model prefix-stripped, mode through
+     * the short-label map. Null whenever the bridge has not reported the
+     * wire field — only ACP sessions ever do — and the card renders each
+     * part only when present, so PTY/hook sessions keep a clean partial or
+     * empty row.
      */
     val modelName: String? = null,
     val modeName: String? = null,
@@ -69,6 +70,31 @@ data class HaloSession(
      */
     val branchLabel: String?
         get() = branch?.let { if (worktree) "⎇ $it · wt" else "⎇ $it" }
+}
+
+/**
+ * The subheading's model part (Halo v2 S9, #102): the bridge's display name
+ * minus a leading "Claude " — the brand prefix says nothing a wrist glance
+ * needs, and "Opus 4.6" fits where "Claude Opus 4.6" wraps at 9.5sp.
+ * Everything else (short names like "Opus", third-party backend ids, the
+ * bare "Default" fallback) renders verbatim, per the wire contract.
+ */
+internal fun modelDisplayName(model: String): String = model.removePrefix("Claude ")
+
+/**
+ * The subheading's mode part (Halo v2 S9, #102): short labels for the ACP
+ * permission-mode ids we know — "default" reads as "manual" because it is
+ * the ask-me-everything mode and the word "default" says nothing on a card.
+ * The vocabulary is the agent's and may grow, so an unknown id passes
+ * through verbatim rather than hiding the mode.
+ */
+internal fun modeLabel(mode: String): String = when (mode) {
+    "default" -> "manual"
+    "plan" -> "plan"
+    "acceptEdits" -> "edits"
+    "bypassPermissions" -> "bypass"
+    "dontAsk" -> "no-ask"
+    else -> mode
 }
 
 /** A project groups the sessions sharing a working directory. */
@@ -172,6 +198,13 @@ data class HaloModel(
                     // repoRoot beats cwd: for a worktree session repoRoot IS
                     // the main checkout, and a new session belongs there.
                     spawnRoot = s.repoRoot ?: s.cwd,
+                    // Session meta (S9, #102) maps to display form here so the
+                    // card just prints. usePercent copies by PRESENCE — the
+                    // Int? carries an explicit 0 (fresh session) through
+                    // untouched, and a null stays null rather than a guess.
+                    modelName = s.model?.let(::modelDisplayName),
+                    modeName = s.mode?.let(::modeLabel),
+                    usePercent = s.contextPct,
                 )
             }
 
