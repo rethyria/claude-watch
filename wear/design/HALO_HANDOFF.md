@@ -537,7 +537,7 @@ plain-JVM-tabled in `GlanceModelTest`.
 ## Halo v2 (epic #94) — pager list, chrome-free feed, persistent morphing ring
 
 _The second design iteration (claude.ai/design project `095874f5-…`, file
-"Claude Watch Halo.dc.html"), ported across slices #95–#105 and closed out by
+"Claude Watch Halo.dc.html"), ported across slices #95–#104 and closed out by
 the #104 finish sweep. Where this section contradicts anything above, THIS
 section wins — the epic's constants table (issue #94) is the numeric source
 of truth. Reference captures: `wear/design/halo-v2-current-*.png`
