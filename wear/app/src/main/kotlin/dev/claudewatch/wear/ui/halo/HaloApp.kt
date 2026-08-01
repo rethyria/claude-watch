@@ -181,12 +181,14 @@ internal val LocalHaloAmbient = compositionLocalOf { false }
  * 2): set by the root PredictiveBackHandler the moment the system dispatches
  * back-started, dropped on completion or cancellation. Every surface drag
  * detector — page/pager steps, feed swipe-right, the swipe-down backs, the
- * at-top pull connections — reads it through [SystemBackDragClaim] to stand
- * down for the drag: the system gesture's touches also arrive in-window as
- * an ordinary drag, and acting on them is the double-consumption race the
- * SM-L330 logs pinned. A [State] (not a value) because the consumers live in
- * pointerInput(Unit) closures that never restart — they must read the live
- * flag, not a composition-time capture.
+ * at-top pull connections, the modal surfaces' overscroll exits — reads it
+ * (through [SystemBackDragClaim] or the poison inside the shared connections
+ * in HaloGestures.kt) to stand down for the drag: the system gesture's
+ * touches also arrive in-window as an ordinary drag, and acting on them is
+ * the double-consumption race the SM-L330 logs pinned. A [State] (not a
+ * value) because the consumers live in pointerInput(Unit) closures that
+ * never restart — they must read the live flag, not a composition-time
+ * capture.
  */
 internal val LocalHaloSystemBackInFlight =
     compositionLocalOf<State<Boolean>> { mutableStateOf(false) }

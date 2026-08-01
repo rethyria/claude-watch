@@ -49,8 +49,8 @@ import org.junit.runner.RunWith
  *    button commits);
  *  - dispatchOnBackStarted/-Progressed drive the PREDICTIVE half of that
  *    same seam — exactly what the API-34 OnBackAnimationCallback feeds it —
- *    which is how the mid-gesture race test holds a system gesture in
- *    flight while injecting the app-surface drag that killed round 1;
+ *    which is how the mid-gesture race tests hold a system gesture in
+ *    flight while injecting the app-surface drags that killed round 1;
  *  - one test shell-injects a true LEFT-EDGE swipe (system-level input, the
  *    gesture the compose harness cannot make) and pins the measured Wear
  *    dispatch's stable half: a registered handler suppresses the system
@@ -406,6 +406,70 @@ class HaloSystemBackTest {
         compose.runOnUiThread { dispatcher.onBackPressed() }
         compose.waitForIdle()
         assertAtHome()
+        assertTrue(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
+    }
+
+    /**
+     * The race's OTHER live seam (#109 round 2 review): on the modal card
+     * surfaces the system gesture's touches never reach the poisoned host-Box
+     * drag detector — the card's verticalScroll wins the drag, and the
+     * unconsumed droop surfaces as nested-scroll leftovers in the shared
+     * overscroll-exit connection (rememberOverscrollExitConnection; the
+     * platform overscroll under the card is disabled precisely so those
+     * leftovers arrive). Unpoisoned, a mid-gesture droop past the threshold
+     * fires "decide later" racing the handler's completion — both orderings
+     * double-navigate (and the voice-overlay twin over home routes the
+     * completion to the deliberate finish). This pins the connection's
+     * stand-down: the droop is withheld (card still up), and the commit then
+     * routes exactly ONE step — card closed, pager position kept, activity
+     * alive.
+     */
+    @Test
+    fun midGestureCardPullDownCannotFireDecideLaterOrDoubleNavigate() {
+        compose.setContent { HaloApp(ui = ui(queue = listOf(betaPrompt)), actions = HaloActions()) }
+        drillToList()
+        stepTo("haloPagerCard-s-2")
+        compose.onNodeWithTag("haloAnswerPill").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloCard").assertIsDisplayed()
+
+        // The system gesture goes in flight (same seam discipline as the
+        // page-drag race test above: waitForIdle lets the handler's collect
+        // coroutine raise the in-flight flag before the drag begins).
+        val dispatcher = compose.activity.onBackPressedDispatcher
+        compose.runOnUiThread {
+            dispatcher.dispatchOnBackStarted(
+                BackEventCompat(2f, 200f, 0f, BackEventCompat.EDGE_LEFT),
+            )
+        }
+        compose.waitForIdle()
+        compose.runOnUiThread {
+            dispatcher.dispatchOnBackProgressed(
+                BackEventCompat(80f, 200f, 0.4f, BackEventCompat.EDGE_LEFT),
+            )
+        }
+        compose.waitForIdle()
+
+        // Mid-gesture, a full-height downward droop lands on the card's
+        // scrollable: at its top nothing is consumable, so every delta spills
+        // into the overscroll-exit connection — far past the ~30dp threshold.
+        // The poison must withhold the exit: still on the card.
+        compose.onNodeWithTag("haloCard").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(0f, height / 10f), delayMillis = 16L) }
+            up()
+        }
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloCard").assertIsDisplayed()
+
+        // The release commits: ONE hierarchy step — the card closes onto the
+        // pager exactly where it was (a leaked decide-later would have taken
+        // that step already, landing this commit a level deeper).
+        compose.runOnUiThread { dispatcher.onBackPressed() }
+        compose.waitForIdle()
+        assertEquals(0, nodeCount("haloCard"))
+        compose.onNodeWithTag("haloPagerCard-s-2").assertIsDisplayed()
+        assertFalse(compose.activity.isFinishing)
         assertTrue(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
     }
 }

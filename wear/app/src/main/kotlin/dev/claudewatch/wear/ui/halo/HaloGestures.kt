@@ -149,3 +149,64 @@ internal fun rememberAtTopBackConnection(
     onBack: () -> Unit,
 ): NestedScrollConnection =
     rememberAtTopBackConnection(atTop = { !listState.canScrollBackward }, onBack = onBack)
+
+/**
+ * The MODAL surfaces' pull-down exit (the approval card's "decide later", the
+ * question card's "answer later", the voice overlay's Cancel): their
+ * verticalScroll consumes every vertical drag — starving the host Box's
+ * swipe-down detector in HaloApp — so the exit is rebuilt from the
+ * nested-scroll leftovers, firing at end-of-drag (onPreFling). No at-top gate,
+ * unlike [rememberAtTopBackConnection]: leftovers only exist past the scroll
+ * bound, and on a modal surface any committed overpull means "leave".
+ *
+ * Carries the #109 stand-down like every other surface detector
+ * ([SystemBackDragClaim]'s poison rule — owned if the system gesture was in
+ * flight at ANY point during the drag): a system back gesture's unconsumed
+ * droop spills in here as leftovers too, and firing the exit races the root
+ * handler's completion — the completion then routes from the ALREADY-mutated
+ * state (a second hierarchy step on the cards; on the voice overlay over
+ * home, systemBack sees no overlay left and routes null — the deliberate
+ * activity finish, for a gesture that meant "close the overlay").
+ */
+@Composable
+internal fun rememberOverscrollExitConnection(onExit: () -> Unit): NestedScrollConnection {
+    val currentOnExit by rememberUpdatedState(onExit)
+    val thresholdPx = with(LocalDensity.current) { AT_TOP_BACK_THRESHOLD.toPx() }
+    val systemBackInFlight = LocalHaloSystemBackInFlight.current
+    return remember(thresholdPx, systemBackInFlight) {
+        object : NestedScrollConnection {
+            // Unconsumed pull-down over the whole drag.
+            private var overscroll = 0f
+            private var systemBackOwned = false
+
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput && systemBackInFlight.value) {
+                    systemBackOwned = true
+                }
+                return Offset.Zero
+            }
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                if (source != NestedScrollSource.UserInput) return Offset.Zero
+                if (systemBackInFlight.value) systemBackOwned = true
+                if (available.y > 0f) overscroll += available.y
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                // The flag is re-read at the decision point too: a gesture
+                // going in flight between the last delta and the release
+                // must still poison the drag.
+                if (systemBackInFlight.value) systemBackOwned = true
+                if (!systemBackOwned && overscroll > thresholdPx) currentOnExit()
+                overscroll = 0f
+                systemBackOwned = false
+                return Velocity.Zero
+            }
+        }
+    }
+}
