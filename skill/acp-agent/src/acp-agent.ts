@@ -127,6 +127,9 @@ import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./u
 import {
   BridgeChannel,
   PermissionDecision,
+  InputDecision,
+  DETACHED_PERMISSION_TIMEOUT_MS,
+  applyWristAskAnswers,
   createBridgeChannel,
   teeClientToBridge,
   guardDetachedClient,
@@ -1349,6 +1352,11 @@ export class ClaudeAcpAgent {
    *  actually pending, so a late decision for a finished call finds nothing and
    *  is dropped rather than resolving the wrong prompt. */
   private readonly wristDecisionWaiters = new Map<string, (d: PermissionDecision) => void>();
+  /** In-flight AskUserQuestion elicitations the watch could still answer,
+   *  keyed by tool call (#111) — the wristDecisionWaiters pattern for the
+   *  input-request lane. A late decision for a settled elicitation finds
+   *  nothing and is dropped, never double-resolved. */
+  private readonly wristInputWaiters = new Map<string, (d: InputDecision) => void>();
 
   constructor(client: AcpClient, logger?: Logger, bridge?: BridgeChannel) {
     this.sessions = {};
@@ -1359,6 +1367,10 @@ export class ClaudeAcpAgent {
     // the request that is waiting for its tool call, if any is still open.
     bridge?.onPermissionDecision?.((d) => {
       this.wristDecisionWaiters.get(d.toolCallId)?.(d);
+    });
+    // The wrist's AskUserQuestion answers ride the same inbox (#111).
+    bridge?.onInputDecision?.((d) => {
+      this.wristInputWaiters.get(d.toolCallId)?.(d);
     });
   }
 
@@ -4796,6 +4808,23 @@ export class ClaudeAcpAgent {
     return { decision, dispose: () => this.wristDecisionWaiters.delete(toolCallId) };
   }
 
+  /** claude-watch (#111): a promise that settles when the watch answers THIS
+   *  AskUserQuestion, plus the disposer that unregisters it — the
+   *  awaitWristDecision pattern for the input lane. Never rejects: a wrist
+   *  that never answers simply loses the race, and the question is left to
+   *  Zed's form. */
+  private awaitWristInput(toolCallId: string): {
+    decision: Promise<InputDecision>;
+    dispose: () => void;
+  } {
+    let settle!: (d: InputDecision) => void;
+    const decision = new Promise<InputDecision>((resolve) => {
+      settle = resolve;
+    });
+    this.wristInputWaiters.set(toolCallId, settle);
+    return { decision, dispose: () => this.wristInputWaiters.delete(toolCallId) };
+  }
+
   /** Emit the `tool_call` a permission request references if it hasn't been sent
    *  yet, so the client has the tool call before being asked to approve it. The
    *  matching streamed tool_use chunk later refines it with a `tool_call_update`
@@ -5105,6 +5134,15 @@ export class ClaudeAcpAgent {
    * Present the built-in AskUserQuestion tool's questions as an ACP form
    * elicitation and return the answers as the tool's `updatedInput`. Called from
    * `canUseTool` since that is where the SDK routes the tool's permission check.
+   *
+   * claude-watch (#111): an elicitation is a client-bound REQUEST, so the
+   * bridge's client tee (notifications + the requestPermission RPC) never sees
+   * it — without an explicit raise the wrist's question card starves. So this
+   * mirrors the #80 permission race: raise `input-request` on the bridge, race
+   * Zed's form against the wrist's `input-decision`, and settle exactly once —
+   * first writer wins, the loser is retracted (Zed by aborting its RPC, the
+   * wrist by the `input-resolved` in the finally, which runs on EVERY exit so
+   * a Zed answer, a turn cancel, or a client failure can never strand a card).
    */
   private async handleAskUserQuestion(
     sessionId: string,
@@ -5118,27 +5156,100 @@ export class ClaudeAcpAgent {
     }
 
     const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID);
-    let response;
-    try {
-      response = await this.client.unstable_createElicitation(createRequest, signal);
-    } catch (error) {
-      // A cancellation we requested (signal aborted) settles as an aborted tool
-      // use, matching the post-response check below.
-      if (signal.aborted) {
-        throw new Error("Tool use aborted", { cause: error });
-      }
-      this.logger.error(`Failed to present AskUserQuestion elicitation: ${error}`);
-      return { behavior: "deny", message: "Could not present the question to the user." };
+    // Waiter BEFORE the raise, so a wrist answer arriving the instant the card
+    // renders can never miss it.
+    const wrist = this.bridge ? this.awaitWristInput(toolUseID) : null;
+    if (wrist) {
+      this.bridge?.forwardInputRequest?.({ sessionId, toolCallId: toolUseID, questions });
     }
-    if (signal.aborted) {
-      throw new Error("Tool use aborted");
-    }
+    // Zed's leg gets its own controller, chained to the caller's signal, so a
+    // wrist win can retract Zed's form without cancelling the tool call. An
+    // already-aborted signal never fires its listener, so chain it by hand.
+    const zedAbort = new AbortController();
+    const chain = () => zedAbort.abort();
+    if (signal.aborted) zedAbort.abort();
+    else signal.addEventListener("abort", chain, { once: true });
+    let disposeBackstop: (() => void) | undefined;
 
-    const outcome = applyAskElicitationResponse(response, toolInput, questions);
-    if (outcome.action === "cancel") {
-      throw new Error("Tool use aborted");
+    type AskWinner =
+      | { lane: "zed"; response: CreateElicitationResponse }
+      | { lane: "wrist"; decision: InputDecision };
+    try {
+      const zedLane: Promise<AskWinner> = this.client
+        .unstable_createElicitation(createRequest, zedAbort.signal)
+        .then((response) => ({ lane: "zed" as const, response }));
+      const wristLane = wrist
+        ? wrist.decision.then((decision) => ({ lane: "wrist" as const, decision }))
+        : null;
+
+      let winner: AskWinner;
+      if (wristLane && this.isSessionDetached(sessionId)) {
+        // A detached session has no editor: guardDetachedClient rejects the
+        // elicitation outright, so the wrist is the ONLY surface. Mirror the
+        // guard's requestPermission contract — park the expected rejection,
+        // hold the race open for the wrist, and settle as an aborted tool use
+        // on turn cancel or after the backstop window, so an unanswered
+        // question can never wedge the turn forever.
+        zedLane.catch(() => {});
+        const backstop = new Promise<never>((_, reject) => {
+          const settle = () => reject(new Error("Tool use aborted"));
+          // unref'd: a pending backstop must not hold the process open past a
+          // Zed quit — the fork's lifetime belongs to the ACP connection.
+          const timer = setTimeout(settle, DETACHED_PERMISSION_TIMEOUT_MS);
+          timer.unref?.();
+          if (signal.aborted) settle();
+          else signal.addEventListener("abort", settle, { once: true });
+          disposeBackstop = () => {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", settle);
+          };
+        });
+        winner = await Promise.race([wristLane, backstop]);
+      } else {
+        try {
+          winner = await (wristLane ? Promise.race([zedLane, wristLane]) : zedLane);
+        } catch (error) {
+          // A cancellation we requested (signal aborted) settles as an aborted
+          // tool use, matching the post-response check below.
+          if (signal.aborted) {
+            throw new Error("Tool use aborted", { cause: error });
+          }
+          this.logger.error(`Failed to present AskUserQuestion elicitation: ${error}`);
+          return { behavior: "deny", message: "Could not present the question to the user." };
+        }
+      }
+      if (signal.aborted) {
+        throw new Error("Tool use aborted");
+      }
+
+      if (winner.lane === "wrist") {
+        // Retract Zed's form: the decision is made, and a panel left open
+        // would invite a second answer into a settled elicitation. A Zed
+        // answer already in flight loses the race and is dropped.
+        zedAbort.abort();
+        return {
+          behavior: "allow",
+          updatedInput: applyWristAskAnswers(winner.decision.answers, toolInput, questions),
+        };
+      }
+
+      const outcome = applyAskElicitationResponse(winner.response, toolInput, questions);
+      if (outcome.action === "cancel") {
+        throw new Error("Tool use aborted");
+      }
+      return { behavior: "allow", updatedInput: outcome.updatedInput };
+    } finally {
+      signal.removeEventListener("abort", chain);
+      disposeBackstop?.();
+      wrist?.dispose();
+      // Retract the wrist card on EVERY exit — the #63 answered-elsewhere
+      // lesson built in from day one. After a wrist win this is a bridge-side
+      // no-op (its pending entry was retired by the answer), so sending it
+      // unconditionally is what pins the race in both directions.
+      if (wrist) {
+        this.bridge?.forwardInputResolved?.({ sessionId, toolCallId: toolUseID });
+      }
     }
-    return { behavior: "allow", updatedInput: outcome.updatedInput };
   }
 
   /**

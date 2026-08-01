@@ -489,7 +489,10 @@ An agent wants approval (blocking). Claude Code shape:
 - **`AskUserQuestion`** prompts (content questions, not permission gates)
   carry **no top-level `options`**; render `tool_input.questions[]` instead —
   each `{header, question, options: [{label, description?}], multiSelect}` —
-  and answer every question.
+  and answer every question. ACP sessions raise the same shape (#111: the
+  adapter mirrors its Zed form elicitation to the bridge), so clients need no
+  source-specific handling; answering in Zed retracts the card via
+  `permission-cleared`, exactly like an answered-elsewhere permission.
 - **Codex synthetic approvals** (`source: "codex"`, `tool_name:
   "ExecApproval"`): top-level `options` present and mirrored in
   `tool_input.questions[0].options`; `tool_input` also carries `command` and

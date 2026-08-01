@@ -11443,6 +11443,222 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
   });
 });
 
+// AskUserQuestion rides Zed's form elicitation (#111): an elicitation is a
+// client-bound REQUEST the client tee never mirrors, so the agent raises an
+// explicit `input-request` on the bridge and races Zed's form against the
+// wrist's `input-decision` — the #80 permission race for the input lane. The
+// pending elicitation resolves exactly once; the loser surface is retracted
+// (Zed by aborting its RPC, the wrist by `input-resolved` on every exit).
+describe("AskUserQuestion on the wrist (claude-watch #111)", () => {
+  const QUESTIONS = [
+    {
+      question: "Favorite color?",
+      header: "Color",
+      options: [{ label: "Blue" }, { label: "Green", description: "calming" }],
+      multiSelect: false,
+    },
+    {
+      question: "Tabs or spaces?",
+      header: "Style",
+      options: [{ label: "Tabs" }, { label: "Spaces" }],
+      multiSelect: false,
+    },
+  ];
+
+  function makeInputBridge() {
+    const inputRequests: any[] = [];
+    const inputResolved: any[] = [];
+    const holder: { notify?: (d: any) => void } = {};
+    const bridge = {
+      registerSession: () => {},
+      deregisterSession: () => {},
+      forwardSessionUpdate: () => {},
+      forwardPermissionRequest: () => {},
+      forwardTurnBoundary: () => {},
+      forwardInputRequest: (p: any) => inputRequests.push(p),
+      forwardInputResolved: (p: any) => inputResolved.push(p),
+      onInject: () => {},
+      onPermissionDecision: () => {},
+      onInputDecision: (h: (d: any) => void) => {
+        holder.notify = h;
+      },
+      start: () => {},
+      stop: () => {},
+    } as unknown as BridgeChannel;
+    return { bridge, inputRequests, inputResolved, holder };
+  }
+
+  function makeAskAgent(
+    client: AcpClient,
+    bridge: BridgeChannel,
+    session: Record<string, any> = {},
+  ) {
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} }, bridge);
+    agent.clientCapabilities = { elicitation: { form: true } } as any;
+    agent.sessions["s-ask"] = mockSessionState({ sessionId: "s-ask", ...session });
+    return agent;
+  }
+
+  function askOnce(agent: ClaudeAcpAgent, toolUseID: string, signal?: AbortSignal) {
+    return agent.canUseTool("s-ask")("AskUserQuestion", { questions: QUESTIONS }, {
+      signal: signal ?? new AbortController().signal,
+      suggestions: [],
+      toolUseID,
+    } as any);
+  }
+
+  it("raises input-request with the full question payload, and Zed's answer sends input-resolved", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      unstable_createElicitation: async () => ({
+        action: "accept",
+        content: { question_0: "Blue", question_1: "Tabs" },
+      }),
+    } as unknown as AcpClient;
+    const { bridge, inputRequests, inputResolved } = makeInputBridge();
+    const agent = makeAskAgent(mockClient, bridge);
+
+    const result = await askOnce(agent, "tc-ask-1");
+
+    expect(inputRequests).toEqual([
+      { sessionId: "s-ask", toolCallId: "tc-ask-1", questions: QUESTIONS },
+    ]);
+    expect(result?.behavior).toBe("allow");
+    expect((result as any).updatedInput.answers).toEqual({
+      "Favorite color?": "Blue",
+      "Tabs or spaces?": "Tabs",
+    });
+    // Zed answered: the wrist card must be retracted, exactly once.
+    expect(inputResolved).toEqual([{ sessionId: "s-ask", toolCallId: "tc-ask-1" }]);
+  });
+
+  it("takes the wrist's answers when they beat Zed, cancelling Zed's form", async () => {
+    let zedSignal: AbortSignal | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      // Zed never answers in this test: the watch gets there first.
+      unstable_createElicitation: (_p: any, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          zedSignal = signal;
+          signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+        }),
+    } as unknown as AcpClient;
+    const { bridge, holder } = makeInputBridge();
+    const agent = makeAskAgent(mockClient, bridge);
+
+    const pending = askOnce(agent, "tc-ask-2");
+    await waitForCondition(() => holder.notify !== undefined && zedSignal !== undefined);
+    // The second question is dictated free text — the wrist's "Other" lane —
+    // and must land as the literal string, same as an option label.
+    holder.notify!({
+      sessionId: "s-ask",
+      toolCallId: "tc-ask-2",
+      answers: ["Green", "whatever the linter says"],
+    });
+
+    const result = await pending;
+    expect(result?.behavior).toBe("allow");
+    expect((result as any).updatedInput.answers).toEqual({
+      "Favorite color?": "Green",
+      "Tabs or spaces?": "whatever the linter says",
+    });
+    expect(zedSignal!.aborted, "Zed's form must be cancelled once the wrist answered").toBe(true);
+    // A duplicate wrist answer after settle finds no waiter — a no-op, and the
+    // settled result above already proved the first writer won.
+    holder.notify!({ sessionId: "s-ask", toolCallId: "tc-ask-2", answers: ["Blue", "Tabs"] });
+  });
+
+  it("drops a late wrist answer once Zed has settled the elicitation", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      unstable_createElicitation: async () => ({
+        action: "accept",
+        content: { question_0: "Blue", question_1: "Spaces" },
+      }),
+    } as unknown as AcpClient;
+    const { bridge, holder } = makeInputBridge();
+    const agent = makeAskAgent(mockClient, bridge);
+
+    const result = await askOnce(agent, "tc-ask-3");
+
+    // The race is settled and the waiter disposed: the wrist losing the race
+    // must be a no-op, never a second resolution.
+    holder.notify!({ sessionId: "s-ask", toolCallId: "tc-ask-3", answers: ["Green", "Tabs"] });
+    expect((result as any).updatedInput.answers).toEqual({
+      "Favorite color?": "Blue",
+      "Tabs or spaces?": "Spaces",
+    });
+  });
+
+  it("clears the wrist card when the turn is cancelled with both surfaces open", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      unstable_createElicitation: (_p: any, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+        }),
+    } as unknown as AcpClient;
+    const { bridge, inputRequests, inputResolved } = makeInputBridge();
+    const agent = makeAskAgent(mockClient, bridge);
+
+    const abort = new AbortController();
+    const pending = askOnce(agent, "tc-ask-4", abort.signal);
+    // The raise precedes the race setup, so its arrival proves both surfaces
+    // are open before the cancel lands.
+    await waitForCondition(() => inputRequests.length > 0);
+    abort.abort();
+
+    await expect(pending).rejects.toThrow("Tool use aborted");
+    expect(inputResolved).toEqual([{ sessionId: "s-ask", toolCallId: "tc-ask-4" }]);
+  });
+
+  it("waits on the wrist alone for a detached session, whose editor leg rejects", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      // The guardDetachedClient contract: a detached session's elicitation
+      // rejects outright — there is no editor to present it.
+      unstable_createElicitation: async () => {
+        throw new Error("detached session: no editor to present this");
+      },
+    } as unknown as AcpClient;
+    const { bridge, inputRequests, holder } = makeInputBridge();
+    const agent = makeAskAgent(mockClient, bridge, { detached: true });
+
+    const pending = askOnce(agent, "tc-ask-5");
+    // The waiter is registered before the raise: the raise's arrival proves
+    // the wrist answer below cannot outrun its waiter.
+    await waitForCondition(() => inputRequests.length > 0);
+    holder.notify!({ sessionId: "s-ask", toolCallId: "tc-ask-5", answers: ["Blue", "Tabs"] });
+
+    const result = await pending;
+    expect(result?.behavior).toBe("allow");
+    expect((result as any).updatedInput.answers).toEqual({
+      "Favorite color?": "Blue",
+      "Tabs or spaces?": "Tabs",
+    });
+  });
+
+  it("keeps today's single-surface behavior when no bridge is wired", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      unstable_createElicitation: async () => ({
+        action: "accept",
+        content: { question_0: "Blue", question_1: "Tabs" },
+      }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.clientCapabilities = { elicitation: { form: true } } as any;
+    agent.sessions["s-ask"] = mockSessionState({ sessionId: "s-ask" });
+
+    const result = await askOnce(agent, "tc-ask-6");
+    expect(result?.behavior).toBe("allow");
+    expect((result as any).updatedInput.answers).toEqual({
+      "Favorite color?": "Blue",
+      "Tabs or spaces?": "Tabs",
+    });
+  });
+});
+
 describe("teeClientToBridge (claude-watch, S3 #77 output tap)", () => {
   function makeInner() {
     const calls: string[] = [];

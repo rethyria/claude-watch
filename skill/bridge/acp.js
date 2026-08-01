@@ -17,7 +17,7 @@
 import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
 import {
   registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
-  markWorkflowActivity,
+  markWorkflowActivity, registerSessionCleanupHook,
 } from "./sessions.js";
 import { ACP_INBOX_HEARTBEAT_MS, ACP_SPAWN_TIMEOUT_MS } from "./config.js";
 import { waitForPermission, canonicalPermissionOptions, cancelPermission } from "./permissions.js";
@@ -38,6 +38,11 @@ const proseBuffers = new Map();
 /** ACP toolCallId -> the bridge permissionId raised for it (#80), so a request
  *  answered in Zed can retract the wrist prompt for the SAME tool call. */
 const acpPermissionsByToolCall = new Map();
+/** ACP toolCallId -> the pending AskUserQuestion card raised for it (#111):
+ *  the input-request twin of acpPermissionsByToolCall. Entries carry the
+ *  sessionId so a session's end can expire its cards — the fork-side
+ *  elicitation dies with the session, so an answer would land in a void. */
+const acpInputsByToolCall = new Map();
 /** Hard cap so a pathological turn cannot grow the buffer without bound; the
  *  wrist cannot read more than this anyway. */
 const PROSE_BUFFER_MAX = 4000;
@@ -470,6 +475,29 @@ export async function handleAcpUpdate(req, res) {
     }
   }
 
+  // AskUserQuestion rides Zed's form elicitation (#111). An elicitation is a
+  // client-bound REQUEST, not a sessionUpdate, so the client tee never mirrors
+  // it — the adapter raises it explicitly. Same pause semantics as a
+  // permission: the user has to answer, so flush the prose that led up to it.
+  if (body.kind === "input-request" && sessions.has(sessionId)) {
+    flushProse(sessionId);
+    raiseAcpInputRequest(sessionId, body.payload);
+  }
+
+  // The elicitation settled somewhere else — Zed answered, the turn was
+  // cancelled, or the client failed. Retract the wrist's question card: the
+  // permission-resolved twin for the input lane (and a no-op after a wrist
+  // answer, whose resolve already retired the pending entry — the adapter
+  // sends this on every exit, which is what pins the race both ways).
+  if (body.kind === "input-resolved") {
+    const toolCallId = body.payload?.toolCallId;
+    const pending = toolCallId ? acpInputsByToolCall.get(toolCallId) : null;
+    if (pending) {
+      acpInputsByToolCall.delete(toolCallId);
+      cancelPermission(pending.permissionId);
+    }
+  }
+
   return jsonResponse(res, 200, { ok: true });
 }
 
@@ -662,6 +690,91 @@ function raiseAcpPermission(sessionId, payload) {
     });
   });
 }
+
+/** Raise an AskUserQuestion elicitation as a question card on the wrist (#111)
+ *  and, once answered, send the positional answers back down the fork's inbox
+ *  as an `input-decision` frame.
+ *
+ *  The card is the HOOK-ERA wire shape the watch already renders (PROTOCOL.md:
+ *  a `permission-request` with tool_name "AskUserQuestion", NO top-level
+ *  options, and the per-question lists in tool_input.questions) — reusing it
+ *  verbatim is what makes the wear side a zero-change consumer. Free text
+ *  needs no "more in Zed" hint either: the wrist card's per-question "Dictate
+ *  an answer…" is already its free-text lane, so the card is a full answering
+ *  surface, not an honest subset.
+ *
+ *  Raise/no-raise mirrors raiseAcpPermission: Zed shows its own form
+ *  regardless, so with no watch connected nothing is raised — EXCEPT for a
+ *  detached session, whose card registers even with zero SSE clients because
+ *  the wrist is the only surface (pendingPermissionsSync replays it on
+ *  connect). The questions must be well-formed AS A SET: the watch answers by
+ *  position over its own leniently-filtered parse of this list, so forwarding
+ *  a list with an unrenderable entry would misalign every answer after it —
+ *  refuse the whole card instead and leave the question to Zed. */
+function raiseAcpInputRequest(sessionId, payload) {
+  if (sseClients.size === 0 && sessions.get(sessionId)?.detached !== true) return;
+  const toolCallId = payload?.toolCallId;
+  if (typeof toolCallId !== "string" || !toolCallId) return;
+  const questions = payload?.questions;
+  if (!Array.isArray(questions) || questions.length === 0) return;
+  if (!questions.every((q) => q && typeof q.question === "string" && q.question.trim() !== "")) return;
+
+  const permissionId = crypto.randomUUID();
+  acpInputsByToolCall.set(toolCallId, { permissionId, sessionId });
+  const eventPayload = {
+    permissionId,
+    sessionId,
+    tool_name: "AskUserQuestion",
+    tool_input: { questions },
+  };
+
+  log("info", `ACP input request ${permissionId} raised on the wrist (session ${sessionId}, ${questions.length} question(s))`);
+  const decision = waitForPermission(permissionId, { sessionId, payload: eventPayload });
+  pushSseEvent("permission-request", eventPayload, sessionId);
+
+  void decision.then((answer) => {
+    acpInputsByToolCall.delete(toolCallId);
+    // A no-decision (expiry, retraction, session end) is NOT an answer: say
+    // nothing and let Zed's form keep the decision, exactly like the
+    // permission lane above.
+    if (!answer || answer.noDecision) return;
+    const answers = positionalAskAnswers(questions, answer);
+    if (!answers) return;
+    writeAcpFrame(sessionId, "input-decision", { sessionId, toolCallId, answers });
+  });
+}
+
+/** One positional answers array aligned with the questions, from any of the
+ *  /v1 decision forms (collectAskUserQuestionAnswers' vocabulary in hooks.js):
+ *  the wear client's aligned array verbatim, the object form keyed by question
+ *  text, or the legacy single selectedOption answering the first question.
+ *  Positional is the frame's contract because the ADAPTER re-keys by question
+ *  text against the very list it raised — the bridge must not collapse
+ *  duplicate texts before it gets there. `null` marks an unanswered slot;
+ *  all-null yields null (nothing worth sending — the answer names no answer,
+ *  so Zed's form keeps the decision). */
+function positionalAskAnswers(questions, decision) {
+  const answers = questions.map((question, index) => {
+    let value;
+    if (Array.isArray(decision.answers)) value = decision.answers[index];
+    else if (decision.answers && typeof decision.answers === "object") value = decision.answers[question.question];
+    else if (index === 0) value = decision.selectedOption;
+    return typeof value === "string" && value.trim() !== "" ? value : null;
+  });
+  return answers.some((a) => a !== null) ? answers : null;
+}
+
+// A session's end expires its pending question cards (#111): the fork-side
+// elicitation died with the session, so nobody is left to consume an answer.
+// cancelPermission both retracts the wrist card (permission-cleared) and
+// resolves the waiter as a no-decision, keeping the frame above unsent.
+registerSessionCleanupHook((sessionId) => {
+  for (const [toolCallId, pending] of acpInputsByToolCall) {
+    if (pending.sessionId !== sessionId) continue;
+    acpInputsByToolCall.delete(toolCallId);
+    cancelPermission(pending.permissionId);
+  }
+});
 
 /** Re-announce an ACP slot as one idempotent `session` running event. The
  *  additive fields (`idle`, `title`, git metadata) ride this payload, so a

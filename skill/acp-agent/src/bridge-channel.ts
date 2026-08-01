@@ -50,6 +50,19 @@ export type PermissionDecision = {
 };
 export type PermissionDecisionHandler = (decision: PermissionDecision) => void;
 
+/** The wrist's answers to an AskUserQuestion input-request (#111), arriving
+ *  down the same inbox as permission decisions. `answers` is POSITIONAL — one
+ *  entry per question, in the order the agent raised them; `null` marks a
+ *  question the wrist skipped. Positional by contract: the agent re-keys by
+ *  question text against the very list it raised, so duplicate question texts
+ *  must stay distinct all the way to that final fold. */
+export type InputDecision = {
+  sessionId: string;
+  toolCallId: string;
+  answers: (string | null)[];
+};
+export type InputDecisionHandler = (decision: InputDecision) => void;
+
 /** A watch "new session" the bridge routed to this fork (the third inbox frame
  *  type). The fork creates a detached session for `cwd` and answers with
  *  {@link BridgeChannel.reportSpawnResult}, echoing the `requestId`. */
@@ -116,6 +129,21 @@ export interface BridgeChannel {
    *  answered in Zed, or the agent cancelled it), so it can retract the wrist
    *  card instead of leaving a zombie prompt (#80). */
   forwardPermissionResolved(params: { sessionId: string; toolCallId: string }): void;
+  /** Raise an AskUserQuestion form elicitation on the wrist (#111). An
+   *  elicitation is a client-bound REQUEST — the client tee mirrors only
+   *  notifications and the requestPermission RPC — so without this explicit
+   *  raise the bridge never hears the question at all. `questions` is the
+   *  tool's validated question list verbatim; the bridge reshapes it into the
+   *  hook-era question-card wire shape the watch already renders. */
+  forwardInputRequest(params: {
+    sessionId: string;
+    toolCallId: string;
+    questions: unknown[];
+  }): void;
+  /** The elicitation settled somewhere else (Zed answered, the turn was
+   *  cancelled, or the client failed) — retract the wrist's question card.
+   *  The forwardPermissionResolved twin for the input lane (#111). */
+  forwardInputResolved(params: { sessionId: string; toolCallId: string }): void;
   /** Remember a freshly-learned thread title for the next re-announce (#79). */
   noteSessionTitle(sessionId: string, title: string): void;
   /** Remember a mid-session model/mode change for the next re-announce (#97,
@@ -131,6 +159,9 @@ export interface BridgeChannel {
   /** Register the handler the inbox calls when the watch answers a permission
    *  request (#80). */
   onPermissionDecision(handler: PermissionDecisionHandler): void;
+  /** Register the handler the inbox calls when the watch answers an
+   *  AskUserQuestion input-request (#111). */
+  onInputDecision(handler: InputDecisionHandler): void;
   /** Register the handler the inbox calls when the watch asks this fork to
    *  create a session (the born-in-Zed spawn). */
   onSpawn(handler: SpawnHandler): void;
@@ -178,6 +209,7 @@ export class HttpBridgeChannel implements BridgeChannel {
   private readonly connectionId = randomUUID();
   private injectHandler: InjectHandler | null = null;
   private permissionHandler: PermissionDecisionHandler | null = null;
+  private inputHandler: InputDecisionHandler | null = null;
   private spawnHandler: SpawnHandler | null = null;
   private stopped = false;
   private abort: AbortController | null = null;
@@ -237,6 +269,10 @@ export class HttpBridgeChannel implements BridgeChannel {
 
   onPermissionDecision(handler: PermissionDecisionHandler): void {
     this.permissionHandler = handler;
+  }
+
+  onInputDecision(handler: InputDecisionHandler): void {
+    this.inputHandler = handler;
   }
 
   onSpawn(handler: SpawnHandler): void {
@@ -370,6 +406,28 @@ export class HttpBridgeChannel implements BridgeChannel {
       connection: this.connectionId,
       sessionId: params.sessionId,
       kind: "permission-resolved",
+      payload: { sessionId: params.sessionId, toolCallId: params.toolCallId },
+    });
+  }
+
+  forwardInputRequest(params: {
+    sessionId: string;
+    toolCallId: string;
+    questions: unknown[];
+  }): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "input-request",
+      payload: params,
+    });
+  }
+
+  forwardInputResolved(params: { sessionId: string; toolCallId: string }): void {
+    void this.post("/acp/update", {
+      connection: this.connectionId,
+      sessionId: params.sessionId,
+      kind: "input-resolved",
       payload: { sessionId: params.sessionId, toolCallId: params.toolCallId },
     });
   }
@@ -560,6 +618,33 @@ export class HttpBridgeChannel implements BridgeChannel {
       }
       return;
     }
+    if (event === "input-decision") {
+      let d: { sessionId?: unknown; toolCallId?: unknown; answers?: unknown };
+      try {
+        d = JSON.parse(dataLines.join("\n"));
+      } catch {
+        return;
+      }
+      if (
+        typeof d.sessionId !== "string" ||
+        typeof d.toolCallId !== "string" ||
+        !Array.isArray(d.answers)
+      ) {
+        return;
+      }
+      // Positional: a non-string entry (a skipped slot's null, or junk) stays
+      // null so the array never loses alignment with the questions.
+      const answers = d.answers.map((a) => (typeof a === "string" ? a : null));
+      this.logger.log(
+        `claude-watch: inbox input decision for ${d.toolCallId} (${answers.length} answer(s))`,
+      );
+      try {
+        this.inputHandler?.({ sessionId: d.sessionId, toolCallId: d.toolCallId, answers });
+      } catch (err) {
+        this.logger.error(`claude-watch: input handler threw: ${String(err)}`);
+      }
+      return;
+    }
     if (event === "spawn") {
       let s: Partial<SpawnRequest>;
       try {
@@ -610,12 +695,13 @@ export function createBridgeChannel(logger: Logger = console): BridgeChannel | n
   return new HttpBridgeChannel(logger);
 }
 
-/** How long a detached session's permission request may sit unanswered before
- *  the guard settles it as cancelled. Slightly ABOVE the bridge's own wrist-card
- *  expiry (~9.5 min), so the wrist always gets the full window first; after it,
- *  the turn ends honestly ("Tool use aborted") instead of wedging forever in a
- *  session with no second surface to fall back to. */
-const DETACHED_PERMISSION_TIMEOUT_MS = 600_000;
+/** How long a detached session's permission request — or AskUserQuestion
+ *  input-request (#111) — may sit unanswered before the pending wait settles
+ *  as cancelled. Slightly ABOVE the bridge's own wrist-card expiry (~9.5 min),
+ *  so the wrist always gets the full window first; after it, the turn ends
+ *  honestly ("Tool use aborted") instead of wedging forever in a session with
+ *  no second surface to fall back to. */
+export const DETACHED_PERMISSION_TIMEOUT_MS = 600_000;
 
 /** Wrap an {@link AcpClient} so a DETACHED session — one spawned from the watch
  *  that no editor thread exists for yet — never reaches the editor. ACP routes
@@ -632,7 +718,8 @@ const DETACHED_PERMISSION_TIMEOUT_MS = 600_000;
  *      backstop so an unanswered card can never wedge the turn forever;
  *    - fs and elicitation REQUESTS reject, which every call site already
  *      catches and degrades gracefully (MCP elicitation → decline,
- *      AskUserQuestion → deny with a message, refusal dialog → cancelled).
+ *      AskUserQuestion → the wrist race parks the rejection and waits on the
+ *      watch alone (#111), refusal dialog → cancelled).
  *
  *  Compose UNDER the bridge tee (`teeClientToBridge(guardDetachedClient(...))`)
  *  so the watch mirror keeps flowing while the editor leg is suppressed. The
@@ -743,4 +830,30 @@ export function teeClientToBridge(inner: AcpClient, bridge: BridgeChannel): AcpC
       return inner.extNotification(method, params);
     },
   };
+}
+
+/** Fold the wrist's positional AskUserQuestion answers into the tool's input
+ *  (#111) — the wire-side twin of elicitation.ts's applyAskElicitationResponse,
+ *  producing the same `{ [questionText]: answer }` map the tool's own call()
+ *  reads back. Positional in, keyed out: duplicate question texts stay
+ *  distinct on the wire and collapse only at this final fold, exactly as the
+ *  Zed path's indexed form fields do. A skipped slot (null/blank) leaves its
+ *  question unanswered, which the tool supports — nothing in the form is
+ *  required. An answer that is an option label and one the user dictated are
+ *  indistinguishable here ON PURPOSE: the tool records the literal string
+ *  either way, so the wrist's dictation lane IS the free-text "Other" box. */
+export function applyWristAskAnswers(
+  answers: ReadonlyArray<string | null>,
+  toolInput: Record<string, unknown>,
+  questions: ReadonlyArray<{ question: string }>,
+): Record<string, unknown> {
+  const collected: Record<string, string> = {};
+  questions.forEach((question, index) => {
+    const value = answers[index];
+    if (typeof value !== "string") return;
+    const text = value.trim();
+    if (text === "") return;
+    collected[question.question] = text;
+  });
+  return { ...toolInput, answers: collected };
 }

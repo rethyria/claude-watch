@@ -705,6 +705,172 @@ test("answering in Zed retracts the wrist prompt (#80)", { timeout: 60_000 }, as
   assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
 });
 
+// --- AskUserQuestion input-requests (#111) ----------------------------------
+// AskUserQuestion rides Zed's form elicitation, which is a client-bound
+// REQUEST the adapter's client tee never mirrors — so the adapter raises an
+// explicit `input-request` frame and the bridge reshapes it into the HOOK-ERA
+// question-card wire shape the watch already renders: a `permission-request`
+// with tool_name "AskUserQuestion", NO top-level options, and the questions in
+// tool_input.questions. The wrist's answers ride back as a positional
+// `input-decision` frame; `input-resolved` and session end retract the card.
+
+const ASK_QUESTIONS = [
+  {
+    question: "Favorite color?",
+    header: "Color",
+    options: [{ label: "Blue" }, { label: "Green", description: "calming" }],
+    multiSelect: false,
+  },
+  {
+    question: "Tabs or spaces?",
+    header: "Style",
+    options: [{ label: "Tabs" }, { label: "Spaces" }],
+    multiSelect: false,
+  },
+];
+
+async function raiseInputRequest(bridge, { connection, sessionId, toolCallId }) {
+  const res = await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection, sessionId, kind: "input-request",
+      payload: { sessionId, toolCallId, questions: ASK_QUESTIONS },
+    },
+  });
+  assert.equal(res.status, 200);
+}
+
+test("an ACP input-request raises the hook-era question card, and the snapshot replays it (#111)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "ask");
+
+  const inbox = connectInbox(bridge, "conn-ask");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-ask", sessionId: "acp-ask", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-ask");
+
+  await raiseInputRequest(bridge, { connection: "conn-ask", sessionId: "acp-ask", toolCallId: "tc-q1" });
+
+  const ev = await sse.waitFor((e) => e.event === "permission-request" && e.parsed?.sessionId === "acp-ask");
+  assert.ok(ev.parsed.permissionId, "the card must carry a permissionId the watch can answer with");
+  assert.equal(ev.parsed.tool_name, "AskUserQuestion");
+  // The question list rides verbatim — headers, descriptions, multiSelect —
+  // and there is NO top-level options menu: question prompts are content, not
+  // permission gates (PROTOCOL.md), which is what routes the wear side to its
+  // existing question card with zero client changes.
+  assert.deepEqual(ev.parsed.tool_input, { questions: ASK_QUESTIONS });
+  assert.equal("options" in ev.parsed, false);
+
+  // A client connecting late (or reconnecting) gets the pending card from the
+  // connect-time snapshot, exactly like a pending hook permission.
+  const late = connectSse(bridge.port, token);
+  t.after(() => late.close());
+  assert.equal(await late.statusCode(), 200);
+  const replay = await late.waitFor((e) => e.event === "permission-request" && e.parsed?.tool_name === "AskUserQuestion");
+  assert.equal(replay.parsed.permissionId, ev.parsed.permissionId);
+});
+
+test("answering the question card on the watch sends positional answers down the inbox (#111)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "askans");
+
+  const inbox = connectInbox(bridge, "conn-askans");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-askans", sessionId: "acp-askans", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-askans");
+
+  await raiseInputRequest(bridge, { connection: "conn-askans", sessionId: "acp-askans", toolCallId: "tc-q2" });
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+
+  // The wear client's /v1 form: behavior allow + one positional answer per
+  // question. The second answer is dictated free text — the wrist's own
+  // "Other" lane — and must ride back as the literal string.
+  const answer = await request(bridge.port, "POST", "/command", {
+    token,
+    body: {
+      permissionId: prompt.parsed.permissionId,
+      decision: { behavior: "allow", answers: ["Green", "whatever the linter says"] },
+    },
+  });
+  assert.equal(answer.status, 200);
+
+  const frame = await inbox.waitFor((e) => e.event === "input-decision");
+  assert.equal(frame.parsed.sessionId, "acp-askans");
+  assert.equal(frame.parsed.toolCallId, "tc-q2");
+  assert.deepEqual(frame.parsed.answers, ["Green", "whatever the linter says"]);
+});
+
+test("an elicitation resolved in Zed retracts the question card (#111)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "askzed");
+
+  const inbox = connectInbox(bridge, "conn-askzed");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-askzed", sessionId: "acp-askzed", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-askzed");
+
+  await raiseInputRequest(bridge, { connection: "conn-askzed", sessionId: "acp-askzed", toolCallId: "tc-q3" });
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+
+  // The adapter reports the elicitation settled on the Zed side (answered
+  // there, or the turn was cancelled).
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-askzed", sessionId: "acp-askzed", kind: "input-resolved",
+      payload: { sessionId: "acp-askzed", toolCallId: "tc-q3" },
+    },
+  });
+
+  const cleared = await sse.waitFor((e) => e.event === "permission-cleared");
+  assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
+});
+
+test("a session's end expires its pending question card (#111)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "askend");
+
+  const inbox = connectInbox(bridge, "conn-askend");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-askend", sessionId: "acp-askend", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-askend");
+
+  await raiseInputRequest(bridge, { connection: "conn-askend", sessionId: "acp-askend", toolCallId: "tc-q4" });
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+
+  // The fork closed the session (Zed quit, thread closed): nobody is left to
+  // consume an answer, so the card must not sit until the ~9.5-minute expiry.
+  const dereg = await request(bridge.port, "POST", "/acp/deregister", {
+    body: { connection: "conn-askend", sessionId: "acp-askend", reason: "acp-closed" },
+  });
+  assert.equal(dereg.status, 200);
+
+  const cleared = await sse.waitFor((e) => e.event === "permission-cleared");
+  assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
+});
+
 // --- Rich ACP option lists (#110) -------------------------------------------
 // The canonical menu is behavior-keyed, so ExitPlanMode's several allow_always
 // mode switches cannot all keep a button. The guard drops an ambiguous
