@@ -13,6 +13,7 @@
 package dev.claudewatch.wear.ui.halo
 
 import android.os.SystemClock
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ContentTransform
@@ -352,6 +353,52 @@ private fun HaloAppBody(
             // shrinking pageCount used to do.
             nav.page > model.projects.size -> nav.copy(page = model.projects.size)
             else -> nav
+        }
+    }
+
+    // Issue #109: the SYSTEM back — one BackHandler at the root, enabled off
+    // the pure systemBack (HaloNav.kt), which owns routing and priority:
+    // topmost overlay first, then the card, then a depth step, then non-home
+    // pages jump home; null disables the handler so the system's own exit
+    // stands. The in-app surface gestures are untouched — they never reach
+    // this dispatcher.
+    //
+    // Predictive-back finding (do not remove the manifest opt-in): Wear
+    // never TRANSLATES the left-bezel edge swipe into this callback.
+    // Measured on the API 33 AND API 34 (Wear OS 5, the SM-L330's
+    // generation) emulator images, the flag-gated dispatch is a SUPPRESSION
+    // switch instead: while this handler is enabled, androidx registers a
+    // window OnBackInvokedCallback and the system leaves the edge swipe
+    // alone — the activity CANNOT be swiped away mid-session, and the
+    // swipe's touches reach the app like any drag, where the surface
+    // gestures (feed swipe-right = back, pager step, page step) own it (the
+    // manifest flag's comment holds the full measured story); while it is
+    // disabled (home at rest) nothing is registered and the system
+    // swipe-dismiss exits to the watch face. What lands HERE is KEYCODE_BACK —
+    // the watch's hardware back button and Espresso's pressBack — routed
+    // through the OnBackInvokedDispatcher when enabled, falling through to
+    // the system exit when not. Without the flag the system dismisses from
+    // ANYWHERE without consulting any dispatcher — the #109 mid-session
+    // exit. HaloSystemBackTest pins the keyevent walks end-to-end and the
+    // armed suppression half with a real shell-injected bezel swipe; the
+    // live wrist walk on the SM-L330 is the issue's remaining checklist
+    // item.
+    val backRoute = systemBack(nav, overlayOpen = voiceOpen || spawnPickerOpen)
+    BackHandler(enabled = backRoute != null) {
+        when (backRoute) {
+            SystemBack.DismissOverlay -> when {
+                // The voice overlay renders ABOVE the picker (both can be up:
+                // an armed send can fail while the picker is open), so it
+                // dismisses first — under the overlay's own modality rule: a
+                // FAILED send keeps it up (Retry/Discard are the only exits,
+                // same as its swipe-down), yet back stays intercepted — it
+                // must not navigate the hierarchy under a modal overlay.
+                voiceOpen -> if (currentUi.commandError == null) voiceOpen = false
+                else -> spawnPickerOpen = false
+            }
+            is SystemBack.Navigate -> nav = backRoute.nav
+            // Unreachable: a null route disables the handler above.
+            null -> Unit
         }
     }
 

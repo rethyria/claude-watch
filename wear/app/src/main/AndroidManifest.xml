@@ -33,10 +33,42 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Predictive-back opt-in (issue #109): on Wear the system back gesture
+         is the LEFT-BEZEL edge swipe, and for a non-opted-in app the system
+         handles it entirely by itself — the swipe-dismiss finishes the
+         activity without ever consulting OnBackPressedDispatcher, which is
+         exactly the mid-session exit #109 reports. This flag (API 33+, our
+         targetSdk is 34) makes the app's back callbacks visible to the
+         system (androidx.activity registers a window OnBackInvokedCallback
+         while any enabled OnBackPressedCallback exists), and the MEASURED
+         Wear dispatch — identical on the API 33 and 34 emulator images — is:
+
+           * callback registered (HaloApp's BackHandler enabled): the system
+             swipe-dismiss is SUPPRESSED — the activity can NEVER be swiped
+             away — and the swipe's touches reach the app window like any
+             other drag (observed on both images, though emulator-injected
+             swipes race SysUI and are sometimes dropped whole), where the
+             app's own surface gestures (feed swipe-right = back, pager
+             step, page step) own the gesture;
+           * no callback registered (home at rest): the system swipe-dismiss
+             stands — the edge swipe exits to the watch face;
+           * KEYCODE_BACK (the hardware back button, Espresso pressBack)
+             routes through the OnBackInvokedDispatcher into the registered
+             callback, or falls through to the system exit when none is.
+
+         So the BackHandler's enabled flag is the whole switch: exits happen
+         ONLY from the home resting state. Pinned by HaloSystemBackTest —
+         keyevent walks end-to-end, plus a real edge-swipe injection for the
+         armed suppression half (the disarmed dismiss half was verified by
+         hand on both images; under instrumentation it races SysUI too
+         erratically to gate on). See the BackHandler in HaloApp.kt for the
+         routing itself. Below API 33 the attribute is ignored and the
+         legacy dismiss-from-anywhere stands. -->
     <application
         android:label="@string/app_name"
         android:icon="@android:drawable/sym_def_app_icon"
         android:networkSecurityConfig="@xml/network_security_config"
+        android:enableOnBackInvokedCallback="true"
         android:theme="@android:style/Theme.DeviceDefault">
 
         <!-- Standalone watch app: no phone relay, installs without a companion. -->

@@ -432,4 +432,76 @@ class HaloNavTest {
         assertEquals("s-a2", project.sessionId)
         assertEquals("p-alpha", project.cardPermissionId)
     }
+
+    // ── System back routing (issue #109) ─────────────────────────────────────
+    // The root BackHandler derives its enabled flag AND its action from
+    // systemBack, so these pin the whole priority order: overlay ≻ card ≻
+    // depth ≻ non-home page ≻ fall through (null = the system exit stands).
+
+    @Test
+    fun systemBackDismissesTheTopmostOverlayBeforeAnythingElse() {
+        // Even with a card open over a deep position, an open overlay (voice
+        // or spawn picker) is what back must hit — never the nav underneath.
+        val deep = HaloNavState(page = 0).drillToList(model())
+            .drillToSession("s-a1")
+            .openCard(null)
+        assertEquals(SystemBack.DismissOverlay, systemBack(deep, overlayOpen = true))
+        // At home too: the overlay outranks the fall-through, so back over an
+        // overlay never lets the app exit.
+        assertEquals(SystemBack.DismissOverlay, systemBack(HaloNavState(), overlayOpen = true))
+    }
+
+    @Test
+    fun systemBackClosesTheCardAndRestoresTheExactPositionUnderIt() {
+        val m = waitingModel()
+        // The pager's Answer card: over the LIST, pinned to alpha's prompt.
+        val card = HaloNavState(page = 1).drillToList(m).step(+1, m)
+            .openCardForListSession(m.sessions.single { it.id == "s-a2" })
+        val closed = systemBack(card, overlayOpen = false)
+        assertEquals(
+            SystemBack.Navigate(card.copy(cardOpen = false, cardPermissionId = null)),
+            closed,
+        )
+        // Position preserved: still LIST depth, same page, same selection.
+        val landed = (closed as SystemBack.Navigate).nav
+        assertEquals(HaloDepth.LIST, landed.depth)
+        assertEquals("s-a2", landed.sessionId)
+        assertEquals(1, landed.page)
+    }
+
+    @Test
+    fun systemBackStepsDepthFeedToListToPage() {
+        val feed = HaloNavState(page = 0).drillToList(model())
+            .step(+1, model())
+            .drillToSession("s-a2")
+        // Feed → list KEEPS the session (back()'s pinned contract)…
+        val list = (systemBack(feed, overlayOpen = false) as SystemBack.Navigate).nav
+        assertEquals(HaloDepth.LIST, list.depth)
+        assertEquals("s-a2", list.sessionId)
+        // …and list → page clears the selection, exactly like a swipe-down.
+        val page = (systemBack(list, overlayOpen = false) as SystemBack.Navigate).nav
+        assertEquals(HaloDepth.PAGE, page.depth)
+        assertNull(page.sessionId)
+    }
+
+    @Test
+    fun systemBackJumpsHomeFromEveryNonHomePage() {
+        // Projects to the right, usage and settings to the left: all jump
+        // straight home — never a page-by-page walk, never an exit.
+        for (page in listOf(2, USAGE_PAGE, SETTINGS_PAGE)) {
+            assertEquals(
+                "page $page must jump home",
+                SystemBack.Navigate(HaloNavState()),
+                systemBack(HaloNavState(page = page), overlayOpen = false),
+            )
+        }
+    }
+
+    @Test
+    fun systemBackAtTheHomeRestingStateDoesNotIntercept() {
+        // Null = the BackHandler disables itself: nothing registered, the
+        // system's own back (exit to the watch face) stands — the ONLY state
+        // where the edge swipe may leave the app.
+        assertNull(systemBack(HaloNavState(), overlayOpen = false))
+    }
 }

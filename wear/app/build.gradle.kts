@@ -100,6 +100,11 @@ dependencies {
     // the FGS, whose permission ask would otherwise cover the compose tree
     // with a system dialog mid-flow.
     androidTestImplementation(libs.androidx.test.rules)
+    // Espresso.pressBack/pressBackUnconditionally for the system-back route
+    // (issue #109): injects a real KEYCODE_BACK through platform dispatch —
+    // the seam the opted-in manifest converges with the edge gesture — where
+    // a dispatcher method call would skip the system's routing entirely.
+    androidTestImplementation(libs.androidx.test.espresso.core)
     androidTestImplementation(libs.okhttp)
     // On-device fake bridge for the dictation flow test (stubbed recognizer
     // result → real POST → ack-gated echo) — no real bridge needed.

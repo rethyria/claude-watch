@@ -34,6 +34,10 @@ junit = "4.13.2"
 androidxTestExtJunit = "1.2.1"
 androidxTestRunner = "1.6.2"
 androidxTestRules = "1.6.1"
+# Espresso.pressBack for the system-back tests (issue #109): a REAL injected
+# KEYCODE_BACK through the platform's dispatch, not a dispatcher method call.
+# 3.6.1 is the espresso line matched to the 1.6.x test runner family.
+espresso = "3.6.1"
 orgJson = "20240303"
 
 [libraries]
@@ -66,6 +70,7 @@ junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestExtJunit" }
 androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
 androidx-test-rules = { group = "androidx.test", name = "rules", version.ref = "androidxTestRules" }
+androidx-test-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espresso" }
 org-json = { group = "org.json", name = "json", version.ref = "orgJson" }
 
 [plugins]

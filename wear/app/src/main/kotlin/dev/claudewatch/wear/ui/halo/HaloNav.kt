@@ -234,3 +234,38 @@ fun HaloNavState.openFirstWaiting(model: HaloModel): HaloNavState {
         cardPermissionId = target.pending?.permissionId,
     )
 }
+
+/**
+ * What the system back gesture/button should do, for [systemBack]. A third
+ * outcome exists beyond "new nav state": the overlays that float OUTSIDE the
+ * nav machine (the voice overlay, the spawn picker — plain flags in HaloApp,
+ * deliberately not nav depths) outrank every nav move, and dismissing one is
+ * the caller's side effect, not a state this file can return.
+ */
+sealed interface SystemBack {
+    /** Dismiss the topmost open overlay; the caller owns those flags. */
+    data object DismissOverlay : SystemBack
+
+    /** Route into the nav machine: land on [nav]. */
+    data class Navigate(val nav: HaloNavState) : SystemBack
+}
+
+/**
+ * The system back gesture's ONE route through the IA (issue #109): the root
+ * BackHandler derives both its enabled flag (`!= null`) and its action from
+ * this, so the priority order is pinned here on the JVM instead of living in
+ * a gesture callback. Overlay first, then the card (closing it restores the
+ * exact prior position — [back]'s card branch), then one depth step
+ * (feed → list keeps the selection, list → page clears it), then any
+ * non-home page — projects, usage, settings — jumps straight home rather
+ * than walking the row. Null means DO NOT INTERCEPT: the app is at the home
+ * resting state, the handler disables itself, and the system's own back
+ * (exit to the watch face) stands — the only place it may.
+ */
+fun systemBack(nav: HaloNavState, overlayOpen: Boolean): SystemBack? = when {
+    overlayOpen -> SystemBack.DismissOverlay
+    nav.cardOpen -> SystemBack.Navigate(nav.back())
+    nav.depth != HaloDepth.PAGE -> SystemBack.Navigate(nav.back())
+    nav.page != 0 -> SystemBack.Navigate(nav.jumpHome())
+    else -> null
+}
