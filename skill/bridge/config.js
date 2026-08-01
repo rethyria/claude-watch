@@ -267,10 +267,17 @@ export const ACP_SPAWN_TIMEOUT_MS = testOverridable(
 // only for slots a Workflow tool hook marked active, so the interval can stay
 // coarse; the staleness window declares a journal untouched this long dead —
 // a killed workflow must clear its indicator instead of pinning it forever.
+// The window must comfortably exceed a workflow agent's longest SILENT tool
+// call: transcripts receive nothing until a tool result returns, and a single
+// instrumented-gradle run sits quiet for 10–25 minutes — at the old 5 minutes
+// the scanner declared live workflows dead three times in one evening
+// (2026-08-01, issue #108), and nothing re-arms without a launch signal or a
+// restart. Cost of the width: a truly dead workflow's blue lingers up to this
+// long. #108's resurrection rescan is the real fix; this width is the interim.
 // Overridable via CLAUDE_WATCH_WORKFLOW_POLL_MS /
 // CLAUDE_WATCH_WORKFLOW_STALE_MS (test-only).
 export const WORKFLOW_POLL_MS = testOverridable("CLAUDE_WATCH_WORKFLOW_POLL_MS", 20_000);
-export const WORKFLOW_STALE_MS = testOverridable("CLAUDE_WATCH_WORKFLOW_STALE_MS", 300_000);
+export const WORKFLOW_STALE_MS = testOverridable("CLAUDE_WATCH_WORKFLOW_STALE_MS", 1_800_000);
 // Where the Claude Code CLI keeps per-project transcripts. Hook bodies carry
 // the real transcript_path, but the ACP channel has no equivalent field on any
 // wire — the bridge derives it from this root plus the CLI's cwd-munging
