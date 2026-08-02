@@ -871,6 +871,64 @@ test("the stale-clear is not final: a resumed tree re-arms the WATCHING slot and
   }
 });
 
+test("a watch re-arm never regresses the peak done — a sibling dir finished before the silence stays counted (#105 x #108)", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // Two wf_* dirs under one tree: A finished (done=2) and aged out mid-run —
+  // its done then lives ONLY in the slot's retained peak, since the scan
+  // aggregates live dirs only. B was mid-flight when the machine slept.
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("peak-resume", "cc-wf-peak-resume",
+    [started("a1"), started("a2"), result("a1"), result("a2")]); // wf_a: done=2
+  const journalB = path.join(path.dirname(path.dirname(journalPath)), "wf_b", "journal.jsonl");
+  fs.mkdirSync(path.dirname(journalB), { recursive: true });
+  fs.writeFileSync(journalB, JSON.stringify(started("b1")) + "\n"); // wf_b: running=1
+  const id = resolveHookSession({ session_id: "cc-wf-peak-resume", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  const old = new Date(Date.now() - 2 * STALE_MS);
+  try {
+    markWorkflowActivity(id);
+    const slot = sessions.get(id);
+    assert.deepEqual(slot.agents, { running: 1, done: 2 }, "both dirs live at arming");
+
+    // A ages out, then the sleep takes B silent too: the stale-clear reports
+    // the peak — clients latch {running: 0, done: 2}.
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 1, done: 2 }, "peak holds while only A is stale");
+    fs.utimesSync(journalB, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 2 }, "stale-clear broadcasts the peak");
+    assert.equal(slot.workflowWatching, true);
+
+    // Wake: B's silent tool call returns and b1 finishes — only B's dir is
+    // live, so the scan's done re-reads as 1, BELOW the retained peak. The
+    // re-arm must max, not assign, or the completion below regresses.
+    fs.appendFileSync(journalB, JSON.stringify(result("b1")) + "\n"); // wf_b: running=0, done=1, fresh
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.workflowActive, true, "the watch re-armed");
+
+    // B goes stale again — the true completion. The zero re-announced must
+    // AGREE with the state clients already hold: {0, done: 2} is unchanged, so
+    // the change gate broadcasts nothing rather than a regressing {0, done: 1}.
+    fs.utimesSync(journalB, old, old);
+    let before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 2 }, "completion agrees with the latched stale-clear state");
+    assert.equal(lastSessionEvent(sseBuffer.slice(before), id), null, "no regressing re-broadcast");
+    assert.equal(slot.workflowWatching, true, "back to watching after the real completion");
+
+    // A later resume with a NEW agent: the resurrect publish itself must carry
+    // the peak, not the resumed dir's own lower count.
+    fs.appendFileSync(journalB, JSON.stringify(started("b2")) + "\n"); // wf_b: running=1, done=1, fresh
+    before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 1, done: 2 }, "resurrect publish keeps the peak done");
+    assert.deepEqual(lastSessionEvent(sseBuffer.slice(before), id).agents, { running: 1, done: 2 });
+  } finally {
+    sessions.delete(id);
+  }
+});
+
 test("watching survives multiple silent stretches — every false stale re-arms on the next resume (#108)", async () => {
   const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");

@@ -1057,14 +1057,21 @@ function watchWorkflowActivity(slot, now) {
   // happened BECAUSE a live tree was scanned, so once it goes stale again the
   // poll must broadcast the zero rather than give up silently.
   slot.workflowSawRunning = true;
-  slot.workflowDone = counts.done;
+  // Max, never assign: the scan aggregates only LIVE dirs, so a sibling wf_*
+  // that finished before the silence — its done folded into the retained peak
+  // and already broadcast in the stale-clear zero — re-reads as 0 here.
+  // Assigning would clobber the peak and let the next completion zero regress
+  // below the state clients latched (the pinned #105 agreement). Maxing is
+  // safe: a watch re-arm is always the SAME workflow resuming — a genuinely
+  // new one re-enters via markWorkflowActivity, which resets the peak.
+  slot.workflowDone = Math.max(counts.done, slot.workflowDone ?? 0);
   log("info", `Workflow watch: tree resumed for session ${slot.id} — re-armed (running=${counts.running})`);
   // Publish only an UNAMBIGUOUS count (the reconcile rule): running === 0 on a
   // live tree is the between-phases gap or an unreadable live journal — the
   // armed poll resolves it while the client's latched zero stands. running > 0
   // always differs from the latched zero, so no change gate is needed here.
   if (counts.running === 0) return;
-  slot.agents = { running: counts.running, done: counts.done };
+  slot.agents = { running: counts.running, done: slot.workflowDone };
   pushSseEvent(
     "session",
     sessionEventPayload(slot, { state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName }),
