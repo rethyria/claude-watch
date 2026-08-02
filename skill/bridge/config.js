@@ -273,7 +273,10 @@ export const ACP_SPAWN_TIMEOUT_MS = testOverridable(
 // the scanner declared live workflows dead three times in one evening
 // (2026-08-01, issue #108), and nothing re-arms without a launch signal or a
 // restart. Cost of the width: a truly dead workflow's blue lingers up to this
-// long. #108's resurrection rescan is the real fix; this width is the interim.
+// long. The width is one of two independent knobs (issue #108): it decides
+// only WHEN the honest zero is broadcast — after the stale-clear the slot
+// keeps WATCHING its tree (watchWorkflowActivity in sessions.js) and re-arms
+// on resumed writes, so the window no longer risks stranding a live workflow.
 // Overridable via CLAUDE_WATCH_WORKFLOW_POLL_MS /
 // CLAUDE_WATCH_WORKFLOW_STALE_MS (test-only).
 export const WORKFLOW_POLL_MS = testOverridable("CLAUDE_WATCH_WORKFLOW_POLL_MS", 20_000);

@@ -32,13 +32,14 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 //   PTY exit) so a stray hook can never revive it (issue #53);
 //   branch/worktree/repoRoot + gitMetaCache carry the git metadata derived at
 //   the slot's root (issue #54, see the git-metadata section below);
-//   agents/workflowActive/workflowActivatedAt/workflowJournalCache track
-//   subagent workflow activity (issue #55, see the workflow-activity section);
+//   agents/workflowActive/workflowWatching/workflowActivatedAt/workflowSawRunning/
+//   workflowDone/workflowJournalCache track subagent workflow activity
+//   (issue #55, see the workflow-activity section);
 //   idle carries the TURN-level truth that state cannot (issue #60 — see
 //   the turn-end-idle section below): state stays "running" across a finished
 //   turn, so idle is what tells a connect-time snapshot apart from a session
 //   that is actually producing work.
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, titleScanAt?: number, titleScanCount?: number, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, titleScanAt?: number, titleScanCount?: number, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowWatching?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowDone?: number, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -678,8 +679,9 @@ function acquireTitleMidTurn(slot) {
 // tool_call whose _meta names the tool (acp.js, issue #105); both call
 // markWorkflowActivity, which flips the slot workflow-active and runs the
 // first scan immediately so the indicator does not wait out a poll interval.
-// A module-level poll then re-scans ONLY active slots every WORKFLOW_POLL_MS
-// (the poll's cheap boolean gate makes idle ticks free). A bridge restarted
+// A module-level poll then visits ONLY armed or watching slots every
+// WORKFLOW_POLL_MS (the poll's cheap boolean gate makes idle ticks free,
+// issue #108's watching notwithstanding). A bridge restarted
 // mid-workflow loses the in-memory arming and never sees a fresh launch
 // signal; reconcileWorkflowActivity re-derives the indicator from the on-disk
 // journal when the surviving session re-registers — createExternalSession for
@@ -714,6 +716,24 @@ function acquireTitleMidTurn(slot) {
 // writing everything, so it still goes stale and clears the indicator instead
 // of pinning it forever. `done` aggregates only live (non-stale) dirs, so a
 // long session's completed workflow history cannot inflate the count.
+//
+// Watching / resurrection (issue #108): the staleness window decides only WHEN
+// the honest zero is broadcast — it is not a verdict of death. A machine-sleep
+// resume, or a single tool call silent for longer than the window (transcripts
+// gain nothing until a tool result returns), makes a "completed" tree start
+// writing again with the one-shot launch signal long past; before #108 nothing
+// could re-arm short of a bridge restart. So a stale-clear moves the slot from
+// armed to WATCHING rather than fully disarming it: the same poll keeps
+// re-statting the tree (watchWorkflowActivity — a bounded stat sweep; the tree
+// exists, so the slot has no claim to the idle fast path), and the moment the
+// newest write is back inside the staleness window it re-arms and re-publishes
+// exactly as the restart reconcile does. The watch rides the existing
+// WORKFLOW_POLL_MS tick rather than a slower sibling: the sweep is a handful
+// of stats, the interval is already coarse, and a second timer would mean a
+// second gate to keep the idle path free. Watching ends with the slot's life
+// (session end or prune — the poll's state gate) or with the tree itself
+// vanishing, never with silence; only sessions with NO workflow tree stay off
+// the poll entirely.
 
 // A real journal is a few KB. Reading only a prefix of an oversized one could
 // see a `started` whose `result` sits beyond the cap — a phantom running
@@ -721,8 +741,10 @@ function acquireTitleMidTurn(slot) {
 const WORKFLOW_JOURNAL_MAX_BYTES = 1024 * 1024;
 
 // Cheap gate for the poll tick: false ⇒ the tick returns without touching the
-// sessions map at all.
-let anyWorkflowActive = false;
+// sessions map at all. True while any slot is armed OR watching (issue #108):
+// a watching slot must keep the poll alive, or the stale-clear that flipped it
+// would also be the tick that silenced its own resurrection path.
+let anyWorkflowTracked = false;
 
 // Count one journal's agents: running = started keys without a result, done =
 // started keys WITH one (an orphan result whose started line we never saw is
@@ -850,8 +872,9 @@ function scanWorkflowActivity(slot, now) {
 // reference) and push the idempotent running `session` event. A zero-running
 // scan clears the indicator and flips the slot workflow-inactive ONLY once the
 // tree has gone stale (a fresh zero is the between-phases gap — see the
-// completion note above, issue #70); after that only a fresh Workflow hook
-// re-arms scanning.
+// completion note above, issue #70); after that the slot WATCHES its tree —
+// a fresh Workflow hook or the tree coming back to life re-arms scanning
+// (issue #108, watchWorkflowActivity).
 function scanAndAnnounceWorkflowActivity(slot, now) {
   const counts = scanWorkflowActivity(slot, now);
   if (counts && counts.running > 0) slot.workflowSawRunning = true;
@@ -879,6 +902,11 @@ function scanAndAnnounceWorkflowActivity(slot, now) {
     // cannot pin the poll on forever.
     if (slot.workflowActivatedAt !== undefined && now - slot.workflowActivatedAt > WORKFLOW_STALE_MS) {
       slot.workflowActive = false;
+      // The give-up is not a verdict either (issue #108): a tree that EXISTS
+      // (stale leftovers) keeps being watched — a future write re-arms. Only
+      // the no-tree case goes fully quiet, preserving the zero-syscall idle
+      // path for ordinary sessions.
+      if (counts) slot.workflowWatching = true;
     }
     return;
   }
@@ -892,7 +920,13 @@ function scanAndAnnounceWorkflowActivity(slot, now) {
   // a tree quiet for the whole staleness window is a real completion. (now -
   // latestMtimeMs naturally treats latestMtimeMs === 0 as long-stale.)
   if (counts.running === 0 && now - counts.latestMtimeMs <= WORKFLOW_STALE_MS) return;
-  if (counts.running === 0) slot.workflowActive = false;
+  if (counts.running === 0) {
+    slot.workflowActive = false;
+    // The zero below is honest UI, not a verdict of death: keep WATCHING the
+    // tree so a resume (machine wake, a longer-than-window silent tool call
+    // returning) re-arms without a launch signal (issue #108).
+    slot.workflowWatching = true;
+  }
   // Report the peak done — equal to counts.done mid-run, but preserved across
   // the completion broadcast where the now-stale dir aggregates to 0.
   const done = Math.max(counts.done, slot.workflowDone ?? 0);
@@ -916,6 +950,9 @@ export function markWorkflowActivity(sessionId) {
   if (!slot) return;
   log("info", `Workflow launch signal: armed scanner for session ${sessionId}`);
   slot.workflowActive = true;
+  // An armed slot is scanned, not watched — the launch signal supersedes any
+  // watch a previous workflow's stale-clear left behind (issue #108).
+  slot.workflowWatching = false;
   slot.workflowActivatedAt = Date.now();
   // Each arming must observe ITS workflow before a zero-running scan may
   // count as completion (see scanAndAnnounceWorkflowActivity).
@@ -923,7 +960,7 @@ export function markWorkflowActivity(sessionId) {
   // Peak done is per-workflow: a fresh arming (a new Workflow call, hence a new
   // journal) must not inherit the previous workflow's completed count.
   slot.workflowDone = 0;
-  anyWorkflowActive = true;
+  anyWorkflowTracked = true;
   scanAndAnnounceWorkflowActivity(slot, Date.now());
 }
 
@@ -941,7 +978,8 @@ export function markWorkflowActivity(sessionId) {
 //     current running count.
 //   - STALE journal (the workflow finished or died during the downtime): set the
 //     explicit zero so the client's stale blue clears. Nothing live to track, so
-//     do not arm.
+//     do not arm — but WATCH the tree (issue #108): the downtime may have been a
+//     machine sleep the workflow survived, and its resumed writes must re-arm.
 //   - no journal tree: no workflow ran — leave `agents` absent, adding no noise
 //     to the far commoner ordinary-session registration.
 // A fresh Workflow hook that already armed this slot takes precedence (guarded).
@@ -958,10 +996,11 @@ function reconcileWorkflowActivity(slot, now = Date.now()) {
     // rather than giving up silently on an "observed nothing live" slot — which
     // would strand a client that finished-during-downtime on a fresh journal.
     slot.workflowActive = true;
+    slot.workflowWatching = false;
     slot.workflowActivatedAt = now;
     slot.workflowSawRunning = true;
     slot.workflowDone = counts.done;
-    anyWorkflowActive = true;
+    anyWorkflowTracked = true;
     log("info", `Workflow reconcile: live journal for session ${slot.id} — re-armed (running=${counts.running})`);
     // Publish only an UNAMBIGUOUS count. running > 0 re-seeds a truthful blue.
     // running === 0 on a live tree is indeterminate — the between-phases gap
@@ -984,26 +1023,86 @@ function reconcileWorkflowActivity(slot, now = Date.now()) {
   // with the completion state clients already hold; a restart-fresh slot has
   // no peak and reports 0, exactly as before.
   slot.agents = { running: 0, done: slot.workflowDone ?? 0 };
+  // The zero is a broadcastable state, not the end of observation: the
+  // downtime may have been a machine sleep the workflow survived. Watch the
+  // tree so resumed writes re-arm without a fresh launch signal (issue #108) —
+  // and raise the gate, or the poll would never visit the watch.
+  slot.workflowWatching = true;
+  anyWorkflowTracked = true;
+}
+
+// Issue #108: the watch tick for a slot whose stale-clear (or reconcile onto a
+// stale tree) already published its zero. Re-stat the tree each poll; the
+// moment its newest write is back inside the staleness window, re-arm and
+// re-publish exactly as the restart reconcile does — observed by construction,
+// running > 0 published, an ambiguous zero left for the armed poll to resolve.
+// (running > 0 needs no separate check: running aggregates only over live
+// dirs, so any running agent implies a fresh newest write.) A genuinely dead
+// tree keeps costing one bounded stat sweep per tick for the slot's lifetime —
+// watching ends at session end or prune (the poll's state gate), never with
+// silence.
+function watchWorkflowActivity(slot, now) {
+  const counts = scanWorkflowActivity(slot, now);
+  if (!counts) {
+    // The tree itself vanished (transcript dir cleaned away): nothing left to
+    // watch, and the no-tree idle fast path applies again.
+    slot.workflowWatching = false;
+    return;
+  }
+  if (now - counts.latestMtimeMs > WORKFLOW_STALE_MS) return; // still quiet — keep watching
+  slot.workflowWatching = false;
+  slot.workflowActive = true;
+  slot.workflowActivatedAt = now;
+  // Observed by construction, same as the restart reconcile: the re-arm
+  // happened BECAUSE a live tree was scanned, so once it goes stale again the
+  // poll must broadcast the zero rather than give up silently.
+  slot.workflowSawRunning = true;
+  // Max, never assign: the scan aggregates only LIVE dirs, so a sibling wf_*
+  // that finished before the silence — its done folded into the retained peak
+  // and already broadcast in the stale-clear zero — re-reads as 0 here.
+  // Assigning would clobber the peak and let the next completion zero regress
+  // below the state clients latched (the pinned #105 agreement). Maxing is
+  // safe: a watch re-arm is always the SAME workflow resuming — a genuinely
+  // new one re-enters via markWorkflowActivity, which resets the peak.
+  slot.workflowDone = Math.max(counts.done, slot.workflowDone ?? 0);
+  log("info", `Workflow watch: tree resumed for session ${slot.id} — re-armed (running=${counts.running})`);
+  // Publish only an UNAMBIGUOUS count (the reconcile rule): running === 0 on a
+  // live tree is the between-phases gap or an unreadable live journal — the
+  // armed poll resolves it while the client's latched zero stands. running > 0
+  // always differs from the latched zero, so no change gate is needed here.
+  if (counts.running === 0) return;
+  slot.agents = { running: counts.running, done: slot.workflowDone };
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, { state: "running", agent: slot.agent, cwd: slot.cwd, folderName: slot.folderName }),
+    slot.id,
+  );
 }
 
 // Poll tick (exported so tests can drive it with an injectable `now` instead
-// of racing the interval). MUST stay a no-op when nothing is workflow-active:
-// the boolean gate keeps the idle cost at one comparison, and per-slot
-// workflowActive keeps a busy bridge from scanning uninvolved sessions.
+// of racing the interval). MUST stay a no-op when nothing is workflow-tracked:
+// the boolean gate keeps the idle cost at one comparison, and the per-slot
+// flags keep a busy bridge from scanning uninvolved sessions — a session with
+// NO workflow tree costs zero syscalls per tick. Armed slots scan-and-announce;
+// watching slots (post-stale-clear, issue #108) get the resume check. Ended
+// slots shed both flags here — watching ends with the slot's life, not with
+// silence.
 export function pollWorkflowActivity(now = Date.now()) {
-  if (!anyWorkflowActive) return;
-  let stillActive = false;
+  if (!anyWorkflowTracked) return;
+  let stillTracked = false;
   for (const [, slot] of sessions) {
-    if (!slot.workflowActive) continue;
+    if (!slot.workflowActive && !slot.workflowWatching) continue;
     if (slot.state !== "running") {
       // An ended slot's indicator is moot; let the poll go quiet for it.
       slot.workflowActive = false;
+      slot.workflowWatching = false;
       continue;
     }
-    scanAndAnnounceWorkflowActivity(slot, now);
-    if (slot.workflowActive) stillActive = true;
+    if (slot.workflowActive) scanAndAnnounceWorkflowActivity(slot, now);
+    else watchWorkflowActivity(slot, now);
+    if (slot.workflowActive || slot.workflowWatching) stillTracked = true;
   }
-  anyWorkflowActive = stillActive;
+  anyWorkflowTracked = stillTracked;
 }
 
 // unref() so importing this module never keeps the process alive on its own

@@ -8,8 +8,10 @@
 // running = `started` records without a matching `result` (matched on `key`),
 // done = matched ones in LIVE (non-stale) journals. The completion state is
 // the EXPLICIT {running: 0, done: N} broadcast — absence never clears — after
-// which the poll goes quiet for the slot until a fresh Workflow hook re-arms
-// it. The launch signal races the runner's first journal write, so a zero
+// which the slot WATCHES its tree (issue #108): the poll keeps re-statting it
+// and re-arms on resumed writes or a fresh Workflow hook, and watching ends
+// with the slot's life, never with silence.
+// The launch signal races the runner's first journal write, so a zero
 // only counts as completion once the workflow was actually OBSERVED since
 // arming (running agents seen, or a journal written after the signal).
 // Stale journals (a killed workflow never writes its results) count as
@@ -114,7 +116,7 @@ test("the launch signal scans immediately: 3 started / 1 result → {running: 2,
   }
 });
 
-test("a fresh running=0 is the inter-phase gap (held); the explicit zero lands only once the tree goes stale, then quiet until re-armed", async () => {
+test("a fresh running=0 is the inter-phase gap (held); the explicit zero lands only once the tree goes stale, then the slot watches", async () => {
   const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
@@ -149,13 +151,14 @@ test("a fresh running=0 is the inter-phase gap (held); the explicit zero lands o
     assert.ok(cleared, "the completion state was broadcast");
     assert.deepEqual(cleared.agents, { running: 0, done: 2 });
 
-    // Quiet after completion: new journal activity is NOT observed by the
-    // poll (only a fresh Workflow hook re-arms the scan).
+    // Completion is no longer the end of observation (issue #108): the slot
+    // keeps WATCHING its tree, so new journal activity re-arms the scan on the
+    // next poll without waiting for a fresh Workflow hook.
     fs.appendFileSync(journalPath, JSON.stringify(started("k9")) + "\n");
     pollWorkflowActivity(Date.now());
-    assert.equal(sessions.get(id).agents.running, 0, "the poll went quiet for the slot");
+    assert.equal(sessions.get(id).agents.running, 1, "the watching slot re-armed on fresh journal activity");
 
-    // Re-arm: the launch signal sees the new agent.
+    // A fresh launch signal on the re-armed slot still sees the new agent.
     markWorkflowActivity(id);
     assert.equal(sessions.get(id).agents.running, 1, "re-arm: the launch signal sees the new agent");
   } finally {
@@ -807,4 +810,292 @@ test("ACP workflow on the wire: agents while running, the explicit zero after th
   fs.utimesSync(journalPath, old, old);
   const cleared = await sse.waitFor((e) => e.event === "session" && e.parsed?.agents?.running === 0);
   assert.deepEqual(cleared.parsed.agents, { running: 0, done: 1 }, "explicit completion zero, peak done preserved");
+});
+
+// --- Watching after the stale-clear (issue #108) -----------------------------
+// The staleness window decides only WHEN the honest zero is broadcast — it is
+// not a verdict of death. A machine-sleep resume, or a single tool call silent
+// for longer than the window (transcripts gain nothing until a tool result
+// returns), makes a "completed" tree write again with the one-shot launch
+// signal long past. So the stale-clear moves the slot to WATCHING: the same
+// poll re-stats the tree and re-arms + re-publishes exactly like the restart
+// reconcile the moment the newest write is back inside the window. Watching
+// ends with the slot's life, never with silence; sessions with no tree stay
+// off the poll entirely (the idle-cost gate).
+
+test("the stale-clear is not final: a resumed tree re-arms the WATCHING slot and publishes running>0 — no restart, no launch signal (#108)", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("resume", "cc-wf-resume",
+    [started("k1"), started("k2"), result("k1")]); // running=1, done=1
+  const id = resolveHookSession({ session_id: "cc-wf-resume", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    markWorkflowActivity(id);
+    const slot = sessions.get(id);
+    assert.deepEqual(slot.agents, { running: 1, done: 1 }, "armed and counting");
+
+    // A longer-than-window silent stretch (machine sleep, or a tool call that
+    // returns nothing for the whole window): the tree reads dead and the
+    // honest zero is broadcast — the pre-#108 permanent disarm point.
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 1 }, "honest zero at the window");
+    assert.equal(slot.workflowActive, false, "armed poll went quiet");
+    assert.equal(slot.workflowWatching, true, "…but the slot is WATCHING, not abandoned");
+
+    // The workflow was alive all along — the silent tool call returns and the
+    // journal gains a line. No bridge restart, no Workflow launch signal.
+    fs.appendFileSync(journalPath, JSON.stringify(started("k3")) + "\n"); // running=2, done=1, fresh
+    const before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.workflowActive, true, "the watch re-armed the scanner");
+    assert.equal(slot.workflowWatching, false, "watching handed back to the armed poll");
+    assert.deepEqual(slot.agents, { running: 2, done: 1 }, "running>0 re-seeded from the resumed tree");
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(event, "the re-arm was published");
+    assert.deepEqual(event.agents, { running: 2, done: 1 });
+
+    // The re-armed scanner still tracks to a REAL completion afterwards: the
+    // fresh zero holds (#70 intact after a watch re-arm), the stale tree
+    // clears with the peak done preserved.
+    fs.appendFileSync(journalPath, [result("k2"), result("k3")].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.agents.running, 2, "fresh zero held (#70 semantics survive the re-arm)");
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 3 }, "true completion: explicit zero, peak done preserved");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("a watch re-arm never regresses the peak done — a sibling dir finished before the silence stays counted (#105 x #108)", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // Two wf_* dirs under one tree: A finished (done=2) and aged out mid-run —
+  // its done then lives ONLY in the slot's retained peak, since the scan
+  // aggregates live dirs only. B was mid-flight when the machine slept.
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("peak-resume", "cc-wf-peak-resume",
+    [started("a1"), started("a2"), result("a1"), result("a2")]); // wf_a: done=2
+  const journalB = path.join(path.dirname(path.dirname(journalPath)), "wf_b", "journal.jsonl");
+  fs.mkdirSync(path.dirname(journalB), { recursive: true });
+  fs.writeFileSync(journalB, JSON.stringify(started("b1")) + "\n"); // wf_b: running=1
+  const id = resolveHookSession({ session_id: "cc-wf-peak-resume", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  const old = new Date(Date.now() - 2 * STALE_MS);
+  try {
+    markWorkflowActivity(id);
+    const slot = sessions.get(id);
+    assert.deepEqual(slot.agents, { running: 1, done: 2 }, "both dirs live at arming");
+
+    // A ages out, then the sleep takes B silent too: the stale-clear reports
+    // the peak — clients latch {running: 0, done: 2}.
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 1, done: 2 }, "peak holds while only A is stale");
+    fs.utimesSync(journalB, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 2 }, "stale-clear broadcasts the peak");
+    assert.equal(slot.workflowWatching, true);
+
+    // Wake: B's silent tool call returns and b1 finishes — only B's dir is
+    // live, so the scan's done re-reads as 1, BELOW the retained peak. The
+    // re-arm must max, not assign, or the completion below regresses.
+    fs.appendFileSync(journalB, JSON.stringify(result("b1")) + "\n"); // wf_b: running=0, done=1, fresh
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.workflowActive, true, "the watch re-armed");
+
+    // B goes stale again — the true completion. The zero re-announced must
+    // AGREE with the state clients already hold: {0, done: 2} is unchanged, so
+    // the change gate broadcasts nothing rather than a regressing {0, done: 1}.
+    fs.utimesSync(journalB, old, old);
+    let before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 2 }, "completion agrees with the latched stale-clear state");
+    assert.equal(lastSessionEvent(sseBuffer.slice(before), id), null, "no regressing re-broadcast");
+    assert.equal(slot.workflowWatching, true, "back to watching after the real completion");
+
+    // A later resume with a NEW agent: the resurrect publish itself must carry
+    // the peak, not the resumed dir's own lower count.
+    fs.appendFileSync(journalB, JSON.stringify(started("b2")) + "\n"); // wf_b: running=1, done=1, fresh
+    before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 1, done: 2 }, "resurrect publish keeps the peak done");
+    assert.deepEqual(lastSessionEvent(sseBuffer.slice(before), id).agents, { running: 1, done: 2 });
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("watching survives multiple silent stretches — every false stale re-arms on the next resume (#108)", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("resume-twice", "cc-wf-resume-twice",
+    [started("a1")]); // running=1
+  const id = resolveHookSession({ session_id: "cc-wf-resume-twice", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  const old = new Date(Date.now() - 2 * STALE_MS);
+  try {
+    markWorkflowActivity(id);
+    const slot = sessions.get(id);
+    assert.deepEqual(slot.agents, { running: 1, done: 0 });
+
+    // Silent stretch 1 → honest zero, watching.
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 0 });
+    assert.equal(slot.workflowWatching, true, "watching after the first false stale");
+
+    // Resume 1 → re-armed and published.
+    fs.appendFileSync(journalPath, JSON.stringify(started("a2")) + "\n"); // running=2, fresh
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 2, done: 0 }, "first resume re-armed");
+    assert.equal(slot.workflowActive, true);
+
+    // Silent stretch 2 → the zero again, watching again — the first re-arm did
+    // not use up the slot's only resurrection.
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 0 });
+    assert.equal(slot.workflowWatching, true, "watching again after the second false stale");
+
+    // Resume 2 → re-armed and published again.
+    fs.appendFileSync(journalPath, JSON.stringify(result("a1")) + "\n"); // running=1, done=1, fresh
+    const before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 1, done: 1 }, "second resume re-armed");
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(event, "the second re-arm was published too");
+    assert.deepEqual(event.agents, { running: 1, done: 1 });
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("watching ends with the slot's life: an ended session's resumed tree re-arms nothing (#108)", async () => {
+  const { sessions, registerAcpSession, endAcpSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  const { cwd, journalPath } = makeAcpWorkflowTree("watch-end", "acp-wf-watch-end", [started("k1")]);
+  registerAcpSession({ sessionId: "acp-wf-watch-end", sdkSessionId: "acp-wf-watch-end", cwd });
+  const slot = sessions.get("acp-wf-watch-end");
+  try {
+    assert.deepEqual(slot.agents, { running: 1, done: 0 }, "armed at registration");
+
+    // False stale → the zero, watching.
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.workflowWatching, true, "stale-clear left the slot watching");
+
+    // The session ends (Zed quit): the next tick sheds the watch with it.
+    endAcpSession("acp-wf-watch-end", "acp-closed");
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.workflowWatching, false, "watching ended with the slot");
+    assert.equal(slot.workflowActive, false);
+
+    // The tree resuming AFTER the session died must resurrect nothing.
+    fs.appendFileSync(journalPath, JSON.stringify(started("k2")) + "\n");
+    const before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.workflowActive, false, "no re-arm for a dead session");
+    assert.equal(slot.workflowWatching, false);
+    assert.equal(lastSessionEvent(sseBuffer.slice(before), "acp-wf-watch-end"), null, "nothing broadcast");
+  } finally {
+    sessions.delete("acp-wf-watch-end");
+  }
+});
+
+test("a genuinely dead tree stays at the explicit zero forever — watching never fabricates a resurrection (#108)", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("dead-forever", "cc-wf-dead-forever",
+    [started("k1")]); // started, never finished — a killed workflow's shape
+  const id = resolveHookSession({ session_id: "cc-wf-dead-forever", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    markWorkflowActivity(id);
+    const slot = sessions.get(id);
+    assert.deepEqual(slot.agents, { running: 1, done: 0 }, "observed running");
+
+    const old = new Date(Date.now() - 2 * STALE_MS);
+    fs.utimesSync(journalPath, old, old);
+    pollWorkflowActivity(Date.now());
+    assert.deepEqual(slot.agents, { running: 0, done: 0 }, "honest zero at the window");
+
+    // Nothing ever writes again: tick after tick the watch pays its bounded
+    // stat sweep (one readdir + a stat per dir; a stale dir is skipped before
+    // any journal read, so the dead journal is never re-parsed) and changes
+    // nothing — no re-arm, no broadcast churn, no give-up either.
+    const before = sseBuffer.length;
+    for (let tick = 1; tick <= 5; tick++) {
+      pollWorkflowActivity(Date.now() + tick * STALE_MS);
+      assert.equal(slot.workflowActive, false, `tick ${tick}: never re-armed`);
+      assert.equal(slot.workflowWatching, true, `tick ${tick}: still watching — silence never ends the watch`);
+    }
+    assert.deepEqual(slot.agents, { running: 0, done: 0 }, "the zero stands");
+    assert.equal(lastSessionEvent(sseBuffer.slice(before), id), null, "no re-broadcast churn");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("a launch signal with no tree gives up WITHOUT watching — no-tree sessions cost the poll nothing (#108)", async () => {
+  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+
+  // A transcript whose journal tree never materializes (same shape as the
+  // give-up test above): there is nothing to stat, so watching it would put a
+  // per-tick readdir on a session that never ran a workflow.
+  const dir = path.join(fixturesRoot, "never-watch");
+  fs.mkdirSync(dir, { recursive: true });
+  const transcriptPath = path.join(dir, "cc-wf-never-watch.jsonl");
+  fs.writeFileSync(transcriptPath, "");
+  const id = resolveHookSession({ session_id: "cc-wf-never-watch", cwd: dir, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    markWorkflowActivity(id);
+    const slot = sessions.get(id);
+    pollWorkflowActivity(Date.now() + STALE_MS + 1_000);
+    assert.equal(slot.workflowActive, false, "gave up after the stale window");
+    assert.notEqual(slot.workflowWatching, true, "no tree → nothing to watch — the idle fast path applies");
+  } finally {
+    sessions.delete(id);
+  }
+});
+
+test("restart onto a stale tree that later resumes: registration's zero is watched, not final (#68 x #108)", async () => {
+  const { sessions, resolveHookSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sseBuffer } = await import("../transport-sse.js");
+
+  // The machine slept through a bridge restart: at re-registration the tree is
+  // stale, so reconcile broadcasts the clearing zero — but the workflow
+  // survived the sleep and resumes writing afterwards.
+  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-resume", "cc-wf-restart-resume",
+    [started("k1")]);
+  const old = new Date(Date.now() - 2 * STALE_MS);
+  fs.utimesSync(journalPath, old, old);
+  // Settle the module gate first (no tracked slots remain → false), so this
+  // test proves reconcile's stale branch RAISES it for the watch — without
+  // that the poll would never visit the watching slot.
+  pollWorkflowActivity(Date.now());
+  const id = resolveHookSession({ session_id: "cc-wf-restart-resume", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  try {
+    const slot = sessions.get(id);
+    assert.deepEqual(slot.agents, { running: 0, done: 0 }, "reconciled to the explicit zero (#68 unchanged)");
+    assert.notEqual(slot.workflowActive, true, "nothing live to track — not armed");
+    assert.equal(slot.workflowWatching, true, "…but the tree is watched");
+
+    // The workflow resumes: the poll's watch re-arms and publishes.
+    fs.appendFileSync(journalPath, [result("k1"), started("k2")].map((r) => JSON.stringify(r)).join("\n") + "\n"); // running=1, done=1, fresh
+    const before = sseBuffer.length;
+    pollWorkflowActivity(Date.now());
+    assert.equal(slot.workflowActive, true, "the watch re-armed the scanner");
+    assert.deepEqual(slot.agents, { running: 1, done: 1 });
+    const event = lastSessionEvent(sseBuffer.slice(before), id);
+    assert.ok(event, "the resume was published");
+    assert.deepEqual(event.agents, { running: 1, done: 1 });
+  } finally {
+    sessions.delete(id);
+  }
 });
