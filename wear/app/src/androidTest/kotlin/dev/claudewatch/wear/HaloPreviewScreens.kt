@@ -3,8 +3,6 @@ package dev.claudewatch.wear
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.claudewatch.shared.protocol.SseFrame
@@ -152,9 +150,10 @@ class HaloPreviewScreens {
         Thread.sleep(8_000)
     }
 
-    /** Drill home → session list, settling on the scope's first card. */
+    /** Drill home → session list (the face tap, v3's one list entry),
+     *  settling on the scope's first card. */
     private fun drillToList() {
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
     }
 

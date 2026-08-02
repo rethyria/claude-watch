@@ -570,10 +570,11 @@ of truth. Reference captures: `wear/design/halo-v2-current-*.png`
   ring at any scroll position) with resting insets top 30 / bottom 48 /
   sides 31dp as contentPadding (lines dissolve in the fade band instead of
   shearing). Touch scrolling joins rotary on the reversed list; swipe right
-  = back, at-top pull-down = back; while the session waits the WHOLE feed
-  surface is the prompt's tap target (no pending → no click handler at
-  all). Dictate pill/unavailable variant keep the bottom slot (microphone
-  icon; unavailable = same icon struck ⊘ — see the #104 feedback section).
+  = back (the at-top pull-down back died in the v3 purge — see the gesture
+  model v3 section); while the session waits the WHOLE feed surface is the
+  prompt's tap target (no pending → no click handler at all). Dictate
+  pill/unavailable variant keep the bottom slot (microphone icon;
+  unavailable = same icon struck ⊘ — see the #104 feedback section).
 - **ONE persistent ring** (`HaloRingHost` + `HaloRingState` + `HaloRingMath`,
   S2/S4/S7): fixed channel radius 214 ref-px for every stroke; arc k ENDS at
   −94° − k·(360/n), winds anticlockwise, gaps 8.5° (8° solo). Paint and
@@ -588,12 +589,13 @@ of truth. Reference captures: `wear/design/halo-v2-current-*.png`
   (out .25s, in .45s delayed .1s; list→page return .3s). Non-adjacent jumps
   (Answer-pill page→feed, jump-home) snap — they happen under the opaque
   card. Ambient snaps to targets, never freezes a mid-morph frame.
-- **Navigation** (S1/S3): nav owns the page — `HorizontalPager` is GONE from
-  the main pages (the design has no drag-follow); horizontal swipes/dot taps
+- **Navigation** (S1/S3, since revised by gesture model v3 — see its own
+  section below): nav owns the page — `HorizontalPager` is GONE from the
+  main pages (the design has no drag-follow); horizontal swipes/dot taps
   change `nav.page` and only content slides (300ms/70px/HaloEasing). Tap
-  face or swipe up → the scope's session list; feed: swipe right → list;
-  no wrap. The centerpiece tap's old jump-to-prompt job moved to the Answer
-  pill.
+  the face → the scope's session list (v3: the ONLY list entry — the
+  swipe-up drill is gone); feed: swipe right → list; no wrap. The
+  centerpiece tap's old jump-to-prompt job moved to the Answer pill.
 - **Main screens** (S3, re-derived in the #104 feedback round): Answer pill
   (25dp tall, terracotta, "Answer" 11sp SemiBold on `#1A0F0A`) whenever the
   scope has a prompting session — out of flow, its top DERIVED as the
@@ -667,6 +669,42 @@ the engine and is never exposed as snapshot state for content to key on.
 Equal inputs launch nothing; unrelated updates never retime an in-flight
 tween.
 
+### Gesture model v3 (#109, user-decided 2026-08-02 — binding)
+
+Supersedes both the imported design's "vertical = depth" IA above AND
+rounds 1–2's hierarchy-back framing of #109 (round 2's machinery — the
+always-enabled PredictiveBackHandler, the SystemBackDragClaim stand-down —
+survives; its ROUTE changed). The model:
+
+- **One horizontal axis.** Swiping RIGHT always moves one step
+  leftward/backward through the app's spaces; swiping LEFT moves one step
+  rightward/forward. The full rightward chain: FEED → its LIST card →
+  previous sessions one by one → first card → its PAGE → project pages
+  toward HOME → USAGE → SETTINGS → **exit the app**. That settings-edge
+  exit (swipe-right or a back at settings-at-rest) is the ONLY exit in the
+  entire app — a deliberate `activity.finish()`; no other screen may exit.
+- **System back = the same step.** The root handler's completion routes the
+  identical one-step-back the surface swipe-right performs
+  (`systemBack(nav, overlayOpen, model)` in HaloNav.kt, JVM-pinned): on the
+  list that means step-to-previous-session — the page is reached only from
+  the first card (the user's explicit choice). Overlay priority stays:
+  back dismisses the topmost overlay (voice/card/picker) first. Hardware
+  KEYCODE_BACK routes identically. No fall-through, no disarm, ever
+  (round 2's always-registered invariant).
+- **The vertical purge — "everything vertical goes":** the depth screens'
+  swipe-down back, the feed's at-top pull-down back, the pages' swipe-up
+  drill, the cards' swipe-down decide-later/answer-later, the voice
+  overlay's pull-down cancel and the spawn picker's pull-down cancel are
+  ALL removed (the shared overscroll-exit connection with them). Tapping
+  the face/centerpiece is the only list entry. NOT navigation and NOT
+  removed: feed/usage/settings content scrolling, rotary input, the card
+  option lists.
+- **Every overlay keeps a non-gesture escape:** the cards' explicit
+  buttons ("decide later"/"answer later", now without the stale ↓), the
+  voice overlay's Cancel/OK/Discard-Retry, and the spawn picker's cancel
+  row (the once-passive "↓ cancel" label made tappable — the pull-down was
+  its only visible escape) — plus the system back over all of them.
+
 ### Deviations ledger (v2, all deliberate)
 
 | Deviation | Rationale |
@@ -677,7 +715,8 @@ tween.
 | Microphone-ICON dictate pill (was: hand-drawn mic glyph) | SUPERSEDED by the 2026-08-01 #104 user feedback (which also supersedes the design's text "Dictate" pill): available = a real microphone icon (`drawable/halo_mic`, the Material mic path, TextPrimary); unavailable = the SAME icon muted (TextFaint) with a ⊘ crossed-circle overlay, non-interactive — #78's honest-unavailability semantics and the `haloDictate`/`haloDictateUnavailable` tags kept. |
 | Curved page dots (+ outlined settings/usage dots at slots 0/1) | Pre-v2 user direction, kept; settings page at slot −2, usage at −1. |
 | 200-line feed buffer (design demo: 30) | Pre-v2 user direction, kept. |
-| Swipe-down-back on list + feed | Kept as the app-wide secondary back (design has none). |
+| Swipe-down-back on list + feed | REMOVED-BY-USER-DIRECTION (2026-08-02, #109 gesture model v3): the whole vertical-navigation family went — swipe-down backs, at-top pull-downs, swipe-up drill, card/voice/picker pull-down exits. One horizontal axis; tap-only list entry; settings-only exit. Supersedes the earlier "kept as the app-wide secondary back". |
+| Spawn picker's tappable cancel row (was: passive "↓ cancel" label) | The v3 purge removed the pull-down cancel — the picker's ONLY visible escape — so the label became the smallest honest affordance: a real cancel row (`haloSpawnCancel`), with the system back as its twin. |
 | Platform-curved non-tappable TimeText, **inset inside the ring channel** | Platform TimeText instead of a custom clock (pre-v2); the v2 sweep added `ClockRingClearance` outer padding — at the platform's 2dp rim padding the clock printed through the list/feed edge ring at 12 o'clock. |
 | DELEGATED `#6BA8D8` + ERROR states | App-side state model is richer than the design's; luminance-matched blue, see the v1 data-mapping notes. |
 | Spawn as trailing "+ new session" pager card | The prototype has no spawn affordance; the card is the All scope's true end (› hidden there) and the empty-scope content; ring highlight fades while it's selected. Same `haloSpawn` tag/picker as v1. |

@@ -107,9 +107,10 @@ class HaloRingMorphTest {
         compose.mainClock.advanceTimeBy(200)
         assertEquals(1, tagCount("haloCensus", unmerged = true))
 
-        // Drill: page → list. Mid-window BOTH contents are composed — the
-        // page fading out (.25s) while the pager card fades in late.
-        fingerDrag("haloRoot", Offset(0f, -30f))
+        // Drill: page → list (the face tap, v3's one list entry).
+        // Mid-window BOTH contents are composed — the page fading out (.25s)
+        // while the pager card fades in late.
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.mainClock.advanceTimeBy(96)
         assertEquals(1, tagCount("haloCensus", unmerged = true))
         assertEquals(1, tagCount("haloPagerCard-s-a1"))
@@ -119,9 +120,10 @@ class HaloRingMorphTest {
         assertEquals(0, tagCount("haloCensus", unmerged = true))
         assertEquals(1, tagCount("haloPagerCard-s-a1"))
 
-        // Back out: the list→page return is the .3s fast fade — same
+        // Back out (swipe right on the scope's FIRST card — the v3 at-start
+        // back): the list→page return is the .3s fast fade — same
         // both-composed property mid-window, page-only after.
-        fingerDrag("haloRoot", Offset(0f, 30f))
+        fingerDrag("haloRoot", Offset(30f, 0f))
         compose.mainClock.advanceTimeBy(96)
         assertEquals(1, tagCount("haloPagerCard-s-a1"))
         assertEquals(1, tagCount("haloCensus", unmerged = true))
@@ -135,7 +137,7 @@ class HaloRingMorphTest {
         compose.mainClock.autoAdvance = false
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         compose.mainClock.advanceTimeBy(200)
-        fingerDrag("haloRoot", Offset(0f, -30f))
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.mainClock.advanceTimeBy(700)
         assertEquals(1, tagCount("haloPagerCard-s-a1"))
 

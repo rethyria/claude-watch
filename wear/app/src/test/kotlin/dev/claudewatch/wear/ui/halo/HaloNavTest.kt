@@ -89,8 +89,8 @@ class HaloNavTest {
     @Test
     fun drillToListFromTheUsagePageIsANoOp() {
         val onUsage = HaloNavState(page = USAGE_PAGE)
-        // No depth below the usage page: the pager-level swipe-up gesture
-        // still fires, but the state machine refuses the jump.
+        // No depth below the usage page: no centerpiece renders there (v3's
+        // one list entry), and even a hand-built drill must be refused.
         assertEquals(onUsage, onUsage.drillToList(model()))
     }
 
@@ -145,9 +145,10 @@ class HaloNavTest {
 
     @Test
     fun drillToListFromTheSettingsPageIsANoOp() {
-        // Settings is a flat glance surface with no depth below it: the
-        // pager-level swipe-up gesture still fires, but the state machine
-        // refuses the jump (page < 0), never a surprise All list.
+        // Settings is a flat glance surface with no depth below it: no
+        // centerpiece renders there (v3's one list entry), and the state
+        // machine refuses even a hand-built jump (page < 0) — never a
+        // surprise All list.
         val onSettings = HaloNavState(page = SETTINGS_PAGE)
         assertEquals(onSettings, onSettings.drillToList(model()))
     }
@@ -433,11 +434,14 @@ class HaloNavTest {
         assertEquals("p-alpha", project.cardPermissionId)
     }
 
-    // ── System back routing (issue #109) ─────────────────────────────────────
+    // ── System back routing (issue #109, gesture model v3) ───────────────────
     // The root PredictiveBackHandler routes every completion through
-    // systemBack, so these pin the whole priority order: overlay ≻ card ≻
-    // depth ≻ non-home page ≻ null (home at rest — the handler's own
-    // deliberate finish, the one exit).
+    // systemBack, which performs THE SAME one-step-leftward move the surface
+    // swipe-right does: overlay ≻ card ≻ feed → its list card ≻ the list
+    // steps to the PREVIOUS session (page only from the first card — the
+    // user's explicit choice) ≻ pages walk ONE step leftward ≻ null
+    // (SETTINGS at rest — the handler's own deliberate finish, the one exit
+    // in the whole app).
 
     @Test
     fun systemBackDismissesTheTopmostOverlayBeforeAnythingElse() {
@@ -446,10 +450,13 @@ class HaloNavTest {
         val deep = HaloNavState(page = 0).drillToList(model())
             .drillToSession("s-a1")
             .openCard(null)
-        assertEquals(SystemBack.DismissOverlay, systemBack(deep, overlayOpen = true))
-        // At home too: the overlay outranks the fall-through, so back over an
-        // overlay never lets the app exit.
-        assertEquals(SystemBack.DismissOverlay, systemBack(HaloNavState(), overlayOpen = true))
+        assertEquals(SystemBack.DismissOverlay, systemBack(deep, overlayOpen = true, model()))
+        // At settings too: the overlay outranks the exit route, so back over
+        // an overlay never lets the app finish.
+        assertEquals(
+            SystemBack.DismissOverlay,
+            systemBack(HaloNavState(page = SETTINGS_PAGE), overlayOpen = true, model()),
+        )
     }
 
     @Test
@@ -458,12 +465,13 @@ class HaloNavTest {
         // The pager's Answer card: over the LIST, pinned to alpha's prompt.
         val card = HaloNavState(page = 1).drillToList(m).step(+1, m)
             .openCardForListSession(m.sessions.single { it.id == "s-a2" })
-        val closed = systemBack(card, overlayOpen = false)
+        val closed = systemBack(card, overlayOpen = false, m)
         assertEquals(
             SystemBack.Navigate(card.copy(cardOpen = false, cardPermissionId = null)),
             closed,
         )
-        // Position preserved: still LIST depth, same page, same selection.
+        // Position preserved: still LIST depth, same page, same selection —
+        // never a list step while the card floats above.
         val landed = (closed as SystemBack.Navigate).nav
         assertEquals(HaloDepth.LIST, landed.depth)
         assertEquals("s-a2", landed.sessionId)
@@ -471,39 +479,72 @@ class HaloNavTest {
     }
 
     @Test
-    fun systemBackStepsDepthFeedToListToPage() {
+    fun systemBackFromAFeedStepsOutToItsOwnListCard() {
         val feed = HaloNavState(page = 0).drillToList(model())
             .step(+1, model())
             .drillToSession("s-a2")
-        // Feed → list KEEPS the session (back()'s pinned contract)…
-        val list = (systemBack(feed, overlayOpen = false) as SystemBack.Navigate).nav
+        // Feed → list KEEPS the session (back()'s pinned contract): the next
+        // back then steps from THIS card, not the scope's first.
+        val list = (systemBack(feed, overlayOpen = false, model()) as SystemBack.Navigate).nav
         assertEquals(HaloDepth.LIST, list.depth)
         assertEquals("s-a2", list.sessionId)
-        // …and list → page clears the selection, exactly like a swipe-down.
-        val page = (systemBack(list, overlayOpen = false) as SystemBack.Navigate).nav
+    }
+
+    @Test
+    fun systemBackOnTheListStepsToThePreviousSessionAndPagesOutAtTheStart() {
+        val second = HaloNavState(page = 0).drillToList(model()).step(+1, model())
+        assertEquals("s-a2", second.sessionId)
+        // Mid-list: back is step(−1) — the previous session, NOT the page
+        // (the user's explicit choice for the v3 step model).
+        val first = (systemBack(second, overlayOpen = false, model()) as SystemBack.Navigate).nav
+        assertEquals(HaloDepth.LIST, first.depth)
+        assertEquals("s-a1", first.sessionId)
+        // Only the FIRST card steps out to the page, selection cleared.
+        val page = (systemBack(first, overlayOpen = false, model()) as SystemBack.Navigate).nav
         assertEquals(HaloDepth.PAGE, page.depth)
         assertNull(page.sessionId)
     }
 
     @Test
-    fun systemBackJumpsHomeFromEveryNonHomePage() {
-        // Projects to the right, usage and settings to the left: all jump
-        // straight home — never a page-by-page walk, never an exit.
-        for (page in listOf(2, USAGE_PAGE, SETTINGS_PAGE)) {
-            assertEquals(
-                "page $page must jump home",
-                SystemBack.Navigate(HaloNavState()),
-                systemBack(HaloNavState(page = page), overlayOpen = false),
-            )
+    fun systemBackOnTheSpawnCardStepsBackOntoTheLastSession() {
+        // The trailing spawn slot is the All list's true END: back from it is
+        // a step onto the last session, exactly like the surface swipe.
+        val spawn = HaloNavState(page = 0).drillToList(model())
+            .step(+1, model()).step(+1, model()).step(+1, model())
+        assertNull(spawn.sessionId)
+        val last = (systemBack(spawn, overlayOpen = false, model()) as SystemBack.Navigate).nav
+        assertEquals("s-b1", last.sessionId)
+        // An EMPTY All scope's sole slot is trivially the start: back leaves
+        // the list rather than dead-ending on the spawn card.
+        val emptyList = HaloNavState(page = 0).drillToList(emptyModel)
+        val out = (systemBack(emptyList, overlayOpen = false, emptyModel) as SystemBack.Navigate).nav
+        assertEquals(HaloDepth.PAGE, out.depth)
+    }
+
+    @Test
+    fun systemBackWalksThePagesOneStepLeftwardToSettings() {
+        // beta → alpha → home → usage → settings: a page-by-page walk, never
+        // round 2's jump home — the chain every rightward swipe also makes.
+        var nav = HaloNavState(page = 2)
+        for (expected in listOf(1, 0, USAGE_PAGE, SETTINGS_PAGE)) {
+            nav = (systemBack(nav, overlayOpen = false, model()) as SystemBack.Navigate).nav
+            assertEquals(expected, nav.page)
+            assertEquals(HaloDepth.PAGE, nav.depth)
         }
     }
 
     @Test
-    fun systemBackAtTheHomeRestingStateDoesNotIntercept() {
-        // Null = nothing left to route: home at rest, the ONLY state where
-        // back may leave the app. Round 2 (#109): the handler stays
-        // registered even here and finishes the activity ITSELF — the system
-        // never gets to commit its own back.
-        assertNull(systemBack(HaloNavState(), overlayOpen = false))
+    fun systemBackExitsOnlyFromSettingsAtRest() {
+        // Null = nothing left to route: SETTINGS at rest, the leftward
+        // chain's end and the ONLY state where back may leave the app — the
+        // handler (still registered even here, round 2's invariant) finishes
+        // the activity ITSELF; the system never commits its own back.
+        assertNull(systemBack(HaloNavState(page = SETTINGS_PAGE), overlayOpen = false, model()))
+        // Home is NOT an exit any more (v3 supersedes round 2): back there
+        // steps leftward onto the usage page.
+        assertEquals(
+            SystemBack.Navigate(HaloNavState(page = USAGE_PAGE)),
+            systemBack(HaloNavState(), overlayOpen = false, model()),
+        )
     }
 }

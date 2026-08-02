@@ -10,8 +10,6 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.claudewatch.wear.data.AesGcmTokenCipher
@@ -147,11 +145,12 @@ class DictationFlowTest {
         compose.onNodeWithTag("haloDictate").assertIsDisplayed().performClick()
     }
 
-    /** Home → the session pager → the named session's feed (no dictation).
-     *  These fixtures stream ONE session, so the drill's resolved selection
-     *  IS its card — tap it, no stepping needed. */
+    /** Home → the session pager (face tap, v3's one list entry) → the named
+     *  session's feed (no dictation). These fixtures stream ONE session, so
+     *  the drill's resolved selection IS its card — tap it, no stepping
+     *  needed. */
     private fun openFeed(sessionId: String) {
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()
         compose.waitForIdle()
@@ -349,9 +348,10 @@ class DictationFlowTest {
             """{"state":"running","agent":"claude","cwd":"/tmp/acp","folderName":"acp","external":true,"kind":"acp","dictatable":true,"sessionId":"s-acp"}""",
             "s-acp",
         )
-        // The pager: the lone ACP session is the resolved selection, its
-        // action arc already on screen — no reveal swipe in v2.
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        // The pager (face tap, v3's one list entry): the lone ACP session is
+        // the resolved selection, its action arc already on screen — no
+        // reveal swipe in v2.
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-s-acp").assertIsDisplayed()
 

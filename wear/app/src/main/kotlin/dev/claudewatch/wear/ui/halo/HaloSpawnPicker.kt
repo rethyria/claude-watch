@@ -4,16 +4,16 @@
 // over the list, offering one entry per KNOWN project (spawn root derived in
 // HaloModel: repoRoot beats cwd, a worktree offers its MAIN checkout) plus an
 // explicit "no project" home entry (the "~" sentinel = the bridge user's
-// home). Selection spawns and closes; a pull-down from the resting top bound
-// cancels without spawning (rememberAtTopBackConnection) — it fires only when
-// the picker was already at the top as the gesture began, so scrolling up to
-// the top never spills into a cancel. The caller must disable the API 31+
-// stretch-overscroll around this composable or the stretch eats the pull.
+// home). Selection spawns and closes; cancelling without spawning is the
+// trailing cancel row or the system back (the pull-down cancel died in the
+// v3 vertical purge, #109 — vertical drags scroll this list and nothing
+// else, so the once-passive "↓ cancel" label became the tappable escape).
 package dev.claudewatch.wear.ui.halo
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.defaultMinSize
@@ -24,9 +24,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -67,9 +67,6 @@ fun HaloSpawnPicker(
         ),
         modifier = modifier
             .fillMaxSize()
-            // Cancel = a pull-down from the resting top bound; fires only if the
-            // picker was already at the top when the gesture began (HaloGestures).
-            .nestedScroll(rememberAtTopBackConnection(listState, onCancel))
             // rotaryScrollable installs the focus target itself; the
             // LaunchedEffect above claims it so the bezel works on entry.
             .rotaryScrollable(
@@ -113,14 +110,26 @@ fun HaloSpawnPicker(
             )
         }
 
-        item {
-            Text(
-                text = "↓ cancel",
-                fontSize = Halo.Type.Min,
-                color = Halo.Palette.TextSecondary,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            )
+        // The visible escape (v3): the old "↓ cancel" was a passive label for
+        // the purged pull-down — the overlay must keep a non-gesture exit,
+        // so the row itself now cancels (the system back is its twin).
+        item(key = "spawn:cancel") {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .defaultMinSize(minHeight = Halo.Geo.TouchMin)
+                    .clickable(onClick = onCancel)
+                    .testTag("haloSpawnCancel")
+                    .padding(top = 8.dp),
+            ) {
+                Text(
+                    text = "cancel",
+                    fontSize = Halo.Type.Min,
+                    color = Halo.Palette.TextSecondary,
+                    textAlign = TextAlign.Center,
+                )
+            }
         }
     }
 }

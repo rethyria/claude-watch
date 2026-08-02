@@ -37,7 +37,6 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -66,24 +65,18 @@ fun HaloVoiceScreen(
     // sees IS what Retry will send.
     val transcript = if (ui.commandError != null) ui.commandDraft else ui.commandInFlightText ?: ui.commandDraft
 
-    // Same scroll + exit chrome as the cards: verticalScroll consumes every
-    // vertical drag (starving HaloApp's swipe-down detector — see
-    // HaloApprovalCard's DecisionLayer for the mechanics), so the Cancel exit
-    // is re-provided from the nested-scroll leftovers, plus rotary support.
-    // The shared connection carries the #109 system-back stand-down: a system
-    // gesture's droop firing Cancel here races the root handler's completion
-    // — which, over home, routes the deliberate exit (HaloGestures.kt).
+    // Touch + rotary scrolling only: the pull-down Cancel that used to ride
+    // the nested-scroll leftovers died in the v3 vertical purge (#109) — the
+    // Cancel pill below and the system back are the sending state's exits.
     val scrollState = rememberScrollState()
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
-    val overscrollExit = rememberOverscrollExitConnection(onCancel)
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
         modifier = modifier
             .fillMaxSize()
-            .nestedScroll(overscrollExit)
             .rotaryScrollable(RotaryScrollableDefaults.behavior(scrollState), focusRequester)
             .verticalScroll(scrollState)
             .padding(Halo.Geo.SafeInset)

@@ -10,7 +10,6 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.claudewatch.shared.state.BridgeState
 import dev.claudewatch.shared.state.SessionState
@@ -28,8 +27,9 @@ import org.junit.runner.RunWith
  * rendition of the old list row, same testTag) opens the picker instead of
  * spawning blind; picking a project fires onSpawn with THAT project's root
  * (the MAIN checkout for a worktree-only project), "no project" fires the "~"
- * home sentinel, and the swipe-down cancel spawns NOTHING — with the pager
- * underneath keeping its own gestures afterwards.
+ * home sentinel, and the trailing cancel row (v3: the purged pull-down
+ * cancel's tappable successor) spawns NOTHING — with the pager underneath
+ * keeping its own gestures afterwards.
  */
 @RunWith(AndroidJUnit4::class)
 class HaloSpawnPickerTest {
@@ -77,9 +77,10 @@ class HaloSpawnPickerTest {
         }
     }
 
-    /** Home → pager → step to the trailing spawn card → tap → picker up. */
+    /** Home → pager → step to the trailing spawn card → tap → picker up.
+     *  The face tap is v3's one list entry. */
     private fun openPicker() {
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
         // The spawn card is the All pager's true end: step ›-wards until it
         // is the current card (chevron clicks, so no swipe tap-guard arms).
@@ -139,21 +140,16 @@ class HaloSpawnPickerTest {
     }
 
     @Test
-    fun swipeDownCancelsWithoutSpawningAndThePagerKeepsItsGestures() {
+    fun cancelRowCancelsWithoutSpawningAndThePagerKeepsItsGestures() {
         val spawns = mutableListOf<Pair<String, String?>>()
         setContent(spawns)
         openPicker()
 
-        // A real finger's pull-down: frame-by-frame moves, never a batched
-        // swipe — the picker's cancel is rebuilt from nested-scroll leftovers,
-        // the very interaction the API 31+ stretch-overscroll used to eat (a
-        // batched swipe crosses the threshold in one delta and false-greens
-        // over the broken finger path).
-        compose.onNodeWithTag("haloSpawnPicker").performTouchInput {
-            down(center)
-            repeat(10) { moveBy(Offset(0f, 30f), delayMillis = 16L) }
-            up()
-        }
+        // The trailing cancel row — v3's tappable successor to the purged
+        // pull-down cancel (the overlay must keep a visible non-gesture
+        // escape; the system back is its twin, pinned in HaloSystemBackTest).
+        scrollPickerTo("haloSpawnCancel")
+        compose.onNodeWithTag("haloSpawnCancel").performClick()
         compose.waitForIdle()
 
         assertEquals("cancel spawns nothing", 0, spawns.size)
@@ -168,14 +164,17 @@ class HaloSpawnPickerTest {
         compose.onNodeWithTag("haloPagerCard-s-b").assertIsDisplayed()
         compose.onNodeWithTag("haloRowClose").assertIsDisplayed()
 
-        // …and the app-wide swipe-down-back still steps home. Frame-by-frame
-        // for the same real-finger injection discipline.
-        compose.onNodeWithTag("haloRoot").performTouchInput {
-            down(center)
-            repeat(14) { moveBy(Offset(0f, 30f), delayMillis = 16L) }
-            up()
+        // …and the pager's own swipe-rights still walk out: card by card to
+        // the first slot, then off the list to home. Frame-by-frame for the
+        // real-finger injection discipline.
+        repeat(2) {
+            compose.onNodeWithTag("haloRoot").performTouchInput {
+                down(center)
+                repeat(10) { moveBy(Offset(width / 12f, 0f), delayMillis = 16L) }
+                up()
+            }
+            compose.waitForIdle()
         }
-        compose.waitForIdle()
         compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
         assertTrue("still no spawn after the whole dance", spawns.isEmpty())
     }

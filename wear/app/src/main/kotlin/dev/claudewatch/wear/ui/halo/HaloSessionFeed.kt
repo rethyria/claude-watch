@@ -4,9 +4,10 @@
 // dissolves before it can reach the ring channel at any scroll position) and
 // scrolls by TOUCH and rotary on a reversed list. Navigation is gestural:
 // swipe right = back to the session list (sibling cycling died with the
-// header — position lives in the list pager now), an at-top pull-down = back
-// too, and while the session waits the whole feed surface is the prompt's tap
-// target. The dictate pill (and its honest "unavailable" variant, issue #78)
+// header — position lives in the list pager now; the at-top pull-down back
+// died in the v3 vertical purge, #109 — vertical drags are scroll and ONLY
+// scroll), and while the session waits the whole feed surface is the prompt's
+// tap target. The dictate pill (and its honest "unavailable" variant, issue #78)
 // keeps the bottom slot when nothing is waiting. The full-circle feed ring
 // (S7) shows through from the root host — the mask keeps text off it.
 // px values are at the 450 reference (≈ px/2 in dp, matching HaloTheme).
@@ -51,7 +52,6 @@ import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -133,12 +133,12 @@ fun HaloSessionFeed(
         modifier = modifier
             .fillMaxSize()
             // Swipe right = back to the list (nav's back() preserves this
-            // session as the pager selection, #95). Horizontal only: vertical
-            // drags belong to the tail's touch scroll (and, on the empty
-            // state, fall through to InnerScreen's swipe-down back). Deltas
-            // are CONSUMED so the tap-to-prompt clickable below sees the
-            // gesture as claimed and cancels its press — the uptime tap
-            // guard stays as the second line of defence.
+            // session as the pager selection, #95). Horizontal only:
+            // vertical drags belong to the tail's touch scroll — content
+            // scrolling, never navigation (v3). Deltas are CONSUMED so the
+            // tap-to-prompt clickable below sees the gesture as claimed and
+            // cancels its press — the uptime tap guard stays as the second
+            // line of defence.
             .pointerInput(Unit) {
                 val threshold = size.width * BACK_SWIPE_FRACTION
                 // #109: a system back gesture's edge swipe reads here as a
@@ -184,7 +184,6 @@ fun HaloSessionFeed(
             FeedTail(
                 lines = bridgeSession?.terminal?.items ?: emptyList(),
                 thinking = bridgeSession?.thinking == true,
-                onBack = back,
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -210,7 +209,6 @@ fun HaloSessionFeed(
 private fun FeedTail(
     lines: List<TerminalLine>,
     thinking: Boolean,
-    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // The empty state composes INSTEAD of the LazyColumn below, so it must be
@@ -255,18 +253,15 @@ private fun FeedTail(
         if (atTail) listState.requestScrollToItem(0)
     }
 
-    // No stretch-overscroll (the API 31+ trap, third bite pre-empted): the
-    // platform stretch effect would consume every post-bound drag delta
-    // before nested scroll sees the leftovers, making the at-top pull-down
-    // back below unreachable by a real finger while synthetic taps stay green.
+    // No stretch-overscroll (API 31+): a bound-hit stretch would smear the
+    // masked tail through the fade band — the feed rests still at its ends.
+    // (Originally load-bearing for the retired at-top pull-down back's
+    // nested-scroll leftovers, gone in the v3 purge.)
     @OptIn(ExperimentalFoundationApi::class)
     CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
         // Bottom-anchored via reverseLayout: index 0 is the NEWEST line pinned
         // to the bottom edge, and touch scrolling (v2) runs the reversed axis —
-        // dragging down walks into history. The visual TOP of the feed is
-        // therefore the list's FORWARD bound: that is the predicate handed to
-        // the pull-down back connection — the direction inversion that bit
-        // twice, encoded once here.
+        // dragging down walks into history.
         LazyColumn(
             state = listState,
             reverseLayout = true,
@@ -295,12 +290,6 @@ private fun FeedTail(
                         drawRect(brush = mask, blendMode = BlendMode.DstIn)
                     }
                 }
-                .nestedScroll(
-                    rememberAtTopBackConnection(
-                        atTop = { !listState.canScrollForward },
-                        onBack = onBack,
-                    ),
-                )
                 .rotaryScrollable(
                     behavior = RotaryScrollableDefaults.behavior(listState),
                     focusRequester = focusRequester,

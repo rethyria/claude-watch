@@ -53,7 +53,6 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -229,25 +228,18 @@ private fun DecisionLayer(
     // The failure path stacks extra rows (status line, local-dismiss hatch)
     // past what a round display fits, so the column scrolls — touch and
     // rotary — with the full circular safe inset as content padding: the
-    // header and the bottom exits must never sit on the curve.
+    // header and the bottom exits must never sit on the curve. Scroll is
+    // ALL a vertical drag does here since the v3 purge (#109): the
+    // pull-down "decide later" died with the rest of the vertical gestures —
+    // the explicit control below and the system back are the exits.
     val scrollState = rememberScrollState()
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
-    // verticalScroll consumes every vertical drag (leftover deltas surface
-    // through nested scroll, never back to the pointer system), which starves
-    // the overlay's swipe-down detector in HaloApp. This restores that exit
-    // from the leftovers: dragging down past the threshold with the column
-    // already at its top is "decide later" — same ~60px-at-450 threshold.
-    // The shared connection carries the #109 system-back stand-down: a system
-    // gesture's droop firing decide-later here would race the root handler's
-    // completion into a double-navigate (HaloGestures.kt).
-    val overscrollExit = rememberOverscrollExitConnection(onDecideLater)
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
         modifier = Modifier
             .fillMaxSize()
-            .nestedScroll(overscrollExit)
             .rotaryScrollable(RotaryScrollableDefaults.behavior(scrollState), focusRequester)
             .verticalScroll(scrollState)
             .padding(Halo.Geo.SafeInset),
@@ -409,7 +401,8 @@ private fun DecisionLayer(
             )
         }
         TextAction(
-            label = "decide later ↓",
+            // Plain label since v3: the ↓ pointed at the purged pull-down.
+            label = "decide later",
             color = Halo.Palette.TextSecondary,
             tag = "haloDecideLater",
             onClick = onDecideLater,

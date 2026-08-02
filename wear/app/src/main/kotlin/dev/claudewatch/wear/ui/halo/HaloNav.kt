@@ -1,6 +1,9 @@
-// Halo's navigation state machine: horizontal = pages (settings and usage left
-// of home, All, then one per project), vertical = depth (page → list pager →
-// session feed), plus the approval/question card as an overlay flag. Pure
+// Halo's navigation state machine: ONE horizontal axis (gesture model v3,
+// #109 — settings and usage left of home, All, one page per project, and the
+// list pager / session feed as depths hanging off a page), plus the
+// approval/question card as an overlay flag. Depth is ENTERED by taps (face →
+// list, card → feed) and every backward move — surface swipe-right, ‹, the
+// system back — is the same one-step-leftward walk ([systemBack]). Pure
 // Kotlin over HaloModel — no Compose, no I/O — so every transition is
 // unit-testable, including the edge cases (no waiting items, a project
 // vanishing under the user, the depth-less settings/usage pages, the pager's
@@ -87,12 +90,13 @@ fun scopeForPage(page: Int, model: HaloModel): ListScope =
     else model.projects.getOrNull(page - 1)?.let { ListScope.Project(it.name) } ?: ListScope.All
 
 /**
- * Swipe up on a page: into the All list or the current project's list, with
- * the pager selection resolved up front — keep the current session if it is
- * in scope, else the scope's first, else null (the spawn card alone, or an
- * empty scope). The settings and usage pages have no depth below them (issue
- * #57) — both are `< 0`, so a drill from either is a NO-OP, never a surprise
- * jump into the All list.
+ * Tap the face/centerpiece (the ONE list entry since the v3 vertical purge,
+ * #109): into the All list or the current project's list, with the pager
+ * selection resolved up front — keep the current session if it is in scope,
+ * else the scope's first, else null (the spawn card alone, or an empty
+ * scope). The settings and usage pages have no depth below them (issue #57)
+ * and render no centerpiece — both are `< 0`, so even a hand-built drill
+ * from either is a NO-OP, never a surprise jump into the All list.
  */
 fun HaloNavState.drillToList(model: HaloModel): HaloNavState {
     if (page < 0) return this
@@ -195,7 +199,8 @@ fun HaloNavState.openCardForListSession(session: HaloSession): HaloNavState {
     return copy(sessionId = session.id, cardOpen = true, cardPermissionId = pending.permissionId)
 }
 
-/** Swipe down: card → feed → list → page; no-op at the top. */
+/** One step out (a feed's swipe-right, ‹/swipe-right on the list's FIRST
+ *  card, closing the card): card → feed → list → page; no-op at the top. */
 fun HaloNavState.back(): HaloNavState = when {
     cardOpen -> copy(cardOpen = false, cardPermissionId = null)
     // Feed → list KEEPS the session: it becomes the pager selection, and the
@@ -251,22 +256,30 @@ sealed interface SystemBack {
 }
 
 /**
- * The system back gesture's ONE route through the IA (issue #109): the root
- * PredictiveBackHandler routes every gesture completion through this, so the
- * priority order is pinned here on the JVM instead of living in a gesture
- * callback. Overlay first, then the card (closing it restores the exact
- * prior position — [back]'s card branch), then one depth step (feed → list
- * keeps the selection, list → page clears it), then any non-home page —
- * projects, usage, settings — jumps straight home rather than walking the
- * row. Null means HOME AT REST: nothing left to route, and the handler —
- * which stays registered even here (round 2's always-enabled invariant: an
- * enabled flag that drops mid-gesture lets the system commit its own back)
- * — finishes the activity itself, the one deliberate exit.
+ * The system back gesture's ONE route through the IA (issue #109, gesture
+ * model v3 — user-decided 2026-08-02, superseding round 2's jump-home
+ * hierarchy walk): back performs THE SAME one-step-leftward move the surface
+ * swipe-right does wherever the app is, so the two inputs can never
+ * disagree. Overlay first (dismissing it is the caller's side effect), then
+ * the card (closing it restores the exact prior position — [back]'s card
+ * branch), then the feed steps out to its own list card, then the LIST
+ * steps to the PREVIOUS session ([step] −1 — the user's explicit choice;
+ * only the first card steps out to the page, [atListStart]), then the pages
+ * walk ONE step leftward ([stepPage] −1: projects toward home, home →
+ * usage → settings). Null means SETTINGS AT REST — the end of the whole
+ * leftward chain and the ONE place the app may exit: the caller finishes
+ * the activity itself, with the handler still registered even there (round
+ * 2's always-enabled invariant: an enabled flag that drops mid-gesture lets
+ * the system commit its own back). Takes the [model] because a step —
+ * unlike round 2's pure depth pop — needs the slot order to find the
+ * previous session and the list start.
  */
-fun systemBack(nav: HaloNavState, overlayOpen: Boolean): SystemBack? = when {
+fun systemBack(nav: HaloNavState, overlayOpen: Boolean, model: HaloModel): SystemBack? = when {
     overlayOpen -> SystemBack.DismissOverlay
     nav.cardOpen -> SystemBack.Navigate(nav.back())
-    nav.depth != HaloDepth.PAGE -> SystemBack.Navigate(nav.back())
-    nav.page != 0 -> SystemBack.Navigate(nav.jumpHome())
+    nav.depth == HaloDepth.SESSION -> SystemBack.Navigate(nav.back())
+    nav.depth == HaloDepth.LIST ->
+        SystemBack.Navigate(if (nav.atListStart(model)) nav.back() else nav.step(-1, model))
+    nav.page > SETTINGS_PAGE -> SystemBack.Navigate(nav.stepPage(-1, model))
     else -> null
 }

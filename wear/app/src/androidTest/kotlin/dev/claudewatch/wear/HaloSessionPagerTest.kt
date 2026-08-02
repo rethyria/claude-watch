@@ -12,11 +12,10 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
-import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.state.BridgeState
@@ -93,8 +92,12 @@ class HaloSessionPagerTest {
         permissionQueue = queue.filter { it.sessionId in ids },
     )
 
+    /** Home/project page → the pager: the face tap, v3's ONE list entry (the
+     *  centerpiece carries a 300ms swipe-suppression guard on real uptime,
+     *  waited out in case a page swipe preceded). */
     private fun drill() {
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        Thread.sleep(350)
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
     }
 
@@ -126,7 +129,9 @@ class HaloSessionPagerTest {
         // Home → the All pager: first card is the flat order's first session.
         drill()
         compose.onNodeWithTag("haloPagerCard-s-a1").assertIsDisplayed()
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeDown() }
+        // Back out from the first card: swipe right (the v3 at-start rule —
+        // the swipe-down back died in the vertical purge).
+        compose.onNodeWithTag("haloRoot").performTouchInput { swipeRight() }
         compose.waitForIdle()
 
         // Beta's page → ITS pager: the project scope's first (and only) card,
@@ -209,9 +214,10 @@ class HaloSessionPagerTest {
         compose.onNodeWithText("Write notes.txt").assertIsDisplayed()
         assertEquals("answering must not drill into the feed", 0, tagCount("haloFeed-s-a2"))
 
-        // "Decide later" (swipe down) lands right back on the same pager
-        // card — the whole point of opening OVER the list.
-        compose.onNodeWithTag("haloCard").performTouchInput { swipeDown() }
+        // "Decide later" (the explicit control — v3 purged the card's
+        // swipe-down) lands right back on the same pager card — the whole
+        // point of opening OVER the list.
+        compose.onNodeWithTag("haloDecideLater").performScrollTo().performClick()
         compose.waitForIdle()
         assertEquals(0, tagCount("haloCard"))
         compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()

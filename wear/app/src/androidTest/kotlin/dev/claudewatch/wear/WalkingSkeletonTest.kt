@@ -2,6 +2,7 @@ package dev.claudewatch.wear
 
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.SemanticsMatcher
@@ -16,8 +17,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeDown
-import androidx.compose.ui.test.swipeUp
+import androidx.compose.ui.test.swipeRight
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.rule.GrantPermissionRule
@@ -198,16 +198,32 @@ class WalkingSkeletonTest {
         return ids
     }
 
-    /** Swipe up from home into the All-scope session pager. */
+    /** Home → the All-scope session pager: the face tap, v3's ONE list entry
+     *  (the centerpiece carries a 300ms swipe-suppression guard on real
+     *  uptime, waited out because the page-walk helpers swipe). */
     private fun drillToList() {
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        Thread.sleep(350)
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
     }
 
-    /** Pager → home: the app-wide swipe-down back (InnerScreen's detector). */
+    /** Pager → home the v3 way: swipe right walks card by card to the
+     *  scope's first slot and then out (the app-wide swipe-down back died in
+     *  the #109 vertical purge). Bounded like the enumeration walks. */
     private fun pagerBackToHome() {
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeDown() }
-        compose.waitForIdle()
+        var swipes = 0
+        // The centerpiece exists only on the pages (never at LIST depth), so
+        // its arrival IS the landed-home signal — findable in the merged
+        // tree, unlike the census text it swallows.
+        while (swipes <= 70 && !tagDisplayed("haloCenter")) {
+            compose.onNodeWithTag("haloRoot").performTouchInput {
+                down(center)
+                repeat(10) { moveBy(Offset(width / 12f, 0f), delayMillis = 16L) }
+                up()
+            }
+            compose.waitForIdle()
+            swipes++
+        }
     }
 
     /** Step the pager to [sessionId]'s card, from wherever it is parked: back
@@ -396,9 +412,10 @@ class WalkingSkeletonTest {
         compose.waitUntil(30_000) {
             compose.onAllNodes(hasText(marker, substring = true)).fetchSemanticsNodes().isNotEmpty()
         }
-        // Back home the way a user does: swipe down twice (feed → pager →
-        // page). The clock is deliberately not a tap target anymore.
-        compose.onNodeWithTag("haloFeed-$markerSession").performTouchInput { swipeDown() }
+        // Back home the way a v3 user does: swipe right off the feed onto
+        // the pager, then swipe-right-walk out (the swipe-down backs died in
+        // the #109 purge; the clock is deliberately not a tap target).
+        compose.onNodeWithTag("haloFeed-$markerSession").performTouchInput { swipeRight() }
         compose.waitForIdle()
         pagerBackToHome()
         waitForText("haloCensus", "session")
@@ -629,12 +646,13 @@ class WalkingSkeletonTest {
             ).fetchSemanticsNodes().isNotEmpty()
         }
 
-        // Back to the pager — the selection survives the feed round trip, so
-        // the spawned card is up with its action arc's close, which kills the
-        // session via /v1/command. The bridge pushes `session ended
-        // killed:true`; the kill-under-cursor self-heal re-selects a
-        // neighbour and the pager stays steppable.
-        compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeDown() }
+        // Back to the pager (swipe right, the feed's v3 back) — the
+        // selection survives the feed round trip, so the spawned card is up
+        // with its action arc's close, which kills the session via
+        // /v1/command. The bridge pushes `session ended killed:true`; the
+        // kill-under-cursor self-heal re-selects a neighbour and the pager
+        // stays steppable.
+        compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeRight() }
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-$spawnedId").assertIsDisplayed()
         compose.onNodeWithTag("haloRowClose").assertIsDisplayed().performClick()

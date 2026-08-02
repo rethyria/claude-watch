@@ -3,8 +3,8 @@
 // are BUFFERED and submitted together after the last one (one positional
 // answer per question — never keyed by question text, which would collapse
 // duplicate questions and deadlock the submit gate). The buffer itself is
-// HOISTED to HaloApp (keyed by prompt id) so "answer later ↓" / swipe-down —
-// which unmount this overlay-scoped composable — lose nothing (§6).
+// HOISTED to HaloApp (keyed by prompt id) so "answer later" / the system
+// back — which unmount this overlay-scoped composable — lose nothing (§6).
 // "Dictate an answer…" is always the last option, so a question whose
 // options failed to parse is still answerable. Renders the [card] it is
 // GIVEN — HaloApp resolves nav's
@@ -46,7 +46,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -73,7 +72,7 @@ fun HaloQuestionCard(
      * The answer buffer: one answer per question POSITION (see the header
      * comment). OWNED BY THE CALLER and keyed to this prompt's id there,
      * because this composable unmounts on every overlay exit — "answer
-     * later ↓", swipe-down, even a reconnect blip — and §6 promises that
+     * later", the system back, even a reconnect blip — and §6 promises that
      * exit "loses nothing": picks made so far must survive a close/reopen
      * round-trip. Kept after submit so a failed POST retries the exact picks.
      */
@@ -207,21 +206,18 @@ private fun QuestionLayer(
     val session = model.sessions.firstOrNull { it.id == card.sessionId }
     val sessionTitle = session?.title ?: card.sessionLabel
 
-    // Same scroll + pull-down-to-exit chrome as the approval card: the
-    // options can outgrow a round display, and verticalScroll starves the
-    // overlay's swipe-down detector (see HaloApprovalCard for the mechanics,
-    // including the #109 system-back stand-down the shared connection carries).
+    // Same scroll chrome as the approval card: the options can outgrow a
+    // round display. Scroll is ALL a vertical drag does since the v3 purge
+    // (#109) — "answer later" below and the system back are the exits.
     val scrollState = rememberScrollState()
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
-    val overscrollExit = rememberOverscrollExitConnection(onAnswerLater)
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
         modifier = Modifier
             .fillMaxSize()
-            .nestedScroll(overscrollExit)
             .rotaryScrollable(RotaryScrollableDefaults.behavior(scrollState), focusRequester)
             .verticalScroll(scrollState)
             .padding(Halo.Geo.SafeInset)
@@ -289,7 +285,8 @@ private fun QuestionLayer(
         }
 
         TextAction(
-            label = "answer later ↓",
+            // Plain label since v3: the ↓ pointed at the purged pull-down.
+            label = "answer later",
             color = Halo.Palette.TextSecondary,
             tag = "haloAnswerLater",
             onClick = onAnswerLater,

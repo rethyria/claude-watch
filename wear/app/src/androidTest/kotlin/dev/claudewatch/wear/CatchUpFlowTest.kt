@@ -6,8 +6,6 @@ import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.claudewatch.wear.data.AesGcmTokenCipher
@@ -181,12 +179,12 @@ class CatchUpFlowTest {
         compose.waitUntil(30_000) { viewModel.state.value.status == "paired, stream open" }
 
         // --- The caught-up event renders ----------------------------------
-        // Drill into s-1's feed — the lone session is the pager's resolved
-        // selection, so its card is the drill's landing screen — and see the
-        // post-disconnect line (the pre-disconnect state survived the
-        // disconnect, so both lines are in the terminal — the new one proves
-        // the replay DELIVERED).
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        // Drill into s-1's feed — the face tap is v3's one list entry, and
+        // the lone session is the pager's resolved selection, so its card is
+        // the drill's landing screen — and see the post-disconnect line (the
+        // pre-disconnect state survived the disconnect, so both lines are in
+        // the terminal — the new one proves the replay DELIVERED).
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-s-1").performClick()
         compose.waitUntil(30_000) {

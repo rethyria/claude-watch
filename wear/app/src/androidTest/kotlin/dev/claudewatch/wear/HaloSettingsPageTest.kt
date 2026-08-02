@@ -128,7 +128,9 @@ class HaloSettingsPageTest {
         swipeToSettings()
         compose.onNodeWithTag("haloSettings").assertIsDisplayed()
 
-        // Swipe up — the drill gesture — must be a no-op here (HaloNav's
+        // A stray swipe up (the pre-v3 drill gesture) must be a no-op here —
+        // and everywhere, since the v3 purge; the glance pages additionally
+        // render no centerpiece, v3's one list entry (HaloNav's
         // settings/usage guard): still the settings page, no session list.
         compose.onNodeWithTag("haloRoot").performTouchInput {
             down(center)

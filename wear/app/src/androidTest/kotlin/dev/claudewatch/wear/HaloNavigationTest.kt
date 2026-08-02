@@ -14,8 +14,6 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performRotaryScrollInput
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.swipeDown
-import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.claudewatch.shared.protocol.SseFrame
 import dev.claudewatch.shared.state.BridgeEventReducer
@@ -32,10 +30,12 @@ import org.junit.runner.RunWith
  * page-per-session coverage became ring-home → list pager → feed nav
  * coverage), fed by fixture events reduced through the shared reducer — the
  * same `{id, event, data}` frames the bridge buffers. Every session is
- * reachable from home (swipe up → its pager card → its live feed with
- * human-readable, ANSI-stripped lines), the thinking indicator renders from
- * per-session state, and a killed session's feed backs out onto the healed
- * pager instead of ghosting. Pure UI test — no bridge, no network.
+ * reachable from home (tap the face → its pager card → its live feed with
+ * human-readable, ANSI-stripped lines — v3: the face tap is the ONE list
+ * entry and swipe-right the one gesture back), the thinking indicator
+ * renders from per-session state, and a killed session's feed backs out
+ * onto the healed pager instead of ghosting. Pure UI test — no bridge, no
+ * network.
  *
  * Page order (issue #57): settings (slot 0) | usage (slot 1) | home/All (slot
  * 2, the landing page) | one page per project. The session-drill tests below
@@ -95,9 +95,12 @@ class HaloNavigationTest {
     private fun ui(bridge: BridgeState) =
         BridgeViewModel.UiState(status = "paired, stream open", paired = true, bridge = bridge)
 
-    /** Home → the session list pager (swipe up = drill, per the handoff IA). */
+    /** Home → the session list pager: the face tap, v3's ONE list entry (the
+     *  centerpiece carries a 300ms swipe-suppression guard on real uptime,
+     *  waited out in case a page swipe preceded). */
     private fun drillToList() {
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        Thread.sleep(350)
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
     }
 
@@ -137,7 +140,7 @@ class HaloNavigationTest {
         compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithText("2 projects · 2 sessions").assertIsDisplayed()
 
-        // Swipe up: the pager lands on the scope's first card (alpha).
+        // Tap the face: the pager lands on the scope's first card (alpha).
         drillToList()
         compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
 
@@ -152,11 +155,11 @@ class HaloNavigationTest {
             compose.onAllNodes(hasText("npm test", substring = true)).fetchSemanticsNodes().size,
         )
 
-        // Swipe down steps back to the pager — WITH the selection preserved
-        // (back-from-feed keeps the session, #95), so alpha's own card is up
-        // and beta is one step away; beta's feed renders ITS lines.
-        compose.onNodeWithTag("haloFeed-$alpha").performTouchInput { swipeDown() }
-        compose.waitForIdle()
+        // Swipe right (v3's one gesture back) steps back to the pager — WITH
+        // the selection preserved (back-from-feed keeps the session, #95),
+        // so alpha's own card is up and beta is one step away; beta's feed
+        // renders ITS lines.
+        fingerDrag("haloFeed-$alpha", Offset(30f, 0f))
         compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
         openFeed(beta)
         compose.onNodeWithTag("haloFeed-$beta").assertIsDisplayed()
@@ -164,30 +167,27 @@ class HaloNavigationTest {
     }
 
     /**
-     * Swipe down ON THE PAGER steps back to home. The v2 pager has no
-     * scrollable, so this rides InnerScreen's plain back detector — but the
-     * injection stays a real finger's frame-by-frame drag: the detector
-     * accumulates per-delta, and a batched swipe crossing the threshold in
-     * one event would green a path no real finger exercises.
+     * The v3 vertical purge's regression pin (#109, user-decided
+     * 2026-08-02): vertical drags NAVIGATE NOWHERE any more. Swipe-up on
+     * home no longer drills (the face tap is the one list entry) and
+     * swipe-down on the pager no longer backs out — both stay put. Real
+     * finger frame-by-frame drags, so a rebuilt detector could not hide
+     * behind batched-injection artifacts.
      */
     @Test
-    fun pagerSwipeDownStepsBackToHome() {
+    fun verticalDragsNoLongerNavigateAnywhere() {
         val bridge = fold(fixtureFrames())
         compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
-        drillToList()
-        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed() // sanity: on the pager
 
-        // A real finger's drag: ~30px per 16ms frame, as DISTINCT timestamped
-        // moves.
-        compose.onNodeWithTag("haloRoot").performTouchInput {
-            down(center)
-            repeat(10) { moveBy(Offset(0f, 30f), delayMillis = 16L) }
-            up()
-        }
-        compose.waitForIdle()
-        // Unmerged: the census sits inside the centerpiece's mergeDescendants
-        // clickable (same gotcha WalkingSkeletonTest documents for this tag).
+        // Swipe up on home: still home — no drill.
+        fingerDrag("haloRoot", Offset(0f, -30f))
         compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
+
+        // Swipe down on the pager: still the pager — no back.
+        drillToList()
+        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
+        fingerDrag("haloRoot", Offset(0f, 30f))
+        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
     }
 
     /** A real finger's frame-by-frame drag on [tag]: distinct timestamped
@@ -204,14 +204,15 @@ class HaloNavigationTest {
     }
 
     /**
-     * The v2 feed (S6) scrolls by TOUCH on its reversed list, and an at-top
-     * pull-down goes back to the pager. "Top" on a reverseLayout list is the
-     * FORWARD bound — the direction inversion the epic flags as twice-bitten,
-     * pinned here with real per-frame drags on the emulator.
+     * The v2 feed (S6) scrolls by TOUCH on its reversed list — content
+     * scrolling explicitly SURVIVES the v3 purge (it is not navigation) —
+     * but the old at-top pull-down back is GONE: a pull past the top now
+     * stays in the feed, and only the swipe-right leaves it. Real per-frame
+     * drags on the emulator.
      */
     @OptIn(ExperimentalTestApi::class)
     @Test
-    fun feedTouchScrollsHistoryAndAtTopPullDownGoesBack() {
+    fun feedTouchScrollsHistoryAndOnlySwipeRightGoesBack() {
         val history = (0 until 60).map { i ->
             SseFrame("${10 + i}", "pty-output", """{"text":"history-line-$i\r\n","sessionId":"$alpha"}""")
         }
@@ -257,7 +258,7 @@ class HaloNavigationTest {
         }
         compose.onNodeWithText("history-line-59").assertIsDisplayed()
 
-        // Touch-scroll back to the visual top for the pull-down leg.
+        // Touch-scroll back to the visual top for the purge pin.
         drags = 0
         while (drags < 40 && compose.onAllNodes(hasText("$ claude")).fetchSemanticsNodes().isEmpty()) {
             fingerDrag("haloFeed-$alpha", Offset(0f, 45f))
@@ -265,18 +266,15 @@ class HaloNavigationTest {
         }
         compose.onNodeWithText("$ claude").assertIsDisplayed()
 
-        // Pull down again from the top: a pull that BEGINS at the bound is
-        // back (the first may only settle the last few pixels of scroll —
-        // reaching the top mid-gesture must not spill into a back).
-        var pulls = 0
-        while (
-            pulls < 5 &&
-            compose.onAllNodes(hasTestTag("haloPagerCard-$alpha")).fetchSemanticsNodes().isEmpty()
-        ) {
-            fingerDrag("haloFeed-$alpha", Offset(0f, 45f))
-            pulls++
-        }
-        // Back on the pager, selection preserved (#95).
+        // The purge pin: pulls past the resting top used to be back — now
+        // they are dead ends, the feed STAYS (vertical = scroll, never
+        // navigation).
+        repeat(3) { fingerDrag("haloFeed-$alpha", Offset(0f, 45f)) }
+        compose.onNodeWithTag("haloFeed-$alpha").assertIsDisplayed()
+
+        // Swipe right is the one way back to the pager, selection
+        // preserved (#95).
+        fingerDrag("haloFeed-$alpha", Offset(30f, 0f))
         compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
     }
 

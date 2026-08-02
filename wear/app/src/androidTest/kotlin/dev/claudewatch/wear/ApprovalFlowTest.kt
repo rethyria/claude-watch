@@ -35,13 +35,14 @@ import org.junit.runner.RunWith
  * The Halo approval and question cards (issues #17/#18 semantics on the Halo
  * surfaces), driven with fixture UiStates — no bridge, no network. Covers:
  * WHAT is asked (tool + summary) and WHICH session asks; answers keyed to the
- * RENDERED card's permissionId (pinned across chaining); no gesture path that
- * sends a decision or drops a prompt (the Halo card's swipe-down is "decide
- * later": nothing sent, prompt still queued and re-openable — the watchOS
- * defect was a swipe that became a 10-minute auto-deny); failed answers keep
- * the card with the error surfaced; the local-dismiss escape hatch unlocks
- * only after repeated failures; and the question card's buffered positional
- * answers, including the dictated free-text path.
+ * RENDERED card's permissionId (pinned across chaining); NO gesture path
+ * that sends a decision, drops a prompt or even leaves the card (v3, #109:
+ * the modal card is swipe-immune in every direction — "decide later" is its
+ * explicit control, nothing sent, prompt still queued and re-openable; the
+ * watchOS defect was a swipe that became a 10-minute auto-deny); failed
+ * answers keep the card with the error surfaced; the local-dismiss escape
+ * hatch unlocks only after repeated failures; and the question card's
+ * buffered positional answers, including the dictated free-text path.
  */
 @RunWith(AndroidJUnit4::class)
 class ApprovalFlowTest {
@@ -198,24 +199,28 @@ class ApprovalFlowTest {
         }
         openCard()
 
-        // Horizontal and upward swipes: the card stays put.
-        compose.onNodeWithTag("haloCard").performTouchInput { swipeRight() }
-        compose.waitForIdle()
-        compose.onNodeWithTag("haloCard").assertIsDisplayed()
-        compose.onNodeWithTag("haloCard").performTouchInput { swipeLeft() }
-        compose.waitForIdle()
-        compose.onNodeWithTag("haloCard").assertIsDisplayed()
-        compose.onNodeWithTag("haloCard").performTouchInput { swipeUp() }
-        compose.waitForIdle()
-        compose.onNodeWithTag("haloCard").assertIsDisplayed()
+        // Every swipe direction: the card stays put — since the v3 purge the
+        // modal card has NO gesture exits at all (its old swipe-down "decide
+        // later" is gone; the system back and the explicit control remain).
+        for (swipe in listOf<androidx.compose.ui.test.TouchInjectionScope.() -> Unit>(
+            { swipeRight() },
+            { swipeLeft() },
+            { swipeUp() },
+            { swipeDown() },
+        )) {
+            compose.onNodeWithTag("haloCard").performTouchInput(swipe)
+            compose.waitForIdle()
+            compose.onNodeWithTag("haloCard").assertIsDisplayed()
+        }
+        assertEquals("no gesture may send a decision", emptyList<Pair<String, String>>(), answers)
 
-        // Swipe down is "decide later" BY DESIGN (handoff §5): the card
+        // "Decide later" is the explicit control (handoff §5, v3): the card
         // closes but NOTHING is sent and the prompt stays queued — never the
         // watchOS swipe-into-auto-deny.
-        compose.onNodeWithTag("haloCard").performTouchInput { swipeDown() }
+        compose.onNodeWithTag("haloDecideLater").performScrollTo().performClick()
         compose.waitForIdle()
         assertEquals(0, cardCount())
-        assertEquals("no gesture may send a decision", emptyList<Pair<String, String>>(), answers)
+        assertEquals("decide later must not send a decision", emptyList<Pair<String, String>>(), answers)
 
         // The prompt is intact and re-openable: while the session waits its
         // whole feed surface is the prompt's tap target (v2 — the waiting
@@ -239,8 +244,9 @@ class ApprovalFlowTest {
         var state by mutableStateOf(ui(listOf(bashPrompt)))
         compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
 
-        // Home → pager (s-1 is the scope's first card) → s-1's feed.
-        compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
+        // Home → pager (s-1 is the scope's first card) → s-1's feed. The
+        // face tap is v3's one list entry.
+        compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-s-1").performClick()
         compose.waitForIdle()
@@ -252,9 +258,10 @@ class ApprovalFlowTest {
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
         compose.onNodeWithText("$ rm -rf ./build").assertIsDisplayed()
 
-        // Decide later, then the prompt resolves elsewhere: the feed stays,
-        // but the click target is GONE with the pending prompt.
-        compose.onNodeWithTag("haloCard").performTouchInput { swipeDown() }
+        // Decide later (the explicit control), then the prompt resolves
+        // elsewhere: the feed stays, but the click target is GONE with the
+        // pending prompt.
+        compose.onNodeWithTag("haloDecideLater").performScrollTo().performClick()
         compose.waitForIdle()
         state = ui(emptyList())
         compose.waitForIdle()
@@ -563,10 +570,12 @@ class ApprovalFlowTest {
 
     /**
      * Issue #18 acceptance: dismissal/restore semantics match the approval
-     * card — no gesture sends answers or drops the prompt ("answer later"
-     * loses nothing), a failed send keeps the card with the error surfaced
-     * AND the buffered answers intact for retry, and the no-decision
-     * local-dismiss escape hatch unlocks only after repeated failures.
+     * card — no gesture sends answers, drops the prompt or leaves the card
+     * (v3: swipe-immune in every direction; "answer later" is the explicit
+     * control and loses nothing), a failed send keeps the card with the
+     * error surfaced AND the buffered answers intact for retry, and the
+     * no-decision local-dismiss escape hatch unlocks only after repeated
+     * failures.
      */
     @Test
     fun questionCardMatchesTheApprovalCardsDismissalAndRestoreSemantics() {
@@ -584,17 +593,20 @@ class ApprovalFlowTest {
         }
         openCard()
 
-        // Swipe-immune horizontally and upward, exactly like the approval card.
+        // Swipe-immune in EVERY direction, exactly like the approval card
+        // (v3: the old swipe-down "answer later" died in the purge).
         compose.onNodeWithTag("haloCard").performTouchInput { swipeRight() }
         compose.onNodeWithTag("haloCard").performTouchInput { swipeLeft() }
         compose.onNodeWithTag("haloCard").performTouchInput { swipeUp() }
+        compose.onNodeWithTag("haloCard").performTouchInput { swipeDown() }
         compose.waitForIdle()
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
 
-        // Swipe down = "answer later": nothing sent, prompt intact, and the
-        // reopened card (feed tap — the waiting session's whole surface)
-        // starts the walk again — no half-buffered ghost state.
-        compose.onNodeWithTag("haloCard").performTouchInput { swipeDown() }
+        // "Answer later" (the explicit control): nothing sent, prompt
+        // intact, and the reopened card (feed tap — the waiting session's
+        // whole surface) starts the walk again — no half-buffered ghost
+        // state.
+        compose.onNodeWithTag("haloAnswerLater").performScrollTo().performClick()
         compose.waitForIdle()
         assertEquals(0, cardCount())
         assertEquals("no gesture may submit answers", 0, sent.size)

@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -32,7 +33,8 @@ import org.junit.runner.RunWith
  * and tappable: the tap fires the recorded onUsageRefresh force seam); the
  * eyebrow toggles the REMAINING/USED reading of a known wire percent; Error
  * renders the message with a tappable retry that re-fires the seam; and the
- * page has no drill-down — swipe up stays put.
+ * page has no drill-down — no centerpiece renders (v3's one list entry), and
+ * a stray swipe up stays put.
  */
 @RunWith(AndroidJUnit4::class)
 class HaloUsagePageTest {
@@ -278,8 +280,15 @@ class HaloUsagePageTest {
         swipeToUsage()
         compose.onNodeWithTag("haloUsage").assertIsDisplayed()
 
-        // Swipe up — the drill gesture — must be a no-op here (HaloNav's
-        // usage-page guard): still the usage page, no session list.
+        // No list entry exists here: the face tap is v3's ONE way down and
+        // the glance pages render no centerpiece (HaloNav's usage-page
+        // guard backs it up for hand-built states)…
+        assertEquals(
+            "the usage page must offer no centerpiece tap target",
+            0,
+            compose.onAllNodes(hasTestTag("haloCenter")).fetchSemanticsNodes().size,
+        )
+        // …and a stray swipe up (the pre-v3 drill gesture) stays put.
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeUp() }
         compose.waitForIdle()
         compose.onNodeWithTag("haloUsage").assertIsDisplayed()

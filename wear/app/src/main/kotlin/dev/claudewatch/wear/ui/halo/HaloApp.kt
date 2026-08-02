@@ -3,11 +3,16 @@
 // project). Horizontal swipes and tappable dots change the page and only page
 // CONTENT slides — the v2 shell (epic #94 S3) dropped HorizontalPager because
 // the design has no drag-follow: halo, clock and dots hold still during page
-// navigation. Vertical swipes drive depth with content FADES (S7: the ring's
-// morphs are the spatial continuity, content follows), a decorative
-// (non-tappable) TimeText renders at the root whenever the centre clock is
-// hidden, and the approval/question card rides as a top overlay chained off
-// the waiting queue.
+// navigation. Navigation rides ONE horizontal axis (gesture model v3, #109 —
+// the vertical gestures were purged by user direction 2026-08-02): depth is
+// ENTERED by taps (face → list, card → feed) and every backward move —
+// surface swipe-right, system back, hardware back — is the same one-step
+// walk through HaloNav's systemBack, with the ONLY swipe-exit at the far
+// left end (settings). Content FADES between depths (S7: the ring's morphs
+// are the spatial continuity, content follows), a decorative (non-tappable)
+// TimeText renders at the root whenever the centre clock is hidden, and the
+// approval/question card rides as a top overlay chained off the waiting
+// queue.
 // Navigation state itself is the pure HaloNavState machine (HaloNav.kt); this
 // file only binds gestures, animation, and the screen composables to it.
 package dev.claudewatch.wear.ui.halo
@@ -35,7 +40,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.PaddingValues
@@ -179,11 +183,10 @@ internal val LocalHaloAmbient = compositionLocalOf { false }
 /**
  * True while a SYSTEM predictive back gesture is in flight (issue #109 round
  * 2): set by the root PredictiveBackHandler the moment the system dispatches
- * back-started, dropped on completion or cancellation. Every surface drag
- * detector — page/pager steps, feed swipe-right, the swipe-down backs, the
- * at-top pull connections, the modal surfaces' overscroll exits — reads it
- * (through [SystemBackDragClaim] or the poison inside the shared connections
- * in HaloGestures.kt) to stand down for the drag: the system gesture's
+ * back-started, dropped on completion or cancellation. Every surviving
+ * surface drag detector — the page steps, the pager steps, the feed
+ * swipe-right (v3 purged the vertical ones) — reads it through
+ * [SystemBackDragClaim] to stand down for the drag: the system gesture's
  * touches also arrive in-window as an ordinary drag, and acting on them is
  * the double-consumption race the SM-L330 logs pinned. A [State] (not a
  * value) because the consumers live in pointerInput(Unit) closures that
@@ -282,9 +285,9 @@ private fun HaloAppBody(
 
     // Issue #56: the spawn picker overlay. The list's "+ new claude session"
     // row OPENS it instead of firing blind; a pick spawns-and-closes, the
-    // swipe-down cancel closes without spawning. A plain flag (like the
-    // overlays below, not a nav depth): it floats over the list it was
-    // summoned from and closing must land exactly there.
+    // cancel row (and the system back) closes without spawning. A plain flag
+    // (like the overlays below, not a nav depth): it floats over the list it
+    // was summoned from and closing must land exactly there.
     var spawnPickerOpen by remember { mutableStateOf(false) }
 
     // §5/§6 result flash: an answered prompt leaves ui.permissionQueue at ACK
@@ -411,12 +414,15 @@ private fun HaloAppBody(
         }
     }
 
-    // Issue #109 round 2: the SYSTEM back — one ALWAYS-ENABLED
-    // PredictiveBackHandler at the root, routing through the pure systemBack
-    // (HaloNav.kt), which owns priority: topmost overlay first, then the
-    // card, then a depth step, then non-home pages jump home — and at the
-    // home resting state (null route) the handler finishes the activity
-    // ITSELF, the one deliberate exit.
+    // Issue #109, gesture model v3 over the round-2 machinery: the SYSTEM
+    // back — one ALWAYS-ENABLED PredictiveBackHandler at the root, routing
+    // through the pure systemBack (HaloNav.kt), which performs THE SAME
+    // one-step-leftward move the surface swipe-right does: topmost overlay
+    // first, then the card, then feed → list card, then the list steps to
+    // the PREVIOUS session (page only from the first card), then pages walk
+    // one step leftward — and at SETTINGS at rest (null route, the end of
+    // the whole chain) the handler finishes the activity ITSELF, the one
+    // deliberate exit alongside the settings swipe-right below.
     //
     // Always-enabled is LOAD-BEARING, not a simplification (the SM-L330
     // 22:47 log race that killed round 1's enabled-flag BackHandler): the
@@ -455,22 +461,23 @@ private fun HaloAppBody(
         systemBackInFlight.value = true
         try {
             progress.collect { event -> systemBackProgress = event.progress }
-            when (val route = systemBack(nav, overlayOpen = voiceOpen || spawnPickerOpen)) {
+            when (val route = systemBack(nav, overlayOpen = voiceOpen || spawnPickerOpen, currentModel)) {
                 SystemBack.DismissOverlay -> when {
                     // The voice overlay renders ABOVE the picker (both can be
                     // up: an armed send can fail while the picker is open), so
                     // it dismisses first — under the overlay's own modality
                     // rule: a FAILED send keeps it up (Retry/Discard are the
-                    // only exits, same as its swipe-down), yet back stays
+                    // only exits, same as its Cancel pill), yet back stays
                     // consumed — it must not navigate the hierarchy under a
                     // modal overlay.
                     voiceOpen -> if (currentUi.commandError == null) voiceOpen = false
                     else -> spawnPickerOpen = false
                 }
                 is SystemBack.Navigate -> nav = route.nav
-                // Home at rest: the ONE deliberate exit — fired at most once
-                // (finish() flips isFinishing synchronously on this thread,
-                // so a second gesture completing behind it is a no-op).
+                // Settings at rest — the leftward chain's end: the deliberate
+                // exit, fired at most once (finish() flips isFinishing
+                // synchronously on this thread, so a second gesture
+                // completing behind it is a no-op).
                 null -> context.findActivity()?.takeIf { !it.isFinishing }?.finish()
             }
         } finally {
@@ -499,9 +506,8 @@ private fun HaloAppBody(
         // fed the full nav-derived snapshot — page arcs, the list's dotted
         // ring + hero highlight, the feed's full circle, and the morphs
         // between them all live in the host's engine. The depth layers above
-        // stopped painting opaque backgrounds (InnerScreen) so it shows
-        // through; only true overlays (cards, voice, spawn picker, offline)
-        // still cover it.
+        // paint no opaque backgrounds so it shows through; only true
+        // overlays (cards, voice, spawn picker, offline) still cover it.
         HaloRingHost(inputs = HaloRingMath.ringInputs(nav, model, lastStepDir))
 
         AnimatedContent(
@@ -520,17 +526,20 @@ private fun HaloAppBody(
                     status = ui.status,
                     onStepPage = { delta ->
                         lastSwipeAtMs = SystemClock.uptimeMillis()
-                        nav = nav.stepPage(delta, currentModel)
+                        if (delta < 0 && nav.page == SETTINGS_PAGE) {
+                            // Swipe-right at settings — the far end of the
+                            // leftward chain: the ONE swipe-exit in the app
+                            // (gesture model v3), the same deliberate finish
+                            // the system back's null route performs.
+                            context.findActivity()?.takeIf { !it.isFinishing }?.finish()
+                        } else {
+                            nav = nav.stepPage(delta, currentModel)
+                        }
                     },
                     onSelectPage = { nav = nav.copy(page = it) },
-                    onDrill = {
-                        lastSwipeAtMs = SystemClock.uptimeMillis()
-                        lastStepDir = StepDir.NONE
-                        nav = nav.drillToList(currentModel)
-                    },
-                    // The centerpiece tap opens the session list too (v2 nav:
-                    // "tap face or swipe up"); its old jump-to-prompt job
-                    // moved to the Answer pill below.
+                    // The centerpiece tap is the ONE list entry (v3: the
+                    // swipe-up drill died in the vertical purge); its old
+                    // jump-to-prompt job moved to the Answer pill below.
                     onTapCenter = {
                         if (SystemClock.uptimeMillis() - lastSwipeAtMs > TAP_GUARD_MS) {
                             lastStepDir = StepDir.NONE
@@ -545,59 +554,49 @@ private fun HaloAppBody(
                     // confirm-gated Unpair is its first invocation.
                     onUnpair = actions.onUnpair,
                 )
-                is Layer.SessionList -> InnerScreen(
+                is Layer.SessionList -> HaloSessionPager(
+                    model = model,
+                    scope = layer.scope,
+                    selectedId = nav.sessionId,
+                    // The at-start-goes-back rule stays the nav's pinned
+                    // predicate; the pager only obeys it.
+                    atStart = nav.atListStart(model),
+                    onStep = { delta ->
+                        lastStepDir = if (delta < 0) StepDir.BACK else StepDir.FORWARD
+                        nav = nav.step(delta, currentModel)
+                    },
                     onBack = { nav = nav.back() },
-                ) {
-                    // The v2 pager (S5) has no scrollable: vertical drags fall
-                    // straight through to InnerScreen's back detector — the
-                    // app-wide swipe-down-back, kept by approved deviation.
-                    HaloSessionPager(
-                        model = model,
-                        scope = layer.scope,
-                        selectedId = nav.sessionId,
-                        // The at-start-goes-back rule stays the nav's pinned
-                        // predicate; the pager only obeys it.
-                        atStart = nav.atListStart(model),
-                        onStep = { delta ->
-                            lastStepDir = if (delta < 0) StepDir.BACK else StepDir.FORWARD
-                            nav = nav.step(delta, currentModel)
-                        },
-                        onBack = { nav = nav.back() },
-                        onOpenSession = { nav = nav.drillToSession(it) },
-                        // The Answer pill: the card OVER the list, pinned to
-                        // this session's own prompt — never a feed drill.
-                        onAnswer = { session -> nav = nav.openCardForListSession(session) },
-                        onKill = actions.onKill,
-                        onHide = actions.onHide,
-                        // Issue #56: the spawn card summons the target picker
-                        // overlay; the actual onSpawn fires from a pick.
-                        onSpawn = { spawnPickerOpen = true },
-                        // Reclaim the bezel when the picker closes (its
-                        // rotary node stole focus and is now disposed).
-                        rotaryActive = !spawnPickerOpen,
-                    )
-                }
-                is Layer.Feed -> InnerScreen(
+                    onOpenSession = { nav = nav.drillToSession(it) },
+                    // The Answer pill: the card OVER the list, pinned to
+                    // this session's own prompt — never a feed drill.
+                    onAnswer = { session -> nav = nav.openCardForListSession(session) },
+                    onKill = actions.onKill,
+                    onHide = actions.onHide,
+                    // Issue #56: the spawn card summons the target picker
+                    // overlay; the actual onSpawn fires from a pick.
+                    onSpawn = { spawnPickerOpen = true },
+                    // Reclaim the bezel when the picker closes (its
+                    // rotary node stole focus and is now disposed).
+                    rotaryActive = !spawnPickerOpen,
+                )
+                is Layer.Feed -> HaloSessionFeed(
+                    model = model,
+                    sessionId = layer.sessionId,
+                    ui = ui,
+                    // The feed tap belongs to THIS session: pin its own
+                    // prompt, not whatever sits at the global queue front.
+                    onOpenCard = {
+                        val pending = currentModel.sessions
+                            .firstOrNull { it.id == layer.sessionId }?.pending
+                        nav = nav.openCard(pending?.permissionId)
+                    },
+                    // Dictation from a feed goes to THAT session.
+                    onDictate = { dictate(layer.sessionId) },
+                    // The swipe-right back (the feed's one gesture back since
+                    // the v3 purge); back() keeps the session as the pager
+                    // selection (#95).
                     onBack = { nav = nav.back() },
-                ) {
-                    HaloSessionFeed(
-                        model = model,
-                        sessionId = layer.sessionId,
-                        ui = ui,
-                        // The feed tap belongs to THIS session: pin its own
-                        // prompt, not whatever sits at the global queue front.
-                        onOpenCard = {
-                            val pending = currentModel.sessions
-                                .firstOrNull { it.id == layer.sessionId }?.pending
-                            nav = nav.openCard(pending?.permissionId)
-                        },
-                        // Dictation from a feed goes to THAT session.
-                        onDictate = { dictate(layer.sessionId) },
-                        // Swipe-right and the at-top pull-down both land here;
-                        // back() keeps the session as the pager selection (#95).
-                        onBack = { nav = nav.back() },
-                    )
-                }
+                )
             }
         }
 
@@ -630,24 +629,23 @@ private fun HaloAppBody(
             // NO gesture-swallowing wrapper: consuming the down in the Main
             // pass reads to the picker list's scrollable as "another detector
             // claimed this gesture", cancelling its drag recognition — which
-            // silently killed the nested-scroll swipe-down cancel for real
-            // fingers (device-bisected). The offline takeover below carried
-            // the exact same bug for its tap targets — the pair Chip and text
-            // fields — until it too dropped the wrapper. No shield is needed
-            // either: the picker's ScalingLazyColumn is fillMaxSize, so ITS
-            // handlers own every hit on screen and nothing falls through to
-            // the session list below; and this overlay is a root-Box sibling,
-            // so no ancestor back detector can double-handle the pull.
+            // silently killed the picker's (since-retired) swipe-down cancel
+            // for real fingers (device-bisected). The offline takeover below
+            // carried the exact same bug for its tap targets — the pair Chip
+            // and text fields — until it too dropped the wrapper. No shield
+            // is needed either: the picker's ScalingLazyColumn is
+            // fillMaxSize, so ITS handlers own every hit on screen and
+            // nothing falls through to the session list below.
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(Halo.Palette.Background)
                     .testTag("haloSpawnPicker"),
             ) {
-                // Same API 31+ trap as the session list: the stretch-
-                // overscroll would consume every post-overpull drag delta
-                // before nested scroll sees it, making the picker's rebuilt
-                // swipe-down cancel unreachable by a real finger.
+                // No stretch-overscroll (API 31+), same reasoning as the
+                // card overlay's: an overlay must sit still at its scroll
+                // bounds. (Originally load-bearing for the retired pull-down
+                // cancel's nested-scroll leftovers.)
                 @OptIn(ExperimentalFoundationApi::class)
                 CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
                     HaloSpawnPicker(
@@ -719,39 +717,25 @@ private fun HaloAppBody(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(Halo.Palette.Background)
-                    // The card is modal (handoff §5: answering or "decide
-                    // later" are the only exits): this pointer node keeps
-                    // taps and swipes off the invisible screens underneath —
-                    // without it the back detector under the card still
-                    // receives input — and owns swipe-down as the "decide
-                    // later" exit.
-                    .pointerInput(Unit) {
-                        val threshold = size.height * SWIPE_THRESHOLD_FRACTION
-                        // #109: a system back gesture owns its drag — stand
-                        // down (the handler's completion is the one back).
-                        val claim = SystemBackDragClaim(systemBackInFlight)
-                        var total = 0f
-                        detectVerticalDragGestures(
-                            onDragStart = {
-                                claim.start()
-                                total = 0f
-                            },
-                            onDragEnd = { if (!claim.owns && total > threshold) nav = nav.back() },
-                        ) { change, dragAmount ->
-                            claim.update()
-                            total += dragAmount
-                            change.consume()
-                        }
-                    }
+                    // The card is modal (v3: the buttons — answer, "decide
+                    // later" — and the system back are the only exits; its
+                    // swipe-down died in the #109 vertical purge): this EMPTY
+                    // pointer node is a pure hit-test shield — being the
+                    // topmost full-size sibling it keeps taps and swipes off
+                    // the invisible screens underneath (load-bearing during
+                    // the result flash, whose layer has no input handling of
+                    // its own), while consuming nothing, so the card's child
+                    // recognizers keep working (the spawn picker's
+                    // consume-the-down trap below).
+                    .pointerInput(Unit) {}
                     .testTag("haloCard"),
             ) {
-                // No stretch-overscroll under the card: on API 31+ the
-                // platform stretch effect consumes every drag delta past the
-                // scroll bound AND the fling velocity, so the leftovers never
-                // reach the cards' overscroll-exit NestedScrollConnections and
-                // swipe-down ("decide later" / "answer later") is unreachable
-                // by touch. The card is a modal surface, not a stretchy list —
-                // disabling the effect restores the §5/§6 pull-down exit.
+                // No stretch-overscroll under the card (API 31+): a modal
+                // decision surface must sit still at its scroll bounds — the
+                // platform stretch reads as more content the card doesn't
+                // have. (Its original load-bearing role — letting the retired
+                // pull-down exits see nested-scroll leftovers — died with the
+                // v3 vertical purge.)
                 @OptIn(ExperimentalFoundationApi::class)
                 CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
                     AnimatedContent(
@@ -809,40 +793,28 @@ private fun HaloAppBody(
 
         // §7 voice overlay, above the card (a feed's Dictate and the card
         // both summon it) and below the offline takeover. Modal like the
-        // card. Swipe-down (= Cancel) only applies while SENDING: it stops
-        // watching but stays armed, so an eventual failure reopens the
-        // overlay — nothing else renders the restored draft. In the FAILED
-        // state the overlay is deliberately modal: Retry and Discard are the
-        // only exits, because a swipe-away would strand the restored text in
-        // a draft no Halo surface shows (the silent-loss class issue #20
-        // exists to prevent, at the rendering layer this time).
+        // card. The Cancel pill (v3: its pull-down twin died in the #109
+        // purge; the system back routes here too) only applies while
+        // SENDING: it stops watching but stays armed, so an eventual failure
+        // reopens the overlay — nothing else renders the restored draft. In
+        // the FAILED state the overlay is deliberately modal: Retry and
+        // Discard are the only exits, because any other escape would strand
+        // the restored text in a draft no Halo surface shows (the
+        // silent-loss class issue #20 exists to prevent, at the rendering
+        // layer this time).
         if (voiceOpen) {
             val cancelVoice = {
-                // Reads currentUi: the gesture closure below never restarts.
+                // Reads currentUi: fired from callbacks that can outlive
+                // this composition's captures.
                 if (currentUi.commandError == null) voiceOpen = false
             }
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(Halo.Palette.Background)
-                    .pointerInput(Unit) {
-                        val threshold = size.height * SWIPE_THRESHOLD_FRACTION
-                        // #109: a system back gesture owns its drag — stand
-                        // down (the handler's completion is the one back).
-                        val claim = SystemBackDragClaim(systemBackInFlight)
-                        var total = 0f
-                        detectVerticalDragGestures(
-                            onDragStart = {
-                                claim.start()
-                                total = 0f
-                            },
-                            onDragEnd = { if (!claim.owns && total > threshold) cancelVoice() },
-                        ) { change, dragAmount ->
-                            claim.update()
-                            total += dragAmount
-                            change.consume()
-                        }
-                    },
+                    // The same empty hit-test shield as the card overlay's:
+                    // blocks the screens underneath, consumes nothing.
+                    .pointerInput(Unit) {},
             ) {
                 HaloVoiceScreen(
                     ui = ui,
@@ -1028,7 +1000,6 @@ private fun PageLayer(
     status: String,
     onStepPage: (Int) -> Unit,
     onSelectPage: (Int) -> Unit,
-    onDrill: () -> Unit,
     onTapCenter: () -> Unit,
     onAnswer: () -> Unit,
     onUsageOpen: () -> Unit,
@@ -1081,36 +1052,17 @@ private fun PageLayer(
         }
     }
 
-    val drill by rememberUpdatedState(onDrill)
     val step by rememberUpdatedState(onStepPage)
     val systemBackInFlight = LocalHaloSystemBackInFlight.current
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            // Swipe up drills into the list under the current page. Vertical
-            // only — threshold per the handoff. On the settings/usage pages
-            // the drill lands in HaloNav's no-op (#57): both are flat,
-            // depth-less glance surfaces.
-            .pointerInput(Unit) {
-                val threshold = size.height * SWIPE_THRESHOLD_FRACTION
-                // #109: a system back gesture owns its drag — stand down.
-                val claim = SystemBackDragClaim(systemBackInFlight)
-                var total = 0f
-                detectVerticalDragGestures(
-                    onDragStart = {
-                        claim.start()
-                        total = 0f
-                    },
-                    onDragEnd = { if (!claim.owns && total < -threshold) drill() },
-                ) { _, dragAmount ->
-                    claim.update()
-                    total += dragAmount
-                }
-            }
             // Horizontal swipes step the nav-owned page (no drag-follow by
-            // design). Deltas are CONSUMED so the centerpiece's whole-screen
-            // clickable sees the gesture as claimed and cancels its press —
-            // the tap guard stays as the second line of defence.
+            // design); vertical drags do NOTHING here since the v3 purge —
+            // the centerpiece tap is the one way down. Deltas are CONSUMED
+            // so the centerpiece's whole-screen clickable sees the gesture
+            // as claimed and cancels its press — the tap guard stays as the
+            // second line of defence.
             .pointerInput(Unit) {
                 val threshold = size.width * SWIPE_THRESHOLD_FRACTION
                 // #109: THE race's surface — an in-flight system back's edge
@@ -1341,54 +1293,5 @@ private fun PageDots(
                 )
             }
         }
-    }
-}
-
-// ── Inner-screen chrome (depth = LIST / SESSION) ────────────────────────────
-
-/**
- * Wraps every screen below the pager with the shared chrome: the
- * swipe-down-to-go-back gesture — and, since the S7 morphs, NO background:
- * the root ring host is the persistent bottom layer, and the dash split /
- * grow morphs play through these screens' content fades (the feed's mask and
- * the pager's insets already keep content off the ring channel). The top
- * clock these screens show is the ROOT TimeText (v2 shell) — lifted so the
- * morphs can fade content without blinking the time. The back detector sits
- * UNDER the content, so it only covers screens without a full-screen
- * scrollable: a scrollable child consumes every vertical drag (its leftover
- * goes to nested scroll, never back to pointer input) and has to re-provide
- * back itself — the touch-scrolling feed (v2 S6) does, via its at-top
- * pull-down connection, exactly as the retired session list did. The v2
- * pager (and the feed's empty state) has no scrollable, so vertical drags
- * there fall through to this one detector.
- */
-@Composable
-private fun InnerScreen(
-    onBack: () -> Unit,
-    content: @Composable () -> Unit,
-) {
-    val back by rememberUpdatedState(onBack)
-    val systemBackInFlight = LocalHaloSystemBackInFlight.current
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .pointerInput(Unit) {
-                val threshold = size.height * SWIPE_THRESHOLD_FRACTION
-                // #109: a system back gesture owns its drag — stand down.
-                val claim = SystemBackDragClaim(systemBackInFlight)
-                var total = 0f
-                detectVerticalDragGestures(
-                    onDragStart = {
-                        claim.start()
-                        total = 0f
-                    },
-                    onDragEnd = { if (!claim.owns && total > threshold) back() },
-                ) { _, dragAmount ->
-                    claim.update()
-                    total += dragAmount
-                }
-            },
-    ) {
-        content()
     }
 }
