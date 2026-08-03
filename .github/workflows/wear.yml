@@ -8,12 +8,14 @@ on:
       - "skill/bridge/**"
       - ".github/workflows/wear.yml"
       - ".github/scripts/wear-e2e.sh"
+      - ".github/scripts/wear-e2e-fake-fork.mjs"
   pull_request:
     paths:
       - "wear/**"
       - "skill/bridge/**"
       - ".github/workflows/wear.yml"
       - ".github/scripts/wear-e2e.sh"
+      - ".github/scripts/wear-e2e-fake-fork.mjs"
 
 jobs:
   build:

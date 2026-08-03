@@ -47,8 +47,9 @@ import java.util.concurrent.TimeUnit
  * the full loop — pair with the code scraped from bridge stdout, watch an SSE
  * event render in a session feed, answer blocking permission hooks (single,
  * queued, allow-always) so each unblocks with the chosen decision, answer an
- * AskUserQuestion payload, and spawn + kill a real PTY session from the
- * session pager (the v2 one-session-per-screen list).
+ * AskUserQuestion payload, and spawn a claude session from the session pager
+ * (the v2 one-session-per-screen list) — born in the harness's fake Zed fork
+ * over the bridge's ACP inbox (issue #107) — then hide it again.
  *
  * The old control-page command box has no Halo equivalent (commands are
  * dictation-only and the recognizer cannot run headlessly); the ack-gated
@@ -590,9 +591,13 @@ class WalkingSkeletonTest {
             executor.shutdownNow()
         }
 
-        // --- Spawn a session from the pager, watch its feed, kill it ------
-        // The real bridge PTY-spawns the stubbed `claude` binary (see
-        // .github/scripts/wear-e2e.sh); its ready line arrives as pty-output.
+        // --- Spawn a session from the pager, watch its feed, hide it ------
+        // Claude spawns are born in the Zed fork since the ACP-only pivot —
+        // no PTY, no pty-output. The spawn POST rides the bridge's /acp/inbox
+        // to the harness's fake fork (.github/scripts/wear-e2e-fake-fork.mjs,
+        // issue #107), which registers a detached session, acks the spawn,
+        // and speaks one greeting turn; the bridge flushes that prose as a
+        // `message` event, the feed evidence this leg waits on below.
         drillToList()
         // Enumerate the WHOLE pager by stepping to the trailing spawn card:
         // the spawn adds one session and we must tell its card from every
@@ -634,24 +639,26 @@ class WalkingSkeletonTest {
         }
         val spawnedId = found ?: throw AssertionError("spawned session row never appeared")
 
-        // The spawned PTY's stub output reaches THIS session's feed. Scope
-        // the match to the feed subtree so text from another (prefetched or
-        // composed) surface can't satisfy it.
+        // The fake fork's greeting prose reaches THIS session's feed (the
+        // coalesced `message` flush at its turn end). Scope the match to the
+        // feed subtree so text from another (prefetched or composed) surface
+        // can't satisfy it.
         openPagerCard(spawnedId)
         compose.onNodeWithTag("haloPagerCard-$spawnedId").performClick()
         compose.waitUntil(60_000) {
             compose.onAllNodes(
-                hasText("stub-claude", substring = true) and
+                hasText("wear-e2e-fake-fork", substring = true) and
                     hasAnyAncestor(hasTestTag("haloFeed-$spawnedId")),
             ).fetchSemanticsNodes().isNotEmpty()
         }
 
         // Back to the pager (swipe right, the feed's v3 back) — the
         // selection survives the feed round trip, so the spawned card is up
-        // with its action arc's close, which kills the session via
-        // /v1/command. The bridge pushes `session ended killed:true`; the
-        // kill-under-cursor self-heal re-selects a neighbour and the pager
-        // stays steppable.
+        // with its action arc's close. An ACP slot is EXTERNAL (the bridge
+        // owns no process it could stop), so the close is the honest LOCAL
+        // hide of issue #53 — no bridge round trip, the card just leaves the
+        // pager; the close-under-cursor self-heal re-selects a neighbour and
+        // the pager stays steppable.
         compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeRight() }
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-$spawnedId").assertIsDisplayed()
