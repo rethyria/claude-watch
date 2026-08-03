@@ -191,6 +191,15 @@ class ConnectionEngine(
     private var reconnectEpoch = 0 // last stream epoch a reconnect was scheduled for
     private var stopped = true
 
+    // True while an SSE stream is actually OPEN at the current epoch (issue
+    // #106): set by onOpen, dropped on any stream failure/close/reconnect and
+    // on teardown. Pair attempts consult THIS — never the surfaced _state,
+    // which their own Pairing write may be masking — to keep a failed
+    // side-attempt from demoting a live connection: a healthy stream never
+    // re-emits Connected, so a mask over it would stick until process death
+    // (the live trace's "three failures, no connection" over an open stream).
+    private var streamLive = false
+
     // Bumped by every action that must abort an in-flight pair() before it
     // commits: a user stop()/unpair and a concurrent pair() winning the race.
     // Deliberately NOT bumped by a definitive 401 tearing the previous token
@@ -284,6 +293,18 @@ class ConnectionEngine(
         /** The bridge refused with 403 — its pairing window is closed/locked. */
         data object WindowClosed : PairOutcome
 
+        /**
+         * The 403 lockout from a bridge whose credential this device ALREADY
+         * HOLDS (issue #106): probably already connected — the single-use
+         * window closed behind our own successful pair, and this attempt
+         * raced it (or a stale pairing screen re-fired). Verification is
+         * already in flight (observing the open stream, or reconnecting/
+         * resuming with the held credential), so there is NO error to
+         * surface; a dead credential still fails honestly downstream — the
+         * verification's 401 lands in [ConnectionState.AuthExpired].
+         */
+        data object AlreadyPaired : PairOutcome
+
         /** Anything else (unreachable, decoy, proto too old, wrong code, superseded). */
         data class Failed(val message: String) : PairOutcome
     }
@@ -311,7 +332,13 @@ class ConnectionEngine(
         deviceName: String,
     ): PairOutcome = withContext(io) {
         val myPairGeneration = synchronized(lock) {
-            _state.value = ConnectionState.Pairing
+            // Issue #106: an OPEN stream is live truth on screen — the
+            // cosmetic Pairing write would flip paired false and remount the
+            // pairing takeover over a working connection, and a healthy
+            // stream never re-emits Connected to clear the mask. A stale
+            // screen's pair tap while connected leaves the surfaced state
+            // alone (its outcome never surfaces either — see failPair).
+            if (!streamLive) _state.value = ConnectionState.Pairing
             pairGeneration
         }
         val candidate = try {
@@ -367,6 +394,20 @@ class ConnectionEngine(
         val newToken = body?.optString("token").takeUnless { it.isNullOrEmpty() }
         if (!result.ok || body == null || newToken == null) {
             val error = body?.optString("error") ?: ""
+            // Issue #106: a 403 lockout from a bridge whose credential this
+            // device already holds is "probably already connected", not a
+            // failure — the single-use window locked behind our OWN pair (a
+            // concurrent tap's success, or an earlier pairing this bridge
+            // still honors). Showing the lockout as an error sent the user
+            // retrying against a door already open behind them; instead,
+            // verify: an open stream is proof on the spot, otherwise
+            // reconnect/resume with the held credential and let THAT outcome
+            // surface (Connected dismisses the screen; a revoked token lands
+            // in the honest AuthExpired).
+            if (result.status == 403 && holdsCredentialFor(ping.bridgeId)) {
+                verifyProbablyConnected(myPairGeneration)
+                return@withContext PairOutcome.AlreadyPaired
+            }
             failPair(myPairGeneration, ConnectionState.PairFailed("${result.status} $error".trim()))
             // A 403 is the bridge's closed-window lockout: the Discover UI turns
             // this into the honest "open pairing on the bridge (SIGUSR1)" hint,
@@ -477,7 +518,76 @@ class ConnectionEngine(
     private fun failPair(myPairGeneration: Int, failure: ConnectionState) {
         synchronized(lock) {
             if (pairGeneration != myPairGeneration) return
+            // Issue #106: an OPEN stream outranks a failed side-attempt.
+            // Surfacing the failure would demote paired to false over a live
+            // connection — and STICK, because a healthy stream emits no
+            // further transitions to heal the mask, leaving the user to
+            // retry against a door already open behind them (the exact live
+            // trace this issue was filed from). The attempt still fails for
+            // its caller; only the screen-facing state stands down.
+            if (streamLive) return
             _state.value = failure
+        }
+    }
+
+    /**
+     * Issue #106: whether this device already holds a credential for
+     * [bridgeId] — the live engine's pinned pairing, or the persisted
+     * store's (the engine may be stopped, e.g. after a notification
+     * disconnect). A 403 pair lockout from such a bridge means "the window
+     * locked behind OUR pair", not "you are shut out": the caller verifies
+     * connectivity instead of surfacing an error.
+     */
+    private suspend fun holdsCredentialFor(bridgeId: String): Boolean {
+        synchronized(lock) {
+            if (!stopped && token != null && pinnedBridgeId == bridgeId) return true
+        }
+        return store.read().credentials?.bridgeId == bridgeId
+    }
+
+    /** What [verifyProbablyConnected] decided under the lock (acted on outside it). */
+    private enum class Verify { NONE, RECONNECT, RESUME }
+
+    /**
+     * Issue #106: a 403 already-paired landed while this device holds that
+     * bridge's credential — resolve "probably connected" into a verified
+     * state instead of an error. An OPEN stream is the verification itself
+     * (re-assert Connected in case this attempt's Pairing write masked it);
+     * a live-but-down engine verifies NOW by reconnecting instead of showing
+     * an error for the rest of a backoff window; a stopped engine resumes
+     * from the persisted credential. Every path ends in an honest state:
+     * Connected dismisses the pairing screen, a dead token lands in
+     * AuthExpired, an unreachable bridge keeps the ordinary retry loop.
+     */
+    private fun verifyProbablyConnected(myPairGeneration: Int) {
+        val action = synchronized(lock) {
+            // A stop() or another pair()'s commit raced this outcome:
+            // whatever won owns the engine now — nothing to verify.
+            if (pairGeneration != myPairGeneration) return
+            when {
+                streamLive -> {
+                    _state.value = ConnectionState.Connected
+                    Verify.NONE
+                }
+                !stopped -> {
+                    // Kick the verification connect in place of the pending
+                    // backoff wait; a failure re-enters the retry loop.
+                    reconnectJob?.cancel()
+                    reconnectJob = null
+                    Verify.RECONNECT
+                }
+                else -> {
+                    // Lower the Pairing state so start()'s Stopped guard
+                    // lets the resume run.
+                    _state.value = ConnectionState.Stopped
+                    Verify.RESUME
+                }
+            }
+        }
+        when (action) {
+            Verify.NONE -> Unit
+            Verify.RECONNECT -> connect()
+            Verify.RESUME -> start()
         }
     }
 
@@ -633,6 +743,7 @@ class ConnectionEngine(
             eventSource?.cancel()
             eventSource = null
             epoch += 1
+            streamLive = false // nothing is open until the NEW stream's onOpen
             myEpoch = epoch
             currentClient = client ?: return
             currentToken = token ?: return
@@ -893,8 +1004,21 @@ class ConnectionEngine(
 
     private fun listenerFor(myEpoch: Int) = object : EventSourceListener() {
         override fun onOpen(eventSource: EventSource, response: Response) {
-            if (!isCurrent(myEpoch)) return
-            synchronized(lock) { attempt = 0 }
+            // Liveness check, attempt reset and the streamLive flip commit in
+            // ONE critical section (issue #106): a pair failure racing this
+            // open must either see the live stream under the lock and stand
+            // down, or land its state strictly before Connected below
+            // overwrites it — never a stuck PairFailed over an open stream.
+            val current = synchronized(lock) {
+                if (stopped || epoch != myEpoch) {
+                    false
+                } else {
+                    attempt = 0
+                    streamLive = true
+                    true
+                }
+            }
+            if (!current) return
             _state.value = ConnectionState.Connected
             // The stream is healthy again: drop any held Wi-Fi escalation so
             // the platform can return to the battery-friendly BT-proxy path.
@@ -936,6 +1060,7 @@ class ConnectionEngine(
     private fun scheduleReconnect(myEpoch: Int, reason: String, escalatePath: Boolean = false) {
         synchronized(lock) {
             if (stopped || epoch != myEpoch) return
+            streamLive = false // the failing stream is dead air from here
             // Escalate only while the engine is still live at OUR epoch, and
             // under the same lock teardownLocked() runs its release() under —
             // so an escalation can never land after the teardown that was
@@ -1000,6 +1125,7 @@ class ConnectionEngine(
     private fun teardownLocked() {
         stopped = true
         epoch += 1
+        streamLive = false
         reconnectJob?.cancel()
         reconnectJob = null
         eventSource?.cancel()

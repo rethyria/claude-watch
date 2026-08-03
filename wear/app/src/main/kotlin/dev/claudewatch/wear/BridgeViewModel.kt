@@ -274,6 +274,19 @@ class BridgeViewModel(
                         status = statusText(connection),
                         paired = connection.isPairedState(),
                         repairExplanation = repairExplanation(connection),
+                        // Issue #106: an OPEN stream retires a stale Discover
+                        // pair error — the connection disproves the failure
+                        // (a concurrent attempt's success, or a resumed
+                        // earlier pairing). Connecting/Reconnecting do NOT
+                        // clear it: while the outcome is still open the
+                        // error may be the truth.
+                        discover = if (connection == ConnectionState.Connected &&
+                            it.discover is DiscoverUi.PairError
+                        ) {
+                            DiscoverUi.Idle
+                        } else {
+                            it.discover
+                        },
                     )
                 }
             }
@@ -377,22 +390,40 @@ class BridgeViewModel(
                     seedSessionFromSnapshot(outcome.snapshot)
                     _state.update { it.copy(discover = DiscoverUi.Idle) }
                 }
-                ConnectionEngine.PairOutcome.WindowClosed -> _state.update {
-                    it.copy(
-                        discover = DiscoverUi.PairError(
-                            bridge.bridgeId,
-                            "Pairing is closed on that bridge. Open it on the computer (SIGUSR1), then tap again.",
-                        ),
-                    )
-                }
-                is ConnectionEngine.PairOutcome.Failed -> _state.update {
-                    it.copy(
-                        discover = DiscoverUi.PairError(
-                            bridge.bridgeId,
-                            "Couldn't pair: ${outcome.message}. Tap to retry.",
-                        ),
-                    )
-                }
+                // Issue #106: the 403 lockout on a bridge whose credential
+                // this device holds — probably already connected, and the
+                // engine's verification is in flight. NO PairError: the state
+                // lands Connected (the screen dismisses) or an honest
+                // AuthExpired; an error here would be exactly the stale lie
+                // that sent the user retrying a door already open behind them.
+                ConnectionEngine.PairOutcome.AlreadyPaired ->
+                    _state.update { it.copy(discover = DiscoverUi.Idle) }
+                ConnectionEngine.PairOutcome.WindowClosed -> discoverPairFailed(
+                    bridge.bridgeId,
+                    "Pairing is closed on that bridge. Open it on the computer (SIGUSR1), then tap again.",
+                )
+                is ConnectionEngine.PairOutcome.Failed -> discoverPairFailed(
+                    bridge.bridgeId,
+                    "Couldn't pair: ${outcome.message}. Tap to retry.",
+                )
+            }
+        }
+    }
+
+    /**
+     * Surface a Discover pair failure — unless the stream is OPEN by the time
+     * the outcome lands (issue #106): a concurrent attempt's success can
+     * outrun a loser's error, and a stale failure must never survive it. The
+     * state collector clears the inverse ordering (error first, Connected
+     * after); this guard covers the error landing last, which the collector —
+     * keyed on state CHANGES — would never see.
+     */
+    private fun discoverPairFailed(bridgeId: String, message: String) {
+        _state.update {
+            if (connection.value == ConnectionState.Connected) {
+                it.copy(discover = DiscoverUi.Idle)
+            } else {
+                it.copy(discover = DiscoverUi.PairError(bridgeId, message))
             }
         }
     }

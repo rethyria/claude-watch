@@ -80,12 +80,15 @@ class ConnectionEngineTest {
     // probePorts is empty in the lifecycle tests: the default 7860..7869
     // ladder would ping real bridges running on this machine's loopback.
     // DiscoveryTest covers the probe ladder with injected candidate ports.
-    private fun newEngine(heartbeatMs: Long = BridgeClient.DEFAULT_HEARTBEAT_TIMEOUT_MS) =
+    private fun newEngine(
+        heartbeatMs: Long = BridgeClient.DEFAULT_HEARTBEAT_TIMEOUT_MS,
+        backoff: BackoffPolicy = BackoffPolicy(baseMs = 40, maxMs = 200, random = Random(7)),
+    ) =
         ConnectionEngine(
             store = store,
             scope = scope,
             clientFactory = { hostIp, port -> BridgeClient(hostIp, port, heartbeatTimeoutMs = heartbeatMs) },
-            backoff = BackoffPolicy(baseMs = 40, maxMs = 200, random = Random(7)),
+            backoff = backoff,
             probePorts = emptyList(),
         ).also { engine = it }
 
@@ -538,16 +541,22 @@ class ConnectionEngineTest {
         awaitCondition { engine.state.value == ConnectionState.Connected }
         awaitCondition { events.any { it.id == "7" } }
 
-        // One accidental Pair tap while connected. It fails (pairing locked)…
+        // One accidental Pair tap while connected. It fails (pairing locked) —
+        // and since issue #106 the OPEN stream also outranks the failure on
+        // screen: the 403 lockout on a bridge whose credential we hold is
+        // "already connected", observed on the spot, so the surfaced state
+        // stays Connected instead of a PairFailed that nothing would ever
+        // clear (a healthy stream never re-emits Connected).
         assertNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
-        assertTrue(engine.state.value is ConnectionState.PairFailed)
+        assertEquals(ConnectionState.Connected, engine.state.value)
 
-        // …and a re-pair attempt against an unreachable bridge fails too.
+        // …and a re-pair attempt against an unreachable bridge fails too —
+        // equally without demoting the live connection's surfaced state.
         val dead = MockWebServer().also { it.start() }
         val deadPort = dead.port
         dead.shutdown()
         assertNull(runBlocking { engine.pair("127.0.0.1", deadPort, "123456", "wear-test") })
-        assertTrue(engine.state.value is ConnectionState.PairFailed)
+        assertEquals(ConnectionState.Connected, engine.state.value)
 
         // Neither failed attempt may have torn the live engine down: the
         // previous pairing's credentials are still persisted, and authed
@@ -672,5 +681,119 @@ class ConnectionEngineTest {
         Thread.sleep(500)
         assertEquals("a rejected code is not retried", 2, server.requestCount)
         assertEquals("tok-old", credentialsInStore()!!.token)
+    }
+
+    // -- Issue #106: 403 already-paired with a held credential --------------
+
+    private fun alreadyPaired403() = MockResponse().setResponseCode(403).setBody(
+        """{"error":"Already paired. Re-pairing requires explicit authorization on the bridge."}""",
+    )
+
+    /**
+     * Issue #106 (the live trace's core): a 403 already-paired while this
+     * engine holds that bridge's credential is "probably already connected" —
+     * the single-use window locked behind our OWN pair. With the stream DOWN
+     * (mid-backoff) the engine verifies by reconnecting NOW instead of
+     * surfacing an error for the rest of the backoff window: PairFailed never
+     * surfaces, the held token reopens the stream, and the state lands
+     * Connected — which is what dismisses the pairing screen.
+     */
+    @Test
+    fun a403AlreadyPairedWithAHeldCredentialVerifiesByReconnectNotError() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse()) // tok-1
+        server.enqueue(sseEnding(":connected\n\n")) // opens, then dies → backoff
+
+        // Backoff far past the test horizon: the reconnect that heals the
+        // dropped stream below must be the VERIFICATION kick, never the
+        // scheduled retry firing on its own.
+        val engine = newEngine(backoff = BackoffPolicy(baseMs = 300_000, maxMs = 300_000))
+        val seen = CopyOnWriteArrayList<ConnectionState>()
+        scope.launch { engine.state.collect { seen.add(it) } }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value is ConnectionState.Reconnecting }
+
+        server.enqueue(pingResponse()) // the retry's pair preflight
+        server.enqueue(alreadyPaired403())
+        server.enqueue(pingResponse()) // the verification connect's preflight
+        server.enqueue(sseHeld(":connected\n\n"))
+
+        // The stale-screen retry the live trace pinned: no snapshot returned…
+        assertNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        // …but the outcome is a verified live connection, not an error.
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        assertTrue(
+            "the held-credential 403 must never surface as PairFailed; saw $seen",
+            seen.none { it is ConnectionState.PairFailed },
+        )
+        assertEquals("tok-1", credentialsInStore()?.token)
+
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("/v1/events", takeRequest().path)
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("/v1/ping", takeRequest().path)
+        takeRequest().let {
+            // The verification IS an authenticated request: the stream
+            // reopens with the token the 403 claimed we already hold.
+            assertEquals("/v1/events", it.path)
+            assertEquals("Bearer tok-1", it.getHeader("Authorization"))
+        }
+    }
+
+    /**
+     * Issue #106: the same 403 lockout against a STOPPED engine that still
+     * holds the bridge's PERSISTED credential (e.g. after a notification
+     * disconnect) resumes from the store instead of erroring — the pairing
+     * screen then dismisses on the resumed stream, exactly as if the user
+     * had never tapped pair. A dead persisted token would land in the honest
+     * AuthExpired downstream instead.
+     */
+    @Test
+    fun a403AlreadyPairedOnAStoppedEngineResumesFromThePersistedCredential() {
+        runBlocking {
+            store.saveCredentials(BridgeCredentials("tok-old", "127.0.0.1", server.port, "b-1"))
+        }
+        server.enqueue(pingResponse()) // pair preflight
+        server.enqueue(alreadyPaired403())
+        server.enqueue(pingResponse()) // the resume's cold-start preflight
+        server.enqueue(sseHeld(":connected\n\n"))
+
+        val engine = newEngine() // never start()ed: Stopped, nothing in memory
+        assertNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+
+        assertEquals("tok-old", credentialsInStore()?.token)
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("/v1/ping", takeRequest().path)
+        takeRequest().let {
+            assertEquals("/v1/events", it.path)
+            assertEquals("Bearer tok-old", it.getHeader("Authorization"))
+        }
+    }
+
+    /**
+     * Issue #106's genuine-failure guard: the SAME 403 lockout with NO stored
+     * credential for that bridge is a real refusal — the operator must reopen
+     * pairing on the bridge — and surfaces exactly as before. Nothing is
+     * verified, nothing resumes, nothing is wiped.
+     */
+    @Test
+    fun a403LockoutWithNoStoredCredentialStillSurfacesTheFailure() {
+        server.enqueue(pingResponse())
+        server.enqueue(alreadyPaired403())
+
+        val engine = newEngine()
+        assertNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+
+        val state = engine.state.value
+        assertTrue("expected PairFailed, got $state", state is ConnectionState.PairFailed)
+        assertTrue((state as ConnectionState.PairFailed).message.startsWith("403"))
+        assertNull(credentialsInStore())
+        Thread.sleep(500)
+        assertEquals("no verification traffic without a credential", 2, server.requestCount)
     }
 }

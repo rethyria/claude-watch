@@ -2262,4 +2262,91 @@ class BridgeViewModelTest {
         awaitStatus { it == "paired, stream open" }
         awaitUi { it.discover is BridgeViewModel.DiscoverUi.Idle }
     }
+
+    /**
+     * Issue #106: a 403 already-paired on a bridge whose credential this
+     * device HOLDS (here: the live pairing established moments earlier — the
+     * stale-screen double-tap of the live trace) surfaces NO error at all.
+     * The engine observes the open stream as the verification, the panel
+     * stays Idle, and the status keeps reporting the open stream — never a
+     * "pair failed" the connection disproves.
+     */
+    @Test
+    fun pairByDiscoveryAlreadyPaired403WithAHeldCredentialSurfacesNoError() {
+        enqueuePing()
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(16, 250, TimeUnit.MILLISECONDS)
+                .setBody(":connected\n\n" + ":pad\n\n".repeat(400)),
+        )
+
+        val bridge = BridgeDiscovery.DiscoveredBridge("Mac-Studio", "127.0.0.1", server.port, "b-1")
+        viewModel = BridgeViewModel(store, discovery = fakeDiscovery(listOf(bridge)))
+        viewModel.pairByDiscovery(bridge)
+        awaitStatus { it == "paired, stream open" }
+
+        // The retry against the now-locked window: ping OK, then the 403.
+        enqueuePing()
+        server.enqueue(
+            MockResponse().setResponseCode(403).setBody(
+                """{"error":"Already paired. Re-pairing requires explicit authorization on the bridge."}""",
+            ),
+        )
+        viewModel.pairByDiscovery(bridge)
+
+        // Wait for the retry's round-trip to land (ping + pair = 5 requests),
+        // then give a buggy PairError write time to surface before asserting.
+        val deadline = System.currentTimeMillis() + 15_000
+        while (server.requestCount < 5 && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertEquals(5, server.requestCount)
+        Thread.sleep(500)
+        assertTrue(
+            "no error may surface for an already-paired 403 with a held credential; " +
+                "discover was ${viewModel.state.value.discover}",
+            viewModel.state.value.discover is BridgeViewModel.DiscoverUi.Idle,
+        )
+        assertEquals("paired, stream open", viewModel.state.value.status)
+    }
+
+    /**
+     * Issue #106: a stale Discover pair error must not survive a later
+     * success — once the stream is OPEN the connection disproves the failure.
+     * Here the error is earned honestly (403 lockout, NO stored credential),
+     * then a manual pair with the fresh code succeeds: the moment Connected
+     * lands, the collector retires the stale PairError to Idle.
+     */
+    @Test
+    fun staleDiscoverPairErrorClearsOnceTheStreamConnects() {
+        enqueuePing()
+        server.enqueue(
+            MockResponse().setResponseCode(403).setBody(
+                """{"error":"Already paired. Re-pairing requires explicit authorization on the bridge."}""",
+            ),
+        )
+
+        val bridge = BridgeDiscovery.DiscoveredBridge("Mac-Studio", "127.0.0.1", server.port, "b-1")
+        viewModel = BridgeViewModel(store, discovery = fakeDiscovery(listOf(bridge)))
+        viewModel.pairByDiscovery(bridge)
+        awaitUi { it.discover is BridgeViewModel.DiscoverUi.PairError }
+
+        // The operator reopened pairing; the manual retry with the fresh
+        // code succeeds and the stream opens.
+        enqueuePing()
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-2","bridgeId":"b-1","sessions":[]}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(16, 250, TimeUnit.MILLISECONDS)
+                .setBody(":connected\n\n" + ":pad\n\n".repeat(400)),
+        )
+        viewModel.pair("127.0.0.1", server.port.toString(), "654321")
+        awaitStatus { it == "paired, stream open" }
+        awaitUi { it.discover is BridgeViewModel.DiscoverUi.Idle }
+    }
 }
