@@ -235,10 +235,11 @@ bridge maps it to `behavior: "allow"` + `updatedPermissions` so the prompt
 does not recur — and the AskUserQuestion card: a blocking two-question hook
 renders both questions, one answered by option chip and one by typed free
 text, and unblocks with both answers keyed by question text in
-`updatedInput.answers` — then spawns a session from the watch, swipes the pager to
-its live terminal (the stubbed agent's PTY output renders as terminal
-lines), and kills it from the page header, asserting the bridge's
-`session ended` prunes the page.
+`updatedInput.answers` — then spawns a claude session from the watch (born in
+the harness's fake Zed fork over the bridge's ACP inbox — see
+`.github/scripts/wear-e2e-fake-fork.mjs`, issue #107), swipes the pager to its
+feed (the fork's greeting turn renders as assistant prose), and closes it from
+the action arc — the honest local hide for an external ACP slot.
 
 `SessionPagerTest` (instrumented, no bridge) renders `SessionPagerScreen`
 directly from fixture events folded through the shared reducer: pager
