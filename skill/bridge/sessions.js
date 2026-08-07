@@ -507,8 +507,17 @@ export function refreshGitMetadata(slot) {
 // PTY output, a headless prompt run). That signal set is deliberately the SAME
 // one the watch reducer folds into markIdle/markWorking, so the flag is
 // exactly "what a client watching live would have computed" — pre-computed for
-// the clients that were NOT watching. A fresh slot is simply born without the
-// field: absent means working, per the omit-when-false wire doctrine below.
+// the clients that were NOT watching.
+//
+// On the WIRE, absence still means working (the omit-when-false doctrine
+// below), but on the SLOT it does not: the connect-time sync reports the flag
+// as a tri-state and an unset one there means "no turn signal has EVER been
+// observed", which clients render idle. So every path that observes work must
+// say `false` OUT LOUD rather than leave the field unset — PTY bytes
+// (bindPtyProcess), a Codex file write (codex.js), an ACP turn start — and a
+// slot with no field is reserved for the sessions the bridge genuinely cannot
+// vouch for (an ACP register that reported no `active` and has yet to run a
+// turn). Leaving a working session unflagged reads as that, and paints it grey.
 //
 // Setting it never broadcasts. Live clients already learn a turn end from the
 // `stop`/`task-complete` event and new work from the output events, so an
@@ -1221,18 +1230,24 @@ export function bindPtyProcess(slot, proc) {
   });
 
   // Bytes out of the PTY are the bridge-owned equivalent of the tool-output
-  // hook: work is happening, so a slot idled by an earlier turn is working
-  // again (issue #60). Written under a guard — this is the hottest path in the
-  // bridge and the flag is false almost every time.
+  // hook: work is happening, so the slot is working (issue #60). The guard
+  // tests `!== false`, NOT truthiness: a PTY slot is born with no flag at all,
+  // and `undefined` is falsy, so a truthy guard left a slot that had never
+  // idled unflagged FOREVER. That was invisible while absence meant "working"
+  // everywhere — but the connect-time sync now reads an unflagged slot as "no
+  // turn signal ever observed" and clients render that grey, so a PTY session
+  // mid-long-command greyed out (and restarted its elapsed clock) on every
+  // reconnect. Same one-assignment-per-turn cost on this, the hottest path in
+  // the bridge: after the first byte the guard is false every time.
   proc.stdout.on("data", (data) => {
     if (!slot.firstOutputSeen) flushReadyWaiters(slot, true);
-    if (slot.idle) slot.idle = false;
+    if (slot.idle !== false) slot.idle = false;
     pushSseEvent("pty-output", { text: data.toString() }, sessionId);
   });
 
   proc.stderr.on("data", (data) => {
     if (!slot.firstOutputSeen) flushReadyWaiters(slot, true);
-    if (slot.idle) slot.idle = false;
+    if (slot.idle !== false) slot.idle = false;
     pushSseEvent("pty-output", { text: data.toString() }, sessionId);
   });
 

@@ -21,7 +21,9 @@ import {
 import {
   sessions,
   attachPtyToSession,
+  markSessionIdle,
   markSessionObserved,
+  markSessionWorking,
   registerSessionCleanupHook,
   writeToSessionStdin,
 } from "./sessions.js";
@@ -106,6 +108,14 @@ function touchExternalSession(sessionId, cwd, createdAt) {
     existing.folderName = folderName;
     existing.state = "running";
     existing.createdAt = createdAt || existing.createdAt || Date.now();
+    // ...and the write is WORK, not just existence — the callers are the
+    // session header (a rollout file appearing) and `task_started`, both turn
+    // starts. Said out loud as `false` rather than left unset, because the
+    // connect-time sync reads an unset flag as "no turn signal ever observed"
+    // and clients render THAT grey (issue #60): a Codex slot never touched
+    // markSessionWorking, so a session mid-exec painted idle on every
+    // reconnect. The turn end that lowers it again is `task_complete` below.
+    existing.idle = false;
     if (wasEnded) {
       pushSseEvent("session", { state: "running", agent: "codex", cwd: resolvedCwd, folderName }, sessionId);
       log("info", `Revived Codex session ${sessionId} (${folderName}) from local session data`);
@@ -121,6 +131,9 @@ function touchExternalSession(sessionId, cwd, createdAt) {
     ptyProcess: null,
     state: "running",
     createdAt: createdAt || Date.now(),
+    // Born working, said out loud (see the revive branch above): we are here
+    // because the scanner watched this session write.
+    idle: false,
   };
   // createdAt comes off the session FILE and can already be minutes old, so
   // the ageing clock (issue #65) starts from the detection instead.
@@ -170,6 +183,13 @@ function extractPatchPaths(rawPatch) {
 }
 
 function emitCodexToolEvent(sessionId, toolName, toolInput = {}, toolOutput = null) {
+  // The single funnel for every `tool-output` this lane pushes, so it is also
+  // the single place the slot's turn flag can be kept in step with what a
+  // client watching LIVE computes from the same frame (markWorking). The two
+  // must agree or the connect-time snapshot contradicts the stream it closes:
+  // a Codex session whose turn is still running would otherwise carry the
+  // `idle: true` left by the previous `task_complete` (issue #60).
+  markSessionWorking(sessionId);
   pushSseEvent("tool-output", {
     source: "codex",
     tool_name: toolName,
@@ -421,6 +441,12 @@ function handleCodexJsonlLine(line, fileState, options = {}) {
     return;
   }
   if (payloadType === "task_complete") {
+    // Codex's turn end, and the mirror of the `false` every observed write
+    // sets above: a client folds the frame below into markIdle, so the slot's
+    // flag has to move with it or the next connect-time sync would say `idle:
+    // false` for a session that finished hours ago — WAKING it on the wrist
+    // and restarting its elapsed clock on every reconnect (issue #60).
+    markSessionIdle(sessionId);
     pushSseEvent("task-complete", { source: "codex" }, sessionId);
   }
 }

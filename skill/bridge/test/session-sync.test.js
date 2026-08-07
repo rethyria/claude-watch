@@ -14,7 +14,9 @@
 // watch drives: connect to /events and read what the snapshot says.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { startBridge, request, connectSse } from "./helpers.js";
+import fs from "node:fs";
+import path from "node:path";
+import { startBridge, request, connectSse, tempDir } from "./helpers.js";
 
 async function pair(bridge) {
   const res = await request(bridge.port, "POST", "/pair", { body: { code: bridge.pairingCode } });
@@ -32,6 +34,24 @@ async function createSession(bridge, token, hookSessionId, cwd) {
   const slot = status.body.sessions.find((s) => s.cwd === cwd && s.state === "running");
   assert.ok(slot, `session for ${cwd} was created`);
   return slot.id;
+}
+
+// The Codex lane is driven by a file scanner on its own interval, so its state
+// arrives when it arrives: poll /status (which omits `idle` unless true, the
+// same present-only-when-true rule the session payload follows) until the slot
+// exists and its verdict matches.
+async function waitForStatusIdle(bridge, token, sessionId, wantIdle, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  let seen = null;
+  for (;;) {
+    const status = await request(bridge.port, "GET", "/status", { token });
+    seen = status.body.sessions.find((s) => s.id === sessionId) ?? null;
+    if (seen && (seen.idle === true) === wantIdle) return seen;
+    if (Date.now() > deadline) {
+      assert.fail(`session ${sessionId} never reached idle=${wantIdle}; last seen ${JSON.stringify(seen)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
 }
 
 // Open a NEW SSE client and return its whole connect-time snapshot, up to and
@@ -139,6 +159,88 @@ test("the sync says out loud whether each session is idle, working, or unobserve
     false,
     "a working session's `session` payload still carries no flag at all",
   );
+});
+
+test("a PTY session producing output says `idle: false` out loud, never an omitted verdict", { timeout: 60_000 }, async (t) => {
+  // The omitted verdict means "no turn signal EVER observed", and clients paint
+  // that grey — so a slot that is genuinely working must never fall into it.
+  // A bridge-owned PTY is the kind most at risk: nothing in that lane calls
+  // markSessionWorking, so its flag is written by the stdout handler alone,
+  // and a slot that had never been idled used to leave it unset forever. The
+  // wrist paid for it on every reconnect: a session mid-long-command greyed
+  // out and its elapsed clock restarted from zero at the next byte.
+  const binDir = tempDir(t, "claude-watch-sync-60-bin-");
+  const bin = path.join(binDir, "codex");
+  fs.writeFileSync(bin, "#!/bin/sh\necho SYNC-60-WORKING\nexec cat\n", { mode: 0o755 });
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
+  const token = await pair(bridge);
+
+  // Codex keeps the PTY path — claude spawns are born in Zed-land (#86).
+  const live = connectSse(bridge.port, token);
+  t.after(() => live.close());
+  assert.equal(await live.statusCode(), 200);
+
+  const spawned = await request(bridge.port, "POST", "/v1/command", {
+    token,
+    body: { spawn: "codex", cwd: tempDir(t, "claude-watch-sync-60-project-") },
+  });
+  assert.equal(spawned.status, 200, JSON.stringify(spawned.body));
+  const sessionId = spawned.body.sessionId;
+
+  // Wait for the first byte rather than racing the stub's echo: the assertion
+  // is about what the flag says once work has been observed.
+  await live.waitFor((e) => e.event === "pty-output" && e.parsed?.sessionId === sessionId, 30_000);
+
+  const { sync } = await snapshot(t, bridge, token);
+  const entry = sync.sessions.find((s) => s.id === sessionId);
+  assert.ok(entry, `the running PTY slot is listed; got ${JSON.stringify(sync.sessions)}`);
+  assert.equal(
+    entry.idle,
+    false,
+    `a PTY slot that has produced output must say idle: false; got ${JSON.stringify(entry)}`,
+  );
+});
+
+test("a Codex session's verdict tracks its turns — working while it writes, idle once the task completes", { timeout: 60_000 }, async (t) => {
+  // The other lane with no markSessionWorking of its own: a Codex slot is born
+  // and refreshed by the session-file scanner, so before this its flag was
+  // never written at all and every sync omitted the verdict — a session
+  // mid-exec painted grey on the wrist. Both directions matter: saying `false`
+  // for a session that finished its turn hours ago would be the same lie
+  // inverted, and would WAKE it (restarting its elapsed clock) on every
+  // reconnect.
+  const home = tempDir(t, "claude-watch-sync-60-codex-home-");
+  const rolloutDir = path.join(home, ".codex", "sessions", "2026", "08", "07");
+  fs.mkdirSync(rolloutDir, { recursive: true });
+  const rollout = path.join(rolloutDir, "rollout-sync-60.jsonl");
+  const codexId = "cdx-sync-60";
+  const append = (obj) => fs.appendFileSync(rollout, `${JSON.stringify(obj)}\n`);
+  append({ type: "session_meta", payload: { id: codexId, cwd: home, timestamp: new Date().toISOString() } });
+
+  const bridge = await startBridge(t, { env: { HOME: home } });
+  const token = await pair(bridge);
+  await waitForStatusIdle(bridge, token, codexId, false);
+
+  const working = (await snapshot(t, bridge, token)).sync.sessions.find((s) => s.id === codexId);
+  assert.equal(
+    working.idle,
+    false,
+    `a Codex slot the scanner just watched write must say idle: false; got ${JSON.stringify(working)}`,
+  );
+
+  // Codex's turn end. The client folds the `task-complete` frame into markIdle,
+  // so the slot's own flag has to move with it or the snapshot contradicts the
+  // stream it closes.
+  append({ type: "event_msg", payload: { type: "task_complete" } });
+  await waitForStatusIdle(bridge, token, codexId, true);
+  assert.equal((await snapshot(t, bridge, token)).sync.sessions.find((s) => s.id === codexId).idle, true);
+
+  // ...and the next turn's tool output lowers it again, through the one funnel
+  // every Codex `tool-output` push goes down.
+  append({ type: "response_item", payload: { type: "function_call", call_id: "call-60", name: "exec_command", arguments: JSON.stringify({ cmd: "ls" }) } });
+  append({ type: "response_item", payload: { type: "function_call_output", call_id: "call-60", output: "README.md" } });
+  await waitForStatusIdle(bridge, token, codexId, false);
+  assert.equal((await snapshot(t, bridge, token)).sync.sessions.find((s) => s.id === codexId).idle, false);
 });
 
 test("a bridge with nothing running still sends the sync — an empty set is the whole truth, not silence", { timeout: 60_000 }, async (t) => {
