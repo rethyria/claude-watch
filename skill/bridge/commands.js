@@ -397,13 +397,52 @@ export async function handleCommand(req, res) {
     }
 
     if (!targetSession) {
-      // Auto-spawn a new session. Inject the command only once the PTY has
-      // produced its first output (the agent is actually up); a blind timed
-      // write silently dropped the command when the PTY died or wasn't ready,
-      // while the client still saw ok:true.
+      // Auto-spawn a new session and dictate into it.
       const requestedAgent = agent || "claude";
       const cwd = resolveSpawnCwd(res, body.cwd);
       if (cwd === null) return; // 400 already sent — no session slot created
+
+      // Dictating with nothing to dictate INTO. Under Zed-only a claude session
+      // is born in the fork exactly like the explicit spawn action (#91): this
+      // composes the same two machines — requestAcpSpawn, then the ordinary ACP
+      // inject — instead of the PTY auto-spawn it replaced, which was the last
+      // path that could mint a claude session Zed never sees (and which
+      // inherited #86's unsubmitted-text bug). Codex has no ACP adapter, so it
+      // keeps the PTY path below.
+      if (requestedAgent === "claude") {
+        const promptText = command.replace(/\n$/, "").trim();
+        if (!promptText) return jsonResponse(res, 400, { error: "Empty command" });
+        const acp = await requestAcpSpawn(cwd);
+        if (acp === null) {
+          return jsonResponse(res, 409, {
+            error: "No Zed agent connection — open Zed (claude-watch agent) and try again",
+          });
+        }
+        if (!acp.ok) {
+          // Same attribution contract as the spawn action: a session that
+          // finishes creating after this answer announces itself over SSE
+          // carrying this requestId, so the client can recognise it.
+          return jsonResponse(res, 409, { error: acp.error, spawnRequestId: acp.requestId });
+        }
+        // The session EXISTS from here on, so a delivery failure must name it:
+        // the fork can die between its ack and this write, and a client told
+        // only "failed" would strand a live session it could still dictate at.
+        if (!injectToAcpSession(acp.sessionId, promptText, "watch")) {
+          return jsonResponse(res, 502, {
+            error: "Spawned a Zed session but its adapter is no longer reachable; dictation not delivered",
+            sessionId: acp.sessionId, agent: "claude", kind: "acp",
+            spawnRequestId: acp.requestId, spawned: true,
+          });
+        }
+        return jsonResponse(res, 200, {
+          ok: true, sessionId: acp.sessionId, agent: "claude", kind: "acp",
+          spawnRequestId: acp.requestId, spawned: true, prompt: true,
+        });
+      }
+      // Codex: a bridge-owned PTY. Inject the command only once the PTY has
+      // produced its first output (the agent is actually up); a blind timed
+      // write silently dropped the command when the PTY died or wasn't ready,
+      // while the client still saw ok:true.
       const newId = spawnSession(requestedAgent, cwd);
       if (!newId) {
         return jsonResponse(res, 500, { error: `Failed to spawn ${requestedAgent}` });

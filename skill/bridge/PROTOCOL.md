@@ -405,11 +405,22 @@ from the option's `kind`) so logs and behavior-keyed consumers stay honest.
   refusals are distinguished: an ended bridge-owned session is reported as
   ended, never mislabeled as external.
 - Without `sessionId`: routed to the most recent active session, or
-  **auto-spawns** one (`agent`, default `"claude"`); the command is injected
-  only after the new PTY produces output → `200 { "ok": true, "sessionId":
-  ..., "agent": ..., "spawned": true }`, or `500` (with `sessionId`,
-  `spawned: true`) when the agent never became ready — the failed session is
-  killed, never left as a zombie target.
+  **auto-spawns** one (`agent`, default `"claude"`).
+  - **claude** composes the spawn of action 1 with the ACP injection above
+    (there is no PTY auto-spawn left for it): the session is born in Zed's
+    adapter and the dictated text is injected into it → `200 { "ok": true,
+    "sessionId": ..., "agent": "claude", "kind": "acp", "spawnRequestId": ...,
+    "spawned": true, "prompt": true }`. No adapter connected → the same honest
+    `409` as action 1, with nothing created; an adapter that fails the spawn →
+    `409` carrying its error and the `spawnRequestId`; a session created but no
+    longer reachable when the prompt is written → `502` **naming the session**
+    (`sessionId`, `spawned: true`), so the client can retry into it rather than
+    treat it as lost.
+  - **codex** keeps the bridge-owned PTY: the command is injected only after
+    the new PTY produces output → `200 { "ok": true, "sessionId": ...,
+    "agent": ..., "spawned": true }`, or `500` (with `sessionId`,
+    `spawned: true`) when the agent never became ready — the failed session is
+    killed, never left as a zombie target.
 - Unknown `sessionId` → `404`.
 
 None of the actions present → `400 {"error": "Missing 'command', 'spawn',
