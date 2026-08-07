@@ -178,6 +178,22 @@ describe("spawnDetachedSession (watch spawn)", () => {
     );
   });
 
+  it("polls the freshly-created session's title exactly ONCE (#90)", async () => {
+    // The creation-time poll existed twice back to back (a merge artifact), so
+    // every session cost two session-file reads and re-pulled a title that had
+    // just been read. One macrotask is enough to catch a duplicate: the two
+    // calls were fire-and-forget in the SAME tick, so both would already be
+    // counted here.
+    const bridge = makeFakeBridge();
+    const agent = new ClaudeAcpAgent(makeMockClient(), { log: () => {}, error: () => {} }, bridge);
+    getSessionInfoMock.mockClear();
+
+    await agent.spawnDetachedSession({ cwd: process.cwd() });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(getSessionInfoMock).toHaveBeenCalledTimes(1);
+  });
+
   it("a normal newSession is NOT detached and registers without the flag", async () => {
     const bridge = makeFakeBridge();
     const agent = new ClaudeAcpAgent(makeMockClient(), { log: () => {}, error: () => {} }, bridge);

@@ -6281,19 +6281,6 @@ export class ClaudeAcpAgent {
       });
     }
 
-    // Pull the title NOW rather than waiting for the first turn to end. The
-    // SDK's title poll is wired to turn-end, which is fine while a session runs
-    // but leaves a RESUMED one (Zed restarted, session/load) advertising its
-    // raw uuid to the watch until the user happens to send a prompt. A resumed
-    // session already has a title in its session file, so there is nothing to
-    // wait for. Best-effort and not awaited: a slow or missing session file
-    // must not delay session creation.
-    if (this.bridge) {
-      void this.maybeUpdateSessionTitle(sessionId, this.sessions[sessionId]!).catch(() => {
-        /* best-effort: the turn-end poll remains the fallback */
-      });
-    }
-
     // Publish the context window NOW. Every other `usage_update` is emitted
     // from the prompt-turn message loop, so before a session's first turn the
     // client has never been told this session's window and falls back to its
