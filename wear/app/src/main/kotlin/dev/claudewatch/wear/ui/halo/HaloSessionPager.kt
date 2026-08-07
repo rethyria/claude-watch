@@ -3,9 +3,10 @@
 // subheading with the shared Answer pill on waiting sessions; ‹ › chevrons and
 // horizontal swipes step the selection (no wrap — the All scope ends on the
 // trailing "+ new session" card, and stepping right at the start is BACK); an
-// unlabelled five-icon action arc rides the bottom with today's exact close
-// semantics (✕ kill for bridge-owned sessions, ⊘ honest hide for external
-// ones — ACP close-frame limits are #88's scope). Selection itself lives in
+// unlabelled five-icon action arc rides the bottom with honest close
+// semantics (✕ kill wherever the bridge can really end the session — its own
+// PTY, or an ACP session via the adapter's close frame, #88 — and ⊘ hide for
+// a hook-observed one it cannot stop). Selection itself lives in
 // the HaloNav state machine — this file only renders nav.sessionId and maps
 // gestures onto the caller's step/back/open lambdas, so every edge (spawn
 // slot, empty scope, at-start back) stays pinned by the nav's JVM tests. The
@@ -306,7 +307,12 @@ fun HaloSessionPager(
         // nothing to close or configure.
         slots.getOrNull(selectedIndex)?.let { session ->
             ActionArc(
-                external = session.external,
+                // Issue #88: an ACP session is EXTERNAL (Zed's process, not the
+                // bridge's) and yet genuinely killable — the bridge's close
+                // frame drives the adapter's own teardown, so the ✕ ends the
+                // agent for real. Only a hook-OBSERVED session has no ending
+                // the bridge can perform, and that one keeps #53's honest hide.
+                killable = session.kind == "acp" || !session.external,
                 onKill = { onKill(session.id) },
                 onHide = { onHide(session.id) },
                 modifier = Modifier.fillMaxSize(),
@@ -537,16 +543,17 @@ private fun StepChevron(
  * 6 o'clock (the page dots' curved-Layout approach, so the row survives every
  * display size). Order along the arc: ◇ model · ◐ mode · close · ▤ compact ·
  * ⇄ handover — the outer four are visible, disabled stubs (0.35 alpha, the
- * v1 strip's treatment); the centre close is LIVE with today's exact
- * semantics: red ✕ kill for a bridge-owned session, ⊘ honest hide for an
- * EXTERNAL one the bridge cannot stop (issue #53 — ACP close-frame limits
- * are #88's scope, not this arc's). The close keeps the stable
- * "haloRowClose" testTag from the retired row strip on purpose: every
- * existing close-semantics test and #88's follow-up find it unmoved.
+ * v1 strip's treatment); the centre close is LIVE, and honest either way
+ * (issue #53): the red ✕ appears ONLY where the bridge can really end the
+ * session — its own PTY, or an ACP session it can close through Zed's adapter
+ * (#88) — and everything else gets ⊘, the local hide that never claims to
+ * have stopped anything. The close keeps the stable "haloRowClose" testTag
+ * from the retired row strip on purpose: every existing close-semantics test
+ * finds it unmoved.
  */
 @Composable
 private fun ActionArc(
-    external: Boolean,
+    killable: Boolean,
     onKill: () -> Unit,
     onHide: () -> Unit,
     modifier: Modifier = Modifier,
@@ -556,10 +563,10 @@ private fun ActionArc(
         content = {
             ArcButton(glyph = "◇", onClick = null, tag = "haloArc-model")
             ArcButton(glyph = "◐", onClick = null, tag = "haloArc-mode")
-            if (external) {
-                ArcButton(glyph = "⊘", onClick = onHide, tag = "haloRowClose")
-            } else {
+            if (killable) {
                 ArcButton(glyph = "✕", tint = Halo.Palette.Error, onClick = onKill, tag = "haloRowClose")
+            } else {
+                ArcButton(glyph = "⊘", onClick = onHide, tag = "haloRowClose")
             }
             ArcButton(glyph = "▤", onClick = null, tag = "haloArc-compact")
             ArcButton(glyph = "⇄", onClick = null, tag = "haloArc-handover")

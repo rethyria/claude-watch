@@ -102,6 +102,12 @@ class DictationFlowTest {
                     // The stub: a fixed-text recognizer activity result,
                     // keeping the session the dictation was started FROM.
                     onDictate = { sessionId -> viewModel.dictationResult(recognized, sessionId) },
+                    // Wired exactly as MainActivity does, so the close cell's
+                    // claim is testable at the WIRE: a kill must POST, a hide
+                    // must not. Left unwired, both are no-ops and a close
+                    // test can only ever assert its own glyph (#88).
+                    onKill = viewModel::killSession,
+                    onHide = viewModel::hideSession,
                 ),
             )
         }
@@ -287,9 +293,9 @@ class DictationFlowTest {
     }
 
     /**
-     * Issue #78: an ACP session is EXTERNAL (Zed's process — the row offers
-     * Hide, not a fake Kill) yet still DICTATABLE. The Dictate pill gates on
-     * `dictatable`, not on `!external`, so it must show here.
+     * Issue #78: an ACP session is EXTERNAL (Zed's process, not one the bridge
+     * owns) yet still DICTATABLE. The Dictate pill gates on `dictatable`, not
+     * on `!external`, so it must show here.
      */
     @Test
     fun anAcpSessionIsDictatableDespiteBeingExternal() {
@@ -333,16 +339,16 @@ class DictationFlowTest {
     }
 
     /**
-     * Issue #78 / #53, through the session pager's action arc: an ACP session
-     * is external (Zed's process, not one the bridge owns), so its card's
-     * close action must HIDE it (⊘ → onHide, local) — never a fake Kill (✕)
-     * that pretends to stop a process the bridge cannot. The arc is unlabelled
-     * (v2 design), so the semantics are asserted by glyph on the stable close
-     * tag. ACP close-frame limits are #88's scope — this pins today's exact
-     * kill/hide split, ported unchanged from the retired row strip.
+     * Issue #88, superseding this case's #78/#53 original: an ACP session is
+     * external (Zed's process, not one the bridge owns) and yet really
+     * killable, because the bridge ends it through the adapter's close frame.
+     * So its card's close must be the ✕ that POSTs a REAL kill — the glyph
+     * alone was only ever a proxy, and the wire is the actual claim being
+     * made. #53's rule is unchanged, just better served: the ⊘ hide belongs to
+     * sessions with no ending the bridge can perform (the next test).
      */
     @Test
-    fun anAcpCardsCloseActionIsHideNotAFakeKill() {
+    fun anAcpCardsCloseIsARealKillOnTheWire() {
         setAppContent()
         pairStreamingSession(
             """{"state":"running","agent":"claude","cwd":"/tmp/acp","folderName":"acp","external":true,"kind":"acp","dictatable":true,"sessionId":"s-acp"}""",
@@ -356,15 +362,47 @@ class DictationFlowTest {
         compose.onNodeWithTag("haloPagerCard-s-acp").assertIsDisplayed()
 
         waitForNode("haloRowClose")
-        // The close cell is the honest Hide glyph…
+        compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
+
+        server.enqueue(MockResponse().setBody("""{"ok":true,"kind":"acp"}"""))
+        compose.onNodeWithTag("haloRowClose").performClick()
+
+        val killRequest = server.takeRequest(10, TimeUnit.SECONDS)
+        assertEquals("a close on an ACP card must reach the bridge", "/v1/command", killRequest?.path)
+        val body = JSONObject(killRequest!!.body.readUtf8())
+        assertTrue("the POST must be a kill", body.optBoolean("kill"))
+        assertEquals("s-acp", body.optString("sessionId"))
+    }
+
+    /**
+     * The other half of the same honesty rule (#53): a HOOK-OBSERVED session
+     * has no process the bridge can stop and no adapter to ask, so its close
+     * stays the local ⊘ hide — no kill glyph, and provably no request. If this
+     * ever POSTs, the wrist is claiming an ending nobody can deliver.
+     */
+    @Test
+    fun aHookObservedCardsCloseHidesWithoutTouchingTheBridge() {
+        setAppContent()
+        pairStreamingSession(
+            """{"state":"running","agent":"claude","cwd":"/tmp/ext","folderName":"ext","external":true,"sessionId":"s-ext"}""",
+            "s-ext",
+        )
+        compose.onNodeWithTag("haloCenter").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloPagerCard-s-ext").assertIsDisplayed()
+
+        waitForNode("haloRowClose")
         compose.onNode(hasTestTag("haloRowClose") and hasText("⊘")).assertIsDisplayed()
-        // …and never the fake Kill.
         assertEquals(
-            "an ACP card must not offer a fake Kill",
+            "a hook-observed card must not offer a Kill the bridge cannot perform",
             0,
             compose.onAllNodes(hasTestTag("haloRowClose") and hasText("✕"))
                 .fetchSemanticsNodes().size,
         )
+
+        compose.onNodeWithTag("haloRowClose").performClick()
+        compose.waitUntil(30_000) { nodeCount("haloPagerCard-s-ext") == 0 }
+        assertNull("an honest hide sends nothing", server.takeRequest(1, TimeUnit.SECONDS))
     }
 
     @Test

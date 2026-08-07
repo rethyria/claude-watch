@@ -14,6 +14,8 @@
 //      resume from disk, gone → forfeit the claim and fall through), and
 //      `session/load` adopts a live detached session regardless of
 //      fingerprint instead of tearing it down.
+//   5. The wrist KILL (#88) is a real teardown of the fork's own session —
+//      query closed, session dropped, bridge deregistered — never a hide.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
@@ -94,6 +96,7 @@ function makeFakeBridge(
     noteSessionTitle: vi.fn(),
     onInject: vi.fn(),
     onPermissionDecision: vi.fn(),
+    onClose: vi.fn(),
     takePendingPickup: vi.fn(async () => null),
     start: vi.fn(),
     stop: vi.fn(),
@@ -134,7 +137,14 @@ function fakeSession(overrides: Record<string, unknown> = {}) {
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
-    query: { supportedCommands: async () => [], close: vi.fn(), setPermissionMode: vi.fn() },
+    query: {
+      supportedCommands: async () => [],
+      close: vi.fn(),
+      setPermissionMode: vi.fn(),
+      // A teardown cancels first (the wrist kill lands mid-turn as often as
+      // not); older CLIs answer the interrupt with no receipt at all.
+      interrupt: vi.fn(async () => undefined),
+    },
     input: { push: vi.fn(), end: vi.fn() },
     detached: true,
     ...overrides,
@@ -204,6 +214,35 @@ describe("spawnDetachedSession (watch spawn)", () => {
     const registerSpy = bridge.registerSession as unknown as ReturnType<typeof vi.fn>;
     const call = registerSpy.mock.calls.find((c: any[]) => c[0].sessionId === response.sessionId);
     expect(call![0].detached).toBeUndefined();
+  });
+});
+
+describe("closeSessionFromWatch (the wrist kill, #88)", () => {
+  it("really ends the session: query closed, slot dropped, bridge deregistered", async () => {
+    const bridge = makeFakeBridge();
+    const agent = new ClaudeAcpAgent(makeMockClient(), { log: () => {}, error: () => {} }, bridge);
+    const live = fakeSession();
+    agent.sessions["watch-1"] = live;
+
+    expect(await agent.closeSessionFromWatch("watch-1", "watch-kill")).toBe(true);
+
+    // The teardown the editor's session/close performs, not a bookkeeping
+    // flag: the SDK query (and its subprocess) is closed and the session is
+    // gone from the map — nothing is left that could keep editing the tree.
+    expect(live.query.close).toHaveBeenCalled();
+    expect(live.settingsManager.dispose).toHaveBeenCalled();
+    expect(agent.sessions["watch-1"]).toBeUndefined();
+    // The deregister IS the ack: the bridge ends its slot on this, so a fork
+    // that could not honour the close is never mistaken for one that did.
+    expect(bridge.deregisterSession).toHaveBeenCalledWith("watch-1", "query-closed");
+  });
+
+  it("answers false — and deregisters nothing — for a session this fork does not host", async () => {
+    const bridge = makeFakeBridge();
+    const agent = new ClaudeAcpAgent(makeMockClient(), { log: () => {}, error: () => {} }, bridge);
+
+    expect(await agent.closeSessionFromWatch("never-existed", "watch-kill")).toBe(false);
+    expect(bridge.deregisterSession).not.toHaveBeenCalled();
   });
 });
 

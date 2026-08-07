@@ -17,6 +17,13 @@
 //      a newborn watch session has said nothing, and an empty feed proves
 //      nothing.
 //
+// It also services the `close` frame (issue #88), because the skeleton's kill
+// leg is a REAL end-to-end kill now: the fork answers a close the only way the
+// real adapter does — by tearing the session down and POSTing /acp/deregister.
+// There is no ack frame, so a harness that ignored the close would leave the
+// wrist's kill hanging until the bridge's timeout, which is exactly the
+// stale-adapter case the timeout exists to catch.
+//
 // The wire contract is pinned from both ends: the bridge's own tests fake
 // this side (skill/bridge/test/acp-spawn.test.js) and the adapter's tests
 // fake the bridge side (skill/acp-agent watch-spawn.test.ts), so the frames
@@ -80,6 +87,12 @@ async function speak(sessionId, text) {
   await update(sessionId, "turn", { phase: "end", stopReason: "end_turn" });
 }
 
+/** Sessions this fork still hosts. A closed session must stop behaving like a
+ *  live one — the real adapter's `injectUserPrompt` throws for a session it no
+ *  longer has — so an inject after a kill speaks nothing rather than
+ *  resurrecting a slot the watch just ended. */
+const liveSessions = new Set();
+
 async function serviceSpawn({ requestId, cwd }) {
   const sessionId = randomUUID();
   // The real fork's order: register (detached) inside createSession, THEN the
@@ -100,9 +113,19 @@ async function serviceSpawn({ requestId, cwd }) {
     contextSize: 200_000,
   });
   await post("/acp/spawn-result", { connection: CONNECTION, requestId, ok: true, sessionId, cwd });
+  liveSessions.add(sessionId);
   log(`spawn ${requestId}: registered detached session ${sessionId} (cwd ${cwd})`);
   // The marker WalkingSkeletonTest's spawn leg greps its feed for.
   await speak(sessionId, `wear-e2e-fake-fork ready: session ${sessionId.slice(0, 8)} spawned in ${cwd}`);
+}
+
+/** The wrist killed the session (#88). The real adapter runs teardownSession —
+ *  cancel, close the query, deregister — and the deregister is the bridge's
+ *  ONLY ack, so this is the whole answer: no result POST, no close frame back. */
+async function serviceClose({ sessionId, reason }) {
+  liveSessions.delete(sessionId);
+  await post("/acp/deregister", { connection: CONNECTION, sessionId, reason: "query-closed" });
+  log(`close: session ${sessionId} torn down (${reason ?? "no reason given"})`);
 }
 
 /** Parse one SSE frame (the adapter's handleFrame, minus the lanes a spawn
@@ -125,9 +148,19 @@ function handleFrame(frame) {
   if (event === "spawn" && typeof data.requestId === "string" && typeof data.cwd === "string") {
     log(`inbox spawn request ${data.requestId} (cwd=${data.cwd})`);
     void serviceSpawn(data);
+  } else if (event === "close" && typeof data.sessionId === "string" && data.sessionId) {
+    log(`inbox close request for session ${data.sessionId}`);
+    void serviceClose(data);
   } else if (event === "inject" && typeof data.sessionId === "string" && typeof data.text === "string") {
     log(`inbox inject for session ${data.sessionId}`);
-    void speak(data.sessionId, `wear-e2e-fake-fork echo: ${data.text}`);
+    // A session this fork no longer hosts gets silence, not a turn: the
+    // bridge refuses to route into a dead slot, and a harness that answered
+    // anyway would paper over that.
+    if (liveSessions.has(data.sessionId)) {
+      void speak(data.sessionId, `wear-e2e-fake-fork echo: ${data.text}`);
+    } else {
+      log(`inject for unknown/closed session ${data.sessionId} ignored`);
+    }
   }
 }
 

@@ -263,6 +263,19 @@ export const ACP_SPAWN_TIMEOUT_MS = testOverridable(
   "CLAUDE_WATCH_ACP_SPAWN_TIMEOUT_MS",
   10_000,
 );
+// ACP close (watch kill → Zed's adapter, #88): how long the bridge waits for
+// the session to actually END after writing the `close` frame. The ending is
+// the ack — the fork's teardown deregisters the session — so this is the
+// window in which a wrist kill either becomes true or is reported as failed.
+// It must cover an in-flight turn's graceful interrupt (cancel, then the
+// force-cancel floor) yet stay under the wear client's 20 s read timeout. An
+// adapter too old to know the frame drops it silently, so the timeout is also
+// the only way that build ever surfaces — never a fake ending. Overridable via
+// CLAUDE_WATCH_ACP_CLOSE_TIMEOUT_MS (test-only).
+export const ACP_CLOSE_TIMEOUT_MS = testOverridable(
+  "CLAUDE_WATCH_ACP_CLOSE_TIMEOUT_MS",
+  10_000,
+);
 // Workflow-activity scanning (issue #55). The poll re-reads workflow journals
 // only for slots a Workflow tool hook marked active, so the interval can stay
 // coarse; the staleness window declares a journal untouched this long dead —

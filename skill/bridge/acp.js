@@ -3,7 +3,8 @@
 //
 //   fork -> bridge   POST /acp/register | /acp/update | /acp/deregister
 //   bridge -> fork   GET  /acp/inbox   (a long-lived SSE the fork holds; the
-//                    bridge writes `inject` frames down it for watch dictation)
+//                    bridge writes `inject` / `permission-decision` /
+//                    `input-decision` / `spawn` / `close` frames down it)
 //
 // Session slot lifecycle lives in sessions.js (registerAcpSession /
 // endAcpSession) so hook-twin correlation and the shared sessions map stay in
@@ -19,7 +20,7 @@ import {
   registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
   markWorkflowActivity, registerSessionCleanupHook,
 } from "./sessions.js";
-import { ACP_INBOX_HEARTBEAT_MS, ACP_SPAWN_TIMEOUT_MS } from "./config.js";
+import { ACP_INBOX_HEARTBEAT_MS, ACP_SPAWN_TIMEOUT_MS, ACP_CLOSE_TIMEOUT_MS } from "./config.js";
 import { waitForPermission, canonicalPermissionOptions, cancelPermission } from "./permissions.js";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -50,6 +51,11 @@ const PROSE_BUFFER_MAX = 4000;
  *  requestId -> { resolve, timer, connectionId }. Settled exactly once — by
  *  the result, the timeout, or the owning inbox closing. */
 const pendingAcpSpawns = new Map();
+/** In-flight wrist kills awaiting the fork's teardown (#88):
+ *  sessionId -> { promise, resolve, timer }. Settled exactly once — by the
+ *  session actually ending (the fork's deregister, or its inbox dying), or by
+ *  the timeout. */
+const pendingAcpCloses = new Map();
 /** Watch-spawned sessions no editor thread has adopted yet:
  *  sessionId -> { cwd, createdAt }. The desk-pickup registry /acp/claim takes
  *  from. Deliberately SEPARATE from the sessions map: a fork death ends the
@@ -292,6 +298,74 @@ export function requestAcpSpawn(cwd) {
     }
   });
 }
+
+/** Ask the owning fork to END an ACP session — the wrist kill (#88). The
+ *  bridge owns no process here, so marking the slot ended locally would be
+ *  precisely the #53 lie: the agent keeps running and its next update
+ *  resurrects a zombie. Instead the `close` frame drives the adapter's
+ *  teardownSession, and the session's DEATH is the ack — it arrives as the
+ *  fork's own deregister, the same ending a Zed-side close produces, so no
+ *  state is ever invented on this side.
+ *
+ *  Resolves (never rejects):
+ *    `null`               — no live inbox owns this session; nothing was
+ *                           stopped and the caller must say so (the wrist
+ *                           falls back to its honest Hide).
+ *    `{ ok: true }`       — the slot really ended.
+ *    `{ ok: false, error }` — the frame went out and nothing ended inside
+ *                           ACP_CLOSE_TIMEOUT_MS. An adapter build too old to
+ *                           know the frame hard-ignores it (that already bit
+ *                           once on spawn), so the timeout names a rebuild. */
+export function requestAcpClose(sessionId, reason = "watch-kill") {
+  const connectionId = sessionConnection.get(sessionId);
+  if (!connectionId || !acpInboxes.has(connectionId)) return Promise.resolve(null);
+  // A second tap while the first close is still landing must not orphan the
+  // first waiter (the settle is keyed by session): both ride the same one.
+  const inFlight = pendingAcpCloses.get(sessionId);
+  if (inFlight) return inFlight.promise;
+
+  let settle;
+  const promise = new Promise((resolve) => { settle = resolve; });
+  const timer = setTimeout(() => {
+    log("warn", `ACP close of session ${sessionId} unacknowledged after ${ACP_CLOSE_TIMEOUT_MS}ms (connection ${connectionId})`);
+    settlePendingClose(sessionId, {
+      ok: false,
+      error: "Zed's agent did not end the session — if Zed is open, the claude-watch adapter may need a rebuild",
+    });
+  }, ACP_CLOSE_TIMEOUT_MS);
+  pendingAcpCloses.set(sessionId, { promise, resolve: settle, timer });
+  log("info", `ACP close requested for session ${sessionId} (${reason}) → connection ${connectionId}`);
+  if (!writeAcpFrameToConnection(connectionId, "close", { sessionId, reason })) {
+    settlePendingClose(sessionId, { ok: false, error: "Zed agent connection lost" });
+  }
+  return promise;
+}
+
+/** Settle (exactly once) an in-flight wrist kill. */
+function settlePendingClose(sessionId, result) {
+  const pending = pendingAcpCloses.get(sessionId);
+  if (!pending) return;
+  pendingAcpCloses.delete(sessionId);
+  clearTimeout(pending.timer);
+  pending.resolve(result);
+}
+
+// The session ended — the only ack a `close` frame ever gets (#88). Whatever
+// ended it (the requested teardown, a Zed-side close that raced us, the fork's
+// inbox dying) the wrist's kill is now TRUE, so the waiter settles as done.
+// Riding the shared cleanup hook is what keeps this honest: the bridge reports
+// the ending it OBSERVED, never the one it asked for.
+registerSessionCleanupHook((sessionId) => {
+  // A session the WRIST killed must not return through the desk pickup. The
+  // registry deliberately outlives a fork death — Zed restarting is not the
+  // user giving up on the session — but a kill IS, and leaving the entry would
+  // hand the next New Thread a session that was explicitly ended: auto-revive
+  // by accident, the very policy #88's resume half is waiting on a decision
+  // for. Only an ending we ASKED for retires it (checked before the settle,
+  // which clears the pending entry).
+  if (pendingAcpCloses.has(sessionId)) pendingPickups.delete(sessionId);
+  settlePendingClose(sessionId, { ok: true });
+});
 
 // POST /acp/update { connection, sessionId, kind: "session_update"|"permission"|"turn", payload }
 //
@@ -564,8 +638,8 @@ function flushProse(sessionId) {
 
 /** Write one SSE frame down a SPECIFIC fork's inbox. The single place that
  *  touches the downlink socket, so dictation (#78), permission decisions
- *  (#80), and spawn requests cannot drift apart in framing or error handling.
- *  Returns false when that connection has no live inbox. */
+ *  (#80), spawn requests and closes (#88) cannot drift apart in framing or
+ *  error handling. Returns false when that connection has no live inbox. */
 function writeAcpFrameToConnection(connectionId, event, data) {
   const inbox = acpInboxes.get(connectionId);
   if (!inbox) return false;
@@ -909,6 +983,9 @@ export function isAcpSession(sessionId) {
 export function closeAllAcpInboxes() {
   for (const requestId of [...pendingAcpSpawns.keys()]) {
     settlePendingSpawn(requestId, { ok: false, error: "bridge shutting down", requestId });
+  }
+  for (const sessionId of [...pendingAcpCloses.keys()]) {
+    settlePendingClose(sessionId, { ok: false, error: "bridge shutting down" });
   }
   for (const { res, heartbeat } of acpInboxes.values()) {
     clearInterval(heartbeat);

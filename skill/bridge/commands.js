@@ -43,7 +43,7 @@ import {
 } from "./sessions.js";
 import { pendingPermissions, pendingPermissionBodies, resolvePermission } from "./permissions.js";
 import { codexSyntheticPermissions, resolveCodexSyntheticPermission } from "./codex.js";
-import { injectToAcpSession, requestAcpSpawn } from "./acp.js";
+import { injectToAcpSession, requestAcpSpawn, requestAcpClose } from "./acp.js";
 
 export async function handlePair(req, res) {
   if (req.method !== "POST") {
@@ -265,10 +265,30 @@ export async function handleCommand(req, res) {
 
   // --- Kill a session ---
   if (killRequest && sessionId) {
-    const killed = killSession(sessionId);
-    if (!killed) {
+    const target = sessions.get(sessionId);
+    if (!target) {
       return jsonResponse(res, 404, { error: "No session with that ID" });
     }
+    // A LIVE ACP session runs inside Zed's fork, so ending the slot here would
+    // stop nothing — the #53 fake kill, with the agent still editing the tree.
+    // Ask the fork to tear it down instead (#88) and report only what actually
+    // happened: the `ended` event comes from the fork's own deregister, never
+    // from this handler. An ACP slot that has already ended falls through to
+    // killSession below, where marking an over session over is no lie.
+    if (target.kind === "acp" && target.state !== "ended") {
+      const closed = await requestAcpClose(sessionId);
+      if (closed === null) {
+        return jsonResponse(res, 502, {
+          error: "ACP session is not reachable (its Zed adapter is not connected); nothing was stopped",
+          sessionId,
+        });
+      }
+      if (!closed.ok) {
+        return jsonResponse(res, 504, { error: closed.error, sessionId });
+      }
+      return jsonResponse(res, 200, { ok: true, sessionId, kind: "acp" });
+    }
+    killSession(sessionId);
     return jsonResponse(res, 200, { ok: true });
   }
 

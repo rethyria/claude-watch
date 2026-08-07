@@ -35,8 +35,10 @@ import org.junit.runner.RunWith
  * wrap (the All scope ends on the trailing spawn card, a project on its last
  * session), stepping right at the start is BACK, a card tap opens the feed
  * while the waiting card's Answer pill opens the prompt OVER the pager
- * (never falling through to the feed), the action arc carries today's exact
- * close semantics (✕ kill owned / ⊘ hide external, stubs visible but dead),
+ * (never falling through to the feed), the action arc carries honest close
+ * semantics (✕ kill wherever the bridge can really end the session — owned
+ * PTY or ACP via #88's close frame — ⊘ hide for a hook-observed one, stubs
+ * visible but dead),
  * and a session killed under the cursor self-heals to the remembered-index
  * neighbour instead of stranding the pager on a ghost.
  */
@@ -67,6 +69,18 @@ class HaloSessionPagerTest {
                 cwd = "/home/dev/beta",
                 folderName = "beta",
                 external = true,
+            ),
+            // An ACP session: external (Zed's process) AND killable, because
+            // the bridge can end it through the adapter's close frame (#88).
+            // Opt-in only — the default fixture keeps three cards.
+            "s-b2" to SessionState(
+                sessionId = "s-b2",
+                agent = "claude",
+                cwd = "/home/dev/beta",
+                folderName = "beta",
+                external = true,
+                kind = "acp",
+                dictatable = true,
             ),
         ).filter { it.first in ids }.toMap(),
     )
@@ -275,7 +289,7 @@ class HaloSessionPagerTest {
         val hides = mutableListOf<String>()
         compose.setContent {
             HaloApp(
-                ui = ui(),
+                ui = ui(ids = listOf("s-a1", "s-a2", "s-b1", "s-b2")),
                 actions = HaloActions(
                     onKill = { kills += it },
                     onHide = { hides += it },
@@ -290,7 +304,7 @@ class HaloSessionPagerTest {
         assertEquals(listOf("s-a1"), kills)
         assertEquals(0, hides.size)
 
-        // External session: the honest ⊘ hide — never a fake kill (#53).
+        // Hook-observed session: the honest ⊘ hide — never a fake kill (#53).
         next()
         next()
         compose.onNodeWithTag("haloPagerCard-s-b1").assertIsDisplayed()
@@ -298,6 +312,16 @@ class HaloSessionPagerTest {
         compose.onNodeWithTag("haloRowClose").performClick()
         assertEquals(listOf("s-b1"), hides)
         assertEquals("hide must never kill", listOf("s-a1"), kills)
+
+        // ACP session: external, but the bridge really can end it through the
+        // adapter (#88's close frame) — so the ✕ is honest here, not a hide
+        // wearing a kill's clothes.
+        next()
+        compose.onNodeWithTag("haloPagerCard-s-b2").assertIsDisplayed()
+        compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
+        compose.onNodeWithTag("haloRowClose").performClick()
+        assertEquals(listOf("s-a1", "s-b2"), kills)
+        assertEquals("an ACP close must not degrade to a local hide", listOf("s-b1"), hides)
     }
 
     @Test
