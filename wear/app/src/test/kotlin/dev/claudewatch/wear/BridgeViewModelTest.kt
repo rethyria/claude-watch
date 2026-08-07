@@ -2094,6 +2094,74 @@ class BridgeViewModelTest {
         )
     }
 
+    /**
+     * Issue #66 meets #53: the authoritative connect-time `session-sync` prunes
+     * the sessions the bridge no longer has — and must leave the honest-hide of
+     * the ones it still has exactly where the user put it.
+     *
+     * Both halves matter. The prune is the whole point of the frame (a session
+     * the bridge FORGOT can never be retracted by an `ended` it cannot emit),
+     * and the hide must survive it because the frame is not the session
+     * "speaking": it carries no sessionId, so it can never un-hide one. A sync
+     * that revealed every hidden session on each reconnect would defeat the
+     * hide as thoroughly as un-hiding on a bare metadata resend would.
+     */
+    @Test
+    fun anAuthoritativeSessionSyncPrunesForgottenSessionsAndKeepsHiddenOnesHidden() {
+        enqueuePing()
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append(
+                """data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj",""" +
+                    """"external":true,"sessionId":"s-ext"}""",
+            )
+            append("\n\n")
+            append("id: 2\nevent: session\n")
+            append(
+                """data: {"state":"running","agent":"claude","cwd":"/tmp/ghost","folderName":"ghost",""" +
+                    """"external":true,"sessionId":"s-ghost"}""",
+            )
+            append("\n\n")
+            // Delayed behind padding so it lands AFTER the hide below: the
+            // bridge's next snapshot lists only s-ext — s-ghost is the session
+            // it forgot (restart, crash, eviction) and can never end.
+            append(":pad\n\n".repeat(400))
+            append("id: 3\nevent: session-sync\n")
+            append("""data: {"sessions":[{"id":"s-ext"}],"complete":true}""")
+            append("\n\n")
+            append(":tail\n\n".repeat(40))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 100, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.bridge.sessions.containsKey("s-ghost") }
+        viewModel.hideSession("s-ext")
+        awaitState { it.hiddenSessions.contains("s-ext") }
+
+        val synced = awaitState(timeoutMs = 60_000) { !it.bridge.sessions.containsKey("s-ghost") }
+        assertTrue(
+            "the session the bridge still lists survives the sync",
+            synced.bridge.sessions.containsKey("s-ext"),
+        )
+        assertTrue(
+            "an authoritative sync is not the session speaking — it must not un-hide",
+            synced.hiddenSessions.contains("s-ext"),
+        )
+        assertTrue(
+            "with the ghost pruned and the hidden one hidden, the wrist shows nothing",
+            HaloModel.from(synced).sessions.isEmpty(),
+        )
+    }
+
     // -- Discover-pairing LIST + code-less pair (issue #23 follow-up) ----------
 
     /**

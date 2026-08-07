@@ -12,6 +12,7 @@ import dev.claudewatch.shared.terminal.TerminalLineType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -881,5 +882,88 @@ class BridgeEventReducerTest {
         val syncFrame = SseFrame(null, "permission-sync", """{"permissionIds":[]}""")
         val synced = (BridgeEventReducer.reduce(before, syncFrame, 1_100_000L) as BridgeEventReducer.Applied).state
         assertTrue("an empty authoritative set must clear the queue", synced.pendingPermissions.isEmpty())
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #66: the authoritative connect-time session-sync
+    // ------------------------------------------------------------------
+
+    /** Two sessions the client knows about, one of which the bridge will forget. */
+    private fun twoKnownSessions(): BridgeState = fold(
+        listOf(
+            SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+            SseFrame("2", "session", """{"state":"running","agent":"claude","cwd":"/b","folderName":"b","sessionId":"B"}"""),
+        ),
+    )
+
+    // Connect-time sync frames carry no id, so they are reduced directly rather
+    // than through the id-keyed `fold` clock.
+    private fun sync(state: BridgeState, data: String, nowMs: Long = 1_100_000L): BridgeState =
+        (BridgeEventReducer.reduce(state, SseFrame(null, "session-sync", data), nowMs) as BridgeEventReducer.Applied).state
+
+    @Test
+    fun aCompleteSessionSyncDropsSessionsTheBridgeNoLongerHas() {
+        // THE BUG (#66): the client's session set only ever grew. A bridge that
+        // has FORGOTTEN a session — restart, crash, cap eviction — cannot emit
+        // its `ended`, so nothing could ever retract it and the ghost held a
+        // ring segment and a list row forever, rendered green.
+        val before = twoKnownSessions()
+        assertEquals(setOf("A", "B"), before.sessions.keys)
+
+        val after = sync(before, """{"sessions":[{"id":"A"}],"complete":true}""")
+        assertEquals("the session absent from a complete sync is dropped", setOf("A"), after.sessions.keys)
+    }
+
+    @Test
+    fun anEmptySessionSyncDropsEverything() {
+        // The restarted bridge verbatim: it knows about NOTHING, and that is
+        // exactly when the client must let go. Silence would keep the ghosts.
+        val after = sync(twoKnownSessions(), """{"sessions":[],"complete":true}""")
+        assertTrue("an empty authoritative set clears the session table", after.sessions.isEmpty())
+    }
+
+    @Test
+    fun aPartialSessionSyncNeverPrunes() {
+        // A frame that cannot claim to describe the WHOLE set has no authority
+        // over absence — and a partial sync is exactly the state in which
+        // dropping is most wrong. `complete` defaults to false, so an older or
+        // paged framing gets the safe reading, never the destructive one.
+        val after = sync(twoKnownSessions(), """{"sessions":[{"id":"A"}]}""")
+        assertEquals("a sync without complete:true drops nothing", setOf("A", "B"), after.sessions.keys)
+
+        val explicit = sync(twoKnownSessions(), """{"sessions":[{"id":"A"}],"complete":false}""")
+        assertEquals(setOf("A", "B"), explicit.sessions.keys)
+    }
+
+    @Test
+    fun anUnparseableSessionSyncIsRejectedAndPrunesNothing() {
+        // The interrupted-sync guard the reducer already owns: a frame that
+        // fails the contract leaves state — lastEventId included — untouched,
+        // so it is replayed rather than silently skipped. A truncated sync must
+        // never read as "the bridge has no sessions".
+        val before = twoKnownSessions()
+        val result = BridgeEventReducer.reduce(before, SseFrame("9", "session-sync", """{"complete":true}"""), 1_100_000L)
+        assertTrue("a sessions-less sync frame is a contract violation", result is BridgeEventReducer.Rejected)
+        assertEquals(setOf("A", "B"), result.state.sessions.keys)
+        assertEquals("a rejected frame must not advance the replay cursor", before.lastEventId, result.state.lastEventId)
+    }
+
+    @Test
+    fun aSessionSyncNeverCreatesASessionItOnlyPrunes() {
+        // Sessions arrive as `session` events, which precede this frame in the
+        // same snapshot. An id we do not know is a re-send we missed, not an
+        // invitation to invent a row with no agent, cwd or terminal.
+        val after = sync(twoKnownSessions(), """{"sessions":[{"id":"A"},{"id":"B"},{"id":"C"}],"complete":true}""")
+        assertEquals(setOf("A", "B"), after.sessions.keys)
+    }
+
+    @Test
+    fun aSessionSyncThatChangesNothingKeepsTheSameStateInstance() {
+        // The common case by far: every reconnect re-lists exactly what the
+        // client already holds. Rebuilding the map there would churn every
+        // downstream recomposition for nothing.
+        val before = twoKnownSessions()
+        val after = sync(before, """{"sessions":[{"id":"A"},{"id":"B"}],"complete":true}""")
+        assertSame(before.sessions, after.sessions)
     }
 }

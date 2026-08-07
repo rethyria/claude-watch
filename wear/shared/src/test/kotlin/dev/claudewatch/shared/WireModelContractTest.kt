@@ -6,10 +6,12 @@ import dev.claudewatch.shared.protocol.MessageEvent
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
 import dev.claudewatch.shared.protocol.SessionEvent
 import dev.claudewatch.shared.protocol.SessionRunState
+import dev.claudewatch.shared.protocol.SessionSyncEvent
 import dev.claudewatch.shared.protocol.ToolOutputEvent
 import dev.claudewatch.shared.protocol.UnknownEvent
 import kotlinx.serialization.json.jsonArray
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -466,6 +468,40 @@ class WireModelContractTest {
         // for the empty "retract everything" set. If it had a default, a
         // truncated frame would clear the whole wrist.
         assertFailsLoudly("permission-sync", """{"sessionId":"A"}""")
+    }
+
+    @Test
+    fun sessionSyncParsesAnEmptyAuthoritativeSet() {
+        // The restarted-bridge case verbatim (issue #66): it knows about
+        // NOTHING, which is exactly when a client must be told to drop what it
+        // is holding. An empty list has to parse, or the ghost survives.
+        val event = BridgeEventParser.parse("session-sync", """{"sessions":[],"complete":true}""")
+        assertTrue(event is SessionSyncEvent)
+        assertEquals(0, (event as SessionSyncEvent).sessions.size)
+        assertTrue(event.complete)
+    }
+
+    @Test
+    fun sessionSyncWithoutCompleteIsNotAuthoritative() {
+        // `complete` defaults to FALSE: an unrecognised or partial framing gets
+        // the SAFE reading (drop nothing), never the destructive one.
+        val event = BridgeEventParser.parse("session-sync", """{"sessions":[{"id":"s-1"}]}""") as SessionSyncEvent
+        assertFalse(event.complete)
+        assertEquals(listOf("s-1"), event.sessions.map { it.id })
+    }
+
+    @Test
+    fun sessionSyncWithoutSessionsFailsLoudly() {
+        // Same doctrine as permissionIds: a MISSING list is a contract
+        // violation, never the empty "prune everything" set. With a default, a
+        // truncated frame would wipe every session off the wrist.
+        assertFailsLoudly("session-sync", """{"complete":true}""")
+    }
+
+    @Test
+    fun sessionSyncEntryWithoutAnIdFailsLoudly() {
+        assertFailsLoudly("session-sync", """{"sessions":[{"idle":true}],"complete":true}""")
+        assertFailsLoudly("session-sync", """{"sessions":[{"id":""}],"complete":true}""")
     }
 
     // ------------------------------------------------------------------

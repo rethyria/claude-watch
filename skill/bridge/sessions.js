@@ -1855,21 +1855,55 @@ export function endAcpSession(sessionId, reason = "acp-closed") {
   return slot.id;
 }
 
+// --- Authoritative connect-time session sync (issue #66) --------------------
 // Send current sessions state so late-connecting SSE clients see existing
 // sessions (runs on every GET /events connect).
+//
+// The per-slot re-send is ADDITIVE: it can create or refresh a session, but it
+// has no way to say "drop everything I did not mention". So a session the
+// bridge FORGOT — a restart wiping the in-memory map, a crash, a cap eviction
+// that happened while this client was offline — could never be retracted, and
+// every connected client held that ghost forever: green, labelled running, for
+// a process that had not existed since the day before. Force-stopping the app
+// was the only cure, because that discards the client's state wholesale. A
+// bridge that has forgotten a session is definitionally unable to emit its
+// `ended` event, so no amount of bridge-side ageing (issue #65) can reach this
+// class — only an authoritative set can.
+//
+// So the sync CLOSES with the whole truth: one framed event listing every
+// running slot. Clients drop what it does not list — the same doctrine as
+// #63's permission-sync, one lane up: any sync that claims to describe current
+// state is authoritative about absence.
+//
+// Ordering is the mirror image of permission-sync's, for the same no-flicker
+// reason read the other way. Permissions retract FIRST because their re-sends
+// restore the payloads; sessions retract LAST because the re-sends ARE the
+// payloads, so refreshing before pruning means no row ever blinks out and back.
+// It also makes an interrupted sync harmless BY CONSTRUCTION: a client whose
+// connection dies mid-snapshot never receives the closing frame, so it never
+// prunes against a half-told story. (The frame is one SSE event, so it also
+// cannot arrive half-parsed — a truncated frame is simply not delivered.)
+//
+// `complete` is the claim the pruning rests on. This bridge enumerates one
+// in-memory map, so it can always make it; a future sync that describes only
+// PART of the session set (a paged snapshot, a relay forwarding one bridge of
+// several) must omit it, and clients then treat the frame as informational —
+// never as a licence to drop what it did not mention.
 registerSseSyncProvider(function* runningSessionsSync() {
+  const listed = [];
   for (const [sid, slot] of sessions) {
-    if (slot.state === "running") {
-      yield {
-        event: "session",
-        data: JSON.stringify(sessionEventPayload(slot, {
-          state: "running",
-          agent: slot.agent,
-          cwd: slot.cwd,
-          folderName: slot.folderName,
-          sessionId: sid,
-        })),
-      };
-    }
+    if (slot.state !== "running") continue;
+    listed.push({ id: sid });
+    yield {
+      event: "session",
+      data: JSON.stringify(sessionEventPayload(slot, {
+        state: "running",
+        agent: slot.agent,
+        cwd: slot.cwd,
+        folderName: slot.folderName,
+        sessionId: sid,
+      })),
+    };
   }
+  yield { event: "session-sync", data: JSON.stringify({ sessions: listed, complete: true }) };
 });

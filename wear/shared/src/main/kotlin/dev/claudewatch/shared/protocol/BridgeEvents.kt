@@ -422,6 +422,50 @@ data class PermissionSyncEvent(
     override val sessionId: String? = null,
 ) : BridgeEvent
 
+/**
+ * One session in a [SessionSyncEvent]'s authoritative set: the slot [id] the
+ * bridge still has, and nothing else the `session` re-send already carried.
+ */
+@Serializable
+data class SessionSyncEntry(
+    val id: String,
+) {
+    init {
+        require(id.isNotEmpty()) { "session-sync entry must carry an id" }
+    }
+}
+
+/**
+ * `session-sync` — the bridge's AUTHORITATIVE set of running sessions, sent at
+ * the END of every connect-time snapshot (issue #66). The per-slot `session`
+ * re-sends that precede it are ADDITIVE: they can create or refresh a session
+ * but can never say "drop everything I did not mention", so a session the
+ * bridge FORGOT — a restart, a crash, a cap eviction that happened while this
+ * client was offline — was orphaned on the wrist forever, green and labelled
+ * running, until the app was force-stopped. This frame is the whole truth.
+ *
+ * PRUNING ONLY, and only when [complete]. It never creates a session (payloads
+ * arrive as `session` events just before it), and a frame that cannot claim to
+ * describe the FULL set must not be allowed to drop anything — a partial or
+ * interrupted sync is exactly the state in which dropping is most wrong. An
+ * interrupted sync is additionally harmless by construction: the frame is
+ * emitted last, so a client whose connection died mid-snapshot never receives
+ * it at all.
+ *
+ * [sessions] is deliberately NOT defaulted, for the same reason as
+ * [PermissionSyncEvent.permissionIds]: an EMPTY list is legal and meaningful
+ * ("the bridge has nothing running"), so a missing field must loud-fail as a
+ * contract violation rather than be mistaken for it and prune the world.
+ * [complete] defaults to FALSE — an unrecognised or older framing gets the
+ * safe reading, never the destructive one.
+ */
+@Serializable
+data class SessionSyncEvent(
+    val sessions: List<SessionSyncEntry>,
+    val complete: Boolean = false,
+    override val sessionId: String? = null,
+) : BridgeEvent
+
 /** `stop` — the Stop hook fired: the agent finished a turn (NOT the session's end). */
 @Serializable
 data class StopEvent(
@@ -483,6 +527,7 @@ object BridgeEventParser {
         "permission-request" -> json.decodeFromString<PermissionRequestEvent>(data)
         "permission-cleared" -> json.decodeFromString<PermissionClearedEvent>(data)
         "permission-sync" -> json.decodeFromString<PermissionSyncEvent>(data)
+        "session-sync" -> json.decodeFromString<SessionSyncEvent>(data)
         "stop" -> json.decodeFromString<StopEvent>(data)
         "task-complete" -> json.decodeFromString<TaskCompleteEvent>(data)
         "notification" -> json.decodeFromString<NotificationEvent>(data)

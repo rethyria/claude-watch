@@ -25,6 +25,7 @@ import dev.claudewatch.shared.protocol.MessageEvent
 import dev.claudewatch.shared.protocol.PtyOutputEvent
 import dev.claudewatch.shared.protocol.SessionEvent
 import dev.claudewatch.shared.protocol.SessionRunState
+import dev.claudewatch.shared.protocol.SessionSyncEvent
 import dev.claudewatch.shared.protocol.SseFrame
 import dev.claudewatch.shared.protocol.StopEvent
 import dev.claudewatch.shared.protocol.TaskCompleteEvent
@@ -219,6 +220,7 @@ object BridgeEventReducer {
 
     private fun apply(state: BridgeState, event: BridgeEvent, nowMs: Long): BridgeState = when (event) {
         is SessionEvent -> applySession(state, event, nowMs)
+        is SessionSyncEvent -> applySessionSync(state, event)
         // Only the addressed session goes idle; an event with no/unknown
         // sessionId changes nothing (never "all sessions"). A finished turn
         // also lowers the thinking cursor — nothing more is coming.
@@ -515,6 +517,41 @@ object BridgeEventReducer {
         }
 
     /**
+     * The authoritative connect-time set (issue #66): drop every session the
+     * bridge did not list.
+     *
+     * The session set used to only ever GROW — the sole removal path was a
+     * `session` event with `state: "ended"`, so anything the bridge forgot
+     * WITHOUT emitting one (a restart wiping its map, a crash, a cap eviction
+     * that landed while this client was offline) stayed on the wrist forever:
+     * green, labelled running, for a process that no longer existed. And a
+     * bridge that has forgotten a session can never emit its `ended`, so the
+     * client had to be told by absence instead. This frame is that telling.
+     *
+     * Two guards, both from the issue:
+     *  - PRUNE ONLY ON A COMPLETE SYNC. A frame that cannot claim to describe
+     *    the whole set has no authority over absence, and a partial sync is
+     *    exactly the state in which dropping is most wrong. (An INTERRUPTED
+     *    sync needs no guard here: the bridge emits this frame last, so a
+     *    connection that died mid-snapshot never delivers it at all — and a
+     *    truncated frame fails to parse, which the reducer already rejects
+     *    without advancing lastEventId.)
+     *  - NEVER CREATE. Sessions arrive as `session` events, which precede this
+     *    frame in the same snapshot; an id listed here that we do not know is
+     *    one whose re-send we missed, not an invitation to invent a row.
+     *
+     * Honest-hidden sessions (#53) are untouched by construction: hiding lives
+     * in the client's own UI state keyed by id, and this frame carries no
+     * sessionId, so it is not "the session speaking" and cannot un-hide one.
+     */
+    private fun applySessionSync(state: BridgeState, event: SessionSyncEvent): BridgeState {
+        if (!event.complete) return state
+        val listed = event.sessions.mapTo(mutableSetOf()) { it.id }
+        if (state.sessions.keys.all { it in listed }) return state
+        return state.copy(sessions = state.sessions.filterKeys { it in listed })
+    }
+
+    /**
      * The IDLE transition itself: stop the running span and freeze whatever it
      * had accumulated. Idempotent — an already-idle session is returned
      * unchanged (identity), so a repeated signal can never re-freeze a span
@@ -595,6 +632,8 @@ object BridgeEventReducer {
             "permission-cleared ${event.permissionId}${event.reason?.let { " ($it)" } ?: ""}"
         is PermissionSyncEvent ->
             "permission-sync ${event.permissionIds.size} live"
+        is SessionSyncEvent ->
+            "session-sync ${event.sessions.size} live${if (event.complete) "" else " (partial)"}"
         is StopEvent -> "stop${event.sessionId?.let { " $it" } ?: ""}"
         is TaskCompleteEvent -> "task-complete${event.sessionId?.let { " $it" } ?: ""}"
         is NotificationEvent -> "notification ${event.notificationType ?: ""}".trimEnd()

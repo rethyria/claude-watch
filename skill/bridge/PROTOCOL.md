@@ -439,19 +439,29 @@ than the buffer are gone — clients needing full state should reconcile with
 
 **Connect-time snapshot.** On every connect the bridge also writes
 authoritative current state: a `session` (`state: "running"`) event per
-running session, one `permission-sync` carrying the authoritative set of live
-prompt ids, and a re-sent `permission-request` per pending prompt (so a prompt
-evicted from the ring buffer can never be lost). A fresh client (no
+running session followed by one `session-sync` carrying the authoritative set
+of running session ids, one `permission-sync` carrying the authoritative set of
+live prompt ids, and a re-sent `permission-request` per pending prompt (so a
+prompt evicted from the ring buffer can never be lost). A fresh client (no
 `Last-Event-ID`) additionally receives up to the last 50 buffered
 `pty-output`/`tool-output` events as terminal backlog. Consequence: clients
 MUST handle duplicate delivery — deduplicate permissions by `permissionId`
-and treat `session` events as idempotent state, not transitions. The
-`permission-sync` frame is emitted BEFORE the per-prompt re-sends, and it
-RETRACTS: drop every pending prompt whose id it omits (the re-sends then carry
-the payloads for everything it kept). This exists because the per-prompt
-re-send is additive and cannot tell a client to drop a prompt that DIED while
-it was offline — its `permission-cleared` long since evicted from the ring
-buffer (issue #63).
+and treat `session` events as idempotent state, not transitions.
+
+Both sync frames exist for the same reason: a per-item re-send is ADDITIVE and
+cannot tell a client to drop an item that DIED while it was offline (its
+`permission-cleared` / `session ended` long since evicted from the ring
+buffer). **Any sync that claims to describe current state is authoritative
+about absence.** They sit on opposite sides of their re-sends, and that
+ordering is deliberate in both directions:
+
+- `permission-sync` comes **BEFORE** the per-prompt re-sends, which then carry
+  the payloads for everything it kept (issue #63).
+- `session-sync` comes **AFTER** the per-session re-sends, because for sessions
+  the re-sends ARE the payloads: refreshing before pruning means no row ever
+  blinks out and back. It also makes an interrupted snapshot harmless — a
+  client that loses the connection mid-snapshot never receives the closing
+  frame, so it never prunes against a half-told story (issue #66).
 
 **Connection care.** Stalled clients (> 1 MiB unflushed) are destroyed and
 expected to reconnect with replay; TCP keepalive probes run every 30 s.
@@ -701,6 +711,37 @@ ignore them.
   changes** — mid-turn usage streams once per message, but sub-percent
   motion never produces an event. `0` is a real value (a fresh session), so
   clients must key on the field's presence, not its truthiness.
+
+### `session-sync`
+The authoritative set of RUNNING sessions, emitted at the END of every
+connect-time snapshot (see Connect-time snapshot) — issue #66.
+
+```json
+{ "sessions": [ { "id": "<slot uuid>" }, ... ], "complete": true }
+```
+
+PRUNING ONLY — drop every session whose id is absent; never create one
+(payloads arrive as `session` events immediately before). An empty list is
+legal and meaningful ("the bridge has nothing running").
+
+`complete: true` is the bridge's claim that the list describes its WHOLE
+session set, and it is what licenses the pruning. A sync that cannot make that
+claim (a future paged snapshot, a relay forwarding one bridge of several) MUST
+omit the field, and clients MUST then treat the frame as informational and drop
+nothing — a partial sync is exactly the state in which dropping is most wrong.
+Clients must likewise treat an unparseable frame as no sync at all.
+
+This exists because the per-session re-send is additive and cannot tell a
+client to drop a session the bridge FORGOT — a restart wiping its in-memory
+map, a crash, an external-session cap eviction — and a bridge that has
+forgotten a session is definitionally unable to emit its `ended` event. Before
+this frame, every bridge restart orphaned that bridge's whole session set on
+every connected client, permanently, rendered green because their last known
+activity was WORKING.
+
+Deliberately hidden sessions (the honest hide of #53) live in a client's own UI
+state, not in this set: the frame carries no `sessionId`, is not the session
+"speaking", and must never un-hide one.
 
 ### `pty-output`
 Raw terminal output from a bridge-owned PTY (ANSI escapes included) or from a
