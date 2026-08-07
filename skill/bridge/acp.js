@@ -56,6 +56,15 @@ const pendingAcpSpawns = new Map();
  *  session actually ending (the fork's deregister, or its inbox dying), or by
  *  the timeout. */
 const pendingAcpCloses = new Map();
+/** Sessions the wrist ASKED to end, held until they actually do (#88). Kept
+ *  SEPARATE from pendingAcpCloses because that entry dies at the timeout while
+ *  the teardown it is waiting on does not: the adapter's teardown awaits an
+ *  unbounded `query.interrupt()`, so a mid-turn kill — the reason anyone kills
+ *  from a wrist — routinely deregisters after the window closed. The intent has
+ *  to outlive the wait for that late ending to still count as the user's kill.
+ *  Consumed by the session's end (below), so it is bounded by the live
+ *  sessions, and dropped wholesale at shutdown. */
+const wristKilledSessions = new Set();
 /** Watch-spawned sessions no editor thread has adopted yet:
  *  sessionId -> { cwd, createdAt }. The desk-pickup registry /acp/claim takes
  *  from. Deliberately SEPARATE from the sessions map: a fork death ends the
@@ -319,6 +328,9 @@ export function requestAcpSpawn(cwd) {
 export function requestAcpClose(sessionId, reason = "watch-kill") {
   const connectionId = sessionConnection.get(sessionId);
   if (!connectionId || !acpInboxes.has(connectionId)) return Promise.resolve(null);
+  // Recorded before the frame goes out and never cleared by the answer — only
+  // by the session's death (see wristKilledSessions).
+  wristKilledSessions.add(sessionId);
   // A second tap while the first close is still landing must not orphan the
   // first waiter (the settle is keyed by session): both ride the same one.
   const inFlight = pendingAcpCloses.get(sessionId);
@@ -361,9 +373,10 @@ registerSessionCleanupHook((sessionId) => {
   // user giving up on the session — but a kill IS, and leaving the entry would
   // hand the next New Thread a session that was explicitly ended: auto-revive
   // by accident, the very policy #88's resume half is waiting on a decision
-  // for. Only an ending we ASKED for retires it (checked before the settle,
-  // which clears the pending entry).
-  if (pendingAcpCloses.has(sessionId)) pendingPickups.delete(sessionId);
+  // for. Keyed on the kill INTENT rather than the in-flight wait: a teardown
+  // slow enough to be reported as failed still ends the session, and that
+  // ending is no less the user's kill for having outrun the timeout.
+  if (wristKilledSessions.delete(sessionId)) pendingPickups.delete(sessionId);
   settlePendingClose(sessionId, { ok: true });
 });
 
@@ -987,6 +1000,7 @@ export function closeAllAcpInboxes() {
   for (const sessionId of [...pendingAcpCloses.keys()]) {
     settlePendingClose(sessionId, { ok: false, error: "bridge shutting down" });
   }
+  wristKilledSessions.clear();
   for (const { res, heartbeat } of acpInboxes.values()) {
     clearInterval(heartbeat);
     try { res.end(); } catch { /* ignore */ }

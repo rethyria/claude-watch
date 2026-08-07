@@ -202,6 +202,38 @@ test("a killed watch-spawned session is no longer claimable at the desk", { time
   assert.equal(claim.body.sessionId, null, "a killed session must not be handed to a New Thread");
 });
 
+test("a teardown that outran the timeout still retires the pickup", { timeout: 60_000 }, async (t) => {
+  // The kill the watch was told had FAILED, landing late. A mid-turn teardown
+  // sits behind an unbounded `query.interrupt()` — the one case a wrist kill is
+  // most likely to hit, since a wedged turn is why anyone kills from a watch —
+  // so the ending routinely arrives after ACP_CLOSE_TIMEOUT_MS. It is still the
+  // user's kill: the session it ends must not be waiting at the next New Thread.
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_ACP_CLOSE_TIMEOUT_MS: "400" } });
+  const token = await pair(bridge);
+  const cwd = tempDir(t, "acp-close-pickup-late-");
+
+  const inbox = connectInbox(t, bridge, "fork-slow");
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "fork-slow", sessionId: "kill-slow", cwd, detached: true });
+
+  const respPromise = request(bridge.port, "POST", "/v1/command", {
+    token,
+    body: { kill: true, sessionId: "kill-slow" },
+  });
+  await inbox.waitFor((e) => e.event === "close");
+  assert.equal((await respPromise).status, 504, "the timeout reported the kill as failed");
+
+  // …and only then does the adapter finish tearing down.
+  await request(bridge.port, "POST", "/acp/deregister", {
+    body: { connection: "fork-slow", sessionId: "kill-slow", reason: "query-closed" },
+  });
+  const slot = await slotOf(bridge, token, "kill-slow");
+  assert.equal(slot.state, "ended", "the late ending is real — the fork's own deregister");
+
+  const claim = await request(bridge.port, "POST", "/acp/claim", { body: { connection: "fork-slow", cwd } });
+  assert.equal(claim.body.sessionId, null, "a slow kill is still a kill — nothing to adopt");
+});
+
 test("a fork death still leaves the pickup claimable (only a KILL retires it)", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   const cwd = tempDir(t, "acp-close-pickup-survives-");

@@ -267,10 +267,15 @@ export const ACP_SPAWN_TIMEOUT_MS = testOverridable(
 // the session to actually END after writing the `close` frame. The ending is
 // the ack — the fork's teardown deregisters the session — so this is the
 // window in which a wrist kill either becomes true or is reported as failed.
-// It must cover an in-flight turn's graceful interrupt (cancel, then the
-// force-cancel floor) yet stay under the wear client's 20 s read timeout. An
-// adapter too old to know the frame drops it silently, so the timeout is also
-// the only way that build ever surfaces — never a fake ending. Overridable via
+// It is sized for the ordinary case (an idle session tears down in well under
+// a second) and deliberately does NOT try to cover a mid-turn one: that
+// teardown awaits an unbounded `query.interrupt()` behind a 30 s force-cancel
+// floor, so waiting it out would mean out-sitting the wear client's 20 s read
+// timeout and answering a watch that already gave up. A teardown that overruns
+// is not lost — its deregister still ends the slot over SSE, and the kill
+// intent it settles against (acp.js) still retires the desk pickup. An adapter
+// too old to know the frame drops it silently, so the timeout is also the only
+// way that build ever surfaces — never a fake ending. Overridable via
 // CLAUDE_WATCH_ACP_CLOSE_TIMEOUT_MS (test-only).
 export const ACP_CLOSE_TIMEOUT_MS = testOverridable(
   "CLAUDE_WATCH_ACP_CLOSE_TIMEOUT_MS",
