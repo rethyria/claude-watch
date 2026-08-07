@@ -5,8 +5,17 @@
 // run as a detached headless `claude -p --continue` fork of the live session
 // (issue #69).
 //
-// Each test points the bridge at a stub `claude` binary via the test-only
-// CLAUDE_WATCH_CLAUDE_BIN override so agent behavior is deterministic.
+// The PTY auto-spawn is CODEX's path now (issue #91): a dictation with no
+// session asks Zed's adapter for a claude session instead of minting a PTY the
+// editor could never see. The reliability machinery below — ready gate, killed
+// zombie, dead PTY — is unchanged and still the only thing standing between a
+// silently-swallowed command and the client, so these tests drive it through
+// the agent that still uses it. The claude side of the same site is covered by
+// test/acp-dictate-spawn.test.js.
+//
+// Each test points the bridge at a stub binary via the test-only
+// CLAUDE_WATCH_CLAUDE_BIN / CLAUDE_WATCH_CODEX_BIN overrides so agent behavior
+// is deterministic.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -14,12 +23,12 @@ import os from "node:os";
 import path from "node:path";
 import { startBridge, request, connectSse } from "./helpers.js";
 
-function makeFakeClaude(t, script) {
+function makeFakeAgent(t, agent, script) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-fake-bin-"));
   t.after(() => {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
-  const bin = path.join(dir, "claude");
+  const bin = path.join(dir, agent);
   fs.writeFileSync(bin, script, { mode: 0o755 });
   return bin;
 }
@@ -38,13 +47,13 @@ test("auto-spawn injects the command only after the first pty-output", { timeout
   // A blind timed write would hit the PTY during the silence and the PTY echo
   // would surface the command BEFORE the marker; the ready-gated write can
   // only ever surface it after.
-  const bin = makeFakeClaude(t, "#!/bin/sh\nsleep 0.7\necho SPAWN-READY-MARKER\nexec cat\n");
-  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
+  const bin = makeFakeAgent(t, "codex", "#!/bin/sh\nsleep 0.7\necho SPAWN-READY-MARKER\nexec cat\n");
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
   const { token, sse } = await pairAndConnect(t, bridge);
 
   const resp = await request(bridge.port, "POST", "/command", {
     token,
-    body: { command: "inject-after-ready\n" },
+    body: { command: "inject-after-ready\n", agent: "codex" },
   });
   assert.equal(resp.status, 200);
   assert.equal(resp.body.ok, true);
@@ -65,15 +74,15 @@ test("auto-spawn injects the command only after the first pty-output", { timeout
 test("auto-spawn that never becomes ready surfaces an error, not ok:true", { timeout: 60_000 }, async (t) => {
   // The stub agent produces no output at all; the bounded ready wait must
   // expire and the client must learn the command was NOT injected.
-  const bin = makeFakeClaude(t, "#!/bin/sh\nexec sleep 30\n");
+  const bin = makeFakeAgent(t, "codex", "#!/bin/sh\nexec sleep 30\n");
   const bridge = await startBridge(t, {
-    env: { CLAUDE_WATCH_CLAUDE_BIN: bin, CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS: "500" },
+    env: { CLAUDE_WATCH_CODEX_BIN: bin, CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS: "500" },
   });
   const { token } = await pairAndConnect(t, bridge);
 
   const resp = await request(bridge.port, "POST", "/command", {
     token,
-    body: { command: "this must not vanish silently\n" },
+    body: { command: "this must not vanish silently\n", agent: "codex" },
   });
   assert.equal(resp.status, 500, "injection failure must not report success");
   assert.notEqual(resp.body.ok, true);
@@ -85,15 +94,15 @@ test("failed auto-spawn is not sticky: a retry never silently targets the zombie
   // registered as running with a live PTY — otherwise the no-session-id
   // fallback selects it on retry, blind-writes past the ready gate, and
   // returns ok:true while the command is silently swallowed.
-  const bin = makeFakeClaude(t, "#!/bin/sh\nexec sleep 30\n");
+  const bin = makeFakeAgent(t, "codex", "#!/bin/sh\nexec sleep 30\n");
   const bridge = await startBridge(t, {
-    env: { CLAUDE_WATCH_CLAUDE_BIN: bin, CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS: "500" },
+    env: { CLAUDE_WATCH_CODEX_BIN: bin, CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS: "500" },
   });
   const { token } = await pairAndConnect(t, bridge);
 
   const first = await request(bridge.port, "POST", "/command", {
     token,
-    body: { command: "first attempt\n" },
+    body: { command: "first attempt\n", agent: "codex" },
   });
   assert.equal(first.status, 500);
   const zombieId = first.body.sessionId;
@@ -109,7 +118,7 @@ test("failed auto-spawn is not sticky: a retry never silently targets the zombie
   // (which also fails here, with the same hanging stub) and reports that.
   const retry = await request(bridge.port, "POST", "/command", {
     token,
-    body: { command: "retry attempt\n" },
+    body: { command: "retry attempt\n", agent: "codex" },
   });
   assert.notEqual(retry.body.ok, true, "retry must not silently swallow the command");
   assert.equal(retry.status, 500);
@@ -125,24 +134,25 @@ test("auto-spawn recovers after a failed injection once the agent behaves", { ti
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
   const marker = path.join(dir, "already-ran");
-  const bin = makeFakeClaude(
+  const bin = makeFakeAgent(
     t,
+    "codex",
     `#!/bin/sh\nif [ ! -f "${marker}" ]; then touch "${marker}"; exec sleep 30; fi\necho RECOVERED-READY\nexec cat\n`,
   );
   const bridge = await startBridge(t, {
-    env: { CLAUDE_WATCH_CLAUDE_BIN: bin, CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS: "500" },
+    env: { CLAUDE_WATCH_CODEX_BIN: bin, CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS: "500" },
   });
   const { token, sse } = await pairAndConnect(t, bridge);
 
   const first = await request(bridge.port, "POST", "/command", {
     token,
-    body: { command: "lost to the hung agent\n" },
+    body: { command: "lost to the hung agent\n", agent: "codex" },
   });
   assert.equal(first.status, 500);
 
   const retry = await request(bridge.port, "POST", "/command", {
     token,
-    body: { command: "second time lucky\n" },
+    body: { command: "second time lucky\n", agent: "codex" },
   });
   assert.equal(retry.status, 200);
   assert.equal(retry.body.ok, true);
@@ -156,15 +166,15 @@ test("auto-spawn recovers after a failed injection once the agent behaves", { ti
 });
 
 test("auto-spawn whose PTY dies immediately surfaces an error and leaves the bridge alive", { timeout: 60_000 }, async (t) => {
-  const bin = makeFakeClaude(t, "#!/bin/sh\nexit 1\n");
+  const bin = makeFakeAgent(t, "codex", "#!/bin/sh\nexit 1\n");
   const bridge = await startBridge(t, {
-    env: { CLAUDE_WATCH_CLAUDE_BIN: bin, CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS: "2000" },
+    env: { CLAUDE_WATCH_CODEX_BIN: bin, CLAUDE_WATCH_SPAWN_INJECT_TIMEOUT_MS: "2000" },
   });
   const { token } = await pairAndConnect(t, bridge);
 
   const resp = await request(bridge.port, "POST", "/command", {
     token,
-    body: { command: "into a dead pty\n" },
+    body: { command: "into a dead pty\n", agent: "codex" },
   });
   assert.equal(resp.status, 500, "dead PTY must not report success");
   assert.notEqual(resp.body.ok, true);
@@ -178,7 +188,7 @@ test("auto-spawn whose PTY dies immediately surfaces an error and leaves the bri
 test("a text command that resolves to an external PTY-less session is refused, never forked headlessly (issue #69)", { timeout: 60_000 }, async (t) => {
   // If the bridge DID fork, this stub would run and echo a marker; the test
   // proves it never does.
-  const bin = makeFakeClaude(t, '#!/bin/sh\necho "HEADLESS-RAN $@"\n');
+  const bin = makeFakeAgent(t, "claude", '#!/bin/sh\necho "HEADLESS-RAN $@"\n');
   const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
   const { token, sse } = await pairAndConnect(t, bridge);
 
@@ -223,13 +233,13 @@ test("a command to an ENDED bridge-owned session is refused as ended, not mislab
   // with ptyProcess=null — the same "no PTY" shape as an external session. Its
   // refusal must say it ENDED, never falsely claim it is an external session
   // the bridge does not own (the bridge spawned it).
-  const bin = makeFakeClaude(t, "#!/bin/sh\necho SPAWN-READY\nexec cat\n");
-  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
+  const bin = makeFakeAgent(t, "codex", "#!/bin/sh\necho SPAWN-READY\nexec cat\n");
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
   const { token, sse } = await pairAndConnect(t, bridge);
 
   // Auto-spawn a bridge-owned (NOT external) session and capture its id.
   const spawn = await request(bridge.port, "POST", "/command", {
-    token, body: { command: "hello\n" },
+    token, body: { command: "hello\n", agent: "codex" },
   });
   assert.equal(spawn.status, 200);
   const sessionId = spawn.body.sessionId;

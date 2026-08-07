@@ -405,11 +405,22 @@ from the option's `kind`) so logs and behavior-keyed consumers stay honest.
   refusals are distinguished: an ended bridge-owned session is reported as
   ended, never mislabeled as external.
 - Without `sessionId`: routed to the most recent active session, or
-  **auto-spawns** one (`agent`, default `"claude"`); the command is injected
-  only after the new PTY produces output → `200 { "ok": true, "sessionId":
-  ..., "agent": ..., "spawned": true }`, or `500` (with `sessionId`,
-  `spawned: true`) when the agent never became ready — the failed session is
-  killed, never left as a zombie target.
+  **auto-spawns** one (`agent`, default `"claude"`).
+  - **claude** composes the spawn of action 1 with the ACP injection above
+    (there is no PTY auto-spawn left for it): the session is born in Zed's
+    adapter and the dictated text is injected into it → `200 { "ok": true,
+    "sessionId": ..., "agent": "claude", "kind": "acp", "spawnRequestId": ...,
+    "spawned": true, "prompt": true }`. No adapter connected → the same honest
+    `409` as action 1, with nothing created; an adapter that fails the spawn →
+    `409` carrying its error and the `spawnRequestId`; a session created but no
+    longer reachable when the prompt is written → `502` **naming the session**
+    (`sessionId`, `spawned: true`), so the client can retry into it rather than
+    treat it as lost.
+  - **codex** keeps the bridge-owned PTY: the command is injected only after
+    the new PTY produces output → `200 { "ok": true, "sessionId": ...,
+    "agent": ..., "spawned": true }`, or `500` (with `sessionId`,
+    `spawned: true`) when the agent never became ready — the failed session is
+    killed, never left as a zombie target.
 - Unknown `sessionId` → `404`.
 
 None of the actions present → `400 {"error": "Missing 'command', 'spawn',
@@ -1018,3 +1029,34 @@ CLAUDE_WATCH_UPDATE_FIXTURES=1 node --test test/protocol-fixtures.test.js
 
 Review the fixture diff like an API review, update this document, and bump
 `PROTOCOL_VERSION`/`MIN_SUPPORTED_CLIENT_PROTO` if the change is breaking.
+
+## Killing an ACP session (#88)
+
+`{ "kill": true, "sessionId": ... }` (action 2 above) means different work for
+the two species of session, and the difference is visible in the response:
+
+- A **bridge-owned PTY** session is stopped directly → `200 { "ok": true }`,
+  unchanged.
+- An **ACP** (Zed-hosted) session runs inside the adapter's process, which the
+  bridge cannot signal. It relays a `close` frame down that fork's `/acp/inbox`
+  instead; the adapter runs the same teardown its own `session/close` does, and
+  the **deregister that teardown emits is the only ack** — so the `session`
+  `ended` event a client sees is the fork's real ending, never a bridge
+  fabrication. The response waits for that ending:
+  - ended → `200 { "ok": true, "sessionId": ..., "kind": "acp" }`;
+  - no adapter connected → `502 {"error": "ACP session is not reachable …
+    nothing was stopped", "sessionId": ...}`;
+  - the frame went out but nothing ended within ~10 s (an adapter build too old
+    to know the frame drops it silently) → `504 {"error": "Zed's agent did not
+    end the session …", "sessionId": ...}`.
+
+Both refusals leave the session **exactly as it was** — still `running`, still
+`dictatable`. That is issue #53's doctrine at the wire: a kill the bridge
+cannot perform must never look performed, because a slot marked ended under a
+live agent goes on absorbing its events invisibly. Clients should offer a real
+kill only where one exists — a bridge-owned PTY, or an ACP session — and an
+honest local "hide" for a hook-observed (`external`, non-`acp`) session, whose
+process nothing in this system can stop.
+
+An already-ended ACP slot needs no frame: it answers `200` directly, since
+marking an over session over invents nothing.

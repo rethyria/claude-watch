@@ -49,7 +49,9 @@ import java.util.concurrent.TimeUnit
  * queued, allow-always) so each unblocks with the chosen decision, answer an
  * AskUserQuestion payload, and spawn a claude session from the session pager
  * (the v2 one-session-per-screen list) — born in the harness's fake Zed fork
- * over the bridge's ACP inbox (issue #107) — then hide it again.
+ * over the bridge's ACP inbox (issue #107) — then KILL it for real: the close
+ * frame of issue #88 travels wrist → bridge → fork, and the fork's own
+ * deregister is what takes the card off the pager.
  *
  * The old control-page command box has no Halo equivalent (commands are
  * dictation-only and the recognizer cannot run headlessly); the ack-gated
@@ -654,15 +656,20 @@ class WalkingSkeletonTest {
 
         // Back to the pager (swipe right, the feed's v3 back) — the
         // selection survives the feed round trip, so the spawned card is up
-        // with its action arc's close. An ACP slot is EXTERNAL (the bridge
-        // owns no process it could stop), so the close is the honest LOCAL
-        // hide of issue #53 — no bridge round trip, the card just leaves the
-        // pager; the close-under-cursor self-heal re-selects a neighbour and
-        // the pager stays steppable.
+        // with its action arc's close. An ACP slot is EXTERNAL and yet really
+        // killable (issue #88): the ✕ POSTs a kill, the bridge relays a
+        // `close` frame down the fork's inbox, and the fork's own deregister
+        // ends the slot — so the card leaves because the SESSION ENDED, not
+        // because the watch hid it. That distinction is invisible from in
+        // here (both make a card vanish), so wear-e2e.sh checks the frame on
+        // both sides of the loopback channel afterwards. The
+        // close-under-cursor self-heal re-selects a neighbour and the pager
+        // stays steppable.
         compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeRight() }
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-$spawnedId").assertIsDisplayed()
-        compose.onNodeWithTag("haloRowClose").assertIsDisplayed().performClick()
+        compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
+        compose.onNodeWithTag("haloRowClose").performClick()
         compose.waitUntil(30_000) { !tagExists("haloPagerCard-$spawnedId") }
         allPagerIds()
         assertTrue("the pager must stay usable after the kill", tagDisplayed("haloSpawn"))

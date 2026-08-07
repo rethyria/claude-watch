@@ -12245,6 +12245,46 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
     });
   });
 
+  // --- Watch kill (#88) — the close frame, the inbox's fifth lane -----------
+
+  it("delivers a close frame to the handler, defaulting the reason", async () => {
+    await withChannel(async (channel, bridge) => {
+      const closes: Array<{ sessionId: string; reason: string }> = [];
+      channel.onClose((c) => closes.push(c));
+      channel.start();
+      await waitFor(() => bridge.inboxConnects.length === 1);
+
+      bridge.pushFrame("close", { sessionId: "acp-c", reason: "watch-kill" });
+      await waitFor(() => closes.length === 1);
+      expect(closes[0]).toEqual({ sessionId: "acp-c", reason: "watch-kill" });
+
+      // A bridge that names no reason still gets a real teardown — the frame's
+      // meaning is the sessionId, and the reason is only ever a log line.
+      bridge.pushFrame("close", { sessionId: "acp-c2" });
+      await waitFor(() => closes.length === 2);
+      expect(closes[1]).toEqual({ sessionId: "acp-c2", reason: "watch-kill" });
+    });
+  });
+
+  it("drops a close frame naming no session without wedging the inbox", async () => {
+    await withChannel(async (channel, bridge) => {
+      const closes: unknown[] = [];
+      const injected: unknown[] = [];
+      channel.onClose((c) => closes.push(c));
+      channel.onInject((sessionId) => injected.push(sessionId));
+      channel.start();
+      await waitFor(() => bridge.inboxConnects.length === 1);
+
+      bridge.pushFrame("close", { reason: "watch-kill" }); // no sessionId
+      bridge.pushFrame("close", { sessionId: "" }); // empty sessionId
+      channel.registerSession({ sessionId: "s-alive", sdkSessionId: "s-alive", cwd: "/proj" });
+      await waitFor(() => bridge.registers.length === 1);
+      bridge.pushInject({ sessionId: "s-alive", text: "still alive", source: "watch" });
+      await waitFor(() => injected.length === 1);
+      expect(closes.length).toBe(0);
+    });
+  });
+
   it("takePendingPickup claims through the real HTTP path and degrades to null", async () => {
     await withChannel(async (channel, bridge) => {
       bridge.setClaimAnswer("picked-1");

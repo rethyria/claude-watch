@@ -133,3 +133,20 @@ cd wear
   -Pandroid.testInstrumentationRunnerArguments.bridgeHost=10.0.2.2 \
   -Pandroid.testInstrumentationRunnerArguments.bridgePort="$PORT" \
   -Pandroid.testInstrumentationRunnerArguments.pairingCode="$CODE"
+
+# --- The kill leg's proof (issue #88) ---------------------------------------
+# The skeleton's close tap is a REAL kill now, not the local hide it was: the
+# wrist's kill rides a `close` frame to the fork, whose deregister is what ends
+# the slot. From inside the app both look identical (a card vanishes), so the
+# evidence is checked here, on BOTH sides of the loopback channel — a silent
+# regression to hide-only, or an unserviced frame the bridge times out on,
+# would otherwise leave the leg green.
+if ! grep -aq "ACP close requested" "$BRIDGE_LOG"; then
+  echo "the wrist kill never became a close frame (bridge log)" >&2
+  exit 1
+fi
+if ! grep -aq "inbox close request" "$FORK_LOG"; then
+  echo "the close frame never reached the fake fork" >&2
+  exit 1
+fi
+echo "kill leg: the close frame was seen on both sides of the inbox"

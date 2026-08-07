@@ -69,6 +69,13 @@ export type InputDecisionHandler = (decision: InputDecision) => void;
 export type SpawnRequest = { requestId: string; cwd: string; agent: string };
 export type SpawnHandler = (request: SpawnRequest) => void;
 
+/** The wrist ended a session (#88). The fork tears it down for real — there is
+ *  no separate ack frame, because the teardown's own `deregister` IS the ack:
+ *  the bridge reports the ending it observes, so a fork that cannot honour the
+ *  close can never be mistaken for one that did. */
+export type CloseRequest = { sessionId: string; reason: string };
+export type CloseHandler = (request: CloseRequest) => void;
+
 /** The seam the agent (and its client tee) talk to. A test supplies a fake;
  *  production uses {@link HttpBridgeChannel}. Every method is best-effort and
  *  MUST NOT throw into agent code. */
@@ -165,6 +172,9 @@ export interface BridgeChannel {
   /** Register the handler the inbox calls when the watch asks this fork to
    *  create a session (the born-in-Zed spawn). */
   onSpawn(handler: SpawnHandler): void;
+  /** Register the handler the inbox calls when the watch KILLS a session
+   *  (#88) — a real teardown, never a hide. */
+  onClose(handler: CloseHandler): void;
   /** Answer a spawn frame: the explicit ack the bridge correlates by
    *  `requestId` (never piggybacked on register — a createSession throw must
    *  surface immediately, and register replay must not re-trigger
@@ -211,6 +221,7 @@ export class HttpBridgeChannel implements BridgeChannel {
   private permissionHandler: PermissionDecisionHandler | null = null;
   private inputHandler: InputDecisionHandler | null = null;
   private spawnHandler: SpawnHandler | null = null;
+  private closeHandler: CloseHandler | null = null;
   private stopped = false;
   private abort: AbortController | null = null;
 
@@ -277,6 +288,10 @@ export class HttpBridgeChannel implements BridgeChannel {
 
   onSpawn(handler: SpawnHandler): void {
     this.spawnHandler = handler;
+  }
+
+  onClose(handler: CloseHandler): void {
+    this.closeHandler = handler;
   }
 
   reportSpawnResult(result: {
@@ -661,6 +676,23 @@ export class HttpBridgeChannel implements BridgeChannel {
         this.spawnHandler?.({ requestId: s.requestId, cwd: s.cwd, agent });
       } catch (err) {
         this.logger.error(`claude-watch: spawn handler threw: ${String(err)}`);
+      }
+      return;
+    }
+    if (event === "close") {
+      let c: { sessionId?: unknown; reason?: unknown };
+      try {
+        c = JSON.parse(dataLines.join("\n"));
+      } catch {
+        return;
+      }
+      if (typeof c.sessionId !== "string" || !c.sessionId) return;
+      const reason = typeof c.reason === "string" && c.reason ? c.reason : "watch-kill";
+      this.logger.log(`claude-watch: inbox close request for session ${c.sessionId} (${reason})`);
+      try {
+        this.closeHandler?.({ sessionId: c.sessionId, reason });
+      } catch (err) {
+        this.logger.error(`claude-watch: close handler threw: ${String(err)}`);
       }
       return;
     }

@@ -195,20 +195,20 @@ test("a fork whose inbox drops (Zed quit / crash) strands no zombie slot", { tim
 });
 
 test("dictatable is live-delivery only: PTY yes+killable, hook no, ACP yes+hide (S4 #78)", { timeout: 60_000 }, async (t) => {
-  // A stub claude so a spawn produces a real, bridge-owned PTY session.
+  // A stub codex so a spawn produces a real, bridge-owned PTY session.
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-fakebin-"));
   t.after(() => { try { fs.rmSync(binDir, { recursive: true, force: true }); } catch { /* ignore */ } });
-  const bin = path.join(binDir, "claude");
+  const bin = path.join(binDir, "codex");
   fs.writeFileSync(bin, "#!/bin/sh\necho READY\nexec cat\n", { mode: 0o755 });
 
-  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
   const token = await pair(bridge);
 
   // (1) A bridge-owned PTY session: dictatable (stdin), NOT external (real
-  // kill). Created via the auto-spawn command path — the explicit claude spawn
-  // action is ACP-only now (born in Zed), so the dictate-with-no-session path
-  // is what still mints a claude PTY.
-  const spawned = await request(bridge.port, "POST", "/command", { token, body: { command: "hello\n", cwd: os.homedir() } });
+  // kill). Spawned as CODEX: every claude path is ACP-only now — the explicit
+  // spawn action since the Zed pivot, and the dictate-with-no-session site
+  // since #91 — so codex is the last agent that can produce a bridge PTY.
+  const spawned = await request(bridge.port, "POST", "/command", { token, body: { command: "hello\n", agent: "codex", cwd: os.homedir() } });
   assert.equal(spawned.status, 200);
   assert.equal(spawned.body.spawned, true, "the command auto-spawned a PTY session");
   const ptyEntry = await statusEntry(bridge, token, spawned.body.sessionId);
@@ -227,7 +227,8 @@ test("dictatable is live-delivery only: PTY yes+killable, hook no, ACP yes+hide 
   assert.notEqual(hookEntry.dictatable, true, "a PTY-less hook session is NOT dictatable");
   assert.equal(hookEntry.external, true, "a hook session is external (Hide)");
 
-  // (3) An ACP session: dictatable (inject) AND external (Hide, not a fake Kill).
+  // (3) An ACP session: dictatable (inject) AND external — the bridge owns no
+  // process of its own here; a kill goes out as a close frame (#88).
   const inbox = connectInbox(bridge, "conn-disc");
   t.after(() => inbox.close());
   assert.equal(await inbox.statusCode(), 200);

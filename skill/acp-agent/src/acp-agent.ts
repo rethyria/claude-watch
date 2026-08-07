@@ -1579,6 +1579,22 @@ export class ClaudeAcpAgent {
     return this.createSession({ cwd: params.cwd, mcpServers: [] }, { detached: true });
   }
 
+  /** claude-watch: end a session because the WRIST killed it (#88). Routes
+   *  through the same `teardownSession` the editor's `session/close` uses, so
+   *  the wrist kill is a real ending — in-flight work cancelled, the query (and
+   *  its subprocess) closed, the session deregistered — and never the hide #53
+   *  forbids. The deregister that teardown emits is also the bridge's only ack,
+   *  which is why nothing is reported back here.
+   *
+   *  Returns false for a session this fork does not host: the caller logs the
+   *  miss, and the bridge's own close timeout is what tells the wrist. */
+  async closeSessionFromWatch(sessionId: string, reason: string): Promise<boolean> {
+    if (!this.sessions[sessionId]) return false;
+    this.logger.log(`claude-watch: ending session ${sessionId} on the wrist's order (${reason})`);
+    await this.teardownSession(sessionId);
+    return true;
+  }
+
   /** claude-watch: whether this session is watch-spawned and not yet adopted by
    *  any editor thread. The predicate `guardDetachedClient` re-checks on every
    *  editor-bound call. */
@@ -6281,19 +6297,6 @@ export class ClaudeAcpAgent {
       });
     }
 
-    // Pull the title NOW rather than waiting for the first turn to end. The
-    // SDK's title poll is wired to turn-end, which is fine while a session runs
-    // but leaves a RESUMED one (Zed restarted, session/load) advertising its
-    // raw uuid to the watch until the user happens to send a prompt. A resumed
-    // session already has a title in its session file, so there is nothing to
-    // wait for. Best-effort and not awaited: a slow or missing session file
-    // must not delay session creation.
-    if (this.bridge) {
-      void this.maybeUpdateSessionTitle(sessionId, this.sessions[sessionId]!).catch(() => {
-        /* best-effort: the turn-end poll remains the fallback */
-      });
-    }
-
     // Publish the context window NOW. Every other `usage_update` is emitted
     // from the prompt-turn message loop, so before a session's first turn the
     // client has never been told this session's window and falls back to its
@@ -8228,6 +8231,22 @@ export function runAcp() {
         .catch((err) => {
           console.error(`claude-watch: watch spawn ${requestId} failed: ${String(err)}`);
           bridge.reportSpawnResult({ requestId, ok: false, error: String(err?.message ?? err) });
+        });
+    });
+    // Watch kill (#88): tear the session down for real. No ack frame — the
+    // teardown's deregister is what the bridge waits for, so a session this
+    // fork does not host (or a teardown that throws) simply never ends, and the
+    // bridge's close timeout tells the wrist the truth.
+    bridge.onClose(({ sessionId, reason }) => {
+      agent
+        .closeSessionFromWatch(sessionId, reason)
+        .then((closed) => {
+          if (!closed) {
+            console.error(`claude-watch: close requested for unknown session ${sessionId}`);
+          }
+        })
+        .catch((err) => {
+          console.error(`claude-watch: closing session ${sessionId} failed: ${String(err)}`);
         });
     });
     bridge.start();

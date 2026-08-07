@@ -10,8 +10,9 @@
 // claude-spawn tests drive a FAKE FORK: an inbox SSE that answers the bridge's
 // `spawn` frame with /acp/register + /acp/spawn-result, exactly as the real
 // adapter does. The resolved cwd must survive the whole pipeline — request →
-// frame → registered slot. The auto-spawn command path still mints a claude
-// PTY and keeps the stub binary.
+// frame → registered slot. Since issue #91 that includes the dictate-with-no-
+// session site, which composes the same spawn; the stub binary stays for the
+// bridge's binary discovery (and the codex-shaped PTY path).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -157,7 +158,9 @@ test("the auto-spawn command site validates cwd identically", { timeout: 60_000 
   const { bridge, token } = await pairedBridge(t);
   const missing = path.join(os.tmpdir(), "claude-watch-spawn-cwd-auto-missing");
 
-  // Invalid target: 400, no slot.
+  // Invalid target: 400, no slot — and the refusal still comes from the SAME
+  // validation, ahead of the fork (issue #91 moved this site's spawn into
+  // Zed-land; a bad directory must never reach the adapter either).
   const bad = await request(bridge.port, "POST", "/v1/command", {
     token,
     body: { command: "hello\n", cwd: missing },
@@ -167,6 +170,8 @@ test("the auto-spawn command site validates cwd identically", { timeout: 60_000 
   assert.deepEqual(await sessionSnapshot(bridge, token), [], "no session slot was created");
 
   // Valid target: the auto-spawned session lands there.
+  const fork = connectFakeFork(t, bridge, "fork-auto-cwd");
+  assert.equal(await fork.inbox.statusCode(), 200);
   const projectDir = tempDir(t, "claude-watch-spawn-cwd-auto-project-");
   const good = await request(bridge.port, "POST", "/v1/command", {
     token,
@@ -175,6 +180,7 @@ test("the auto-spawn command site validates cwd identically", { timeout: 60_000 
   assert.equal(good.status, 200);
   assert.equal(good.body.ok, true);
   assert.equal(good.body.spawned, true);
+  assert.equal(fork.served[0].parsed.cwd, projectDir, "the frame carries the requested directory");
   const slot = (await sessionSnapshot(bridge, token)).find((s) => s.id === good.body.sessionId);
   assert.equal(slot.cwd, projectDir);
 });
