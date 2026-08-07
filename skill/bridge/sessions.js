@@ -1889,11 +1889,24 @@ export function endAcpSession(sessionId, reason = "acp-closed") {
 // PART of the session set (a paged snapshot, a relay forwarding one bridge of
 // several) must omit it, and clients then treat the frame as informational —
 // never as a licence to drop what it did not mention.
+//
+// Each entry also carries the slot's turn-level truth as a TRI-STATE (issue
+// #60), which the `session` payload's `idle` deliberately cannot: on a session
+// event the flag is present-only-when-true, so "working" and "the bridge has
+// no idea" are the same absence there, and a client meeting the session for
+// the first time has to guess — which is how a session idle for three hours
+// rendered green on a freshly-paired watch. In a SYNC the two are told apart:
+//   idle: true   — the last lifecycle signal was a turn end
+//   idle: false  — a turn is in flight
+//   omitted      — no turn signal has ever been observed for this slot
+// A sync is a description of current state, so it says all three out loud
+// rather than leaning on a merge rule. (The per-session payload's flag is
+// unchanged: it stays the one-way latch every live event uses.)
 registerSseSyncProvider(function* runningSessionsSync() {
   const listed = [];
   for (const [sid, slot] of sessions) {
     if (slot.state !== "running") continue;
-    listed.push({ id: sid });
+    listed.push({ id: sid, ...(typeof slot.idle === "boolean" ? { idle: slot.idle } : {}) });
     yield {
       event: "session",
       data: JSON.stringify(sessionEventPayload(slot, {

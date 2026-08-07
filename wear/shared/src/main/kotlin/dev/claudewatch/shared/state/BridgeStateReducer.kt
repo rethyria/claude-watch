@@ -220,7 +220,7 @@ object BridgeEventReducer {
 
     private fun apply(state: BridgeState, event: BridgeEvent, nowMs: Long): BridgeState = when (event) {
         is SessionEvent -> applySession(state, event, nowMs)
-        is SessionSyncEvent -> applySessionSync(state, event)
+        is SessionSyncEvent -> applySessionSync(state, event, nowMs)
         // Only the addressed session goes idle; an event with no/unknown
         // sessionId changes nothing (never "all sessions"). A finished turn
         // also lowers the thinking cursor — nothing more is coming.
@@ -518,7 +518,8 @@ object BridgeEventReducer {
 
     /**
      * The authoritative connect-time set (issue #66): drop every session the
-     * bridge did not list.
+     * bridge did not list, and take its word for what the ones it kept are
+     * doing (issue #60).
      *
      * The session set used to only ever GROW — the sole removal path was a
      * `session` event with `state: "ended"`, so anything the bridge forgot
@@ -543,12 +544,31 @@ object BridgeEventReducer {
      * Honest-hidden sessions (#53) are untouched by construction: hiding lives
      * in the client's own UI state keyed by id, and this frame carries no
      * sessionId, so it is not "the session speaking" and cannot un-hide one.
+     *
+     * ACTIVITY (issue #60) rides the same authority, and is the one place the
+     * one-way idle latch does NOT apply. On a `session` event absence means
+     * "working, or an older bridge" and must never wake anything, because every
+     * routine reconnect resend arrives that way. A sync entry is a DESCRIPTION
+     * of current state, so it can afford all three answers — and the third is
+     * the one the issue asks for: an entry with NO verdict is the bridge saying
+     * it has observed no turn signal at all, which renders IDLE, not green.
+     * Guessing WORKING there is what put a three-hours-idle session on the
+     * wrist in green; guessing IDLE is self-correcting, because a session that
+     * really is working re-marks itself on its very next event.
      */
-    private fun applySessionSync(state: BridgeState, event: SessionSyncEvent): BridgeState {
-        if (!event.complete) return state
+    private fun applySessionSync(state: BridgeState, event: SessionSyncEvent, nowMs: Long): BridgeState {
+        var sessions = state.sessions
+        for (entry in event.sessions) {
+            val known = sessions[entry.id] ?: continue
+            // Both transitions are idempotent, so a reconnect that tells us
+            // nothing new cannot restart or re-freeze an elapsed span.
+            val next = if (entry.idle == false) working(known, nowMs) else idled(known, nowMs)
+            if (next !== known) sessions = sessions + (entry.id to next)
+        }
+        if (!event.complete) return state.copy(sessions = sessions)
         val listed = event.sessions.mapTo(mutableSetOf()) { it.id }
-        if (state.sessions.keys.all { it in listed }) return state
-        return state.copy(sessions = state.sessions.filterKeys { it in listed })
+        if (sessions.keys.all { it in listed }) return state.copy(sessions = sessions)
+        return state.copy(sessions = sessions.filterKeys { it in listed })
     }
 
     /**

@@ -957,13 +957,116 @@ class BridgeEventReducerTest {
         assertEquals(setOf("A", "B"), after.sessions.keys)
     }
 
+    // ------------------------------------------------------------------
+    // Issue #60: the sync's TRI-STATE activity
+    // ------------------------------------------------------------------
+
+    @Test
+    fun aSyncEntryWithNoVerdictRendersIdleNotWorking() {
+        // Defence in depth (#60): the snapshot creates the session as WORKING
+        // (absence on a `session` payload means "working, or an older bridge",
+        // and that rule must not change), and the closing sync then says the
+        // bridge has observed no turn signal for it AT ALL. That is not a claim
+        // of work — rendering it green is the exact lie the issue is about — so
+        // it lands IDLE, with no elapsed clock to show for a span this client
+        // never witnessed.
+        val snapshot = fold(
+            listOf(SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}""")),
+        )
+        assertEquals(SessionActivity.WORKING, snapshot.sessions.getValue("A").activity)
+
+        val after = sync(snapshot, """{"sessions":[{"id":"A"}],"complete":true}""", nowMs = 1_001_050L)
+        val a = after.sessions.getValue("A")
+        assertEquals("an unobserved session must render idle, never green", SessionActivity.IDLE, a.activity)
+        assertNull(a.activeSinceMs)
+        // The clock stops at what this client actually witnessed — and it met
+        // the session in the very snapshot the sync closes, so that is the
+        // 50 ms between the two frames, not a fabricated hours-long span.
+        assertEquals(50L, a.frozenElapsedMs)
+    }
+
+    @Test
+    fun aSyncEntryFlaggedIdleFreezesTheSpanItReports() {
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "pty-output", """{"text":"working...\r\n","sessionId":"A"}"""),
+            ),
+        )
+        assertEquals(1_001_000L, state.sessions.getValue("A").activeSinceMs)
+
+        val after = sync(state, """{"sessions":[{"id":"A"},{"id":"B","idle":true}],"complete":true}""", nowMs = 1_005_000L)
+        val a = after.sessions.getValue("A")
+        assertEquals(SessionActivity.IDLE, a.activity)
+        assertEquals("the span that really ran is what we show", 4_000L, a.frozenElapsedMs)
+    }
+
+    @Test
+    fun aSyncEntryFlaggedWorkingWakesASessionTheClientHadIdled() {
+        // The mirror case, and the reason `false` is said OUT LOUD in a sync:
+        // a long ACP turn coalesces its prose to the end, so a watch that
+        // reconnects mid-turn has NO event to wake it — before this it sat grey
+        // for the whole turn. A sync describes current state, so it may wake;
+        // the one-way latch only ever governed the ambiguous absence.
+        val idle = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "stop", """{"sessionId":"A"}"""),
+            ),
+        )
+        assertEquals(SessionActivity.IDLE, idle.sessions.getValue("A").activity)
+
+        val after = sync(idle, """{"sessions":[{"id":"A","idle":false}],"complete":true}""", nowMs = 1_009_000L)
+        val a = after.sessions.getValue("A")
+        assertEquals(SessionActivity.WORKING, a.activity)
+        assertEquals("the woken session starts a fresh span", 1_009_000L, a.activeSinceMs)
+        assertNull(a.frozenElapsedMs)
+    }
+
+    @Test
+    fun repeatedSyncsNeitherReFreezeNorRestartASpan() {
+        // Every reconnect re-sends the same verdicts. Both transitions are
+        // idempotent, so a watch that drops SSE ten times an hour cannot
+        // inflate a frozen duration or restart a running clock.
+        val working = fold(
+            listOf(SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}""")),
+        )
+        val wokenOnce = sync(working, """{"sessions":[{"id":"A","idle":false}],"complete":true}""", nowMs = 1_004_000L)
+        val wokenTwice = sync(wokenOnce, """{"sessions":[{"id":"A","idle":false}],"complete":true}""", nowMs = 1_009_000L)
+        assertEquals(
+            "a repeated working verdict must not restart the elapsed clock",
+            1_001_000L,
+            wokenTwice.sessions.getValue("A").activeSinceMs,
+        )
+
+        val idledOnce = sync(wokenTwice, """{"sessions":[{"id":"A","idle":true}],"complete":true}""", nowMs = 1_011_000L)
+        val idledTwice = sync(idledOnce, """{"sessions":[{"id":"A","idle":true}],"complete":true}""", nowMs = 1_099_000L)
+        assertEquals(
+            "a repeated idle verdict must not re-freeze from a later clock",
+            10_000L,
+            idledTwice.sessions.getValue("A").frozenElapsedMs,
+        )
+    }
+
+    @Test
+    fun aPartialSyncStillCarriesTheActivityOfTheSessionsItNames() {
+        // Completeness is a claim about ABSENCE only. A frame that cannot list
+        // the whole set is still authoritative about the sessions it DOES
+        // describe, so its verdicts apply while its silence prunes nothing.
+        val after = sync(twoKnownSessions(), """{"sessions":[{"id":"A","idle":true}]}""")
+        assertEquals(setOf("A", "B"), after.sessions.keys)
+        assertEquals(SessionActivity.IDLE, after.sessions.getValue("A").activity)
+        assertEquals(SessionActivity.WORKING, after.sessions.getValue("B").activity)
+    }
+
     @Test
     fun aSessionSyncThatChangesNothingKeepsTheSameStateInstance() {
         // The common case by far: every reconnect re-lists exactly what the
-        // client already holds. Rebuilding the map there would churn every
-        // downstream recomposition for nothing.
+        // client already holds, with the verdicts it already applied.
+        // Rebuilding the map there would churn every downstream recomposition
+        // for nothing.
         val before = twoKnownSessions()
-        val after = sync(before, """{"sessions":[{"id":"A"},{"id":"B"}],"complete":true}""")
+        val after = sync(before, """{"sessions":[{"id":"A","idle":false},{"id":"B","idle":false}],"complete":true}""")
         assertSame(before.sessions, after.sessions)
     }
 }

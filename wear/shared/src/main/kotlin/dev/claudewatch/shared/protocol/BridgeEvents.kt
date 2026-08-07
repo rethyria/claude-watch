@@ -424,11 +424,25 @@ data class PermissionSyncEvent(
 
 /**
  * One session in a [SessionSyncEvent]'s authoritative set: the slot [id] the
- * bridge still has, and nothing else the `session` re-send already carried.
+ * bridge still has, plus its turn-level truth as a TRI-STATE (issue #60).
+ *
+ * [idle] here is NOT [SessionEvent.idle]'s one-way latch. That flag is
+ * present-only-when-true, so on a `session` payload "working" and "the bridge
+ * has no idea" are the same absence — which is why a client meeting a session
+ * for the first time had to guess, and guessed green for a session that had
+ * been idle for hours. A sync DESCRIBES CURRENT STATE, so it says all three
+ * out loud instead of leaning on a merge rule:
+ *
+ *  - `true`  — the bridge's last lifecycle signal was a turn END.
+ *  - `false` — a turn is in flight; the session really is working.
+ *  - absent  — the bridge has observed no turn signal at all for this slot
+ *    (a session registered but never yet run, an older bridge). It is NOT a
+ *    claim of work, and a client must not render one.
  */
 @Serializable
 data class SessionSyncEntry(
     val id: String,
+    val idle: Boolean? = null,
 ) {
     init {
         require(id.isNotEmpty()) { "session-sync entry must carry an id" }

@@ -93,6 +93,54 @@ test("a session the bridge no longer runs is absent from the next sync — the r
   assert.equal(sync.complete, true);
 });
 
+// --- The sync's tri-state activity (issue #60) -------------------------------
+// A `session` payload's `idle` is present-only-when-true, so on that event
+// "working" and "the bridge has no idea" are the SAME absence — which is how a
+// session idled hours before the watch existed rendered green on first sight.
+// The sync is a description of current state, so it tells all three apart.
+
+test("the sync says out loud whether each session is idle, working, or unobserved", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+
+  // Idle: its last lifecycle signal was a turn end.
+  const idle = await createSession(bridge, token, "cc-tri-idle", "/tmp/sync-60-idle");
+  assert.equal((await request(bridge.port, "POST", "/hooks/stop", {
+    body: { session_id: "cc-tri-idle", cwd: "/tmp/sync-60-idle" },
+  })).status, 200);
+
+  // Working: a completed tool use is the bridge-side markWorking signal, and
+  // createSession already fired one.
+  const working = await createSession(bridge, token, "cc-tri-working", "/tmp/sync-60-working");
+
+  // Unobserved: an ACP session registered by a fork that reports no `active`
+  // has never produced a turn signal at all. The bridge must not invent one.
+  const unobserved = "acp-sync-60-unobserved";
+  assert.equal((await request(bridge.port, "POST", "/acp/register", {
+    body: { connection: "conn-sync-60", sessionId: unobserved, cwd: "/tmp/sync-60-acp" },
+  })).status, 200);
+
+  const { sync } = await snapshot(t, bridge, token);
+  const byId = new Map(sync.sessions.map((s) => [s.id, s]));
+  assert.equal(byId.get(idle).idle, true, "a turn-ended slot says idle: true");
+  assert.equal(byId.get(working).idle, false, `a mid-turn slot says idle: false out loud; got ${JSON.stringify(byId.get(working))}`);
+  assert.equal(
+    Object.hasOwn(byId.get(unobserved), "idle"),
+    false,
+    `a slot with no turn signal must OMIT the verdict rather than guess; got ${JSON.stringify(byId.get(unobserved))}`,
+  );
+
+  // The per-session payload is unchanged: still present-only-when-true, so the
+  // one-way latch every live event relies on keeps working (issue #60's rule).
+  const { frames } = await snapshot(t, bridge, token);
+  const workingPayload = frames.find((e) => e.event === "session" && e.parsed?.sessionId === working).parsed;
+  assert.equal(
+    Object.hasOwn(workingPayload, "idle"),
+    false,
+    "a working session's `session` payload still carries no flag at all",
+  );
+});
+
 test("a bridge with nothing running still sends the sync — an empty set is the whole truth, not silence", { timeout: 60_000 }, async (t) => {
   // The reported bug verbatim: a restarted bridge knows about NOTHING, which is
   // precisely when a client must be told to drop what it is holding. Silence

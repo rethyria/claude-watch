@@ -629,6 +629,12 @@ guess WORKING — and the `stop` that had idled it hours earlier was long gone
 from the SSE replay ring, so nothing ever corrected the guess. Additive: no
 protocol-version bump, and older clients ignore it.
 
+The connect-time `session-sync` carries the same truth as a **tri-state** per
+entry, because a snapshot is a description of current state rather than a
+transition: there, `idle: false` is said out loud and an OMITTED verdict means
+"no turn signal ever observed" — which clients render idle, not green. See
+[`session-sync`](#session-sync).
+
 A `kill` on an external session is therefore best-effort and non-authoritative:
 the bridge marks the slot `ended`, but if the still-alive process emits another
 hook the bridge **revives** it — re-broadcasting the idempotent `running` event
@@ -717,12 +723,30 @@ The authoritative set of RUNNING sessions, emitted at the END of every
 connect-time snapshot (see Connect-time snapshot) — issue #66.
 
 ```json
-{ "sessions": [ { "id": "<slot uuid>" }, ... ], "complete": true }
+{ "sessions": [ { "id": "<slot uuid>", "idle": true }, ... ], "complete": true }
 ```
 
 PRUNING ONLY — drop every session whose id is absent; never create one
 (payloads arrive as `session` events immediately before). An empty list is
 legal and meaningful ("the bridge has nothing running").
+
+Each entry's `idle` is the slot's turn-level truth as a **tri-state** (issue
+#60), which the `session` payload's own `idle` deliberately cannot express:
+
+| entry | meaning |
+|---|---|
+| `"idle": true` | the last lifecycle signal was a turn END |
+| `"idle": false` | a turn is in flight — the session really is working |
+| omitted | no turn signal has ever been observed for this slot |
+
+On a `session` event the flag is present-only-when-true, so "working" and "the
+bridge has no idea" arrive as the same absence and a client meeting the session
+for the first time has to guess — which is exactly how a session idle for three
+hours rendered green on a freshly-paired watch. A sync DESCRIBES current state,
+so it says all three out loud. Clients must render the omitted case as **idle**:
+it is not a claim of work, and a session that really is working re-marks itself
+on its very next event. (The one-way latch on `session.idle` is unchanged; it
+still governs every live event.)
 
 `complete: true` is the bridge's claim that the list describes its WHOLE
 session set, and it is what licenses the pruning. A sync that cannot make that

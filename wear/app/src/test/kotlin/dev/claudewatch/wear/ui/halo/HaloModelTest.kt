@@ -173,6 +173,40 @@ class HaloModelTest {
     }
 
     /**
+     * #60's defence in depth, at the same layer: the closing `session-sync` of
+     * a connect-time snapshot (#66) carries the bridge's turn-state verdict for
+     * every slot it lists, and an entry with NO verdict means the bridge has
+     * observed no turn signal at all. That is not a claim of work — so the dot
+     * goes grey, not green, even though the `session` frame that preceded it
+     * carried no `idle` flag and created the session WORKING.
+     */
+    @Test
+    fun aSnapshotSessionTheBridgeCannotVouchForRendersIdleNotRunning() {
+        fun modelAfterSnapshot(syncEntry: String): HaloModel {
+            val frames = listOf(
+                SseFrame(null, "session", """{"state":"running","agent":"claude","cwd":"/home/dev/claypot","folderName":"claypot","external":true,"sessionId":"A"}"""),
+                SseFrame(null, "session-sync", """{"sessions":[$syncEntry],"complete":true}"""),
+            )
+            val state = frames.fold(BridgeState()) { acc, frame ->
+                (BridgeEventReducer.reduce(acc, frame, 1_000L) as BridgeEventReducer.Applied).state
+            }
+            return HaloModel.from(UiState(bridge = state))
+        }
+
+        assertEquals(
+            "a session the bridge cannot vouch for must not render green",
+            Halo.SessionState.IDLE,
+            modelAfterSnapshot("""{"id":"A"}""").sessions.single().state,
+        )
+        // ...and a sync that says a turn IS in flight paints it green, which is
+        // what keeps the defence from becoming the opposite bug.
+        assertEquals(
+            Halo.SessionState.RUNNING,
+            modelAfterSnapshot("""{"id":"A","idle":false}""").sessions.single().state,
+        )
+    }
+
+    /**
      * The #60 follow-up: "the turn ended" and "nothing is happening" are NOT
      * the same claim. A session that yields its turn while a workflow's
      * subagents keep running is neither RUNNING (it will not answer you) nor
