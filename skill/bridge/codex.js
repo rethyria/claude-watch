@@ -21,6 +21,7 @@ import {
 import {
   sessions,
   attachPtyToSession,
+  markSessionObserved,
   registerSessionCleanupHook,
   writeToSessionStdin,
 } from "./sessions.js";
@@ -94,6 +95,12 @@ function touchExternalSession(sessionId, cwd, createdAt) {
 
   if (existing) {
     const wasEnded = existing.state !== "running";
+    // The scanner just saw this session write, which is the only liveness
+    // signal a Codex slot has: it owns no PTY and holds no connection, so
+    // without this the zombie ageing (issue #65) would measure its silence
+    // from a createdAt taken off the session FILE — a chatty session with an
+    // old birth timestamp would age out mid-conversation.
+    markSessionObserved(existing);
     existing.agent = "codex";
     existing.cwd = resolvedCwd;
     existing.folderName = folderName;
@@ -115,6 +122,9 @@ function touchExternalSession(sessionId, cwd, createdAt) {
     state: "running",
     createdAt: createdAt || Date.now(),
   };
+  // createdAt comes off the session FILE and can already be minutes old, so
+  // the ageing clock (issue #65) starts from the detection instead.
+  markSessionObserved(slot);
   sessions.set(sessionId, slot);
   pushSseEvent("session", { state: "running", agent: "codex", cwd: resolvedCwd, folderName }, sessionId);
   log("info", `Detected Codex session ${sessionId} (${folderName}) from local session data`);

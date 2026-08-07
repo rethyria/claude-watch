@@ -235,6 +235,42 @@ export const SESSION_PRUNE_INTERVAL_MS = testOverridable(
   "CLAUDE_WATCH_SESSION_PRUNE_INTERVAL_MS",
   60_000,
 );
+// Zombie ageing for slots stuck in state "running" (issue #65). Nothing used
+// to age one out — pruneEndedSessions only ever considered `ended` — so a
+// session whose death the bridge never OBSERVED stayed running in the map
+// forever and was re-sent to every client on every connect.
+//
+// Two windows, because the evidence comes in two strengths, and the honesty
+// doctrine (#53) says the weaker the evidence the longer we wait:
+//
+//  * UNHOSTED — a liveness probe positively reports that nothing hosts the
+//    session any more (an ACP slot whose fork connection has no live inbox:
+//    the process that ran it is gone, which is the same verdict the inbox's
+//    own close handler emits as `acp-fork-disconnected`). The window only has
+//    to outlast the races that can leave a slot briefly unbound — the fork's
+//    register POST landing while its inbox is mid-reconnect (capped at 10 s of
+//    backoff), or a watch spawn's early-register beating the fork's own. Two
+//    minutes is twelve times the worst of those.
+//  * SILENT — nobody can say either way (a hook-created or Codex slot: no
+//    process handle, no connection, nothing to interrogate). This is a pure
+//    timeout, so it must be GENEROUS: a real session sitting at its prompt
+//    while the user is at lunch looks exactly like a dead one. Twelve hours
+//    covers a working day of silence, and the reported zombie had already been
+//    stuck for ten.
+//
+// Neither ending is authoritative: both are "we have no evidence this is
+// alive", so any later proof of life revives the slot (issue #53's revive
+// path). Overridable via CLAUDE_WATCH_SESSION_UNHOSTED_GRACE_MS /
+// CLAUDE_WATCH_SESSION_SILENT_GRACE_MS (test-only).
+export const SESSION_UNHOSTED_GRACE_MS = testOverridable(
+  "CLAUDE_WATCH_SESSION_UNHOSTED_GRACE_MS",
+  120_000,
+);
+export const SESSION_SILENT_GRACE_MS = testOverridable(
+  "CLAUDE_WATCH_SESSION_SILENT_GRACE_MS",
+  12 * 60 * 60 * 1000,
+);
+
 // Hard cap on hook-created (external) session slots. /hooks/* is
 // unauthenticated, so without a bound every unique session_id (or cwd) in a
 // hook payload would mint a permanent "running" slot — unbounded memory, SSE

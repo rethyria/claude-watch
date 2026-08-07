@@ -17,7 +17,7 @@
 import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
 import {
   registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
-  markWorkflowActivity, registerSessionCleanupHook,
+  markWorkflowActivity, registerSessionCleanupHook, registerSessionLivenessProbe,
 } from "./sessions.js";
 import { ACP_INBOX_HEARTBEAT_MS, ACP_SPAWN_TIMEOUT_MS } from "./config.js";
 import { waitForPermission, canonicalPermissionOptions, cancelPermission } from "./permissions.js";
@@ -904,6 +904,24 @@ export function injectToAcpSession(sessionId, text, source = "watch") {
 export function isAcpSession(sessionId) {
   return sessions.get(sessionId)?.kind === "acp";
 }
+
+// Liveness for the zombie ageing (issue #65). An ACP session's fork connection
+// IS its liveness — the same fact the inbox close handler acts on when it ends
+// every session bound to a dropped connection. So a slot whose fork still holds
+// an inbox is ALIVE no matter how long its last turn was, which is exactly the
+// "long-idle session with a live process must not be reaped" guarantee; and a
+// slot whose binding names no live inbox is one the close handler already
+// missed (a register that landed after its fork's inbox closed, or one that
+// carried no connection at all) — nothing will ever end it, so `false` hands it
+// to the short unhosted window rather than the long silent one.
+//
+// `null` for every non-ACP slot: a probe must never answer for a kind it does
+// not own, or a PTY/hook slot would inherit an ACP verdict.
+registerSessionLivenessProbe((slot) => {
+  if (slot.kind !== "acp") return null;
+  const connectionId = sessionConnection.get(slot.id);
+  return Boolean(connectionId && acpInboxes.has(connectionId));
+});
 
 /** End every inbox (graceful shutdown). */
 export function closeAllAcpInboxes() {

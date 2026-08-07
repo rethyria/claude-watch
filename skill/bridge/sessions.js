@@ -11,6 +11,8 @@ import {
   CLI_CWD,
   SESSION_PRUNE_GRACE_MS,
   SESSION_PRUNE_INTERVAL_MS,
+  SESSION_UNHOSTED_GRACE_MS,
+  SESSION_SILENT_GRACE_MS,
   MAX_EXTERNAL_SESSIONS,
   WORKFLOW_POLL_MS,
   WORKFLOW_STALE_MS,
@@ -38,8 +40,11 @@ import { pushSseEvent, registerSseSyncProvider } from "./transport-sse.js";
 //   idle carries the TURN-level truth that state cannot (issue #60 — see
 //   the turn-end-idle section below): state stays "running" across a finished
 //   turn, so idle is what tells a connect-time snapshot apart from a session
-//   that is actually producing work.
-/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", idle?: boolean, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, titleScanAt?: number, titleScanCount?: number, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowWatching?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowDone?: number, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
+//   that is actually producing work;
+//   observedAt is the last moment the bridge OBSERVED the session existing (a
+//   hook, an ACP register or turn boundary, a Codex scan) — the clock the
+//   zombie ageing measures silence from (issue #65, see the section below).
+/** @type {Map<string, {id: string, agent: string, cwd: string, folderName: string, ptyProcess: import("child_process").ChildProcess | null, state: string, createdAt: number, endedAt?: number, hookSessionId?: string, hookCreated?: boolean, kind?: "acp", idle?: boolean, observedAt?: number, title?: string, titleIsAi?: boolean, transcriptPath?: string, titleCache?: {path: string, mtimeMs: number, size: number, title: string | null}, titleScanAt?: number, titleScanCount?: number, projectRootVerified?: boolean, projectRootAttempt?: string, shallowestObservedCwd?: string, pendingRebindCwd?: string, pendingRebindCount?: number, endedAuthoritatively?: boolean, branch?: string, worktree?: boolean, repoRoot?: string, gitMetaCache?: {headPath: string, mtimeMs: number, size: number}, agents?: {running: number, done: number}, workflowActive?: boolean, workflowWatching?: boolean, workflowActivatedAt?: number, workflowSawRunning?: boolean, workflowDone?: number, workflowJournalCache?: Map<string, {mtimeMs: number, size: number, running: number, done: number}>}>} */
 export const sessions = new Map();
 
 // Claude Code hook payloads carry the emitting instance's own session_id.
@@ -514,13 +519,20 @@ export function refreshGitMetadata(slot) {
 /** Mark a slot idle: its last lifecycle signal was a turn end. */
 export function markSessionIdle(sessionId) {
   const slot = sessions.get(sessionId);
-  if (slot) slot.idle = true;
+  if (!slot) return;
+  slot.idle = true;
+  // A turn boundary is the bridge OBSERVING the session, which is what the
+  // zombie ageing measures silence from (issue #65). A session that keeps
+  // ending turns is alive, however little else it says.
+  markSessionObserved(slot);
 }
 
 /** Mark a slot working again: it just produced output. */
 export function markSessionWorking(sessionId) {
   const slot = sessions.get(sessionId);
-  if (slot) slot.idle = false;
+  if (!slot) return;
+  slot.idle = false;
+  markSessionObserved(slot);
 }
 
 // The additive `title` field rides every session payload once known; absent
@@ -1431,9 +1443,141 @@ export function pruneEndedSessions(now = Date.now()) {
   }
 }
 
+// --- Zombie ageing (issue #65) ----------------------------------------------
+// pruneEndedSessions above only ever considers `ended`, and NOTHING used to
+// consider `running` — so a session whose death the bridge never OBSERVED sat
+// in the map forever and was re-sent to every client on every connect. The
+// original report: a slot whose last hook was a Stop at 10:01 was still being
+// announced as an active session at 20:20, with no owning process the bridge
+// could see and no path to ever leave the map.
+//
+// In the ACP era most deaths ARE observed — an inbox drop ends every session
+// bound to that fork (`acp-fork-disconnected`), even on SIGKILL — so the
+// surviving zombie class is narrower than the hook-era issue text, and worth
+// naming exactly:
+//   * an ACP slot whose connection binding LEAKED — a register (or a watch
+//     spawn's early register) that landed after its fork's inbox had already
+//     closed, or one that carried no connection at all. The inbox close that
+//     would have ended it has already run, so nothing else ever will;
+//   * hook-created and Codex slots, which have no process handle and no
+//     connection: exactly the hook-era class, still reachable through /hooks
+//     and the Codex session scanner.
+//
+// Liveness evidence beats a timeout wherever it exists (the issue is explicit,
+// and #53 is binding: never fabricate an end for a session that may be alive):
+//   * a bridge-owned PTY is alive while its process object is — its close
+//     handler ends the slot, so the ageing must never race it;
+//   * an ACP slot whose fork inbox is live is ALIVE, however long it has been
+//     idle. That is the whole answer to "a long-idle session must not be
+//     reaped": in the ACP era every real session has a fork holding it open;
+//   * a transcript written recently proves SOMETHING is running the session,
+//     for the slots no probe can speak for (the issue's own suggestion — the
+//     mtime is already tracked for the title/git refresh).
+// Only when every one of those comes up empty does the window apply, and even
+// then the end is NOT authoritative: it says "no evidence", not "it is dead",
+// so a later hook, register or Codex write revives the slot through the same
+// path a watch-kill revive uses. And it is an END, broadcast like any other,
+// never a silent delete — clients observe the transition instead of watching a
+// row vanish.
+
+/** @type {Array<(slot: any) => boolean | null>} */
+const livenessProbes = [];
+
+/** Register a liveness probe. Returns `true` (something demonstrably hosts
+ *  this slot), `false` (nothing does — a stronger statement than silence), or
+ *  `null` for "no opinion", which is what a probe MUST return for slots of a
+ *  kind it does not own. Lives here rather than being imported so acp.js can
+ *  answer for its own sessions without sessions.js importing it back. */
+export function registerSessionLivenessProbe(probe) {
+  livenessProbes.push(probe);
+}
+
+function probeSessionLiveness(slot) {
+  let verdict = null;
+  for (const probe of livenessProbes) {
+    let answer;
+    try { answer = probe(slot); } catch { answer = null; }
+    if (answer === true) return true; // any positive proof of life wins outright
+    if (answer === false) verdict = false;
+  }
+  return verdict;
+}
+
+/** Note that the bridge just OBSERVED this slot existing — a hook, a register,
+ *  a turn boundary, a Codex scan. The ageing window below runs from here, so a
+ *  session that keeps speaking is never a zombie however quiet its transcript.
+ *  Exported for the observation paths outside this module (codex.js). */
+export function markSessionObserved(slot) {
+  if (slot) slot.observedAt = Date.now();
+}
+
+// Newest transcript write, or 0 when there is no readable transcript. Only
+// consulted for a slot that has ALREADY gone silent past its window, so the
+// stat costs nothing on the common path. Non-regular files are skipped for the
+// same reason refreshSessionTitle skips them.
+function transcriptMtimeMs(slot) {
+  if (typeof slot.transcriptPath !== "string" || !slot.transcriptPath) return 0;
+  try {
+    const stat = fs.statSync(slot.transcriptPath);
+    return stat.isFile() ? stat.mtimeMs : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** End a slot the bridge has no evidence is alive. Deliberately NOT
+ *  endedAuthoritatively: this is an absence of evidence, not an observed
+ *  death, so the session's next sign of life revives it (issue #53). */
+function endUnevidencedSession(slot, reason, now) {
+  slot.state = "ended";
+  slot.endedAt = now;
+  runSessionCleanupHooks(slot.id, reason);
+  pushSseEvent(
+    "session",
+    sessionEventPayload(slot, { state: "ended", agent: slot.agent, folderName: slot.folderName, reason }),
+    slot.id,
+  );
+  log("warn", `Aged out running session ${slot.id} (${slot.agent}, ${slot.folderName}): ${reason}`);
+}
+
+// Sweep every running slot. `now` is injectable so tests exercise the windows
+// without waiting them out.
+export function ageOutZombieSessions(now = Date.now()) {
+  for (const [, slot] of sessions) {
+    if (slot.state !== "running") continue;
+    // Bridge-owned PTY: the process object IS the evidence, and its close
+    // handler owns the ending.
+    if (slot.ptyProcess) {
+      slot.observedAt = now;
+      continue;
+    }
+    const hosted = probeSessionLiveness(slot);
+    if (hosted === true) {
+      // Alive now: reset the clock, so a fork that dies later is measured from
+      // the moment it stopped being observable, not from its last turn.
+      slot.observedAt = now;
+      continue;
+    }
+    const observedAt = slot.observedAt ?? slot.createdAt;
+    // A probe's `false` is a positive verdict about the HOST, which a file
+    // mtime cannot overturn — the same transcript can legitimately be written
+    // by the successor slot of a resumed session. Only the no-opinion case
+    // falls back to transcript evidence.
+    const evidenceAt = hosted === false ? observedAt : Math.max(observedAt, transcriptMtimeMs(slot));
+    const grace = hosted === false ? SESSION_UNHOSTED_GRACE_MS : SESSION_SILENT_GRACE_MS;
+    if (now - evidenceAt < grace) continue;
+    endUnevidencedSession(slot, hosted === false ? "host-gone" : "no-liveness", now);
+  }
+}
+
 // unref() so importing this module (e.g. from an in-process unit test) never
-// keeps the process alive on its own.
-setInterval(() => pruneEndedSessions(), SESSION_PRUNE_INTERVAL_MS).unref();
+// keeps the process alive on its own. Ageing runs BEFORE the prune so a slot it
+// ends still waits out the full grace period in `ended` — clients get their
+// usual window to observe the transition.
+setInterval(() => {
+  ageOutZombieSessions();
+  pruneEndedSessions();
+}, SESSION_PRUNE_INTERVAL_MS).unref();
 
 // /hooks/* is unauthenticated, so hook-created slots must be bounded: before
 // minting a new one, evict the oldest hook-created slot once the cap is hit.
@@ -1561,6 +1705,9 @@ export function resolveHookSession(body) {
         if (bound.state === "ended" && bound.hookCreated && !bound.endedAuthoritatively) {
           reviveSlotToRunning(bound);
         }
+        // Any hook is proof the session exists right now, which is what the
+        // zombie ageing measures silence from (issue #65).
+        markSessionObserved(bound);
         // Remember the transcript path on the hot path; the stat+read happens
         // only at the opportunistic refresh points — of which this is one, but
         // ONLY for a slot still missing its AI title (see acquireTitleMidTurn).
@@ -1798,6 +1945,9 @@ export function registerAcpSession({ sessionId, sdkSessionId, cwd, active, title
     sessions.set(sessionId, slot);
   }
   bindHookSession(slot, boundSdkId);
+  // A register (first, or the fork's replay after a restart) is the bridge
+  // observing the session; the zombie ageing measures silence from here.
+  markSessionObserved(slot);
   // Feed the workflow scanner (issue #105). Derivation only fills an EMPTY
   // slot, for two reasons that point the same way: a hook-carried path — the
   // real one, straight from Claude Code — must never be clobbered by the

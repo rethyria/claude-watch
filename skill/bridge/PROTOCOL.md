@@ -553,7 +553,24 @@ Lifecycle of agent sessions. Variants:
 - `{ "state": "ended", "agent": ..., "folderName": ..., "sessionId": ... }` —
   plus, depending on how it ended: `exitCode` and `signal` (PTY exit),
   `error` (spawn failure), `killed: true` (kill command), or `reason`
-  (`"session-end"`, `"evicted"`, ...).
+  (`"session-end"`, `"evicted"`, `"acp-fork-disconnected"`, ...).
+
+Two `reason` values are **ageing**, not observed deaths (issue #65) — the
+bridge ends a slot stuck in `running` that it has no evidence is alive, rather
+than announcing it as an active session forever:
+
+- `"host-gone"` — the process hosting the session is demonstrably gone (an ACP
+  slot whose fork connection has no live inbox).
+- `"no-liveness"` — nothing could speak for the session at all (a hook-created
+  or Codex slot: no process handle, no connection) and it has been silent, with
+  an untouched transcript, for the whole (generous) window.
+
+Both are honest about their uncertainty and neither is authoritative: they say
+"no evidence", not "it is dead", so the session's next sign of life **revives**
+the slot exactly as after a watch kill. A session with observable liveness is
+never aged out, however long it has been idle — an ACP session whose fork still
+holds its connection is alive by definition, and so is a bridge-owned PTY whose
+process is running.
 
 **`title`** (string, **optional, additive**): the session's human-readable
 title, carried on `running`/`ended` payloads (and the `/v1/status` and pair
