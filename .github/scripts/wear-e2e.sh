@@ -64,11 +64,23 @@ BRIDGE_LOG="$(mktemp "${TMPDIR:-/tmp}/wear-e2e-bridge.XXXXXX")"
 node skill/bridge/server.js > "$BRIDGE_LOG" 2>&1 &
 BRIDGE_PID=$!
 cleanup() {
+  status=$?
   echo "--- bridge log ($BRIDGE_LOG) ---"
   cat "$BRIDGE_LOG" || true
   if [ -n "${FORK_LOG:-}" ]; then
     echo "--- fake fork log ($FORK_LOG) ---"
     cat "$FORK_LOG" || true
+  fi
+  # On a failure the bridge log only proves what DIDN'T arrive; the wrist's own
+  # log is the half that says why. Worth having on CI, where the emulator is
+  # gone by the time anyone reads the report and a local re-run may not
+  # reproduce (a green run stays quiet — this is noisy on purpose).
+  if [ "$status" -ne 0 ]; then
+    echo "--- watch logcat (app + crashes) ---"
+    adb logcat -d -v time \
+      ActivityManager:I AndroidRuntime:E ConnectionEngine:V BridgeViewModel:V \
+      BridgeClient:V ClaudeWatch:V dev.claudewatch.wear:V '*:F' 2>/dev/null \
+      | tail -200 || true
   fi
   # The fake fork dies WITH the throwaway bridge — never before its spawn
   # answer, never after the run.
