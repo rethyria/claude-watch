@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /home/deck/Development/claude-watch show issue-8-session-attribution:skill/bridge/sessions.js)",
+      "Bash(git -C /home/deck/Development/claude-watch show issue-11-spawn-reliability:skill/bridge/sessions.js)",
+      "Bash(git -C /home/deck/Development/claude-watch worktree add --detach /tmp/claude-1000/-home-deck-Development-claude-watch/87f6aa4f-f064-47f1-9413-6fc0f541c730/scratchpad/rev-37-regression issue-37-pairing-refinements)",
+      "Bash(cp -r /home/deck/Development/claude-watch/skill/bridge/node_modules /tmp/claude-1000/-home-deck-Development-claude-watch/87f6aa4f-f064-47f1-9413-6fc0f541c730/scratchpad/rev-37-regression/skill/bridge/)",
+      "Bash(git -C /home/deck/Development/claude-watch show \"issue-6-endpoint-hardening:ios/ClaudeWatch/ClaudeWatch watchOS/Views/OnboardingView.swift\")",
+      "Bash(git -C /home/deck/Development/claude-watch show \"issue-6-endpoint-hardening:ios/ClaudeWatch/ClaudeWatch iOS/Networking/BridgeClient.swift\")",
+      "Bash(git -C /home/deck/Development/claude-watch show issue-12-port-file:skill/bridge/server.js)",
+      "Bash(perl -i -pe 's/\\\\x1b/\\\\\\\\u001b/g' wear/app/src/androidTest/kotlin/dev/claudewatch/wear/SessionPagerTest.kt)",
+      "Bash(node -e \"const os=require\\('os'\\);for\\(const [n,as] of Object.entries\\(os.networkInterfaces\\(\\)\\)\\)for\\(const a of as||[]\\)if\\(a.family==='IPv4'&&!a.internal\\)console.log\\(a.address\\)\")",
+      "Bash(git -C /home/deck/Development/claude-watch worktree list)",
+      "Bash(ls ~/.gradle/caches/modules-2/files-2.1/ | grep -i -E \"robolectric|mockito\" ; echo \"---\"; ls /home/deck/Development/claude-watch/.claude/worktrees/wf_f92bba65-fa2-20/skill/bridge/ ; echo \"---\"; ls /home/deck/Development/claude-watch/.claude/worktrees/wf_f92bba65-fa2-20/skill/bridge/test 2>/dev/null | head -30)"
+    ]
+  }
+}

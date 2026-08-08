@@ -1740,7 +1740,18 @@ class BridgeViewModelTest {
         assertEquals("never went in-flight", null, refused.commandInFlightText)
         assertEquals("the transcription is kept, not lost", "run the migration", refused.commandDraft)
         assertEquals(listOf("failed"), haptics.events.toList())
-        assertNull("no /v1/command POST may leave the device", server.takeRequest(1, TimeUnit.SECONDS))
+        // What must not happen is a COMMAND leaving the device — not "no
+        // request at all". The throttled SSE body ends on its own, so the
+        // engine's reconnect can land inside this window on a loaded machine
+        // (seen failing on CI, green locally); rejecting any request made this
+        // assertion a clock race rather than a contract.
+        generateSequence { server.takeRequest(1, TimeUnit.SECONDS) }
+            .forEach { late ->
+                assertFalse(
+                    "no /v1/command POST may leave the device (saw ${late.method} ${late.path})",
+                    late.method == "POST" && late.path?.contains("/command") == true,
+                )
+            }
     }
 
     /**

@@ -71,16 +71,16 @@ cleanup() {
     echo "--- fake fork log ($FORK_LOG) ---"
     cat "$FORK_LOG" || true
   fi
-  # On a failure the bridge log only proves what DIDN'T arrive; the wrist's own
-  # log is the half that says why. Worth having on CI, where the emulator is
-  # gone by the time anyone reads the report and a local re-run may not
-  # reproduce (a green run stays quiet — this is noisy on purpose).
+  # On a failure the bridge log only proves what DIDN'T arrive. The app writes
+  # no logcat of its own (deliberately — nothing about a session should reach
+  # the system log), so the only wrist-side evidence worth pulling is a crash
+  # or an ANR; the app's own verdict reaches the report through the assertion
+  # messages instead. A green run stays quiet.
   if [ "$status" -ne 0 ]; then
-    echo "--- watch logcat (app + crashes) ---"
-    adb logcat -d -v time \
-      ActivityManager:I AndroidRuntime:E ConnectionEngine:V BridgeViewModel:V \
-      BridgeClient:V ClaudeWatch:V dev.claudewatch.wear:V '*:F' 2>/dev/null \
-      | tail -200 || true
+    echo "--- watch crashes/ANRs (empty is normal) ---"
+    adb logcat -d -v time -b crash 2>/dev/null | tail -60 || true
+    adb logcat -d -v time 2>/dev/null \
+      | grep -aE "FATAL EXCEPTION|ANR in|claudewatch" | tail -40 || true
   fi
   # The fake fork dies WITH the throwaway bridge — never before its spawn
   # answer, never after the run.

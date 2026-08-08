@@ -5,6 +5,7 @@ import android.os.ParcelFileDescriptor
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasAnyAncestor
@@ -156,7 +157,24 @@ class WalkingSkeletonTest {
      * a hook fired in the pair→connect window is still delivered.
      */
     private fun waitForOnlineHome(timeoutMs: Long = 30_000) {
-        compose.waitUntil(timeoutMs) { !tagExists("status") }
+        try {
+            compose.waitUntil(timeoutMs) { !tagExists("status") }
+        } catch (e: ComposeTimeoutException) {
+            // The app writes no logcat, so a bare timeout here is undebuggable
+            // once the runner's emulator is gone — and the bridge log can only
+            // prove what never arrived. The offline screen's own status line
+            // carries the engine's verdict (unreachable, 401, proto mismatch),
+            // so make the failure quote it.
+            val status = runCatching {
+                compose.onNodeWithTag("status").fetchSemanticsNode()
+                    .config.getOrNull(SemanticsProperties.Text)
+                    ?.joinToString(" ") { it.text }
+            }.getOrNull()
+            throw AssertionError(
+                "never reached the online home; the offline screen still reads: ${status ?: "<no status text>"}",
+                e,
+            )
+        }
     }
 
     private fun tagExists(tag: String): Boolean =
