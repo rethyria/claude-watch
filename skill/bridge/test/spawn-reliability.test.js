@@ -264,3 +264,71 @@ test("a command to an ENDED bridge-owned session is refused as ended, not mislab
   assert.notEqual(resp.body.external, true, "a bridge-spawned session must not be mislabeled external");
   assert.match(resp.body.error, /ended/i);
 });
+
+// The submitted-vs-typed distinction (issue #86) needs a stub that only
+// speaks when a line is DELIVERED, not merely echoed: `read` in the PTY's
+// canonical mode completes exactly when a terminating CR/NL arrives, i.e.
+// when Enter was pressed. Unterminated text sits echoed-but-unsubmitted in
+// the line discipline forever — visible in the pty-output stream (the echo)
+// but never wrapped in the stub's SUBMITTED[...] marker.
+const SUBMIT_ECHO_AGENT =
+  '#!/bin/sh\necho DICTATE-READY\nwhile IFS= read -r line; do echo "SUBMITTED[$line]"; done\n';
+
+test("a dictated codex prompt is submitted, not just typed (issue #86)", { timeout: 60_000 }, async (t) => {
+  const bin = makeFakeAgent(t, "codex", SUBMIT_ECHO_AGENT);
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
+  const { token, sse } = await pairAndConnect(t, bridge);
+
+  // Auto-spawn leg: the exact wire shape of a sessionless dictation — the
+  // watch POSTs the bare transcription, NO trailing newline.
+  const resp = await request(bridge.port, "POST", "/command", {
+    token,
+    body: { command: "dictated with no newline", agent: "codex" },
+  });
+  assert.equal(resp.status, 200);
+  assert.equal(resp.body.ok, true);
+  await sse.waitFor(
+    (e) => e.event === "pty-output" && e.parsed?.text?.includes("SUBMITTED[dictated with no newline]"),
+  );
+
+  // Existing-session leg: a follow-up dictation into the same live PTY walks
+  // the other writeToSessionStdin site and must submit just the same.
+  const followUp = await request(bridge.port, "POST", "/command", {
+    token,
+    body: { sessionId: resp.body.sessionId, command: "follow-up prompt" },
+  });
+  assert.equal(followUp.status, 200);
+  await sse.waitFor(
+    (e) => e.event === "pty-output" && e.parsed?.text?.includes("SUBMITTED[follow-up prompt]"),
+  );
+});
+
+test("a command carrying its own terminator is not double-submitted", { timeout: 60_000 }, async (t) => {
+  // Plain command injection may already include its newline (every historical
+  // caller does); appending another would submit a second, EMPTY prompt at
+  // the agent right after the real one.
+  const bin = makeFakeAgent(t, "codex", SUBMIT_ECHO_AGENT);
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
+  const { token, sse } = await pairAndConnect(t, bridge);
+
+  const resp = await request(bridge.port, "POST", "/command", {
+    token,
+    body: { command: "self terminated\n", agent: "codex" },
+  });
+  assert.equal(resp.status, 200);
+  await sse.waitFor(
+    (e) => e.event === "pty-output" && e.parsed?.text?.includes("SUBMITTED[self terminated]"),
+  );
+
+  // Give a would-be phantom empty submission time to surface, then assert the
+  // stream never carried one.
+  await new Promise((r) => setTimeout(r, 300));
+  const stream = sse.events
+    .filter((e) => e.event === "pty-output")
+    .map((e) => e.parsed?.text ?? "")
+    .join("");
+  assert.ok(
+    !stream.includes("SUBMITTED[]"),
+    "an already-terminated command must not submit a second, empty prompt",
+  );
+});

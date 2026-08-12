@@ -195,6 +195,19 @@ function resolveSpawnCwd(res, requestedCwd) {
   return null;
 }
 
+// A dictated prompt must be SUBMITTED, not merely typed (issue #86): the
+// watch POSTs the trimmed transcription with no terminator, and a PTY
+// delivers nothing to the agent until the Enter keystroke arrives — the text
+// sat echoed in codex's input box forever, which from the wrist looked like a
+// dead session. The carriage return is appended at the two dictation sites
+// below rather than in writeToSessionStdin, whose other caller (codex.js)
+// writes raw approval-menu keystrokes ("y", Esc) that must land
+// unterminated. A command that already ends in a newline keeps it — a second
+// terminator would submit a second, empty prompt.
+function asSubmittedPrompt(command) {
+  return /[\r\n]$/.test(command) ? command : `${command}\r`;
+}
+
 export async function handleCommand(req, res) {
   if (req.method !== "POST") {
     return jsonResponse(res, 405, { error: "Method not allowed" });
@@ -465,7 +478,7 @@ export async function handleCommand(req, res) {
           spawned: true,
         });
       }
-      if (!writeToSessionStdin(slot, command)) {
+      if (!writeToSessionStdin(slot, asSubmittedPrompt(command))) {
         // Same sticky-failure hazard as the !ready path above.
         killSession(newId);
         log("error", `Session ${newId} (${requestedAgent}) PTY unavailable; command not injected`);
@@ -480,7 +493,7 @@ export async function handleCommand(req, res) {
       return jsonResponse(res, 200, { ok: true, sessionId: newId, agent: requestedAgent, spawned: true });
     }
 
-    if (!writeToSessionStdin(targetSession, command)) {
+    if (!writeToSessionStdin(targetSession, asSubmittedPrompt(command))) {
       return jsonResponse(res, 500, { error: `Session ${targetSession.id} PTY is not writable; command not injected` });
     }
     log("info", `Command injected into session ${targetSession.id} (${command.length} chars)`);

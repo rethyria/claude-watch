@@ -399,7 +399,11 @@ from the option's `kind`) so logs and behavior-keyed consumers stay honest.
 "sessionId"?: "<uuid>", "agent"?: "claude", "cwd"?: "/path" }`:
 
 - With `sessionId` naming a PTY-backed session: the text is written to its
-  stdin → `200 { "ok": true, "sessionId": ..., "agent": ... }`.
+  stdin and **submitted** — text not already ending in a newline gains a
+  terminating carriage return (the Enter keystroke), so a dictated prompt
+  (the watch sends the bare transcription) is entered rather than left typed
+  in the agent's input box (#86) → `200 { "ok": true, "sessionId": ...,
+  "agent": ... }`.
 - With `sessionId` naming an **ACP** (Zed-hosted) session: the text is injected
   into the LIVE session over the loopback channel → `200 { "ok": true,
   "sessionId": ..., "agent": ..., "prompt": true }`. A session whose adapter is
@@ -423,7 +427,8 @@ from the option's `kind`) so logs and behavior-keyed consumers stay honest.
     longer reachable when the prompt is written → `502` **naming the session**
     (`sessionId`, `spawned: true`), so the client can retry into it rather than
     treat it as lost.
-  - **codex** keeps the bridge-owned PTY: the command is injected only after
+  - **codex** keeps the bridge-owned PTY: the command is injected (with the
+    same submit terminator as above) only after
     the new PTY produces output → `200 { "ok": true, "sessionId": ...,
     "agent": ..., "spawned": true }`, or `500` (with `sessionId`,
     `spawned: true`) when the agent never became ready — the failed session is
