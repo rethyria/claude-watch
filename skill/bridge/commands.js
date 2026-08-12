@@ -5,7 +5,7 @@ import { spawn as childSpawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { log, jsonResponse, readBody } from "./util.js";
+import { log, isLoggingDegraded, jsonResponse, readBody } from "./util.js";
 import {
   BRIDGE_ID,
   CLI_CWD,
@@ -525,6 +525,11 @@ export function handleStatus(req, res) {
     sseClients: sseClients.size,
     pendingPermissions: pendingPermissions.size + codexSyntheticPermissions.size,
     eventBufferSize: sseBuffer.length,
+    // The primary log sink has died and lines now land in the bridge.log
+    // fallback (issue #93) — announced here because the diagnostic doctrine is
+    // to read the log, and a bridge that quietly stopped logging removes that
+    // tool. /v1 only: the legacy response shape is frozen.
+    ...(isV1 ? { loggingDegraded: isLoggingDegraded() } : {}),
     // Backward compat: expose the most recent active session's info
     hasPty: findMostRecentActiveSession() !== null,
     activeAgent: mostRecentRunningSession?.agent || null,

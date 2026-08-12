@@ -1,12 +1,59 @@
 // Shared low-level helpers: logging and HTTP request/response plumbing.
 // This module sits at the bottom of the dependency graph and must not import
 // any other bridge module.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { format } from "node:util";
+
+// Fallback log sink (issue #93): where log lines go once the primary sink is
+// dead. Silencing a dead sink's errors (see the guards in server.js and the
+// catch in log() below) keeps the bridge alive but made the state SILENT — a
+// bridge started from a terminal that later closed served on forever with no
+// log output at all, and the standing diagnostic doctrine here is to read the
+// log rather than reason from the state machine. The path mirrors config.js's
+// CREDENTIALS_DIR (including the CLAUDE_WATCH_CREDENTIALS_DIR override, so
+// tests never touch the real one) rather than importing it: util.js must not
+// import bridge modules, and config.js imports this one.
+const FALLBACK_LOG_FILE = path.join(
+  process.env.CLAUDE_WATCH_CREDENTIALS_DIR || path.join(os.homedir(), ".claude-watch"),
+  "bridge.log",
+);
+
+let loggingDegraded = false;
+
+// Surfaced as `loggingDegraded` in GET /v1/status, so the condition is
+// visible from the admin surface and the wrist instead of inferred from
+// silence.
+export function isLoggingDegraded() {
+  return loggingDegraded;
+}
+
+function appendToFallback(line) {
+  try {
+    fs.mkdirSync(path.dirname(FALLBACK_LOG_FILE), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(FALLBACK_LOG_FILE, `${line}\n`, { mode: 0o600 });
+  } catch { /* both sinks gone: dropping the line is all that is left */ }
+}
+
+// Every primary-sink failure lands here — the asynchronous EPIPE the stream
+// 'error' silencers in server.js observe, and the synchronous throw caught in
+// log() below. One-way for the life of the process: a destroyed stdio stream
+// never comes back, so neither does the flag.
+export function logSinkFailed(err) {
+  if (loggingDegraded) return;
+  loggingDegraded = true;
+  appendToFallback(format(
+    `[${new Date().toISOString()}] [WARN]`,
+    `Primary log sink failed (${err?.code || err?.message || err}); logging continues in this file`,
+  ));
+}
 
 // A failed log write must never propagate: the process-level guards in
 // server.js log the exceptions they catch, so a throwing log() turns one fault
 // into an endless log→throw→log cycle. server.js silences the asynchronous
-// EPIPE on stdout/stderr; this catches the synchronous case (a destroyed or
-// already-closed stream throws on write) for every caller.
+// EPIPE on stdout/stderr; the catch below handles the synchronous case (a
+// destroyed or already-closed stream throws on write) for every caller.
 export function log(level, msg, ...args) {
   const ts = new Date().toISOString();
   const prefix = `[${ts}] [${level.toUpperCase()}]`;
@@ -16,7 +63,14 @@ export function log(level, msg, ...args) {
     } else {
       console.log(prefix, msg);
     }
-  } catch { /* nowhere to write: dropping the line beats taking the bridge down */ }
+  } catch (err) {
+    logSinkFailed(err);
+  }
+  // Degraded: the line goes to the fallback file instead of being dropped —
+  // including the very line whose write threw above. The console.log attempt
+  // stays (a destroyed stream swallows it harmlessly), so a degradation on
+  // one stream never costs a still-working sink its lines.
+  if (loggingDegraded) appendToFallback(format(prefix, msg, ...args));
 }
 
 export function jsonResponse(res, status, body) {
