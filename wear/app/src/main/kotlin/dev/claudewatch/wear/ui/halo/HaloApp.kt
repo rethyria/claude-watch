@@ -1251,7 +1251,8 @@ private const val DOT_ARC_MAX_DEGREES = 120f
 /**
  * Page dots, curved along the bottom of the face (handoff: current 11px cream,
  * others 8px grey, tappable). They sit on an arc CONCENTRIC with the status
- * ring, [Halo.Geo.DotChannelClearance] inside its inner stroke edge, so every
+ * ring, [Halo.Geo.DotChannelClearance] plus the #115 [Halo.Geo.DotLiftPx]
+ * inside its inner stroke edge, so every
  * dot holds the same clearance from the ring however many pages there are — a
  * straight row only clears at 6 o'clock and collides at the ends, where the
  * ring curves down to meet it.
@@ -1304,13 +1305,17 @@ private fun PageDots(
         // channel centreline minus half the solid stroke; the clearance token
         // and the dot's own radius — the largest one, so the current dot
         // growing never eats the gap — come off that. DotChannelClearance is
-        // expressed so this arithmetic lands bit-identical to the old
-        // edge-derived radius (pinned by HaloRingMathTest): the token swap
-        // must not move a dot by a pixel.
+        // expressed so its arithmetic lands bit-identical to the old
+        // edge-derived radius (pinned by HaloRingMathTest); the #115 lift
+        // (DotLiftPx) then comes off deliberately — the ONE token that moves
+        // the dots, so ring/clock/content provably cannot follow.
         val minDim = minOf(width, height).toFloat()
         val scale = minDim / HALO_REF_PX
         val dotEdge =
-            (Halo.Geo.RingChannel - Halo.Geo.RingStroke / 2f - Halo.Geo.DotChannelClearance) * scale
+            (
+                Halo.Geo.RingChannel - Halo.Geo.RingStroke / 2f -
+                    Halo.Geo.DotChannelClearance - Halo.Geo.DotLiftPx
+                ) * scale
         val radius = dotEdge - DOT_SIZE_CURRENT.toPx() / 2f
 
         // Arc-length pitch → angle, so dot spacing looks identical to the old

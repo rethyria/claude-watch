@@ -496,9 +496,12 @@ class HaloRingMathTest {
 
     @Test
     fun channelDerivedDotClearanceKeepsTheDotsExactlyWhereV1PutThem() {
-        // PageDots will re-derive from the channel (a later slice); this pins
-        // that the channel-based arithmetic reproduces the v1 dot-edge radius
-        // bit-for-bit, so the swap cannot move a pixel.
+        // This pins that the channel-based arithmetic reproduces the v1
+        // dot-edge radius bit-for-bit, so the token swap could not move a
+        // pixel. The #115 lift is the DELIBERATE departure from that
+        // position, and it must stay its own separate token (DotLiftPx,
+        // subtracted on top in PageDots) — folding it into the clearance
+        // would silently break this parity story.
         val v1DotEdge = HALO_REF_PX / 2f - Halo.Geo.RingEdgeGap - Halo.Geo.RingStroke - Halo.Geo.DotArcGap
         val channelDotEdge = Halo.Geo.RingChannel - Halo.Geo.RingStroke / 2f - Halo.Geo.DotChannelClearance
         assertEquals(v1DotEdge, channelDotEdge, 0f)

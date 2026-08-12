@@ -171,6 +171,20 @@ object Halo {
             (RingChannel - RingStroke / 2f) - (HALO_REF_PX / 2f - RingEdgeGap - RingStroke - DotArcGap)
 
         /**
+         * The #115 dots lift (user direction, 2026-08-12: "the nav circles
+         * on the main project page can be lifted a little higher"): an EXTRA
+         * inward inset for the page dots, ON TOP of [DotChannelClearance].
+         * A separate token on purpose — the clearance above is expressed to
+         * reproduce the v1 dot position bit-exactly (its whole doc), and
+         * this is the deliberate departure from that position, kept where
+         * the departure is visible. 12 ref-px ≈ one current-dot diameter:
+         * reads as clearly higher at arm's length, while the dot slots still
+         * clear the usage page's freshness-label band above them. Dots ONLY:
+         * the ring, clock group and content geometry take nothing from it.
+         */
+        const val DotLiftPx = 12f
+
+        /**
          * Outer arc padding for the root TimeText: display edge to the clock
          * glyphs' OUTER edge, sized so the platform-curved time sits INSIDE
          * the ring channel with 2 ref-px to spare against the channel's

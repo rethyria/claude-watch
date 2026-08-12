@@ -852,6 +852,16 @@ user's binding direction replaced them with a MENU. As built:
   approval card / voice / offline overlays; rotary belongs to the menu's
   list while it is up.
 
+### Post-epic refinement: nav dots lifted (#115, 2026-08-12)
+
+`Halo.Geo.DotLiftPx` (12 ref-px ≈ one current-dot diameter) — an extra
+inward inset for the page dots ON TOP of `DotChannelClearance`, which stays
+untouched (its bit-exact v1-parity story, pinned by `HaloRingMathTest`,
+still holds for the base; the lift is the deliberate departure, kept as its
+own token). Dots only: ring, clock group and content geometry take nothing
+from it. Before/after captures: `halo-dots-before.png` /
+`halo-dots-after.png` (uncommitted, design dir).
+
 ### Pending on-wrist live checks (post-epic, user steps)
 
 - **Subheading on a live ACP session** (#102's deferred criterion): with the
