@@ -1,12 +1,12 @@
-// The v2 session list (Halo v2 S5, epic #94): one session per screen instead
-// of scrolling rows. Each card is a wrapping title + `model · mode · use%`
-// subheading with the shared Answer pill on waiting sessions; ‹ › chevrons and
-// horizontal swipes step the selection (no wrap — the All scope ends on the
-// trailing "+ new session" card, and stepping right at the start is BACK); an
-// unlabelled five-icon action arc rides the bottom with honest close
-// semantics (✕ kill wherever the bridge can really end the session — its own
-// PTY, or an ACP session via the adapter's close frame, #88 — and ⊘ hide for
-// a hook-observed one it cannot stop). Selection itself lives in
+// The v2 session list (Halo v2 S5, epic #94; action arc retired by #114):
+// one session per screen instead of scrolling rows. Each card is a wrapping
+// title + `model · mode · use%` subheading with the shared Answer pill on
+// waiting sessions; ‹ › chevrons and horizontal swipes step the selection
+// (no wrap — the All scope ends on the trailing "+ new session" card, and
+// stepping right at the start is BACK). Tapping a card opens the
+// session-actions MENU (HaloSessionMenu — the user's on-wrist verdict killed
+// the arc's five 26dp circles, and the feed moved behind the menu's "open
+// feed" row). Selection itself lives in
 // the HaloNav state machine — this file only renders nav.sessionId and maps
 // gestures onto the caller's step/back/open lambdas, so every edge (spawn
 // slot, empty scope, at-start back) stays pinned by the nav's JVM tests. The
@@ -51,20 +51,15 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
-import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.Text
-import kotlin.math.PI
-import kotlin.math.cos
 import kotlin.math.roundToInt
-import kotlin.math.sin
 
 /** Step-swipe threshold ≈60px at the 450 reference (the app-wide gesture unit). */
 private const val STEP_SWIPE_FRACTION = 60f / HALO_REF_PX
@@ -94,26 +89,14 @@ private val SUBHEADING_DOT = 1.5.dp
  * Answer-pill clearance below the card's text stack (the prototype's own
  * pager geometry: a 7px column gap + the pill's 15px margin). On this screen
  * the pill rides IN FLOW under the card group — the #104 user feedback
- * superseding S5's reuse of the main pages' screen-absolute slot, which
- * planted the pill squarely on the ✕ kill cell: the arc's top cells begin at
- * 284 ref-px, far below where the group + this clearance puts the pill.
+ * superseding S5's reuse of the main pages' screen-absolute slot. The action
+ * arc that slot collided with is gone (#114), but the in-flow geometry stays:
+ * it is the prototype's own, not an arc workaround.
  */
 private val PILL_CARD_CLEARANCE = 11.dp
 
 /** Chevron cells: 48dp hit targets hugging the sides, glyphs 36px Light. */
 private val ChevronCell = Halo.Geo.TouchMin
-
-/**
- * The action arc (epic constants): five 52px circles whose centres sit on a
- * 144 ref-px radius from the display centre at 144/117/90/63/36° (90° = the
- * bottom of the face). Adjacent centres are only ~67 ref-px apart along the
- * chord, so the hit cells cannot reach the 48dp minimum without overlapping —
- * same accepted trade as the v1 action strip's 50px circles.
- */
-private val ArcButton = 26.dp
-private val ArcCell = 33.dp
-private const val ARC_RADIUS = 144f
-private val ARC_ANGLES = listOf(144f, 117f, 90f, 63f, 36f)
 
 /** One `model · mode · use%` subheading part; [hot] = terracotta (use ≥80). */
 internal data class SubheadingPart(val text: String, val hot: Boolean = false)
@@ -162,6 +145,8 @@ internal fun sessionDetailLine(branchLabel: String?, agentsRunning: Int): String
  * [HaloNavState.atListStart]): ‹ and a right swipe call [onBack] there,
  * [onStep] −1 otherwise. Rotary only ever steps — the nav's no-wrap makes
  * the edges no-ops, so a crown overshoot can never fall out of the list.
+ * A card tap calls [onOpenMenu] (issue #114): the session-actions menu is
+ * the tap's destination now, and the feed lives behind its "open feed" row.
  */
 @Composable
 fun HaloSessionPager(
@@ -171,10 +156,8 @@ fun HaloSessionPager(
     atStart: Boolean,
     onStep: (Int) -> Unit,
     onBack: () -> Unit,
-    onOpenSession: (String) -> Unit,
+    onOpenMenu: (String) -> Unit,
     onAnswer: (HaloSession) -> Unit,
-    onKill: (String) -> Unit,
-    onHide: (String) -> Unit,
     onSpawn: () -> Unit,
     modifier: Modifier = Modifier,
     /**
@@ -266,8 +249,8 @@ fun HaloSessionPager(
         // blank frame; HaloApp's self-heal re-resolves it before the next.
         if (selectedIndex < 0) return@Box
 
-        // Only the CARD slides — chevrons and the action arc below are
-        // chrome, holding still like the clock while content steps.
+        // Only the CARD slides — the chevrons are chrome, holding still
+        // like the clock while content steps.
         AnimatedContent(
             targetState = selectedIndex,
             transitionSpec = { stepTransition() },
@@ -279,7 +262,7 @@ fun HaloSessionPager(
                 else -> SessionCard(
                     session = session,
                     swipedAtMs = { lastSwipeAtMs },
-                    onOpen = { onOpenSession(session.id) },
+                    onOpen = { onOpenMenu(session.id) },
                 )
             }
         }
@@ -303,34 +286,17 @@ fun HaloSessionPager(
             modifier = Modifier.align(Alignment.CenterEnd),
         )
 
-        // The action arc belongs to sessions only: the spawn card has
-        // nothing to close or configure.
-        slots.getOrNull(selectedIndex)?.let { session ->
-            ActionArc(
-                // Issue #88: an ACP session is EXTERNAL (Zed's process, not the
-                // bridge's) and yet genuinely killable — the bridge's close
-                // frame drives the adapter's own teardown, so the ✕ ends the
-                // agent for real. Only a hook-OBSERVED session has no ending
-                // the bridge can perform, and that one keeps #53's honest hide.
-                killable = session.kind == "acp" || !session.external,
-                onKill = { onKill(session.id) },
-                onHide = { onHide(session.id) },
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
-
         // The Answer pill, LAST so it wins any contested pixels (the 46f8489
-        // hoist, kept as defence-in-depth): while the pill lived inside the
-        // card, the later-composed arc took its taps — a finger aiming at
-        // Answer's lower half hit the ✕ KILL cell. Its POSITION follows the
+        // hoist, kept as defence-in-depth even with the arc gone, #114: the
+        // card's whole-surface tap opens the actions MENU, and a finger
+        // aiming at Answer must never summon it). Its POSITION follows the
         // prototype's own pager geometry (#104 user feedback, superseding
-        // S5's reuse of the main pages' screen-absolute slot that overlapped
-        // the arc): in flow below the card's text stack, laid out here
+        // S5's reuse of the main pages' screen-absolute slot): in flow below
+        // the card's text stack, laid out here
         // against an unseen twin of that stack so the two layers can never
         // drift. Same AnimatedContent key + spec as the card, so the pill
         // still slides in exact lockstep; the wrapper Box takes no input of
-        // its own, so everything outside the pill still reaches the arc and
-        // the card.
+        // its own, so everything outside the pill still reaches the card.
         AnimatedContent(
             targetState = selectedIndex,
             transitionSpec = { stepTransition() },
@@ -408,7 +374,7 @@ private fun SessionCard(
         // The waiting card's Answer pill is NOT here: it renders as the
         // pager's topmost layer (see the call site), positioned in flow
         // below an unseen twin of the text stack above, so its click target
-        // out-ranks both this card's and the action arc's.
+        // out-ranks this card's whole-surface menu tap.
     }
 }
 
@@ -536,92 +502,7 @@ private fun StepChevron(
     }
 }
 
-// ── The action arc ──────────────────────────────────────────────────────────
-
-/**
- * Five unlabelled icon buttons on an arc concentric with the face, centred on
- * 6 o'clock (the page dots' curved-Layout approach, so the row survives every
- * display size). Order along the arc: ◇ model · ◐ mode · close · ▤ compact ·
- * ⇄ handover — the outer four are visible, disabled stubs (0.35 alpha, the
- * v1 strip's treatment); the centre close is LIVE, and honest either way
- * (issue #53): the red ✕ appears ONLY where the bridge can really end the
- * session — its own PTY, or an ACP session it can close through Zed's adapter
- * (#88) — and everything else gets ⊘, the local hide that never claims to
- * have stopped anything. The close keeps the stable "haloRowClose" testTag
- * from the retired row strip on purpose: every existing close-semantics test
- * finds it unmoved.
- */
-@Composable
-private fun ActionArc(
-    killable: Boolean,
-    onKill: () -> Unit,
-    onHide: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Layout(
-        modifier = modifier,
-        content = {
-            ArcButton(glyph = "◇", onClick = null, tag = "haloArc-model")
-            ArcButton(glyph = "◐", onClick = null, tag = "haloArc-mode")
-            if (killable) {
-                ArcButton(glyph = "✕", tint = Halo.Palette.Error, onClick = onKill, tag = "haloRowClose")
-            } else {
-                ArcButton(glyph = "⊘", onClick = onHide, tag = "haloRowClose")
-            }
-            ArcButton(glyph = "▤", onClick = null, tag = "haloArc-compact")
-            ArcButton(glyph = "⇄", onClick = null, tag = "haloArc-handover")
-        },
-    ) { measurables, constraints ->
-        val width = constraints.maxWidth
-        val height = constraints.maxHeight
-        val cells = measurables.map { it.measure(Constraints()) }
-        val scale = minOf(width, height) / HALO_REF_PX
-        val radius = ARC_RADIUS * scale
-        val centerX = width / 2f
-        val centerY = height / 2f
-        layout(width, height) {
-            cells.forEachIndexed { index, cell ->
-                // Canvas-degree polar placement, y pointing down: 90° is the
-                // bottom of the face, larger angles walk left — so the list
-                // order above reads left→right on screen.
-                val angle = ARC_ANGLES[index] * PI.toFloat() / 180f
-                val x = centerX + radius * cos(angle)
-                val y = centerY + radius * sin(angle)
-                cell.place(
-                    x = (x - cell.width / 2f).roundToInt(),
-                    y = (y - cell.height / 2f).roundToInt(),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun ArcButton(
-    glyph: String,
-    onClick: (() -> Unit)?,
-    tag: String,
-    tint: androidx.compose.ui.graphics.Color = Halo.Palette.TextPrimary,
-) {
-    val enabled = onClick != null
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .size(ArcCell)
-            .clickable(enabled = enabled, onClick = onClick ?: {})
-            .testTag(tag),
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .size(ArcButton) // 52px circle
-                .background(Halo.Palette.Surface2, CircleShape),
-        ) {
-            Text(
-                text = glyph,
-                fontSize = 12.sp,
-                color = if (enabled) tint else tint.copy(alpha = 0.35f),
-            )
-        }
-    }
-}
+// The action arc that used to ride the bottom of the card died with #114:
+// its five 26dp circles were "too small but even so take up too much space"
+// (the user's on-wrist verdict). The actions live in HaloSessionMenu now —
+// full-width rows behind the card's tap.

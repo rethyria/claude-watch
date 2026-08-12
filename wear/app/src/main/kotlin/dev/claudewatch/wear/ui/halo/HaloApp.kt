@@ -566,18 +566,19 @@ private fun HaloAppBody(
                         nav = nav.step(delta, currentModel)
                     },
                     onBack = { nav = nav.back() },
-                    onOpenSession = { nav = nav.drillToSession(it) },
+                    // A card tap raises the session-actions menu (#114); the
+                    // feed moved behind the menu's own "open feed" row.
+                    onOpenMenu = { nav = nav.openMenu(it) },
                     // The Answer pill: the card OVER the list, pinned to
                     // this session's own prompt — never a feed drill.
                     onAnswer = { session -> nav = nav.openCardForListSession(session) },
-                    onKill = actions.onKill,
-                    onHide = actions.onHide,
                     // Issue #56: the spawn card summons the target picker
                     // overlay; the actual onSpawn fires from a pick.
                     onSpawn = { spawnPickerOpen = true },
-                    // Reclaim the bezel when the picker closes (its
-                    // rotary node stole focus and is now disposed).
-                    rotaryActive = !spawnPickerOpen,
+                    // Reclaim the bezel when the picker or the actions menu
+                    // closes (each claims rotary focus while up and is then
+                    // disposed).
+                    rotaryActive = !spawnPickerOpen && !nav.menuOpen,
                 )
                 is Layer.Feed -> HaloSessionFeed(
                     model = model,
@@ -620,6 +621,47 @@ private fun HaloAppBody(
                 // top → the curved row's OUTER arc padding on round screens.
                 contentPadding = PaddingValues(top = (Halo.Geo.ClockRingClearance / 2f).dp),
             )
+        }
+
+        // Issue #114: the session-actions menu, over the pager card whose tap
+        // summoned it (the tap used to open the feed; the feed lives behind
+        // the menu's "open feed" row now). Nav-owned state, not a plain flag
+        // like the picker's, because the back chain must treat it as one step
+        // (menu → card) and the pure machine owns that walk. Rendered like
+        // the spawn picker — opaque, over the ring and the clock, UNDER the
+        // approval card / voice / offline overlays — and with the picker's
+        // no-gesture-swallowing-wrapper rule: the menu's own list is
+        // fillMaxSize, so its handlers own every hit. An action tap closes
+        // the menu back onto the card (nav.back()); the session's death then
+        // clears the card through the ordinary self-heal, exactly as the
+        // arc's in-place taps behaved. A session vanishing UNDER the open
+        // menu renders nothing for a frame; the self-heal effect above closes
+        // the menu with the repair.
+        val menuSession = if (nav.depth == HaloDepth.LIST && nav.menuOpen) {
+            model.sessions.firstOrNull { it.id == nav.sessionId }
+        } else {
+            null
+        }
+        if (menuSession != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Halo.Palette.Background),
+            ) {
+                HaloSessionMenu(
+                    session = menuSession,
+                    onOpenFeed = { nav = nav.drillToSession(menuSession.id) },
+                    onKill = {
+                        actions.onKill(menuSession.id)
+                        nav = nav.back()
+                    },
+                    onHide = {
+                        actions.onHide(menuSession.id)
+                        nav = nav.back()
+                    },
+                    onBack = { nav = nav.back() },
+                )
+            }
         }
 
         // Issue #56: the spawn target picker, over the list that summoned it

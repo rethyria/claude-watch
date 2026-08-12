@@ -461,7 +461,7 @@ private fun DictateUnavailablePill(modifier: Modifier = Modifier) {
 
 /** The crossed circle over the muted mic: ⊘ in the app's own idiom (the
  *  external-session hide glyph), drawn to enclose the icon's ink. Solidus
- *  orientation matches the ⊘ character the action arc renders. */
+ *  orientation matches the ⊘ character the menu's hide row renders. */
 @Composable
 private fun MicOffOverlay() {
     Canvas(modifier = Modifier.size(Halo.Geo.MicOffOverlay).testTag("haloDictateMicOff")) {

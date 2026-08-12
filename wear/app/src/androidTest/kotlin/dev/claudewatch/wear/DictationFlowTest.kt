@@ -153,12 +153,14 @@ class DictationFlowTest {
 
     /** Home → the session pager (face tap, v3's one list entry) → the named
      *  session's feed (no dictation). These fixtures stream ONE session, so
-     *  the drill's resolved selection IS its card — tap it, no stepping
-     *  needed. */
+     *  the drill's resolved selection IS its card — tap it (which opens the
+     *  actions menu, #114) and take the menu's "open feed" row. */
     private fun openFeed(sessionId: String) {
         compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloMenuFeed").performClick()
         compose.waitForIdle()
     }
 
@@ -355,11 +357,12 @@ class DictationFlowTest {
             "s-acp",
         )
         // The pager (face tap, v3's one list entry): the lone ACP session is
-        // the resolved selection, its action arc already on screen — no
-        // reveal swipe in v2.
+        // the resolved selection; its tap opens the actions menu (#114),
+        // where the close row lives now.
         compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("haloPagerCard-s-acp").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-s-acp").assertIsDisplayed().performClick()
+        compose.waitForIdle()
 
         waitForNode("haloRowClose")
         compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
@@ -389,7 +392,8 @@ class DictationFlowTest {
         )
         compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("haloPagerCard-s-ext").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-s-ext").assertIsDisplayed().performClick()
+        compose.waitForIdle()
 
         waitForNode("haloRowClose")
         compose.onNode(hasTestTag("haloRowClose") and hasText("⊘")).assertIsDisplayed()

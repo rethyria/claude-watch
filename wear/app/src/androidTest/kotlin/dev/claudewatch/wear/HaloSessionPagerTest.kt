@@ -6,6 +6,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -13,6 +15,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
@@ -23,22 +26,23 @@ import dev.claudewatch.shared.state.SessionState
 import dev.claudewatch.wear.ui.halo.HaloActions
 import dev.claudewatch.wear.ui.halo.HaloApp
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * The v2 session-list pager (Halo v2 S5, #99), driven with fixture UiStates —
- * no bridge, no network. One session per screen: entry from home and project
- * pages lands on the scope's first card, swipes and chevrons step with no
- * wrap (the All scope ends on the trailing spawn card, a project on its last
- * session), stepping right at the start is BACK, a card tap opens the feed
- * while the waiting card's Answer pill opens the prompt OVER the pager
- * (never falling through to the feed), the action arc carries honest close
- * semantics (✕ kill wherever the bridge can really end the session — owned
- * PTY or ACP via #88's close frame — ⊘ hide for a hook-observed one, stubs
- * visible but dead),
+ * The v2 session-list pager (Halo v2 S5, #99; action arc → actions menu by
+ * #114), driven with fixture UiStates — no bridge, no network. One session
+ * per screen: entry from home and project pages lands on the scope's first
+ * card, swipes and chevrons step with no wrap (the All scope ends on the
+ * trailing spawn card, a project on its last session), stepping right at the
+ * start is BACK, a card tap opens the session-actions MENU (the feed lives
+ * behind its "open feed" row) while the waiting card's Answer pill opens the
+ * prompt OVER the pager (never falling through to the menu), the menu's
+ * close row carries honest close semantics (✕ kill wherever the bridge can
+ * really end the session — owned PTY or ACP via #88's close frame — ⊘ hide
+ * for a hook-observed one, stubs visible but dead, every row finger-sized),
  * and a session killed under the cursor self-heals to the remembered-index
  * neighbour instead of stranding the pager on a ghost.
  */
@@ -205,28 +209,68 @@ class HaloSessionPagerTest {
     }
 
     @Test
-    fun cardTapOpensTheSessionFeed() {
+    fun cardTapOpensTheActionsMenuAndItsOpenFeedRowReachesTheFeed() {
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         drill()
+        // The tap's destination is the MENU now (#114), never the feed.
         compose.onNodeWithTag("haloPagerCard-s-a1").performClick()
         compose.waitForIdle()
+        compose.onNodeWithTag("haloSessionMenu").assertIsDisplayed()
+        assertEquals("a card tap must not drill into the feed", 0, tagCount("haloFeed-s-a1"))
+
+        // "Open feed" goes where the tap used to.
+        compose.onNodeWithTag("haloMenuFeed").performClick()
+        compose.waitForIdle()
         compose.onNodeWithTag("haloFeed-s-a1").assertIsDisplayed()
+        assertEquals(0, tagCount("haloSessionMenu"))
     }
 
     @Test
-    fun answerPillOpensTheCardOverThePagerWithoutFallingThroughToTheFeed() {
+    fun menuBackReturnsToItsOwnCardAndTheFeedsBackSkipsTheMenu() {
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drill()
+        next()
+        compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
+
+        // Swipe right on the menu: back onto the SAME card — one step in,
+        // never a list step under the floating menu.
+        compose.onNodeWithTag("haloPagerCard-s-a2").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloSessionMenu").assertIsDisplayed()
+        compose.onNodeWithTag("haloSessionMenu").performTouchInput { swipeRight() }
+        compose.waitForIdle()
+        assertEquals(0, tagCount("haloSessionMenu"))
+        compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
+
+        // Through the menu into the feed, then back: the feed's swipe-right
+        // lands on the pager card DIRECTLY — the menu is a pass-through
+        // launcher, not a second stop on the way out.
+        compose.onNodeWithTag("haloPagerCard-s-a2").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloMenuFeed").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloFeed-s-a2").assertIsDisplayed()
+        compose.onNodeWithTag("haloFeed-s-a2").performTouchInput { swipeRight() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
+        assertEquals("the feed's back must skip the menu", 0, tagCount("haloSessionMenu"))
+    }
+
+    @Test
+    fun answerPillOpensTheCardOverThePagerWithoutFallingThroughToTheMenu() {
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         drill()
         next()
         compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
 
         // The pill is its own click target ABOVE the card's: tapping it must
-        // raise the session's OWN prompt, not open the feed underneath.
+        // raise the session's OWN prompt, not the menu underneath (#114 —
+        // the card's whole surface summons the menu now).
         compose.onNodeWithTag("haloAnswerPill").assertIsDisplayed().performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
         compose.onNodeWithText("Write notes.txt").assertIsDisplayed()
-        assertEquals("answering must not drill into the feed", 0, tagCount("haloFeed-s-a2"))
+        assertEquals("answering must not summon the menu", 0, tagCount("haloSessionMenu"))
 
         // "Decide later" (the explicit control — v3 purged the card's
         // swipe-down) lands right back on the same pager card — the whole
@@ -235,56 +279,34 @@ class HaloSessionPagerTest {
         compose.waitForIdle()
         assertEquals(0, tagCount("haloCard"))
         compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
-        assertEquals(0, tagCount("haloFeed-s-a2"))
+        assertEquals(0, tagCount("haloSessionMenu"))
     }
 
     @Test
-    fun answerPillOutranksTheKillCellInTheirOverlapBand() {
-        val kills = mutableListOf<String>()
-        compose.setContent {
-            HaloApp(ui = ui(), actions = HaloActions(onKill = { kills += it }))
-        }
+    fun answerPillOutranksTheCardsMenuTapInTheirOverlapBand() {
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         drill()
         next()
         compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
 
-        // The #104 in-flow position no longer overlaps the arc, but the pill
-        // stays the pager's TOPMOST layer as defence-in-depth: whatever the
-        // card group's height puts under the pill's lower edge, a finger
-        // aiming at Answer must never kill the session — this tap targets
-        // the pill's bottom band BY COORDINATE, not by node.
+        // The pill stays the pager's TOPMOST layer (the 46f8489 hoist, kept
+        // as defence-in-depth with the arc gone): the whole card beneath it
+        // is the menu's tap target, so a finger aiming at Answer's lower
+        // half must raise the PROMPT, never the actions menu — this tap
+        // targets the pill's bottom band BY COORDINATE, not by node.
         val pill = compose.onNodeWithTag("haloAnswerPill").fetchSemanticsNode().boundsInRoot
         compose.onNodeWithTag("haloRoot").performTouchInput {
             down(Offset(pill.center.x, pill.bottom - 2f))
             up()
         }
         compose.waitForIdle()
-        assertEquals("a tap on the pill must never reach the ✕ cell", 0, kills.size)
+        assertEquals("a tap on the pill must never summon the menu", 0, tagCount("haloSessionMenu"))
         compose.onNodeWithTag("haloCard").assertIsDisplayed()
         compose.onNodeWithText("Write notes.txt").assertIsDisplayed()
     }
 
     @Test
-    fun answerPillRidesTheCardGroupAndClearsTheActionArc() {
-        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
-        drill()
-        next()
-        compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
-
-        // #104 user feedback: the pill follows the prototype's own pager
-        // geometry — in flow below the card's text stack — instead of the
-        // main pages' screen-absolute slot, which planted it squarely on the
-        // ✕ kill cell and grazing its neighbours. Geometric acceptance: no
-        // arc cell shares a pixel with the pill.
-        val pill = compose.onNodeWithTag("haloAnswerPill").fetchSemanticsNode().boundsInRoot
-        for (tag in listOf("haloArc-model", "haloArc-mode", "haloRowClose", "haloArc-compact", "haloArc-handover")) {
-            val cell = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
-            assertFalse("the pill must clear the $tag cell", pill.overlaps(cell))
-        }
-    }
-
-    @Test
-    fun actionArcCloseKillsOwnedSessionsAndHidesExternalOnes() {
+    fun menuCloseKillsOwnedSessionsAndHidesExternalOnes() {
         val kills = mutableListOf<String>()
         val hides = mutableListOf<String>()
         compose.setContent {
@@ -298,18 +320,36 @@ class HaloSessionPagerTest {
         }
         drill()
 
-        // Owned session: the red ✕, wired to a REAL kill.
+        /** Fire the open menu's close row; the action tap closes the menu
+         *  back onto [sessionId]'s card (the fixture never shrinks here, so
+         *  the card stays until a real model would remove it). */
+        fun fireClose(sessionId: String) {
+            compose.onNodeWithTag("haloRowClose").performClick()
+            compose.waitForIdle()
+            assertEquals("the action tap must close the menu", 0, tagCount("haloSessionMenu"))
+            compose.onNodeWithTag("haloPagerCard-$sessionId").assertIsDisplayed()
+        }
+
+        // Owned session: the red ✕ row, wired to a REAL kill.
+        compose.onNodeWithTag("haloPagerCard-s-a1").performClick()
+        compose.waitForIdle()
         compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
-        compose.onNodeWithTag("haloRowClose").performClick()
+        fireClose("s-a1")
         assertEquals(listOf("s-a1"), kills)
         assertEquals(0, hides.size)
 
         // Hook-observed session: the honest ⊘ hide — never a fake kill (#53).
         next()
         next()
-        compose.onNodeWithTag("haloPagerCard-s-b1").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-s-b1").performClick()
+        compose.waitForIdle()
         compose.onNode(hasTestTag("haloRowClose") and hasText("⊘")).assertIsDisplayed()
-        compose.onNodeWithTag("haloRowClose").performClick()
+        assertEquals(
+            "a hook-observed session must not offer a kill",
+            0,
+            compose.onAllNodes(hasTestTag("haloRowClose") and hasText("✕")).fetchSemanticsNodes().size,
+        )
+        fireClose("s-b1")
         assertEquals(listOf("s-b1"), hides)
         assertEquals("hide must never kill", listOf("s-a1"), kills)
 
@@ -317,28 +357,72 @@ class HaloSessionPagerTest {
         // adapter (#88's close frame) — so the ✕ is honest here, not a hide
         // wearing a kill's clothes.
         next()
-        compose.onNodeWithTag("haloPagerCard-s-b2").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-s-b2").performClick()
+        compose.waitForIdle()
         compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
-        compose.onNodeWithTag("haloRowClose").performClick()
+        fireClose("s-b2")
         assertEquals(listOf("s-a1", "s-b2"), kills)
         assertEquals("an ACP close must not degrade to a local hide", listOf("s-b1"), hides)
     }
 
     @Test
-    fun actionArcStubsAreVisibleButDisabledAndTheSpawnCardHasNoArc() {
+    fun menuRowsAreFingerSizedWithStubsVisibleButDisabled() {
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         drill()
+        compose.onNodeWithTag("haloPagerCard-s-a1").performClick()
+        compose.waitForIdle()
 
-        // The four stubs render (the arc reads complete) but take no input.
-        for (tag in listOf("haloArc-model", "haloArc-mode", "haloArc-compact", "haloArc-handover")) {
-            compose.onNodeWithTag(tag).assertIsDisplayed().assertIsNotEnabled()
+        // The issue's headline acceptance: every action row is a full-width
+        // fingertip target — ≥48dp tall — where the arc's 33dp cells could
+        // not reach the minimum without overlapping.
+        val minPx = 48f * compose.density.density - 1f
+        for (tag in listOf("haloMenuFeed", "haloRowClose")) {
+            val row = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
+            assertTrue("$tag must be finger-sized (${row.height} < $minPx)", row.height >= minPx)
         }
 
-        // The spawn card has nothing to close or configure: no arc at all.
+        // The stubs keep their arc treatment: visible, dead, dimmed. The
+        // menu list is LAZY, so the tail rows need the scroll to compose.
+        for (tag in listOf("haloMenu-model", "haloMenu-mode", "haloMenu-compact", "haloMenu-handover")) {
+            compose.onNode(
+                hasScrollAction() and hasAnyAncestor(hasTestTag("haloSessionMenu")),
+            ).performScrollToNode(hasTestTag(tag))
+            compose.onNodeWithTag(tag).assertExists().assertIsNotEnabled()
+        }
+    }
+
+    @Test
+    fun spawnCardOpensThePickerNotTheMenu() {
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drill()
+        // The spawn card has nothing to close or configure: its tap keeps
+        // opening the target picker, never a session menu.
         repeat(3) { next() }
-        compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
+        compose.onNodeWithTag("haloSpawn").assertIsDisplayed().performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloSpawnPicker").assertIsDisplayed()
+        assertEquals(0, tagCount("haloSessionMenu"))
         assertEquals(0, tagCount("haloRowClose"))
-        assertEquals(0, tagCount("haloArc-model"))
+    }
+
+    @Test
+    fun killUnderTheOpenMenuClosesItOntoTheHealedNeighbour() {
+        var state by mutableStateOf(ui())
+        compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
+        drill()
+        next()
+        compose.onNodeWithTag("haloPagerCard-s-a2").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloSessionMenu").assertIsDisplayed()
+
+        // The menu's session dies under it (the bridge announcing a kill this
+        // very menu fired, say): the heal closes the menu WITH the repair —
+        // a surviving menu would offer the neighbour's ending under the dead
+        // session's title.
+        state = ui(ids = listOf("s-a1", "s-b1"))
+        compose.waitForIdle()
+        assertEquals(0, tagCount("haloSessionMenu"))
+        compose.onNodeWithTag("haloPagerCard-s-b1").assertIsDisplayed()
     }
 
     @Test

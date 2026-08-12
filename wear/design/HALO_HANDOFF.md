@@ -821,6 +821,37 @@ decision in this document:
    `halo-v2-current-08-dictate-mic.png` /
    `halo-v2-current-09-dictate-unavailable.png`.
 
+### Post-epic refinement: the session-actions menu (#114, 2026-08-12)
+
+From the same on-wrist verdict that closed the epic: the action arc's five
+26dp circles were *"too small but even so take up too much space"* — the
+user's binding direction replaced them with a MENU. As built:
+
+- **The pager card carries no action arc.** Tapping the card opens the
+  session-actions menu (`HaloSessionMenu.kt`), not the feed; the feed moved
+  behind the menu's own **"open feed"** row (first — it is the old tap's
+  destination and the most-travelled path). The Answer pill stays the
+  pager's topmost layer and keeps outranking the card's whole-surface menu
+  tap.
+- **Rows, not circles:** full-width ≥48dp pills (spawn-picker geometry
+  family), glyph + label — "› open feed", then the live close ("✕ end
+  session" in Error red / "⊘ hide session"), then the four stubs (◇ model ·
+  ◐ mode · ▤ compact · ⇄ handover) KEPT as disabled rows at the arc's 0.35
+  alpha (implementer's call, recorded: the arc showed this roadmap and the
+  menu has the room the arc lacked). The close keeps the stable
+  `haloRowClose` tag; kill/hide semantics are untouched (#88 close frame
+  for fork-owned AND acp, #53 honest hide for hook-observed).
+- **Navigation (gesture model v3 intact):** the menu is nav state
+  (`HaloNavState.menuOpen`, a flag like `cardOpen` — a pass-through
+  launcher, not a depth). Swipe-right/system back from the menu returns to
+  the pager card that summoned it; the FEED's back goes straight to the
+  pager card, skipping the menu (the recommended shape). An action tap
+  closes the menu onto the card; a session dying under the open menu closes
+  it through the list self-heal. No vertical gestures, no new exit paths.
+- Rendered like the spawn picker: opaque over ring and clock, under the
+  approval card / voice / offline overlays; rotary belongs to the menu's
+  list while it is up.
+
 ### Pending on-wrist live checks (post-epic, user steps)
 
 - **Subheading on a live ACP session** (#102's deferred criterion): with the

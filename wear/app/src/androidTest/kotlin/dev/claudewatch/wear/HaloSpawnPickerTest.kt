@@ -156,13 +156,11 @@ class HaloSpawnPickerTest {
         assertEquals("cancel closes the picker", 0, pickerCount())
 
         // The pager underneath is intact, still on the spawn card it was
-        // summoned from: ‹ steps back to the last session card with its
-        // action arc live…
+        // summoned from: ‹ steps back to the last session card…
         compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
         compose.onNodeWithTag("haloPrev").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-s-b").assertIsDisplayed()
-        compose.onNodeWithTag("haloRowClose").assertIsDisplayed()
 
         // …and the pager's own swipe-rights still walk out: card by card to
         // the first slot, then off the list to home. Frame-by-frame for the

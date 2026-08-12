@@ -52,7 +52,9 @@ import java.util.concurrent.TimeUnit
  * (the v2 one-session-per-screen list) — born in the harness's fake Zed fork
  * over the bridge's ACP inbox (issue #107) — then KILL it for real: the close
  * frame of issue #88 travels wrist → bridge → fork, and the fork's own
- * deregister is what takes the card off the pager.
+ * deregister is what takes the card off the pager. Since #114 a pager card's
+ * tap opens the session-actions MENU: the feed sits behind its "open feed"
+ * row, and the kill fires from the menu's close row.
  *
  * The old control-page command box has no Halo equivalent (commands are
  * dictation-only and the recognizer cannot run headlessly); the ack-gated
@@ -247,6 +249,15 @@ class WalkingSkeletonTest {
         }
     }
 
+    /** A pager card's tap opens the session-actions MENU (issue #114); the
+     *  feed lives behind its "open feed" row — this walks the pass-through. */
+    private fun openFeedFromCard(sessionId: String) {
+        compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()
+        compose.waitUntil(10_000) { tagExists("haloMenuFeed") }
+        compose.onNodeWithTag("haloMenuFeed").performClick()
+        compose.waitForIdle()
+    }
+
     /** Step the pager to [sessionId]'s card, from wherever it is parked: back
      *  out to the page and drill again (re-resolving to the first slot), then
      *  walk ›-wards until the card is in front. */
@@ -427,9 +438,10 @@ class WalkingSkeletonTest {
         ).use { assertEquals(200, it.code) }
         waitForText("haloCensus", "1 session")
         drillToList()
-        // The lone session is the pager's resolved selection: its card is up.
+        // The lone session is the pager's resolved selection: its card is up
+        // — through the actions menu into its feed (#114).
         val markerSession = pagerCardIds().single()
-        compose.onNodeWithTag("haloPagerCard-$markerSession").performClick()
+        openFeedFromCard(markerSession)
         compose.waitUntil(30_000) {
             compose.onAllNodes(hasText(marker, substring = true)).fetchSemanticsNodes().isNotEmpty()
         }
@@ -664,7 +676,7 @@ class WalkingSkeletonTest {
         // feed subtree so text from another (prefetched or composed) surface
         // can't satisfy it.
         openPagerCard(spawnedId)
-        compose.onNodeWithTag("haloPagerCard-$spawnedId").performClick()
+        openFeedFromCard(spawnedId)
         compose.waitUntil(60_000) {
             compose.onAllNodes(
                 hasText("wear-e2e-fake-fork", substring = true) and
@@ -672,20 +684,24 @@ class WalkingSkeletonTest {
             ).fetchSemanticsNodes().isNotEmpty()
         }
 
-        // Back to the pager (swipe right, the feed's v3 back) — the
-        // selection survives the feed round trip, so the spawned card is up
-        // with its action arc's close. An ACP slot is EXTERNAL and yet really
+        // Back to the pager (swipe right, the feed's v3 back — landing on
+        // the CARD directly: the menu is a pass-through, never a stop on the
+        // way out) — the selection survives the feed round trip, so the
+        // spawned card is up; its tap reopens the actions menu, whose close
+        // row is the kill now (#114). An ACP slot is EXTERNAL and yet really
         // killable (issue #88): the ✕ POSTs a kill, the bridge relays a
         // `close` frame down the fork's inbox, and the fork's own deregister
         // ends the slot — so the card leaves because the SESSION ENDED, not
         // because the watch hid it. That distinction is invisible from in
         // here (both make a card vanish), so wear-e2e.sh checks the frame on
-        // both sides of the loopback channel afterwards. The
+        // both sides of the loopback channel afterwards. The action tap
+        // closes the menu back onto the card; the
         // close-under-cursor self-heal re-selects a neighbour and the pager
         // stays steppable.
         compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeRight() }
         compose.waitForIdle()
-        compose.onNodeWithTag("haloPagerCard-$spawnedId").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-$spawnedId").assertIsDisplayed().performClick()
+        compose.waitUntil(10_000) { tagExists("haloRowClose") }
         compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
         compose.onNodeWithTag("haloRowClose").performClick()
         compose.waitUntil(30_000) { !tagExists("haloPagerCard-$spawnedId") }

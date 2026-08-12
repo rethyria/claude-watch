@@ -58,8 +58,9 @@ import org.junit.runner.RunWith
  *    dispatch's stable half: a registered handler suppresses the system
  *    swipe-dismiss — no more mid-session exits.
  *
- * Priority: overlays first (voice, spawn picker), then the card (position
- * under it preserved), then the step — and the handler stays REGISTERED
+ * Priority: overlays first (voice, spawn picker), then the card, then the
+ * actions menu (#114) — position under either preserved — then the step —
+ * and the handler stays REGISTERED
  * everywhere, settings included (round 2's invariant: an enabled flag that
  * could drop mid-gesture was the round-1 exit); at settings a completed
  * back is the one deliberate activity.finish(), twinned by the settings
@@ -134,7 +135,10 @@ class HaloSystemBackTest {
     }
 
     private fun openFeed(sessionId: String) {
+        // Card tap → actions menu (#114) → its "open feed" row.
         compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloMenuFeed").performClick()
         compose.waitForIdle()
     }
 
@@ -236,6 +240,25 @@ class HaloSystemBackTest {
         dispatchSystemBack()
         assertAtHome()
         assertTrue(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
+    }
+
+    @Test
+    fun backClosesTheActionsMenuOntoItsOwnCardBeforeSteppingTheList() {
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drillToList()
+        stepTo("haloPagerCard-s-2")
+        compose.onNodeWithTag("haloPagerCard-s-2").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloSessionMenu").assertIsDisplayed()
+
+        // Back = close the menu (#114): EXACTLY where it was — s-2's card,
+        // one step in, never a list step under the floating menu (the same
+        // outranking the answer card gets).
+        Espresso.pressBack()
+        compose.waitForIdle()
+        assertEquals(0, nodeCount("haloSessionMenu"))
+        compose.onNodeWithTag("haloPagerCard-s-2").assertIsDisplayed()
+        assertFalse(compose.activity.isFinishing)
     }
 
     @Test

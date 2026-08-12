@@ -354,6 +354,89 @@ class HaloNavTest {
         assertEquals(onIdle, onIdle.openCardForListSession(m.sessions.single { it.id == "s-a1" }))
     }
 
+    // ── The session-actions menu (issue #114) ────────────────────────────────
+    // A pager card's tap raises the menu OVER the card (the feed moved behind
+    // the menu's "open feed" row); the menu is a pass-through launcher — back
+    // lands on the card that summoned it, and the feed's back skips it.
+
+    @Test
+    fun cardTapOpensTheMenuOverTheCardAndBackReturnsToIt() {
+        val second = HaloNavState(page = 0).drillToList(model()).step(+1, model())
+        val menu = second.openMenu("s-a2")
+        // OVER the card: depth stays LIST, position untouched.
+        assertEquals(HaloDepth.LIST, menu.depth)
+        assertTrue(menu.menuOpen)
+        assertEquals("s-a2", menu.sessionId)
+
+        // Back (swipe-right's twin): the menu closes onto the SAME card —
+        // never a list step while the menu floats above.
+        val closed = menu.back()
+        assertEquals(second, closed)
+        assertFalse(closed.menuOpen)
+    }
+
+    @Test
+    fun openFeedFromTheMenuDrillsAndTheFeedsBackSkipsTheMenu() {
+        val menu = HaloNavState(page = 0).drillToList(model())
+            .step(+1, model())
+            .openMenu("s-a2")
+        val feed = menu.drillToSession("s-a2")
+        assertEquals(HaloDepth.SESSION, feed.depth)
+        assertFalse("the drill closes the menu behind it", feed.menuOpen)
+
+        // Feed → the pager CARD directly: the menu is a launcher passed
+        // through, not a resting place — re-raising it here would put a
+        // second stop on every feed exit.
+        val back = feed.back()
+        assertEquals(HaloDepth.LIST, back.depth)
+        assertEquals("s-a2", back.sessionId)
+        assertFalse(back.menuOpen)
+    }
+
+    @Test
+    fun openMenuOutsideTheListIsANoOp() {
+        // No card on screen to float over: a hand-built call from a page (or
+        // a feed) must be refused, never a surprise LIST jump.
+        val onPage = HaloNavState(page = 0)
+        assertEquals(onPage, onPage.openMenu("s-a1"))
+        val onFeed = HaloNavState(page = 0).drillToList(model()).drillToSession("s-a1")
+        assertEquals(onFeed, onFeed.openMenu("s-a1"))
+    }
+
+    @Test
+    fun systemBackClosesTheMenuOntoItsOwnCardBeforeSteppingTheList() {
+        val m = model()
+        val menu = HaloNavState(page = 0).drillToList(m).step(+1, m).openMenu("s-a2")
+        val closed = (systemBack(menu, overlayOpen = false, m) as SystemBack.Navigate).nav
+        // The menu outranks the step, exactly as the card does: still s-a2's
+        // card, one step in — not s-a1.
+        assertEquals(HaloDepth.LIST, closed.depth)
+        assertEquals("s-a2", closed.sessionId)
+        assertFalse(closed.menuOpen)
+        // An open OVERLAY (voice/picker) still outranks the menu.
+        assertEquals(SystemBack.DismissOverlay, systemBack(menu, overlayOpen = true, m))
+    }
+
+    @Test
+    fun healClosesTheMenuWhenItsSessionVanishes() {
+        // A kill fired FROM the menu lands here: the dead session's menu must
+        // not survive onto the healed neighbour, whose actions it never named.
+        val shrunk = HaloModel(
+            projects = listOf(HaloProject("alpha", listOf(session("s-a1", "alpha")))),
+            sessions = listOf(session("s-a1", "alpha")),
+            queue = emptyList(),
+        )
+        val stale = HaloNavState(depth = HaloDepth.LIST, sessionId = "s-gone", menuOpen = true)
+        val healed = stale.healListSelection(shrunk, 0)
+        assertEquals("s-a1", healed.sessionId)
+        assertFalse(healed.menuOpen)
+        // The emptied-All repair (→ the spawn card) closes it too: the spawn
+        // slot has no menu.
+        val emptied = stale.healListSelection(emptyModel, 0)
+        assertNull(emptied.sessionId)
+        assertFalse(emptied.menuOpen)
+    }
+
     // ── The LIST-depth self-heal (Halo v2 S5, #99) ───────────────────────────
     // step/atListStart deliberately dead-end on a vanished selection and
     // back-from-feed parks the dead id at LIST depth; the pager heals it

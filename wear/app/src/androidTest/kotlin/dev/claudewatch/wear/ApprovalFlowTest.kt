@@ -245,10 +245,13 @@ class ApprovalFlowTest {
         compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
 
         // Home → pager (s-1 is the scope's first card) → s-1's feed. The
-        // face tap is v3's one list entry.
+        // face tap is v3's one list entry; the card tap opens the actions
+        // menu (#114) and its "open feed" row is the way in.
         compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-s-1").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloMenuFeed").performClick()
         compose.waitForIdle()
 
         // Waiting: the whole feed surface is the tap target, opening the card

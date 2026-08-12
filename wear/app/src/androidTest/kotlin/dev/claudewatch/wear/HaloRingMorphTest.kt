@@ -141,9 +141,15 @@ class HaloRingMorphTest {
         compose.mainClock.advanceTimeBy(700)
         assertEquals(1, tagCount("haloPagerCard-s-a1"))
 
-        // Into the feed: card and feed both composed through the window.
+        // Into the feed via the actions menu (#114): the card tap raises the
+        // menu (instant — no animation of its own), its "open feed" row
+        // drills, and the menu vanishes the same frame the drill lands.
         compose.onNodeWithTag("haloPagerCard-s-a1").performClick()
+        compose.mainClock.advanceTimeBy(64)
+        assertEquals(1, tagCount("haloSessionMenu"))
+        compose.onNodeWithTag("haloMenuFeed").performClick()
         compose.mainClock.advanceTimeBy(96)
+        assertEquals(0, tagCount("haloSessionMenu"))
         assertEquals(1, tagCount("haloPagerCard-s-a1"))
         assertEquals(1, tagCount("haloFeed-s-a1"))
         compose.mainClock.advanceTimeBy(600)

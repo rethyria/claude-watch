@@ -30,9 +30,11 @@ import org.junit.runner.RunWith
  * page-per-session coverage became ring-home → list pager → feed nav
  * coverage), fed by fixture events reduced through the shared reducer — the
  * same `{id, event, data}` frames the bridge buffers. Every session is
- * reachable from home (tap the face → its pager card → its live feed with
+ * reachable from home (tap the face → its pager card → its actions menu →
+ * "open feed" → its live feed with
  * human-readable, ANSI-stripped lines — v3: the face tap is the ONE list
- * entry and swipe-right the one gesture back), the thinking indicator
+ * entry and swipe-right the one gesture back; #114 put the menu between
+ * card and feed), the thinking indicator
  * renders from per-session state, and a killed session's feed backs out
  * onto the healed pager instead of ghosting. Pure UI test — no bridge, no
  * network.
@@ -123,7 +125,11 @@ class HaloNavigationTest {
 
     private fun openFeed(sessionId: String) {
         stepToCard(sessionId)
+        // The card's tap opens the actions MENU (#114); the feed lives
+        // behind the menu's own "open feed" row.
         compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloMenuFeed").performClick()
         compose.waitForIdle()
     }
 

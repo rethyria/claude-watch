@@ -186,7 +186,7 @@ class HaloPreviewScreens {
         previewEnabled()
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         // Alpha is the drill's resolved selection: a RUNNING card with the
-        // #54/#55 detail line, the dotted position ring and the action arc.
+        // #54/#55 detail line and the dotted position ring (arc-free, #114).
         drillToList()
         hold()
     }
@@ -214,6 +214,14 @@ class HaloPreviewScreens {
         hold()
     }
 
+    /** Card → the session-actions menu (#114) → its "open feed" row. */
+    private fun openFeedFromCard(sessionId: String) {
+        compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloMenuFeed").performClick()
+        compose.waitForIdle()
+    }
+
     @Test
     fun sessionFeed() {
         previewEnabled()
@@ -221,7 +229,30 @@ class HaloPreviewScreens {
         drillToList()
         // Alpha is the drill's resolved selection (the scope's first card):
         // the chrome-free masked feed inside the full-circle state ring.
+        openFeedFromCard(alpha)
+        hold()
+    }
+
+    @Test
+    fun sessionMenuRunning() {
+        previewEnabled()
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drillToList()
+        // Alpha is bridge-owned: the menu's reference capture with the live
+        // red ✕ "end session" row (#114) over the "open feed" row and stubs.
         compose.onNodeWithTag("haloPagerCard-$alpha").performClick()
+        hold()
+    }
+
+    /** The EXTERNAL variant: a hook-observed session's menu carries the
+     *  honest ⊘ "hide session" row instead of a kill (#53 unchanged). */
+    @Test
+    fun sessionMenuExternal() {
+        previewEnabled()
+        val delta = "d2f8c4a7-1b3e-4d6f-8a9c-7e5b2c4d8f22"
+        compose.setContent { HaloApp(ui = externalSessionUi(delta), actions = HaloActions()) }
+        drillToList()
+        compose.onNodeWithTag("haloPagerCard-$delta").performClick()
         hold()
     }
 
@@ -242,17 +273,14 @@ class HaloPreviewScreens {
         drillToList()
         // Alpha is bridge-owned (dictatable): the bottom slot carries the
         // microphone-icon Dictate pill (#104 user feedback).
-        compose.onNodeWithTag("haloPagerCard-$alpha").performClick()
+        openFeedFromCard(alpha)
         hold()
     }
 
-    /** A lone EXTERNAL hook session (dictatable = false): the reference for
-     *  the muted mic + ⊘ unavailable affordance. Its own fixture, so the
+    /** A lone EXTERNAL hook session (dictatable = false): the fixture behind
+     *  the muted-mic and ⊘-hide-menu references. Its own fixture, so the
      *  main captures' three-session ring stays untouched. */
-    @Test
-    fun feedDictateUnavailable() {
-        previewEnabled()
-        val delta = "d2f8c4a7-1b3e-4d6f-8a9c-7e5b2c4d8f22"
+    private fun externalSessionUi(delta: String): BridgeViewModel.UiState {
         val frames = listOf(
             SseFrame("1", "session", """{"state":"connected"}"""),
             SseFrame(
@@ -274,14 +302,20 @@ class HaloPreviewScreens {
                     """"tool_output":"46f8489 wear: the Answer pill outranks the kill cell","cwd":"/home/dev/projects/claude-watch","source":"claude","sessionId":"$delta"}""",
             ),
         )
-        val state = BridgeViewModel.UiState(
+        return BridgeViewModel.UiState(
             status = "paired, stream open",
             paired = true,
             bridge = fold(frames),
         )
-        compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
+    }
+
+    @Test
+    fun feedDictateUnavailable() {
+        previewEnabled()
+        val delta = "d2f8c4a7-1b3e-4d6f-8a9c-7e5b2c4d8f22"
+        compose.setContent { HaloApp(ui = externalSessionUi(delta), actions = HaloActions()) }
         drillToList()
-        compose.onNodeWithTag("haloPagerCard-$delta").performClick()
+        openFeedFromCard(delta)
         hold()
     }
 }

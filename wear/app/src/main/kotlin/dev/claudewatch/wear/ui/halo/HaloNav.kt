@@ -1,8 +1,9 @@
 // Halo's navigation state machine: ONE horizontal axis (gesture model v3,
 // #109 — settings and usage left of home, All, one page per project, and the
 // list pager / session feed as depths hanging off a page), plus the
-// approval/question card as an overlay flag. Depth is ENTERED by taps (face →
-// list, card → feed) and every backward move — surface swipe-right, ‹, the
+// approval/question card and the session-actions menu (#114) as overlay
+// flags. Depth is ENTERED by taps (face → list, card → menu → feed) and
+// every backward move — surface swipe-right, ‹, the
 // system back — is the same one-step-leftward walk ([systemBack]). Pure
 // Kotlin over HaloModel — no Compose, no I/O — so every transition is
 // unit-testable, including the edge cases (no waiting items, a project
@@ -70,6 +71,16 @@ data class HaloNavState(
      * restore the exact prior position.
      */
     val cardOpen: Boolean = false,
+    /**
+     * The session-actions menu (issue #114): what a pager card's tap raises
+     * now — the feed moved behind the menu's own "open feed" row. A flag like
+     * [cardOpen], not a depth, because the menu is a pass-through launcher:
+     * closing it must land exactly on the card that summoned it, and the
+     * feed's back SKIPS it (feed → card, never feed → menu — a launcher is
+     * not a resting place). Only meaningful at [HaloDepth.LIST] with a
+     * session selected; every transition that leaves the card clears it.
+     */
+    val menuOpen: Boolean = false,
     /**
      * The specific prompt the card was opened FOR (a project page's first
      * waiting item, a feed banner's own prompt). Null means the global queue
@@ -171,17 +182,45 @@ fun HaloNavState.healListSelection(model: HaloModel, rememberedIndex: Int): Halo
     if (depth != HaloDepth.LIST || sessionId == null) return this
     val inScope = model.sessionsIn(listScope)
     if (inScope.any { it.id == sessionId }) return this
+    // Every repair also closes the actions menu (issue #114): its session is
+    // the one that vanished — a kill fired from the menu lands here — and a
+    // menu surviving onto the neighbour would offer THAT session's ending
+    // under the dead one's summons.
     return when {
         inScope.isNotEmpty() ->
-            copy(sessionId = inScope[rememberedIndex.coerceIn(0, inScope.size - 1)].id)
-        listScope == ListScope.All -> copy(sessionId = null)
+            copy(
+                sessionId = inScope[rememberedIndex.coerceIn(0, inScope.size - 1)].id,
+                menuOpen = false,
+            )
+        listScope == ListScope.All -> copy(sessionId = null, menuOpen = false)
         else -> jumpHome()
     }
 }
 
-/** Tap a session row: into its live feed. */
+/**
+ * Tap a pager card (issue #114): raise the session-actions menu over it. LIST
+ * only — the menu floats over the card whose tap summoned it, so there is
+ * nothing honest for a hand-built call from another depth to float over. The
+ * selection moves to the tapped session (the pager passes the RENDERED card's
+ * id, normally already selected), never to the spawn slot: the spawn card
+ * keeps its own picker.
+ */
+fun HaloNavState.openMenu(sessionId: String): HaloNavState {
+    if (depth != HaloDepth.LIST) return this
+    return copy(sessionId = sessionId, menuOpen = true)
+}
+
+/** The menu's "open feed" row (and any hand-built feed drill): into the live
+ *  feed, the menu closed BEHIND the drill — back from the feed must land on
+ *  the pager card, not re-raise the launcher that was passed through. */
 fun HaloNavState.drillToSession(sessionId: String): HaloNavState =
-    copy(depth = HaloDepth.SESSION, sessionId = sessionId, cardOpen = false, cardPermissionId = null)
+    copy(
+        depth = HaloDepth.SESSION,
+        sessionId = sessionId,
+        menuOpen = false,
+        cardOpen = false,
+        cardPermissionId = null,
+    )
 
 /** Feed banner tap: raise the card for this session's own prompt. */
 fun HaloNavState.openCard(permissionId: String?): HaloNavState =
@@ -200,9 +239,15 @@ fun HaloNavState.openCardForListSession(session: HaloSession): HaloNavState {
 }
 
 /** One step out (a feed's swipe-right, ‹/swipe-right on the list's FIRST
- *  card, closing the card): card → feed → list → page; no-op at the top. */
+ *  card, closing the card or the menu): card → menu → feed → list → page;
+ *  no-op at the top. */
 fun HaloNavState.back(): HaloNavState = when {
     cardOpen -> copy(cardOpen = false, cardPermissionId = null)
+    // Menu → its own pager card (issue #114): position untouched — the menu
+    // floats over the card that opened it. Guarded to LIST because the flag
+    // is meaningless anywhere else; a corrupt hand-built state must not trap
+    // back on an invisible menu.
+    depth == HaloDepth.LIST && menuOpen -> copy(menuOpen = false)
     // Feed → list KEEPS the session: it becomes the pager selection, and the
     // shrink morph must land on that session's ring segment, not the first's.
     depth == HaloDepth.SESSION -> copy(depth = HaloDepth.LIST)
@@ -262,7 +307,8 @@ sealed interface SystemBack {
  * swipe-right does wherever the app is, so the two inputs can never
  * disagree. Overlay first (dismissing it is the caller's side effect), then
  * the card (closing it restores the exact prior position — [back]'s card
- * branch), then the feed steps out to its own list card, then the LIST
+ * branch), then the actions menu closes onto its own pager card (#114),
+ * then the feed steps out to its own list card, then the LIST
  * steps to the PREVIOUS session ([step] −1 — the user's explicit choice;
  * only the first card steps out to the page, [atListStart]), then the pages
  * walk ONE step leftward ([stepPage] −1: projects toward home, home →
@@ -277,6 +323,11 @@ sealed interface SystemBack {
 fun systemBack(nav: HaloNavState, overlayOpen: Boolean, model: HaloModel): SystemBack? = when {
     overlayOpen -> SystemBack.DismissOverlay
     nav.cardOpen -> SystemBack.Navigate(nav.back())
+    // The actions menu (issue #114) closes onto its own pager card — the same
+    // one-step [back] its swipe-right performs, and it outranks the list step
+    // exactly as the card does: back over a floating surface never moves the
+    // position underneath.
+    nav.depth == HaloDepth.LIST && nav.menuOpen -> SystemBack.Navigate(nav.back())
     nav.depth == HaloDepth.SESSION -> SystemBack.Navigate(nav.back())
     nav.depth == HaloDepth.LIST ->
         SystemBack.Navigate(if (nav.atListStart(model)) nav.back() else nav.step(-1, model))

@@ -181,12 +181,16 @@ class CatchUpFlowTest {
         // --- The caught-up event renders ----------------------------------
         // Drill into s-1's feed — the face tap is v3's one list entry, and
         // the lone session is the pager's resolved selection, so its card is
-        // the drill's landing screen — and see the post-disconnect line (the
+        // the drill's landing screen; the card tap opens the actions menu
+        // (#114) whose "open feed" row is the way in — and see the
+        // post-disconnect line (the
         // pre-disconnect state survived the disconnect, so both lines are in
         // the terminal — the new one proves the replay DELIVERED).
         compose.onNodeWithTag("haloCenter").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-s-1").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloMenuFeed").performClick()
         compose.waitUntil(30_000) {
             compose.onAllNodes(hasText("catchup-after", substring = true))
                 .fetchSemanticsNodes().isNotEmpty()
