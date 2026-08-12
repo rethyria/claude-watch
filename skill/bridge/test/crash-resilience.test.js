@@ -147,3 +147,89 @@ test("a fault after the parent process dies must not spin the bridge", { timeout
   const ping = await request(port, "GET", "/ping");
   assert.equal(ping.status, 200, "orphaned bridge must still serve requests");
 });
+
+test("a dead log sink degrades to the bridge.log fallback and /v1/status says so", { timeout: 60_000 }, async (t) => {
+  // The fix above traded the log→EPIPE→log spin for a bridge that survives a
+  // dead sink SILENTLY — every line dropped, nothing announcing it, on a
+  // project whose diagnostic doctrine is to read the log (issue #93). So a
+  // failed primary write must (a) reroute lines to bridge.log next to the
+  // credentials and (b) raise loggingDegraded in /v1/status.
+  //
+  // Phase 1 — a healthy bridge: pins the flag's resting state, and mints the
+  // token the orphaned bridge below is interrogated with (its pairing banner
+  // has no reader; credentials persist in credsDir across the restart).
+  const credsDir = tempDir(t, "claude-watch-logsink-");
+  const first = await startBridge(t, { credentialsDir: credsDir });
+  const pair = await request(first.port, "POST", "/pair", { body: { code: first.pairingCode } });
+  assert.equal(pair.status, 200);
+  const token = pair.body.token;
+  const healthy = await request(first.port, "GET", "/v1/status", { token });
+  assert.equal(healthy.body.loggingDegraded, false, "a bridge whose sink works must not claim degradation");
+  await first.stop();
+
+  // Phase 2 — the dead-sink state, via the same reproduction trap the spin
+  // test documents: the parent PROCESS must be gone, not merely the pipe
+  // closed, so the bridge is spawned from a shim that exits immediately.
+  const shimSource = `
+    const { spawn } = require("node:child_process");
+    const child = spawn(process.execPath, ["server.js"], {
+      cwd: ${JSON.stringify(BRIDGE_DIR)},
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    process.stdout.write(String(child.pid));
+    process.exit(0);
+  `;
+  const shim = spawnSync(process.execPath, ["-e", shimSource], {
+    encoding: "utf-8",
+    env: {
+      ...process.env,
+      CLAUDE_WATCH_CREDENTIALS_DIR: credsDir,
+      CLAUDE_WATCH_DISABLE_MDNS: "1",
+      CLAUDE_WATCH_PORT_RANGE_END: "7929",
+      // A known line to hunt for in the fallback: the guard logs the injected
+      // fault well after boot, i.e. squarely into the dead sink.
+      CLAUDE_WATCH_TEST_FAULT: "uncaughtException",
+      CLAUDE_WATCH_TEST_FAULT_DELAY_MS: "1500",
+      // The orphan watchdog would shut this bridge down mid-interrogation.
+      CLAUDE_WATCH_EXIT_WHEN_ORPHANED: "0",
+    },
+  });
+  const pid = Number(shim.stdout.trim());
+  assert.ok(pid > 0, `shim must report the bridge pid, got ${JSON.stringify(shim.stdout)}`);
+  t.after(() => { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } });
+
+  // The orphan republishes its port (the graceful stop above removed the
+  // first bridge's file, so this never reads a stale one).
+  const portFile = path.join(credsDir, "port");
+  let port = null;
+  const portDeadline = Date.now() + 15_000;
+  while (Date.now() < portDeadline && !port) {
+    try { port = Number(fs.readFileSync(portFile, "utf-8").trim()) || null; } catch { /* not yet */ }
+    if (!port) await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(port, "orphaned bridge must publish its port");
+
+  // (a) The lines: the fallback file opens by naming the failure, and the
+  // guard's fault line — logged ~1.5 s into the dead-sink state — lands in it
+  // rather than vanishing.
+  const fallbackLog = path.join(credsDir, "bridge.log");
+  let logged = "";
+  const lineDeadline = Date.now() + 15_000;
+  while (Date.now() < lineDeadline && !/Uncaught exception \(bridge kept alive\)/.test(logged)) {
+    try { logged = fs.readFileSync(fallbackLog, "utf-8"); } catch { /* not yet */ }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  assert.match(logged, /Primary log sink failed/, "the fallback must announce why it took over");
+  assert.match(
+    logged,
+    /Uncaught exception \(bridge kept alive\).*injected test fault/,
+    "a line logged after the sink died must land in the fallback file, not vanish",
+  );
+
+  // (b) The flag: visible from the admin surface instead of inferred from
+  // silence.
+  const status = await request(port, "GET", "/v1/status", { token });
+  assert.equal(status.status, 200, "orphaned bridge must still serve /v1/status");
+  assert.equal(status.body.loggingDegraded, true, "a dead log sink must be announced in /v1/status");
+});

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import { Bonjour } from "bonjour-service";
-import { log, jsonResponse } from "./util.js";
+import { log, logSinkFailed, jsonResponse } from "./util.js";
 import { createHostAllowList } from "./host-guard.js";
 import {
   PORT_RANGE_START,
@@ -67,9 +67,12 @@ import { handleAdminDevices, handleAdminRevoke, handleAdminPairingOpen } from ".
 // server keeps answering, so the process looks perfectly healthy while burning
 // a CPU. It is exactly how a stranded test bridge once accumulated 28
 // CPU-hours. Losing log lines to a reader that is already gone costs nothing,
-// so swallow the write error and break the cycle at its source.
+// so swallow the write error and break the cycle at its source — but not
+// SILENTLY (issue #93): logSinkFailed flips log() over to the bridge.log
+// fallback file and raises the loggingDegraded flag /status reports, so a
+// bridge that lost its terminal keeps its diagnostics and says so.
 for (const stream of [process.stdout, process.stderr]) {
-  stream.on("error", () => { /* reader gone: nothing to report, and nowhere to report it */ });
+  stream.on("error", (err) => logSinkFailed(err));
 }
 
 process.on("unhandledRejection", (reason) => {

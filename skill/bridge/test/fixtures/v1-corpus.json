@@ -144,6 +144,7 @@
         "sseClients": 0,
         "pendingPermissions": 0,
         "eventBufferSize": 1,
+        "loggingDegraded": false,
         "hasPty": false,
         "activeAgent": null
       }
