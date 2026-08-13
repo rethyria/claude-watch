@@ -64,6 +64,17 @@ const pendingAcpCloses = new Map();
  *  Consumed by the session's end (below), so it is bounded by the live
  *  sessions, and dropped wholesale at shutdown. */
 const wristKilledSessions = new Set();
+/** In-flight cross-fork handoffs (#89): sessionId -> { promise, resolve,
+ *  timer, oldConnection }. Created when a LIVE session re-registers from a
+ *  DIFFERENT fork — the old fork is told to tear its copy down (the #88 close
+ *  frame) and the new registration waits here. Settled exactly once: by the
+ *  old fork's deregister (the handoff), its inbox dying (the copy died with
+ *  it), or the timeout (proceed anyway — the old query is orphaned, but
+ *  holding the migration hostage to a wedged fork would leave the dual-writer
+ *  running on BOTH sides). Deliberately SEPARATE from pendingAcpCloses: a
+ *  release is not a kill — the session survives it, so nothing here touches
+ *  wristKilledSessions or the pickup registry. */
+const pendingAcpReleases = new Map();
 /** Watch-spawned sessions no editor thread has adopted yet:
  *  sessionId -> { cwd, createdAt }. The desk-pickup registry /acp/claim takes
  *  from. Deliberately SEPARATE from the sessions map: a fork death ends the
@@ -121,6 +132,30 @@ export async function handleAcpRegister(req, res) {
   const { connection, sessionId, sdkSessionId, cwd, active, title, detached, model, mode } = body;
   if (typeof connection !== "string" || !connection || typeof sessionId !== "string" || !sessionId) {
     return jsonResponse(res, 400, { error: "Missing 'connection' or 'sessionId'" });
+  }
+
+  // A LIVE session re-registering from a DIFFERENT fork (#89): the user opened
+  // it from another Zed window, whose fork cannot see the first fork's
+  // in-memory copy, so a second SDK query now writes the same on-disk
+  // transcript — the #69 dual-writer class, cross-process. The bridge is the
+  // only party that can see both copies, so it RELEASES the old one before
+  // this registration goes live: the #88 close frame drives the old fork's
+  // teardown, whose deregister is consumed as the handoff (the session is
+  // migrating, not dying — no ended event, no prune), and only then does the
+  // slot refresh below announce the new host. A fork re-announcing its OWN
+  // session (same connection — the replay after a bridge restart) is the #68
+  // reconcile path and must never trigger this; a prior binding with no live
+  // inbox needs no release either — the inbox close already ended that copy,
+  // and this register is the ordinary revival.
+  const priorConnection = sessionConnection.get(sessionId);
+  if (
+    priorConnection && priorConnection !== connection && acpInboxes.has(priorConnection) &&
+    sessions.get(sessionId)?.state === "running"
+  ) {
+    const released = await releaseAcpSession(sessionId, priorConnection);
+    if (!released.ok) {
+      log("warn", `ACP session ${sessionId} re-registered by connection ${connection} without the old fork's release (${released.error}) — proceeding; the old copy is orphaned until that fork dies`);
+    }
   }
 
   // `active` is the fork's report of whether a turn is in flight; it is what
@@ -361,6 +396,55 @@ function settlePendingClose(sessionId, result) {
   pending.resolve(result);
 }
 
+/** Tear down the OLD fork's copy of a session that is re-registering from a
+ *  NEW fork (#89). The same close machinery as the wrist kill — the frame
+ *  drives the adapter's teardownSession — but the resulting deregister is a
+ *  HANDOFF, not an ending (handleAcpDeregister consumes it), so the wrist
+ *  never hears `ended` for a session that is merely changing hosts.
+ *
+ *  Resolves (never rejects) within ACP_CLOSE_TIMEOUT_MS:
+ *    `{ ok: true }`         — the old copy is down (its deregister, or its
+ *                             fork dying, which is the same fact observed
+ *                             later).
+ *    `{ ok: false, error }` — nothing ended in time (an adapter too old to
+ *                             know the frame drops it silently). The caller
+ *                             proceeds anyway: refusing the registration
+ *                             would keep BOTH queries alive, which is the
+ *                             very state this exists to end. */
+function releaseAcpSession(sessionId, oldConnection) {
+  // Two registers racing for one session (a duplicate POST, or a third fork)
+  // ride the same release; the settle is keyed by session.
+  const inFlight = pendingAcpReleases.get(sessionId);
+  if (inFlight) return inFlight.promise;
+
+  let settle;
+  const promise = new Promise((resolve) => { settle = resolve; });
+  const timer = setTimeout(() => {
+    settlePendingRelease(sessionId, {
+      ok: false,
+      error: `old fork did not release within ${ACP_CLOSE_TIMEOUT_MS}ms — its adapter may need a rebuild`,
+    });
+  }, ACP_CLOSE_TIMEOUT_MS);
+  pendingAcpReleases.set(sessionId, { promise, resolve: settle, timer, oldConnection });
+  log("info", `ACP release requested for session ${sessionId}: live on connection ${oldConnection}, re-registered by another fork`);
+  if (!writeAcpFrameToConnection(oldConnection, "close", { sessionId, reason: "superseded" })) {
+    // The inbox died between the caller's check and the write: the old copy
+    // is dying with its fork (the inbox close handler ends everything it
+    // hosted), which is the release, observed early.
+    settlePendingRelease(sessionId, { ok: true });
+  }
+  return promise;
+}
+
+/** Settle (exactly once) an in-flight cross-fork release. */
+function settlePendingRelease(sessionId, result) {
+  const pending = pendingAcpReleases.get(sessionId);
+  if (!pending) return;
+  pendingAcpReleases.delete(sessionId);
+  clearTimeout(pending.timer);
+  pending.resolve(result);
+}
+
 // The session ended — the only ack a `close` frame ever gets (#88). Whatever
 // ended it (the requested teardown, a Zed-side close that raced us, the fork's
 // inbox dying) the wrist's kill is now TRUE, so the waiter settles as done.
@@ -402,11 +486,31 @@ export async function handleAcpUpdate(req, res) {
   if (typeof sessionId !== "string" || !sessionId) {
     return jsonResponse(res, 400, { error: "Missing 'sessionId'" });
   }
+  // A handoff in flight (#89): the incoming fork's updates must not interleave
+  // with the old fork's teardown — the old copy's death rattle (the cancelled
+  // turn's end, a final prose flush) is still arriving on the OLD connection,
+  // and a fresh working announce threaded through it would flap the wrist
+  // mid-migration. The held responses ARE the buffer: the adapter's posts are
+  // fire-and-forget, so parking each one until the release settles (bounded by
+  // its timeout) serializes new-fork updates behind the handoff — and behind
+  // the register that initiated it, whose continuation queued first — with no
+  // replay machinery. Old-connection updates flow untouched.
+  const release = pendingAcpReleases.get(sessionId);
+  if (release && typeof connection === "string" && connection && connection !== release.oldConnection) {
+    await release.promise;
+  }
   // Keep the routing binding fresh: a tapped update for a known session whose
   // connection binding was lost (e.g. the register POST was dropped) re-asserts
-  // it, so a subsequent dictation can still be routed.
+  // it, so a subsequent dictation can still be routed. Only into a vacant (or
+  // dead-inbox) binding though: after a cross-fork handoff (#89) the old
+  // fork's late teardown updates still name the old connection, and letting
+  // them steal a LIVE binding would re-route dictation at a fork that already
+  // gave the session up — and hang its liveness on an inbox about to close.
   if (typeof connection === "string" && connection && sessions.has(sessionId)) {
-    sessionConnection.set(sessionId, connection);
+    const owner = sessionConnection.get(sessionId);
+    if (!owner || owner === connection || !acpInboxes.has(owner)) {
+      sessionConnection.set(sessionId, connection);
+    }
   }
 
   // Turn boundary (#79 / #83). The ACP `sessionUpdate` union has no turn-end
@@ -886,9 +990,35 @@ export async function handleAcpDeregister(req, res) {
   const body = await readAcpBody(req, res);
   if (body === null) return;
 
-  const { sessionId, reason } = body;
+  const { connection, sessionId, reason } = body;
   if (typeof sessionId !== "string" || !sessionId) {
     return jsonResponse(res, 400, { error: "Missing 'sessionId'" });
+  }
+  // The old fork servicing a release (#89): its teardown's deregister is the
+  // HANDOFF, not an ending — the register that requested the release is
+  // waiting on this settle and the session lives on under the new fork, so no
+  // ended event goes to the wrist and the slot stays running. The dropped
+  // prose is the old copy's interrupted turn: the wrist must not read it
+  // merged into the new fork's first flush. Gated on the releasing connection
+  // (absent-connection accepted for older forks) so a deregister from anyone
+  // ELSE mid-handoff stays the real ending it claims to be.
+  const release = pendingAcpReleases.get(sessionId);
+  if (release && (typeof connection !== "string" || !connection || connection === release.oldConnection)) {
+    log("info", `ACP session ${sessionId} released by connection ${release.oldConnection} — handoff, not an ending`);
+    proseBuffers.delete(sessionId);
+    settlePendingRelease(sessionId, { ok: true });
+    return jsonResponse(res, 200, { ok: true, handoff: true });
+  }
+  // A deregister from a connection that no longer owns the session is a
+  // release timeout's late echo (#89): the migration already completed and the
+  // old fork's slow teardown (the unbounded `query.interrupt()` from #88)
+  // finally finished. Ending the slot now would kill the NEW fork's live copy
+  // and lie `ended` to the wrist — the one ending this endpoint must never
+  // invent. Same-connection and connection-less deregisters keep today's path.
+  const owner = sessionConnection.get(sessionId);
+  if (typeof connection === "string" && connection && owner && owner !== connection) {
+    log("info", `ACP deregister of session ${sessionId} from connection ${connection} ignored: the session migrated to ${owner}`);
+    return jsonResponse(res, 200, { ok: true, stale: true });
   }
   endAcpSession(sessionId, typeof reason === "string" ? reason : "acp-closed");
   sessionConnection.delete(sessionId);
@@ -963,6 +1093,15 @@ export function handleAcpInbox(req, res) {
     for (const [sid, conn] of sessionConnection) {
       if (conn !== connectionId) continue;
       sessionConnection.delete(sid);
+      // A fork dying mid-release (#89): the copy it was asked to hand over
+      // died with it, which IS the release — same doctrine as a fork dying
+      // mid-close settling the kill. The waiting registration completes the
+      // migration instead of the wrist seeing the ended/revived flap a real
+      // fork death would be.
+      if (pendingAcpReleases.get(sid)?.oldConnection === connectionId) {
+        settlePendingRelease(sid, { ok: true });
+        continue;
+      }
       if (endAcpSession(sid, "acp-fork-disconnected")) ended++;
     }
     log("info", `ACP fork inbox disconnected (connection ${connectionId}); ended ${ended} session(s)`);
@@ -1023,6 +1162,9 @@ export function closeAllAcpInboxes() {
   }
   for (const sessionId of [...pendingAcpCloses.keys()]) {
     settlePendingClose(sessionId, { ok: false, error: "bridge shutting down" });
+  }
+  for (const sessionId of [...pendingAcpReleases.keys()]) {
+    settlePendingRelease(sessionId, { ok: false, error: "bridge shutting down" });
   }
   wristKilledSessions.clear();
   for (const { res, heartbeat } of acpInboxes.values()) {
