@@ -1864,9 +1864,9 @@ export class ClaudeAcpAgent {
    *  disarms it permanently (evolutions keep riding the turn-end poll), polls
    *  are rate-limited to one a second with no overlap (fire-and-forget off
    *  the loop — a message must never wait on a file read), and a hard
-   *  lifetime cap covers sessions whose title never settles. Mirrors the
-   *  bridge's acquireTitleMidTurn (sessions.js), which solves the same
-   *  shape one layer down for the hook path. */
+   *  lifetime cap covers sessions whose title never settles. (The bridge's
+   *  hook-era acquireTitleMidTurn solved the same shape one layer down until
+   *  #87 made this adapter the sole title source for an ACP slot.) */
   private maybeAcquireTitleMidTurn(sessionId: string, session: Session): void {
     if (session.titleSettled || session.titleScanInFlight) return;
     const scans = session.titleScanCount ?? 0;

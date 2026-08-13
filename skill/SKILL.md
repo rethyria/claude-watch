@@ -12,7 +12,7 @@ to the Agent Watch iOS/watchOS app.
 
 ## What it does
 - Runs a Node.js bridge server on your LAN
-- Registers HTTP hooks for real-time event forwarding
+- Mirrors agent sessions hosted by the Zed-launched ACP adapter (`skill/acp-agent`)
 - Generates a 6-digit pairing code for the iPhone app
 - Enables voice commands from your Apple Watch
 

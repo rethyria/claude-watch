@@ -39,22 +39,28 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
  * The walking skeleton, CI-scripted: a real bridge runs on the emulator host
  * (reachable via 10.0.2.2) and this test drives the actual Halo app through
  * the full loop — pair with the code scraped from bridge stdout, watch an SSE
- * event render in a session feed, answer blocking permission hooks (single,
- * queued, allow-always) so each unblocks with the chosen decision, answer an
- * AskUserQuestion payload, and spawn a claude session from the session pager
+ * event render in a session feed, answer queued permission prompts (single,
+ * queued, allow-always) so each decision rides back to the agent, answer an
+ * AskUserQuestion card, and spawn a claude session from the session pager
  * (the v2 one-session-per-screen list) — born in the harness's fake Zed fork
  * over the bridge's ACP inbox (issue #107) — then KILL it for real: the close
  * frame of issue #88 travels wrist → bridge → fork, and the fork's own
  * deregister is what takes the card off the pager. Since #114 a pager card's
  * tap opens the session-actions MENU: the feed sits behind its "open feed"
  * row, and the kill fires from the menu's close row.
+ *
+ * Sessions are fabricated over the ACP wire (#87 retired the hook channel):
+ * this test plays a second Zed-fork against the throwaway bridge — its own
+ * /acp/inbox connection, registers, turns, permission and input-request
+ * frames — mirroring the adapter's wire moves the bridge and adapter suites
+ * pin from both ends (skill/bridge/test/acp.test.js, skill/acp-agent). The
+ * wrist behavior asserted is unchanged; only who fabricates changed.
  *
  * The old control-page command box has no Halo equivalent (commands are
  * dictation-only and the recognizer cannot run headlessly); the ack-gated
@@ -90,21 +96,165 @@ class WalkingSkeletonTest {
     private val pairingCode: String = args.getString("pairingCode")
         ?: error("pass the bridge pairing code: -e pairingCode <6 digits>")
 
-    // Plays the role of Claude Code's hook scripts (curl on the host): raw
-    // HTTP POSTs to the unauthenticated /hooks/* surface. The permission hook
-    // blocks server-side until the watch decides, so its read timeout is long.
-    private val hookHttp = OkHttpClient.Builder()
+    // Plays the role of the Zed-launched claude-agent-acp fork: the
+    // loopback-only /acp/* uplink. The emulator's user-mode NAT egresses
+    // every guest connection to 10.0.2.2 from the HOST's own loopback — which
+    // is why the bridge's loopback gate passes — so an on-device test can
+    // hold the fork's role end to end: register fabricated sessions, drive
+    // turns, raise permission/question cards with the adapter's own frames,
+    // and observe the decision frames the bridge writes back down the held
+    // /acp/inbox SSE.
+    private val acpHttp = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    private fun postHook(path: String, body: JSONObject): Response =
-        hookHttp.newCall(
+    // One connection id per run, like the real fork (HttpBridgeChannel).
+    private val acpConnection = "wear-e2e-test-${System.currentTimeMillis()}"
+
+    private fun postAcp(path: String, body: JSONObject): Response =
+        acpHttp.newCall(
             Request.Builder()
                 .url("http://$bridgeHost:$bridgePort$path")
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build(),
         ).execute()
+
+    private fun acpRegister(sessionId: String, cwd: String) {
+        postAcp(
+            "/acp/register",
+            JSONObject()
+                .put("connection", acpConnection)
+                .put("sessionId", sessionId)
+                .put("sdkSessionId", sessionId)
+                .put("cwd", cwd)
+                .put("active", false),
+        ).use { assertEquals(200, it.code) }
+    }
+
+    private fun acpUpdate(sessionId: String, kind: String, payload: JSONObject) {
+        postAcp(
+            "/acp/update",
+            JSONObject()
+                .put("connection", acpConnection)
+                .put("sessionId", sessionId)
+                .put("kind", kind)
+                .put("payload", payload),
+        ).use { assertEquals(200, it.code) }
+    }
+
+    /** One scripted assistant turn, the adapter's own frame order. Sequential
+     *  on purpose: the bridge clears its prose buffer at a turn start and
+     *  flushes the coalesced `message` at the end, so an out-of-order chunk
+     *  would silently vanish instead of failing the leg. */
+    private fun speak(sessionId: String, text: String) {
+        acpUpdate(sessionId, "turn", JSONObject().put("phase", "start"))
+        acpUpdate(
+            sessionId,
+            "session_update",
+            JSONObject()
+                .put("sessionId", sessionId)
+                .put(
+                    "update",
+                    JSONObject()
+                        .put("sessionUpdate", "agent_message_chunk")
+                        .put("content", JSONObject().put("type", "text").put("text", text)),
+                ),
+        )
+        acpUpdate(sessionId, "turn", JSONObject().put("phase", "end").put("stopReason", "end_turn"))
+    }
+
+    /** Raise a permission the way the adapter's forwardPermissionRequest does:
+     *  a teed RequestPermissionRequest with the SDK's canonical option trio
+     *  (allow_always / allow / reject — acp-agent.ts requestPermission). */
+    private fun raisePermission(sessionId: String, toolCallId: String, title: String, rawInput: JSONObject) {
+        acpUpdate(
+            sessionId,
+            "permission",
+            JSONObject()
+                .put("sessionId", sessionId)
+                .put(
+                    "toolCall",
+                    JSONObject().put("toolCallId", toolCallId).put("title", title).put("rawInput", rawInput),
+                )
+                .put(
+                    "options",
+                    org.json.JSONArray()
+                        .put(JSONObject().put("optionId", "allow_always").put("name", "Always Allow").put("kind", "allow_always"))
+                        .put(JSONObject().put("optionId", "allow").put("name", "Allow").put("kind", "allow_once"))
+                        .put(JSONObject().put("optionId", "reject").put("name", "Reject").put("kind", "reject_once")),
+                ),
+        )
+    }
+
+    /**
+     * The held /acp/inbox SSE for [acpConnection]: the channel the bridge
+     * writes `permission-decision` / `input-decision` frames down — the ONLY
+     * place a wrist answer is observable to the agent side, so the "the
+     * decision reached the agent" assertions read from here. A background
+     * thread accumulates frames; waits poll the list.
+     */
+    private inner class AcpInbox : AutoCloseable {
+        private val frames = mutableListOf<Pair<String, JSONObject>>()
+
+        // No read timeout: the stream idles between frames (the bridge's 15s
+        // heartbeats are comment lines and keep the socket honest).
+        private val call = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS)
+            .build()
+            .newCall(
+                Request.Builder()
+                    .url("http://$bridgeHost:$bridgePort/acp/inbox?connection=$acpConnection")
+                    .header("Accept", "text/event-stream")
+                    .build(),
+            )
+
+        private val thread = Thread {
+            runCatching {
+                call.execute().use { response ->
+                    assertEquals(200, response.code)
+                    val source = response.body!!.source()
+                    var event = "message"
+                    val data = StringBuilder()
+                    while (true) {
+                        val line = source.readUtf8Line() ?: break
+                        when {
+                            line.startsWith("event:") -> event = line.removePrefix("event:").trim()
+                            line.startsWith("data:") -> data.append(line.removePrefix("data:").removePrefix(" "))
+                            line.isEmpty() -> {
+                                if (data.isNotEmpty()) {
+                                    runCatching { JSONObject(data.toString()) }.getOrNull()?.let {
+                                        synchronized(frames) { frames.add(event to it) }
+                                    }
+                                }
+                                event = "message"
+                                data.setLength(0)
+                            }
+                        }
+                    }
+                }
+            } // A canceled call throws here; close() is the intended exit.
+        }.apply { start() }
+
+        fun hasFrame(event: String, predicate: (JSONObject) -> Boolean = { true }): Boolean =
+            synchronized(frames) { frames.any { it.first == event && predicate(it.second) } }
+
+        fun awaitFrame(event: String, timeoutMs: Long = 30_000, predicate: (JSONObject) -> Boolean = { true }): JSONObject {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                synchronized(frames) { frames.firstOrNull { it.first == event && predicate(it.second) } }
+                    ?.let { return it.second }
+                Thread.sleep(100)
+            }
+            throw AssertionError("no '$event' frame arrived on the ACP inbox within ${timeoutMs}ms")
+        }
+
+        override fun close() {
+            call.cancel()
+            thread.join(2_000)
+        }
+    }
 
     // Arm the pairing-field seam before the UI is touched: each field now
     // launches the Wear RemoteInput activity (no headless IME in this
@@ -156,7 +306,7 @@ class WalkingSkeletonTest {
      * the always-composed base layer, so it can't be used directly (it reads
      * as displayed under the offline overlay). The bridge replays its buffered
      * backlog and a running-session snapshot on connect (transport-sse.js), so
-     * a hook fired in the pair→connect window is still delivered.
+     * an ACP frame teed in the pair→connect window is still delivered.
      */
     private fun waitForOnlineHome(timeoutMs: Long = 30_000) {
         try {
@@ -422,20 +572,17 @@ class WalkingSkeletonTest {
         waitForOnlineHome()
 
         // --- An SSE event arrives and renders in the session's feed -------
-        // The tool-output hook auto-creates a bridge session; its "session"
-        // event puts a row on the list and a segment on the home ring. The
-        // marker rides the Bash COMMAND: the feed renders a Bash tool-output
-        // as its `$ <command>` line, whereas Read/Edit/Write render only the
-        // filename and drop the tool_output (ToolOutputFormatter, watchOS
-        // parity), so a marker in tool_output would never surface.
+        // The fabricated register announces a session (a row on the list, a
+        // segment on the home ring); one scripted turn then speaks the marker
+        // as assistant prose. An ACP feed's content IS the coalesced prose
+        // the bridge flushes as a `message` event at turn end — the hook-era
+        // `$ <command>` tool-output lines died with the hook channel, and the
+        // per-tool rendering they exercised stays pinned by the
+        // ToolOutputFormatter unit tests.
+        val inbox = AcpInbox()
         val marker = "wear-e2e-marker-${System.currentTimeMillis()}"
-        postHook(
-            "/hooks/tool-output",
-            JSONObject()
-                .put("tool_name", "Bash")
-                .put("cwd", "/tmp/wear-e2e-project")
-                .put("tool_input", JSONObject().put("command", marker)),
-        ).use { assertEquals(200, it.code) }
+        acpRegister("wear-e2e-project-session", "/tmp/wear-e2e-project")
+        speak("wear-e2e-project-session", marker)
         waitForText("haloCensus", "1 session")
         drillToList()
         // The lone session is the pager's resolved selection: its card is up
@@ -453,175 +600,150 @@ class WalkingSkeletonTest {
         pagerBackToHome()
         waitForText("haloCensus", "session")
 
-        // --- Concurrent blocking permission hooks (issue #17) -------------
-        // Two curl-simulated sessions ask at once: both must queue (neither
-        // orphans the other), each must be answerable, and each answer must
-        // land on the RENDERED card's permissionId — proven end-to-end by
-        // which hook unblocks with which decision.
-        val executor = Executors.newFixedThreadPool(2)
-        fun permissionHook(body: JSONObject) = executor.submit<Pair<Int, String>> {
-            postHook("/hooks/permission", body).use { it.code to (it.body?.string() ?: "") }
-        }
+        // --- Concurrent permission prompts (issue #17, on the ACP wire) ---
+        // Two sessions ask at once: both must queue (neither orphans the
+        // other), each must be answerable, and each answer must ride back to
+        // the agent as a permission-decision frame naming the RENDERED
+        // card's tool call — the frame is the ACP era's "which decision
+        // landed where" proof (the hook-era blocking-response body is gone).
+        acpRegister("wear-e2e-session-a", "/tmp/wear-e2e-a")
+        acpRegister("wear-e2e-session-b", "/tmp/wear-e2e-b")
 
-        fun decisionOf(hookBody: String): JSONObject =
-            JSONObject(hookBody).getJSONObject("hookSpecificOutput").getJSONObject("decision")
+        // Session A asks first: the Answer pill opens ITS card.
+        raisePermission("wear-e2e-session-a", "tc-a", "Bash", JSONObject().put("command", "rm -rf ./build"))
+        openFirstWaitingCard()
+        // The card says WHAT is being asked, not just the tool name.
+        waitForText("haloTool", "Bash")
+        waitForText("haloSummary", "rm -rf ./build")
 
-        try {
-            // Session A asks first: the Answer pill opens ITS card.
-            val hookA = permissionHook(
+        // Session B asks while A's card is up: the rendered card stays
+        // PINNED (a new arrival must not slide in over a card mid-read)
+        // and the queue depth shows.
+        raisePermission("wear-e2e-session-b", "tc-b", "Write", JSONObject().put("file_path", "/tmp/wear-e2e-b/notes.txt"))
+        waitForText("haloWaitingCount", "2 waiting")
+
+        // Nobody has answered yet: no decision may have reached the agent.
+        Thread.sleep(500)
+        assertFalse(
+            "no decision frame may ride the inbox before the wrist answers",
+            inbox.hasFrame("permission-decision"),
+        )
+
+        // Deny the RENDERED card (A's Bash — it was pinned first).
+        // Ack-gated: the card leaves only on the 2xx ack, then queue
+        // chaining slides B's Write card in.
+        compose.onNodeWithTag("haloDeny").assertIsDisplayed().performClick()
+        val decisionA = inbox.awaitFrame("permission-decision") { it.optString("toolCallId") == "tc-a" }
+        assertEquals(
+            "the deny must land on A — the request that was rendered",
+            "deny",
+            decisionA.getString("behavior"),
+        )
+        assertEquals("reject", decisionA.getString("optionId"))
+        waitForText("haloTool", "Write")
+        waitForText("haloSummary", "notes.txt")
+        assertFalse(
+            "B must stay undecided after A's answer",
+            inbox.hasFrame("permission-decision") { it.optString("toolCallId") == "tc-b" },
+        )
+
+        // Allow the chained card (B's Write): the allow lands on B.
+        armCard()
+        compose.onNodeWithTag("haloApprove").assertIsDisplayed().performClick()
+        val decisionB = inbox.awaitFrame("permission-decision") { it.optString("toolCallId") == "tc-b" }
+        assertEquals(
+            "the allow must land on B — the request that was rendered",
+            "allow",
+            decisionB.getString("behavior"),
+        )
+        assertEquals("allow", decisionB.getString("optionId"))
+        waitForCardGone()
+
+        // --- Allow-always names the agent's own allow_always option -------
+        // The wrist's "always allow" answers with the bare behavior; the
+        // bridge must map it onto the option the AGENT offered (#110) —
+        // allow_always, never the allow-once option masquerading as a
+        // standing grant. (Persisting the rule is the agent's job now; the
+        // hook era's updatedPermissions echo died with the hook channel.)
+        raisePermission("wear-e2e-session-a", "tc-c", "Bash", JSONObject().put("command", "npm test"))
+        openFirstWaitingCard()
+        waitForText("haloSummary", "npm test")
+        compose.onNodeWithTag("haloAlwaysAllow").performScrollTo().performClick()
+        val decisionC = inbox.awaitFrame("permission-decision") { it.optString("toolCallId") == "tc-c" }
+        assertEquals("allow-always", decisionC.getString("behavior"))
+        assertEquals(
+            "the agent's allow_always option must be named, not invented",
+            "allow_always",
+            decisionC.getString("optionId"),
+        )
+        waitForCardGone()
+
+        // --- AskUserQuestion: every question answered, buffered submit ----
+        // The #111 input-request frame raises the question card in the
+        // hook-era wire shape (tool_name AskUserQuestion, the questions in
+        // tool_input) — the wear side is a zero-change consumer. The card
+        // walks ALL questions; the answers are buffered and submitted
+        // together, and reach the agent as ONE positional input-decision
+        // frame aligned with the questions.
+        val questions = org.json.JSONArray()
+            .put(
                 JSONObject()
-                    .put("tool_name", "Bash")
-                    .put("session_id", "wear-e2e-session-a")
-                    .put("cwd", "/tmp/wear-e2e-a")
-                    .put("tool_input", JSONObject().put("command", "rm -rf ./build")),
+                    .put("question", "Which database should the service use?")
+                    .put("header", "Database")
+                    .put("multiSelect", false)
+                    .put(
+                        "options",
+                        org.json.JSONArray()
+                            .put(JSONObject().put("label", "PostgreSQL"))
+                            .put(JSONObject().put("label", "SQLite")),
+                    ),
             )
-            openFirstWaitingCard()
-            // The card says WHAT is being asked, not just the tool name.
-            waitForText("haloTool", "Bash")
-            waitForText("haloSummary", "rm -rf ./build")
-
-            // Session B asks while A's card is up: the rendered card stays
-            // PINNED (a new arrival must not slide in over a card mid-read)
-            // and the queue depth shows.
-            val hookB = permissionHook(
+            .put(
                 JSONObject()
-                    .put("tool_name", "Write")
-                    .put("session_id", "wear-e2e-session-b")
-                    .put("cwd", "/tmp/wear-e2e-b")
-                    .put("tool_input", JSONObject().put("file_path", "/tmp/wear-e2e-b/notes.txt")),
+                    .put("question", "What should the service be called?")
+                    .put("header", "Name")
+                    .put("multiSelect", false)
+                    .put("options", org.json.JSONArray().put(JSONObject().put("label", "api-server"))),
             )
-            waitForText("haloWaitingCount", "2 waiting")
+        acpUpdate(
+            "wear-e2e-session-a",
+            "input-request",
+            JSONObject()
+                .put("sessionId", "wear-e2e-session-a")
+                .put("toolCallId", "tc-q")
+                .put("questions", questions),
+        )
+        openFirstWaitingCard()
+        waitForText("haloQuestionText", "Which database should the service use?")
 
-            // Neither hook has been answered yet: both must still block.
-            Thread.sleep(500)
-            assertFalse("hook A must block until a decision arrives", hookA.isDone)
-            assertFalse("hook B must block until a decision arrives", hookB.isDone)
+        // Answer question 0; the submit is buffered until EVERY question
+        // has an answer, so nothing may reach the agent yet.
+        compose.onNodeWithTag("haloQOption-0-SQLite").performScrollTo().performClick()
+        waitForText("haloQuestionText", "What should the service be called?")
+        Thread.sleep(500)
+        assertFalse(
+            "no answers may ride the inbox until every question is answered",
+            inbox.hasFrame("input-decision"),
+        )
 
-            // Deny the RENDERED card (A's Bash — it was pinned first).
-            // Ack-gated: the card leaves only on the 2xx ack, then queue
-            // chaining slides B's Write card in.
-            compose.onNodeWithTag("haloDeny").assertIsDisplayed().performClick()
-            val (statusA, bodyA) = hookA.get(30, TimeUnit.SECONDS)
-            assertEquals(200, statusA)
-            assertEquals(
-                "the deny must land on A — the request that was rendered",
-                "deny",
-                decisionOf(bodyA).getString("behavior"),
-            )
-            waitForText("haloTool", "Write")
-            waitForText("haloSummary", "notes.txt")
-            assertFalse("hook B must still be blocked after A's answer", hookB.isDone)
+        // The last answer submits both positionally.
+        compose.onNodeWithTag("haloQOption-1-api-server").performScrollTo().performClick()
+        val answersQ = inbox.awaitFrame("input-decision") { it.optString("toolCallId") == "tc-q" }
+            .getJSONArray("answers")
+        assertEquals("the first answer must land on its question", "SQLite", answersQ.getString(0))
+        assertEquals("the second answer must land on its question", "api-server", answersQ.getString(1))
+        waitForCardGone()
 
-            // Allow the chained card (B's Write): the allow lands on B.
-            armCard()
-            compose.onNodeWithTag("haloApprove").assertIsDisplayed().performClick()
-            val (statusB, bodyB) = hookB.get(30, TimeUnit.SECONDS)
-            assertEquals(200, statusB)
-            assertEquals(
-                "the allow must land on B — the request that was rendered",
-                "allow",
-                decisionOf(bodyB).getString("behavior"),
-            )
-            waitForCardGone()
-
-            // --- Allow-always rides the machine-readable behavior field ---
-            // The bridge offers allow-always only when the hook supplies
-            // permission suggestions to persist; answering with it must make
-            // the bridge apply those suggestions (updatedPermissions in the
-            // hook decision) so the prompt does not recur.
-            val suggestion = JSONObject()
-                .put("type", "addRules")
-                .put("rules", org.json.JSONArray().put(JSONObject().put("toolName", "Bash")))
-            val hookC = permissionHook(
-                JSONObject()
-                    .put("tool_name", "Bash")
-                    .put("session_id", "wear-e2e-session-a")
-                    .put("cwd", "/tmp/wear-e2e-a")
-                    .put("tool_input", JSONObject().put("command", "npm test"))
-                    .put("permission_suggestions", org.json.JSONArray().put(suggestion)),
-            )
-            openFirstWaitingCard()
-            waitForText("haloSummary", "npm test")
-            compose.onNodeWithTag("haloAlwaysAllow").performScrollTo().performClick()
-            val (statusC, bodyC) = hookC.get(30, TimeUnit.SECONDS)
-            assertEquals(200, statusC)
-            val decisionC = decisionOf(bodyC)
-            // The bridge maps the behavior-based allow-always answer onto the
-            // hook contract: allow + the persisted suggestions.
-            assertEquals("allow", decisionC.getString("behavior"))
-            assertEquals(
-                "allow-always must persist the hook's permission suggestions",
-                1,
-                decisionC.getJSONArray("updatedPermissions").length(),
-            )
-            waitForCardGone()
-
-            // --- AskUserQuestion: every question answered, buffered submit --
-            // A multi-question payload walks ALL questions on the question
-            // card (the legacy client answered only the first); the answers
-            // are buffered and POSTed together as a positional array in
-            // question order; the bridge zips it with the questions and the
-            // blocked hook unblocks with BOTH answers keyed by question text
-            // (updatedInput.answers — collectAskUserQuestionAnswers in
-            // skill/bridge/hooks.js).
-            val questions = org.json.JSONArray()
-                .put(
-                    JSONObject()
-                        .put("question", "Which database should the service use?")
-                        .put("header", "Database")
-                        .put("multiSelect", false)
-                        .put(
-                            "options",
-                            org.json.JSONArray()
-                                .put(JSONObject().put("label", "PostgreSQL"))
-                                .put(JSONObject().put("label", "SQLite")),
-                        ),
-                )
-                .put(
-                    JSONObject()
-                        .put("question", "What should the service be called?")
-                        .put("header", "Name")
-                        .put("multiSelect", false)
-                        .put("options", org.json.JSONArray().put(JSONObject().put("label", "api-server"))),
-                )
-            val hookQ = permissionHook(
-                JSONObject()
-                    .put("tool_name", "AskUserQuestion")
-                    .put("session_id", "wear-e2e-session-a")
-                    .put("cwd", "/tmp/wear-e2e-a")
-                    .put("tool_input", JSONObject().put("questions", questions)),
-            )
-            openFirstWaitingCard()
-            waitForText("haloQuestionText", "Which database should the service use?")
-
-            // Answer question 0; the submit is buffered until EVERY question
-            // has an answer, so the hook must still block.
-            compose.onNodeWithTag("haloQOption-0-SQLite").performScrollTo().performClick()
-            waitForText("haloQuestionText", "What should the service be called?")
-            Thread.sleep(500)
-            assertFalse("hook must block until every question is answered", hookQ.isDone)
-
-            // The last answer submits both positionally.
-            compose.onNodeWithTag("haloQOption-1-api-server").performScrollTo().performClick()
-            val (statusQ, bodyQ) = hookQ.get(30, TimeUnit.SECONDS)
-            assertEquals(200, statusQ)
-            val decisionQ = decisionOf(bodyQ)
-            assertEquals("allow", decisionQ.getString("behavior"))
-            val answersQ = decisionQ.getJSONObject("updatedInput").getJSONObject("answers")
-            assertEquals(
-                "the first answer must land on its question",
-                "SQLite",
-                answersQ.getString("Which database should the service use?"),
-            )
-            assertEquals(
-                "the second answer must land on its question",
-                "api-server",
-                answersQ.getString("What should the service be called?"),
-            )
-            waitForCardGone()
-        } finally {
-            executor.shutdownNow()
-        }
+        // --- The fabricating fork leaves; its sessions end with it --------
+        // The wrist spawn below routes to the newest held inbox when no
+        // running session matches the target cwd, so this test's connection
+        // must be GONE first — otherwise the harness's fake Zed fork (the
+        // one that actually services spawn frames) loses the election and
+        // the spawn times out. Closing it is also the honest Zed-quit move:
+        // the inbox drop ends every session this connection registered, so
+        // the fabricated cards leave the pager the same way real ones do.
+        inbox.close()
+        waitForText("haloCensus", "no sessions")
 
         // --- Spawn a session from the pager, watch its feed, hide it ------
         // Claude spawns are born in the Zed fork since the ACP-only pivot —

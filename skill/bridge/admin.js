@@ -4,7 +4,7 @@
 // separate CLI editing credentials.json would race the running bridge (which
 // overwrites the file on the next pair/revoke).
 //
-// Loopback-only, mirroring /hooks/*: this is operator-on-machine trust, not a
+// Loopback-only, mirroring /acp/*: this is operator-on-machine trust, not a
 // bearer-authed watch surface. A LAN peer must never be able to enumerate or
 // disconnect paired devices. It is NOT part of the versioned /v1 client
 // protocol — it is a server-local operator surface (see PROTOCOL.md "Admin
@@ -16,11 +16,9 @@ import { dropSseClientsForHashes, dropAllSseClients } from "./transport-sse.js";
 import { PAIRING_CODE_TTL_MS } from "./config.js";
 
 // Admin endpoints expose and mutate the credential store, so they carry the
-// same operator-on-machine trust as /hooks/*: reject any non-loopback source
+// same operator-on-machine trust as /acp/*: reject any non-loopback source
 // before touching the store. The message is deliberately distinct from the
-// hook gate's "Hooks are only accepted from localhost" (that string is frozen
-// and asserted by endpoint-hardening.test.js) so an /admin 403 does not claim
-// to be about hooks.
+// ACP gate's wording so an /admin 403 says which surface refused it.
 function requireLoopback(req, res) {
   const addr = req.socket?.remoteAddress;
   if (isLoopbackAddress(addr)) return true;

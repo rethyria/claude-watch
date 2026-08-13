@@ -15,17 +15,18 @@ approvals, and `AskUserQuestion` prompts on a Wear OS watch.
 There are two pieces you run:
 
 ```
-  Wear OS watch  ──Wi-Fi (SSE + HTTP)──►  Bridge (Node.js)  ──HTTP hooks──►  Claude Code
+  Wear OS watch  ──Wi-Fi (SSE + HTTP)──►  Bridge (Node.js)  ──ACP uplink──►  Zed's agent
    (the app)                              on your computer                  on your computer
 ```
 
 - **The bridge** is a small Node.js server that ships **inside this repo**
   (`skill/bridge/server.js`). It is **not** a download, a binary, or a Play
-  Store item — you clone the repo and run the script. It receives Claude Code's
-  hook events and streams them to your watch, and it blocks Claude on a
-  permission prompt until you answer from the wrist.
-- **The bridge runs on the same computer as Claude Code.** On its own it does
-  nothing — it's a companion to a running Claude Code session, not a standalone
+  Store item — you clone the repo and run the script. It mirrors the agent
+  sessions Zed's forked `claude-agent-acp` adapter announces to it and streams
+  them to your watch, and it raises each permission prompt as a wrist card
+  whose answer rides back to the agent.
+- **The bridge runs on the same computer as Zed.** On its own it does nothing
+  — it's a companion to sessions hosted in Zed's agent panel, not a standalone
   service.
 - **The watch and the computer must be on the same Wi-Fi network.**
 
@@ -74,28 +75,26 @@ taken) and writes the actual port to `~/.claude-watch/port`.
 > the bridge through the bundled Claude Code skill (`/claude-watch`), but
 > `node server.js` is the clearest path to start with.
 
-### Wire Claude Code to the bridge
+### Wire the editor to the bridge
 
-In a second terminal, install the hooks that make **every** Claude Code session
-stream to the bridge:
+Sessions reach the bridge through the forked `claude-agent-acp` adapter
+running as an agent server in Zed — the product is Zed-only, and the
+hook-observation channel that once mirrored terminal sessions was retired
+(#87). Build the adapter and install its `agent_servers` entry:
 
 ```bash
-cd claude-watch
-./skill/setup-hooks.sh
+cd claude-watch/skill/acp-agent
+npm install && npm run build
+./apply-zed-config.sh        # idempotent; --check verifies, --remove undoes
 ```
 
-This adds HTTP hooks to your global `~/.claude/settings.json` for Claude Code's
-tool-use, permission, stop, session-end, failure, and notification events (eight
-hook entries in all), every one pointing at `http://127.0.0.1:<port>/hooks/…`.
-It reads the port from `~/.claude-watch/port`, so **start the bridge first**; if
-you run it too early it falls back to 7860 and warns — just re-run it once the
-bridge is up.
+The adapter reads the bridge's actual bound port from `~/.claude-watch/port`
+on every launch, so the order of starting Zed and the bridge doesn't matter.
+Every session started under the "Claude (watch)" agent in Zed announces
+itself to the bridge automatically.
 
-To undo it later: `./skill/setup-hooks.sh --remove`.
-
-> If you also have the `codex` CLI installed, the installer drops a small
-> `codex-watch` wrapper into `~/.local/bin` (and `--remove` takes it back out).
-> Harmless if you only use Claude Code.
+> If you also have the `codex` CLI installed, the bridge's scanner picks up
+> Codex sessions from `~/.codex/sessions` on its own — nothing to install.
 
 ---
 

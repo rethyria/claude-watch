@@ -23,9 +23,10 @@ https://github.com/user-attachments/assets/5f478c28-2086-4696-9d76-e43dda853201
   (SwiftUI)     sendMessage       (Relay)   HTTP    Bridge Server
                 transferUserInfo           SSE     (Node.js)
                                                       |
-                                            HTTP Hooks | PTY stdin
+                                            ACP uplink | PTY stdin
                                                       v
-                                              Claude Code Session
+                                              Agent Session
+                                        (Zed's claude-agent-acp fork)
 ```
 
 ## What It Does
@@ -35,7 +36,7 @@ https://github.com/user-attachments/assets/5f478c28-2086-4696-9d76-e43dda853201
 - **Dynamic questions** — answer `AskUserQuestion` prompts with all options displayed
 - **Voice commands** — dictate commands to Claude via watchOS dictation
 - **iPhone companion** — pairing UI, connection status, terminal preview, permission approvals
-- **Bridge server** — Node.js server on your Mac that connects Claude Code to the watch via HTTP hooks + SSE
+- **Bridge server** — Node.js server on your Mac that connects agent sessions to the watch via a local ACP channel + SSE
 
 ## Architecture
 
@@ -43,11 +44,11 @@ The system has three components:
 
 ### 1. Bridge Server (Mac)
 A Node.js HTTP server (`skill/bridge/server.js`) that:
-- Receives events from Claude Code via [HTTP hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) (`PostToolUse`, `PermissionRequest`, `Stop`, etc.)
+- Mirrors agent sessions announced over a loopback-only ACP channel by the forked [`claude-agent-acp`](skill/acp-agent) adapter Zed launches (registers, turn boundaries, teed tool calls and permission requests)
 - Streams events to connected clients via Server-Sent Events (SSE)
 - Handles pairing with a 6-digit code + session token
 - Advertises itself on the local network via Bonjour/mDNS
-- Blocks on `PermissionRequest` hooks — waits for watch/phone approval, then returns the decision to Claude Code
+- Raises permission prompts on the watch/phone and sends the decision back down the adapter's channel to the agent
 
 ### 2. iPhone App
 A SwiftUI iOS app that:
@@ -102,24 +103,26 @@ You'll see:
 ╚═══════════════════════════════════════╝
 ```
 
-Start the bridge **before** installing hooks: if the default port 7860 is
-taken (Gradio's default, notably), the bridge binds the next free port and
-publishes it to `~/.claude-watch/port` — the hook installer reads that file
-to write correct hook URLs.
+If the default port 7860 is taken (Gradio's default, notably), the bridge
+binds the next free port and publishes it to `~/.claude-watch/port` — the
+ACP adapter reads that file to find the bridge.
 
-### 3. Install Claude Code hooks
+### 3. Wire the editor to the bridge
 
-This configures all Claude Code sessions to stream events to the bridge:
+Sessions reach the bridge through the forked
+[`claude-agent-acp`](skill/acp-agent) adapter running as an agent server in
+Zed (the hook-observation channel that once mirrored terminal sessions was
+retired in #87 — the product is Zed-only). Build the adapter and install its
+`agent_servers` entry:
 
 ```bash
-./skill/setup-hooks.sh
+cd skill/acp-agent
+npm install && npm run build
+./apply-zed-config.sh        # idempotent; --check verifies, --remove undoes
 ```
 
-If you run it before the bridge has ever started, it falls back to port 7860
-and warns loudly — re-run it once the bridge is up so the hook URLs match the
-bridge's actual port.
-
-To remove hooks later: `./skill/setup-hooks.sh --remove`
+Every session started under that agent in Zed announces itself to the
+running bridge automatically.
 
 ### 4. Build the iOS + watchOS apps
 
@@ -142,9 +145,9 @@ In Xcode:
 
 **Discovery probe:** When a watch client verifies a candidate bridge address — the localhost fallback, a manually entered IP, or `10.0.2.2` from an Android emulator — it probes the unauthenticated `GET /ping` endpoint, which answers with `{proto, bridgeId, machineName}`. `GET /status` requires the paired device's bearer token and cannot be used for discovery.
 
-### 6. Use Claude Code normally
+### 6. Use the agent normally
 
-Start any Claude Code session in a terminal. Every tool use (Read, Edit, Bash, Grep) streams to the watch and phone in real-time. Permission prompts appear as interactive cards.
+Start a session under the "Claude (watch)" agent in Zed. Turn activity and assistant prose stream to the watch and phone in real-time. Permission prompts appear as interactive cards.
 
 ## Project Structure
 
@@ -154,8 +157,8 @@ claude-watch/
 │   ├── bridge/
 │   │   ├── server.js          # Bridge server (HTTP + SSE + Bonjour)
 │   │   └── package.json       # Node.js dependencies
+│   ├── acp-agent/             # Forked claude-agent-acp (the Zed agent server)
 │   ├── setup.sh               # Install bridge dependencies
-│   ├── setup-hooks.sh         # Install/remove Claude Code hooks
 │   └── SKILL.md               # Claude Code skill definition
 │
 ├── ios/ClaudeWatch/
@@ -212,37 +215,23 @@ claude-watch/
 
 ### Event Flow (Mac -> Watch)
 
-1. Claude Code runs a tool (e.g., Edit a file)
-2. The `PostToolUse` HTTP hook fires, POSTing to the bridge server
+1. The agent runs its turn inside the Zed-launched `claude-agent-acp` fork
+2. The fork tees each session update (turn boundaries, tool calls, assistant prose) to the bridge over its loopback `/acp/*` uplink
 3. Bridge pushes the event to all connected SSE clients
-4. The watch/phone receives the SSE event and renders it as a terminal line
+4. The watch/phone receives the SSE event and renders it in the session feed
 
 ### Permission Flow (Mac -> Watch -> Mac)
 
-1. Claude Code hits a permission prompt (e.g., "Do you want to edit this file?")
-2. The `PermissionRequest` HTTP hook fires — bridge **blocks** the response
+1. The agent hits a permission prompt (e.g., "Do you want to edit this file?")
+2. The fork mirrors the ACP permission request to the bridge, which registers a pending prompt
 3. Bridge pushes a `permission-request` SSE event with the question + options
 4. Watch shows the approval sheet with all options as tappable buttons
 5. User taps an option — watch sends the decision back to the bridge via HTTP
-6. Bridge returns the decision to Claude Code's hook — Claude continues or stops
+6. Bridge writes a `permission-decision` frame down the fork's inbox naming the agent's own option — the agent continues or stops (Zed's dialog stays a second answering surface; whichever answers first wins)
 
 ### AskUserQuestion Flow
 
-Same as permission flow, but the hook data includes `tool_input.questions` with dynamic options (label + description). The watch renders these as a scrollable list matching the terminal's numbered choices.
-
-## Claude Code Hooks
-
-The `setup-hooks.sh` script installs these HTTP hooks globally in `~/.claude/settings.json`:
-
-| Hook Event | Purpose | Blocking? |
-|-----------|---------|-----------|
-| `PostToolUse` | Capture tool output (file reads, edits, commands) | No (async) |
-| `PreToolUse` | Capture tool invocations | No (async) |
-| `PermissionRequest` | Forward permission prompts to watch | **Yes** (up to 10 min) |
-| `Stop` | Detect when Claude finishes responding | No (async) |
-| `PostToolUseFailure` | Capture errors | No (async) |
-| `StopFailure` | Capture API errors | No (async) |
-| `Notification` | Idle/permission notifications | No (async) |
+Same as permission flow, but the card carries `tool_input.questions` with dynamic options (label + description); the answers ride back as one positional `input-decision` frame. The watch renders the questions as a scrollable list.
 
 ## Configuration
 
@@ -251,19 +240,6 @@ The `setup-hooks.sh` script installs these HTTP hooks globally in `~/.claude/set
 | Env Var | Default | Description |
 |---------|---------|-------------|
 | `PORT` | 7860 | Starting port (tries 7860-7869) |
-
-### Removing Hooks
-
-```bash
-./skill/setup-hooks.sh --remove
-```
-
-Removal (and reinstall dedup) matches individual hook objects by exact URL —
-`http://127.0.0.1:<port>` plus one of the installer's own `/hooks/<path>`
-endpoints — so your own hooks are never touched, even ones on other loopback
-ports/paths or sharing a settings entry with claude-watch's. All settings.json
-rewrites go through a temp file + rename, so an interrupted run can't corrupt
-the file.
 
 ### Unpairing
 
@@ -298,13 +274,13 @@ the file.
 - The bridge must be on the same LAN as the iPhone
 
 ### Permission prompts don't appear on watch
-- Verify hooks are installed: check `~/.claude/settings.json` for hook entries
-- Check bridge logs for "Hook: PermissionRequest received"
+- Verify the Zed agent entry is healthy: `./skill/acp-agent/apply-zed-config.sh --check`
+- Check bridge logs for "ACP permission … raised on the wrist"
 - Ensure the watch is connected to the bridge (green status dot)
 
 ### Bridge exits immediately
-- The bridge no longer auto-spawns Claude. It waits for events from hooks.
-- Start Claude Code in a separate terminal — hooks will forward events automatically.
+- The bridge no longer auto-spawns Claude. It waits for the Zed-launched adapter to announce sessions.
+- Start a session under the "Claude (watch)" agent in Zed — the adapter forwards events automatically.
 
 ## License
 

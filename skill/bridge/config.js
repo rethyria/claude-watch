@@ -111,10 +111,9 @@ export const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "credentials.json");
 
 // Port file: the bridge publishes its ACTUAL bound port here on startup
 // (single source of truth). The bridge walks PORT_RANGE_START..END when the
-// default is taken (7860 is Gradio's default, notably), so the hook installer
-// (setup-hooks.sh) and the codex-watch wrapper must read this file instead of
-// assuming 7860 — otherwise every hook, including the blocking permission
-// hook, posts to the wrong instance.
+// default is taken (7860 is Gradio's default, notably), so the forked
+// claude-agent-acp Zed launches must read this file instead of assuming 7860
+// — otherwise every register and inbox connect lands on the wrong instance.
 export const PORT_FILE = path.join(CREDENTIALS_DIR, "port");
 
 // Test-only override hook (see testOverridable below): lets the test suite
@@ -191,25 +190,15 @@ export const SSE_BUFFER_SIZE = testOverridable("CLAUDE_WATCH_SSE_BUFFER_SIZE", 5
 // was just doing.
 export const SSE_SYNC_TERMINAL_BACKLOG = 50;
 
-// Client-side timeout of the blocking PermissionRequest hook, as installed by
-// setup-hooks.sh (its PERMISSION_HOOK_TIMEOUT_S, in seconds — a test asserts
-// the two stay equal). Claude Code aborts the hook request after this window.
-// Overridable via CLAUDE_WATCH_HOOK_PERMISSION_TIMEOUT_MS (test-only).
-export const HOOK_PERMISSION_TIMEOUT_MS = testOverridable(
-  "CLAUDE_WATCH_HOOK_PERMISSION_TIMEOUT_MS",
-  600_000, // 10 minutes — keep in sync with setup-hooks.sh
-);
-
-// Bridge-side auto-deny for unanswered permissions. This MUST fire before the
-// hook's client-side timeout above: when both were exactly 600 s, expiry
-// raced nondeterministically — sometimes the hook aborted first and the
-// bridge's deny went into a dead socket. The margin keeps the bridge
-// deterministically first while degrading gracefully when tests shorten the
-// hook window below the production margin.
+// How long an unanswered permission card stays pending before it expires as a
+// no-decision (permission-cleared, reason "expired"). The value predates the
+// retired hook channel (it sat 30 s inside the hook scripts' own 10-minute
+// window); in the ACP era it simply bounds how long a wrist card can wait —
+// the agent's own prompt (Zed's dialog) keeps the answer past it.
 // Overridable via CLAUDE_WATCH_PERMISSION_TIMEOUT_MS (test-only).
 export const PERMISSION_TIMEOUT_MS = testOverridable(
   "CLAUDE_WATCH_PERMISSION_TIMEOUT_MS",
-  Math.max(HOOK_PERMISSION_TIMEOUT_MS - 30_000, Math.ceil(HOOK_PERMISSION_TIMEOUT_MS / 2)),
+  570_000,
 );
 
 // Maximum bytes allowed to queue in a single SSE client's response stream.
@@ -270,13 +259,6 @@ export const SESSION_SILENT_GRACE_MS = testOverridable(
   "CLAUDE_WATCH_SESSION_SILENT_GRACE_MS",
   12 * 60 * 60 * 1000,
 );
-
-// Hard cap on hook-created (external) session slots. /hooks/* is
-// unauthenticated, so without a bound every unique session_id (or cwd) in a
-// hook payload would mint a permanent "running" slot — unbounded memory, SSE
-// broadcasts, and /status snapshot growth. Beyond the cap the oldest
-// hook-created slot is evicted (ended ones first).
-export const MAX_EXTERNAL_SESSIONS = 32;
 
 // Auto-spawned command injection waits for the new PTY's first output (the
 // ready signal) before writing the command, bounded by this timeout. A blind

@@ -39,15 +39,6 @@ import {
 } from "./acp.js";
 import { handlePair, handleCommand, handleStatus, handlePing } from "./commands.js";
 import { handleUsage } from "./usage.js";
-import {
-  handleHookToolOutput,
-  handleHookPermission,
-  handleHookStop,
-  handleHookSessionEnd,
-  handleHookTaskComplete,
-  handleHookError,
-  handleHookNotification,
-} from "./hooks.js";
 import { handleAdminDevices, handleAdminRevoke, handleAdminPairingOpen } from "./admin.js";
 
 // ---------------------------------------------------------------------------
@@ -117,13 +108,6 @@ const routes = {
   "POST /pair": handlePair,
   "POST /command": handleCommand,
   "GET /events": handleEvents,
-  "POST /hooks/tool-output": handleHookToolOutput,
-  "POST /hooks/permission": handleHookPermission,
-  "POST /hooks/stop": handleHookStop,
-  "POST /hooks/session-end": handleHookSessionEnd,
-  "POST /hooks/task-complete": handleHookTaskComplete,
-  "POST /hooks/error": handleHookError,
-  "POST /hooks/notification": handleHookNotification,
   "GET /status": handleStatus,
   "GET /usage": handleUsage,
   "GET /ping": handlePing,
@@ -219,10 +203,10 @@ async function onRequest(req, res) {
 // The bridge walks PORT_RANGE_START..END, so the port it actually binds is
 // not knowable ahead of time (7860 is Gradio's default and frequently taken).
 // The bound port is published to PORT_FILE as the single source of truth: the
-// hook installer (setup-hooks.sh) reads it when writing hook URLs and the
-// codex-watch wrapper reads it at launch. Written (and thus refreshed after a
-// port change or a stale crash leftover) on every startup; removed on
-// graceful shutdown.
+// forked claude-agent-acp Zed launches reads it to find its /acp/* uplink
+// (readBridgePort in the adapter's bridge-channel.ts). Written (and thus
+// refreshed after a port change or a stale crash leftover) on every startup;
+// removed on graceful shutdown.
 
 function writePortFile(port) {
   try {

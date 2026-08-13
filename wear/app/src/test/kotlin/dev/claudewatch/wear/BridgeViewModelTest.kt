@@ -742,8 +742,9 @@ class BridgeViewModelTest {
 
     /**
      * An AskUserQuestion permission-request frame: no top-level options, ALL
-     * questions in tool_input.questions — the exact event shape hooks.js
-     * broadcasts for tool_name AskUserQuestion.
+     * questions in tool_input.questions — the exact event shape the bridge's
+     * ACP input-request lane (raiseAcpInputRequest in acp.js) broadcasts for
+     * tool_name AskUserQuestion.
      */
     private fun askUserQuestionFrame(id: Int, permissionId: String, sessionId: String = "s-1"): String =
         "id: $id\nevent: permission-request\n" +
@@ -760,9 +761,9 @@ class BridgeViewModelTest {
      * question card, not the behavior buttons), and answerQuestions POSTs the
      * bridge's /v1 array decision shape — `decision.answers` as a positional
      * array aligned with the payload's question order, free-text values
-     * verbatim — which the bridge zips with the questions into the blocked
-     * hook's `updatedInput.answers` (collectAskUserQuestionAnswers in
-     * hooks.js). Positional rather than text-keyed so questions sharing the
+     * verbatim — which the bridge aligns with the questions into the
+     * `input-decision` frame it sends the agent (positionalAskAnswers in
+     * acp.js). Positional rather than text-keyed so questions sharing the
      * same text still each carry their own answer on the wire. Ack-gated
      * exactly like a behavior answer: only the 2xx dismisses the card.
      */

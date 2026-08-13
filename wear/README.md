@@ -2,8 +2,8 @@
 
 A standalone Wear OS app that speaks the bridge's `/v1` protocol end to end:
 pair with the code from the bridge banner, stream events over SSE, watch each
-session's live terminal in a pager, send session-scoped commands, spawn/kill
-sessions, and answer blocking permission hooks.
+session's live feed in a pager, send session-scoped commands, spawn/kill
+sessions, and answer pending permission prompts.
 
 - **Module layout:** `:app` (Compose UI + OkHttp networking) and `:shared`
   (pure-JVM protocol layer; eventually `:phone` joins).
@@ -53,13 +53,13 @@ sessions, and answer blocking permission hooks.
   (same queue, ack-gating, swipe-immunity, escape hatch) with a question body
   instead of behavior buttons. They carry no canonical options; the typed
   `PermissionRequestEvent.questions` surfaces EVERY question of
-  `tool_input.questions` (parsed leniently — hook content never fails the
+  `tool_input.questions` (parsed leniently — prompt content never fails the
   frame), each with its own option chips (single-select replaces, `multiSelect`
   toggles and joins in option order) plus a free-text field per question. One
   Send goes out only when every question has an answer, POSTing
-  `decision: {behavior: "allow", answers: {<question text>: <answer>}}` —
-  the /v1 object form the bridge maps back to the blocked hook as
-  `updatedInput.answers`. A failed send restores the card with the picks
+  `decision: {behavior: "allow", answers: [<answer>, …]}` — the /v1 positional
+  array form the bridge aligns with the questions into the `input-decision`
+  frame it sends the agent. A failed send restores the card with the picks
   intact for retry.
 - **Dictated/typed commands with ack-gated echo (issue #20):** voice input
   rides `RecognizerIntent.ACTION_RECOGNIZE_SPEECH` (never a raw
@@ -224,22 +224,25 @@ cd wear
    real bridge, scrapes the pairing code and port from its stdout, and runs
    `:app:connectedDebugAndroidTest` with them as instrumentation arguments.
 
-The instrumented e2e (`WalkingSkeletonTest`) drives the actual UI: it pairs,
-waits for a hook-generated SSE event to render, sends a session-scoped
-command (expects 2xx), then exercises the approval flow end to end — two
-curl-simulated sessions post blocking `/hooks/permission` requests
-concurrently, both queue on the sheet, and each answer unblocks exactly the
-hook whose card was rendered (deny lands on one, allow on the other), plus an
-allow-always answer for a hook with `permission_suggestions` asserting the
-bridge maps it to `behavior: "allow"` + `updatedPermissions` so the prompt
-does not recur — and the AskUserQuestion card: a blocking two-question hook
-renders both questions, one answered by option chip and one by typed free
-text, and unblocks with both answers keyed by question text in
-`updatedInput.answers` — then spawns a claude session from the watch (born in
-the harness's fake Zed fork over the bridge's ACP inbox — see
-`.github/scripts/wear-e2e-fake-fork.mjs`, issue #107), swipes the pager to its
-feed (the fork's greeting turn renders as assistant prose), and closes it from
-the action arc — the honest local hide for an external ACP slot.
+The instrumented e2e (`WalkingSkeletonTest`) drives the actual UI, playing a
+second Zed-fork against the throwaway bridge (its own `/acp/inbox` connection
+— sessions are fabricated over the ACP wire since #87 retired the hook
+channel): it pairs, registers a session and speaks a marker turn that renders
+as assistant prose in the feed, then exercises the approval flow end to end —
+two fabricated sessions raise permission requests concurrently, both queue on
+the sheet, and each answer rides back down the held inbox as a
+`permission-decision` frame naming exactly the rendered card's tool call
+(deny lands on one, allow on the other), plus an allow-always answer
+asserting the bridge names the agent's own `allow_always` option (#110,
+never an allow-once masquerading as a standing grant) — and the
+AskUserQuestion card (the #111 `input-request` frame): both questions
+rendered and answered, arriving as ONE positional `input-decision` frame —
+then spawns a claude session from the watch (born in the harness's fake Zed
+fork over the bridge's ACP inbox — see
+`.github/scripts/wear-e2e-fake-fork.mjs`, issue #107), opens its feed from
+the session menu (the fork's greeting turn renders as assistant prose), and
+kills it for real from the menu's close row: the #88 close frame travels
+wrist → bridge → fork, whose deregister ends the slot.
 
 `SessionPagerTest` (instrumented, no bridge) renders `SessionPagerScreen`
 directly from fixture events folded through the shared reducer: pager

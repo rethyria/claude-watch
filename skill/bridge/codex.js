@@ -228,7 +228,7 @@ function truncateText(value, maxLength = 80) {
 }
 
 // Canonical option list for the Codex synthetic exec-approval menu — built
-// through the same canonicalPermissionOptions() as the Claude hook prompts,
+// through the same canonicalPermissionOptions() as the ACP-raised prompts,
 // so every option carries a machine-readable behavior. Exported for the unit
 // tests in test/permission-semantics-unit.test.js.
 export function buildCodexApprovalOptions(prefixRule = []) {

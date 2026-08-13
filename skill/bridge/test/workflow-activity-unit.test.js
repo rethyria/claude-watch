@@ -1,9 +1,8 @@
 // Issue #55: the workflow-activity indicator. The Workflow tool returns
 // immediately (it runs in the background), so the launch signal is the one
-// wire that names the tool — the PostToolUse hook for hook sessions, the teed
-// ACP tool_call for ACP sessions (issue #105, the ACP-feed section below);
-// completion is discovered by a slow poll over the session's workflow
-// journals:
+// wire that names the tool — the teed ACP tool_call (issue #105, the ACP-feed
+// section below); completion is discovered by a slow poll over the session's
+// workflow journals:
 //   <transcript minus .jsonl>/subagents/workflows/wf_*/journal.jsonl
 // running = `started` records without a matching `result` (matched on `key`),
 // done = matched ones in LIVE (non-stale) journals. The completion state is
@@ -15,7 +14,9 @@
 // only counts as completion once the workflow was actually OBSERVED since
 // arming (running agents seen, or a journal written after the signal).
 // Stale journals (a killed workflow never writes its results) count as
-// dead so the indicator cannot stick.
+// dead so the indicator cannot stick. Sessions are created the way the
+// product creates them — registerAcpSession, whose registration-time
+// reconcile (#68) is part of the machinery under test.
 //
 // Env overrides must be set before any bridge module loads (config.js reads
 // them once at evaluation), hence the dynamic imports inside the tests. The
@@ -56,21 +57,6 @@ function lastSessionEvent(sseBuffer, sessionId) {
   return null;
 }
 
-// Build a session's transcript + workflow journal tree:
-//   <fixturesRoot>/<name>/<sid>.jsonl                       (the transcript)
-//   <fixturesRoot>/<name>/<sid>/subagents/workflows/wf_a/journal.jsonl
-// Returns { cwd, transcriptPath, journalPath }.
-function makeWorkflowTree(name, sid, records) {
-  const dir = path.join(fixturesRoot, name);
-  const wfDir = path.join(dir, sid, "subagents", "workflows", "wf_a");
-  fs.mkdirSync(wfDir, { recursive: true });
-  const transcriptPath = path.join(dir, `${sid}.jsonl`);
-  fs.writeFileSync(transcriptPath, "");
-  const journalPath = path.join(wfDir, "journal.jsonl");
-  fs.writeFileSync(journalPath, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
-  return { cwd: dir, transcriptPath, journalPath };
-}
-
 const started = (key) => ({ type: "started", key, agentId: `agent-${key}` });
 const result = (key) => ({ type: "result", key, value: "ok" });
 
@@ -99,12 +85,13 @@ function makeAcpWorkflowTree(name, sid, records) {
 }
 
 test("the launch signal scans immediately: 3 started / 1 result → {running: 2, done: 1} on payload + snapshot", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, getSessionsSnapshot } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, getSessionsSnapshot } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
-  const { cwd, transcriptPath } = makeWorkflowTree("counts", "cc-wf-counts",
+  const { cwd, transcriptPath } = makeAcpWorkflowTree("counts", "cc-wf-counts",
     [started("k1"), started("k2"), started("k3"), result("k1")]);
-  const id = resolveHookSession({ session_id: "cc-wf-counts", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-counts", sdkSessionId: "cc-wf-counts", cwd });
+  const id = "cc-wf-counts";
   try {
     markWorkflowActivity(id);
     assert.deepEqual(sessions.get(id).agents, { running: 2, done: 1 });
@@ -117,12 +104,13 @@ test("the launch signal scans immediately: 3 started / 1 result → {running: 2,
 });
 
 test("a fresh running=0 is the inter-phase gap (held); the explicit zero lands only once the tree goes stale, then the slot watches", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("complete", "cc-wf-complete",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("complete", "cc-wf-complete",
     [started("k1"), started("k2"), result("k1")]);
-  const id = resolveHookSession({ session_id: "cc-wf-complete", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-complete", sdkSessionId: "cc-wf-complete", cwd });
+  const id = "cc-wf-complete";
   try {
     markWorkflowActivity(id);
     assert.deepEqual(sessions.get(id).agents, { running: 1, done: 1 });
@@ -167,13 +155,14 @@ test("a fresh running=0 is the inter-phase gap (held); the explicit zero lands o
 });
 
 test("multi-phase: a poll landing in the inter-phase running=0 gap holds blue, and phase 2's agents surface (issue #70 flaw 1)", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   // Phase 1: two agents running.
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("multiphase", "cc-wf-multi",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("multiphase", "cc-wf-multi",
     [started("p1a"), started("p1b")]);
-  const id = resolveHookSession({ session_id: "cc-wf-multi", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-multi", sdkSessionId: "cc-wf-multi", cwd });
+  const id = "cc-wf-multi";
   try {
     markWorkflowActivity(id);
     assert.deepEqual(sessions.get(id).agents, { running: 2, done: 0 }, "phase 1 running");
@@ -200,14 +189,15 @@ test("multi-phase: a poll landing in the inter-phase running=0 gap holds blue, a
 });
 
 test("a phase with one long-running agent stays live via its agent-*.jsonl transcript after journal.jsonl goes stale (issue #70 flaw 2)", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
 
   // One agent started, none finished — the journal gains no further line until
   // that agent completes.
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("longagent", "cc-wf-long",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("longagent", "cc-wf-long",
     [started("only")]);
   const wfDir = path.dirname(journalPath);
-  const id = resolveHookSession({ session_id: "cc-wf-long", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-long", sdkSessionId: "cc-wf-long", cwd });
+  const id = "cc-wf-long";
   try {
     markWorkflowActivity(id);
     assert.deepEqual(sessions.get(id).agents, { running: 1, done: 0 }, "the single agent is running");
@@ -234,17 +224,18 @@ test("a phase with one long-running agent stays live via its agent-*.jsonl trans
 });
 
 test("a launch signal that sees only a stale journal stays armed — the new workflow's journal still surfaces {running: N}", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   // An earlier workflow's long-dead journal is already on disk, so the
   // workflows dir EXISTS when the launch signal for the next workflow fires
   // — but the runner has not written the new journal yet.
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("stale", "cc-wf-stale",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("stale", "cc-wf-stale",
     [started("k1")]);
   const old = new Date(Date.now() - 2 * STALE_MS);
   fs.utimesSync(journalPath, old, old);
-  const id = resolveHookSession({ session_id: "cc-wf-stale", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-stale", sdkSessionId: "cc-wf-stale", cwd });
+  const id = "cc-wf-stale";
   try {
     markWorkflowActivity(id);
     const slot = sessions.get(id);
@@ -271,13 +262,14 @@ test("a launch signal that sees only a stale journal stays armed — the new wor
 });
 
 test("only stale journals and nothing ever materializing: give up quietly after the stale window", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
 
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("stale-giveup", "cc-wf-stale-giveup",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("stale-giveup", "cc-wf-stale-giveup",
     [started("k1")]);
   const old = new Date(Date.now() - 10 * STALE_MS);
   fs.utimesSync(journalPath, old, old);
-  const id = resolveHookSession({ session_id: "cc-wf-stale-giveup", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-stale-giveup", sdkSessionId: "cc-wf-stale-giveup", cwd });
+  const id = "cc-wf-stale-giveup";
   try {
     markWorkflowActivity(id);
     const slot = sessions.get(id);
@@ -293,11 +285,12 @@ test("only stale journals and nothing ever materializing: give up quietly after 
 });
 
 test("an OBSERVED workflow whose journal goes stale gets the explicit zero — the indicator cannot stick", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
 
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("stuck", "cc-wf-stuck",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("stuck", "cc-wf-stuck",
     [started("k1")]); // started, never finished — a killed workflow's shape
-  const id = resolveHookSession({ session_id: "cc-wf-stuck", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-stuck", sdkSessionId: "cc-wf-stuck", cwd });
+  const id = "cc-wf-stuck";
   try {
     markWorkflowActivity(id);
     assert.deepEqual(sessions.get(id).agents, { running: 1, done: 0 }, "the workflow was observed running");
@@ -317,15 +310,13 @@ test("an OBSERVED workflow whose journal goes stale gets the explicit zero — t
 });
 
 test("a launch signal with no observable journal tree stays armed, then gives up after the stale window", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
-  // A transcript path whose journal tree never materializes.
-  const dir = path.join(fixturesRoot, "never");
-  fs.mkdirSync(dir, { recursive: true });
-  const transcriptPath = path.join(dir, "cc-wf-never.jsonl");
-  fs.writeFileSync(transcriptPath, "");
-  const id = resolveHookSession({ session_id: "cc-wf-never", cwd: dir, transcript_path: transcriptPath, tool_name: "Bash" });
+  // A session whose journal tree never materializes.
+  const { cwd } = makeAcpWorkflowTree("never", "cc-wf-never", null);
+  registerAcpSession({ sessionId: "cc-wf-never", sdkSessionId: "cc-wf-never", cwd });
+  const id = "cc-wf-never";
   try {
     markWorkflowActivity(id);
     const slot = sessions.get(id);
@@ -344,12 +335,13 @@ test("a launch signal with no observable journal tree stays armed, then gives up
 });
 
 test("an oversized live journal is indeterminate: last-known counts carry forward, no false completion", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("oversized", "cc-wf-big",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("oversized", "cc-wf-big",
     [started("k1"), started("k2")]);
-  const id = resolveHookSession({ session_id: "cc-wf-big", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-big", sdkSessionId: "cc-wf-big", cwd });
+  const id = "cc-wf-big";
   try {
     markWorkflowActivity(id);
     assert.deepEqual(sessions.get(id).agents, { running: 2, done: 0 });
@@ -376,133 +368,22 @@ test("an oversized live journal is indeterminate: last-known counts carry forwar
   }
 });
 
-// Black-box wiring: a real bridge process, a real SSE client, and the actual
-// /hooks/tool-output surface — proves hooks.js routes a Workflow PostToolUse
-// into markWorkflowActivity and the indicator reaches the wire. (The
-// in-process tests above cover the scan/poll semantics; this covers the glue.)
-test("a Workflow tool-output hook arms the scan and the session event carries agents on the wire", async (t) => {
-  const { cwd, transcriptPath } = makeWorkflowTree("wire", "cc-wf-wire",
-    [started("k1"), started("k2"), result("k1")]);
-  const bridge = await startBridge(t, {
-    env: {
-      // The parent process env pushed the poll out to an hour (for the
-      // in-process tests); the child bridge inherits process.env, so pin its
-      // own values explicitly. The launch signal scans immediately, so the
-      // poll interval is irrelevant here — only the stale window matters.
-      CLAUDE_WATCH_WORKFLOW_POLL_MS: "3600000",
-      CLAUDE_WATCH_WORKFLOW_STALE_MS: String(STALE_MS),
-    },
-  });
-  const pair = await request(bridge.port, "POST", "/pair", { body: { code: bridge.pairingCode } });
-  assert.equal(pair.status, 200);
-  const sse = connectSse(bridge.port, pair.body.token);
-  t.after(() => sse.close());
-  assert.equal(await sse.statusCode(), 200);
 
-  const posted = await request(bridge.port, "POST", "/hooks/tool-output", {
-    body: { session_id: "cc-wf-wire", cwd, transcript_path: transcriptPath, tool_name: "Workflow", tool_output: "launched" },
-  });
-  assert.equal(posted.status, 200);
 
-  const event = await sse.waitFor((e) => e.event === "session" && e.parsed?.agents?.running === 1);
-  assert.deepEqual(event.parsed.agents, { running: 1, done: 1 });
-});
 
-// Issue #68: a bridge restart loses the in-memory workflow arming. The surviving
-// Claude session re-registers (its hookSessionId binding gone) via
-// resolveHookSession -> createExternalSession, where reconcileWorkflowActivity
-// must re-derive the indicator from the on-disk journal — no fresh Workflow hook,
-// no markWorkflowActivity.
-test("restart mid-workflow: re-registration re-arms the scanner from a live journal and re-seeds the count (issue #68)", async () => {
-  const { sessions, resolveHookSession, pollWorkflowActivity } = await import("../sessions.js");
-  const { sseBuffer } = await import("../transport-sse.js");
-
-  // A live workflow journal already on disk, as after a mid-run restart.
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-live", "cc-wf-restart-live",
-    [started("k1"), started("k2"), started("k3"), result("k1")]); // running=2, done=1, fresh
-  const before = sseBuffer.length;
-  // The first post-restart hook re-registers the session. NO Workflow hook.
-  const id = resolveHookSession({ session_id: "cc-wf-restart-live", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
-  try {
-    assert.deepEqual(sessions.get(id).agents, { running: 2, done: 1 }, "re-seeded the running count on registration");
-    assert.equal(sessions.get(id).workflowActive, true, "re-armed the scanner without a Workflow hook");
-    const event = lastSessionEvent(sseBuffer.slice(before), id);
-    assert.ok(event, "the registration running event carried the reconciled agents");
-    assert.deepEqual(event.agents, { running: 2, done: 1 });
-
-    // The scanner now tracks to completion like any armed workflow: the last two
-    // finish (fresh zero, held per #70), then the tree goes stale and clears.
-    fs.appendFileSync(journalPath, [result("k2"), result("k3")].map((r) => JSON.stringify(r)).join("\n") + "\n");
-    pollWorkflowActivity(Date.now());
-    assert.equal(sessions.get(id).agents.running, 2, "held through the fresh inter-phase zero");
-    const old = new Date(Date.now() - 2 * STALE_MS);
-    fs.utimesSync(journalPath, old, old);
-    pollWorkflowActivity(Date.now());
-    assert.equal(sessions.get(id).agents.running, 0, "tracked to completion and cleared to green");
-    assert.equal(sessions.get(id).workflowActive, false, "poll went quiet");
-  } finally {
-    sessions.delete(id);
-  }
-});
-
-test("restart after the workflow finished during the downtime: registration broadcasts the explicit zero to clear a stale blue (issue #68)", async () => {
-  const { sessions, resolveHookSession } = await import("../sessions.js");
-  const { sseBuffer } = await import("../transport-sse.js");
-
-  // A workflow that was in flight but whose journal is now stale (it finished or
-  // died while the bridge was down).
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-stale", "cc-wf-restart-stale",
-    [started("k1")]);
-  const old = new Date(Date.now() - 2 * STALE_MS);
-  fs.utimesSync(journalPath, old, old);
-  const before = sseBuffer.length;
-  const id = resolveHookSession({ session_id: "cc-wf-restart-stale", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
-  try {
-    // The client may be latched on a stale running>0; the bridge must broadcast
-    // the explicit zero so preserve-on-absence is overwritten. Nothing is live,
-    // so the scanner is not armed.
-    assert.deepEqual(sessions.get(id).agents, { running: 0, done: 0 }, "reconciled to the explicit zero");
-    assert.notEqual(sessions.get(id).workflowActive, true, "nothing live to track — not armed");
-    const event = lastSessionEvent(sseBuffer.slice(before), id);
-    assert.ok(event, "the registration event carried the clearing zero");
-    assert.deepEqual(event.agents, { running: 0, done: 0 });
-  } finally {
-    sessions.delete(id);
-  }
-});
-
-test("registration of a session that never ran a workflow adds no agents field (reconcile is silent)", async () => {
-  const { sessions, resolveHookSession } = await import("../sessions.js");
-  const { sseBuffer } = await import("../transport-sse.js");
-
-  // A transcript with no workflows dir at all.
-  const dir = path.join(fixturesRoot, "restart-none");
-  fs.mkdirSync(dir, { recursive: true });
-  const transcriptPath = path.join(dir, "cc-wf-restart-none.jsonl");
-  fs.writeFileSync(transcriptPath, "");
-  const before = sseBuffer.length;
-  const id = resolveHookSession({ session_id: "cc-wf-restart-none", cwd: dir, transcript_path: transcriptPath, tool_name: "Bash" });
-  try {
-    assert.equal(sessions.get(id).agents, undefined, "no workflow tree → no agents field");
-    const event = lastSessionEvent(sseBuffer.slice(before), id);
-    assert.ok(event, "a running event was still broadcast");
-    assert.ok(!Object.hasOwn(event, "agents"), "no agents field on the wire");
-  } finally {
-    sessions.delete(id);
-  }
-});
 
 test("restart during an inter-phase gap (live tree reading running=0) does NOT clear blue — it arms and lets the poll resolve (issue #68 x #70)", async () => {
-  const { sessions, resolveHookSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   // Phase 1 finished, phase 2 not yet spawned: the journal reads running=0 but
   // was just written (fresh) — indistinguishable from real completion. Clearing
   // here would drop a still-live workflow's blue to green (the #70 bug).
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-gap", "cc-wf-restart-gap",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("restart-gap", "cc-wf-restart-gap",
     [started("p1a"), started("p1b"), result("p1a"), result("p1b")]); // running=0, done=2, fresh
   const before = sseBuffer.length;
-  const id = resolveHookSession({ session_id: "cc-wf-restart-gap", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-restart-gap", sdkSessionId: "cc-wf-restart-gap", cwd });
+  const id = "cc-wf-restart-gap";
   try {
     assert.equal(sessions.get(id).agents, undefined, "no false clear on a fresh inter-phase zero — agents left absent");
     assert.equal(sessions.get(id).workflowActive, true, "armed to track the live workflow");
@@ -520,18 +401,19 @@ test("restart during an inter-phase gap (live tree reading running=0) does NOT c
 });
 
 test("restart onto an oversized (unreadable) live journal does NOT false-clear the indicator (issue #68 x unreadableLive)", async () => {
-  const { sessions, resolveHookSession } = await import("../sessions.js");
+  const { sessions, registerAcpSession } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   // A live workflow (running=2) whose journal has outgrown the read cap: the
   // scan cannot read it and, on a fresh post-restart slot with an empty cache,
   // reports running=0 with unreadableLive=true and a fresh mtime. Reconcile must
   // NOT mistake "could not read" for "completed" and clear to green.
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-big", "cc-wf-restart-big",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("restart-big", "cc-wf-restart-big",
     [started("k1"), started("k2")]);
   fs.appendFileSync(journalPath, "x".repeat(1024 * 1024 + 1) + "\n"); // outgrows the cap, fresh mtime
   const before = sseBuffer.length;
-  const id = resolveHookSession({ session_id: "cc-wf-restart-big", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-restart-big", sdkSessionId: "cc-wf-restart-big", cwd });
+  const id = "cc-wf-restart-big";
   try {
     assert.equal(sessions.get(id).agents, undefined, "no false clear on an unreadable live journal — agents left absent");
     assert.equal(sessions.get(id).workflowActive, true, "armed; the poll resolves it once readable or stale");
@@ -543,7 +425,7 @@ test("restart onto an oversized (unreadable) live journal does NOT false-clear t
 });
 
 test("restart onto a just-finished workflow with a still-fresh journal holds, then clears once the tree goes stale (issue #68)", async () => {
-  const { sessions, resolveHookSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   // The workflow finished during the downtime, but its journal is still fresh at
@@ -552,9 +434,10 @@ test("restart onto a just-finished workflow with a still-fresh journal holds, th
   // lets the poll broadcast the completion zero once the tree goes quiet, exactly
   // like a normal completion (#70). Without arming-as-observed the poll would
   // give up silently and strand the client's stale blue.
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-fresh-done", "cc-wf-restart-fresh-done",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("restart-fresh-done", "cc-wf-restart-fresh-done",
     [started("k1"), result("k1")]); // running=0, done=1, fresh
-  const id = resolveHookSession({ session_id: "cc-wf-restart-fresh-done", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-restart-fresh-done", sdkSessionId: "cc-wf-restart-fresh-done", cwd });
+  const id = "cc-wf-restart-fresh-done";
   try {
     assert.equal(sessions.get(id).agents, undefined, "held — a fresh running=0 is not an immediate clear");
     assert.equal(sessions.get(id).workflowActive, true, "armed, observed by construction");
@@ -824,12 +707,13 @@ test("ACP workflow on the wire: agents while running, the explicit zero after th
 // off the poll entirely (the idle-cost gate).
 
 test("the stale-clear is not final: a resumed tree re-arms the WATCHING slot and publishes running>0 — no restart, no launch signal (#108)", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("resume", "cc-wf-resume",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("resume", "cc-wf-resume",
     [started("k1"), started("k2"), result("k1")]); // running=1, done=1
-  const id = resolveHookSession({ session_id: "cc-wf-resume", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-resume", sdkSessionId: "cc-wf-resume", cwd });
+  const id = "cc-wf-resume";
   try {
     markWorkflowActivity(id);
     const slot = sessions.get(id);
@@ -872,18 +756,19 @@ test("the stale-clear is not final: a resumed tree re-arms the WATCHING slot and
 });
 
 test("a watch re-arm never regresses the peak done — a sibling dir finished before the silence stays counted (#105 x #108)", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   // Two wf_* dirs under one tree: A finished (done=2) and aged out mid-run —
   // its done then lives ONLY in the slot's retained peak, since the scan
   // aggregates live dirs only. B was mid-flight when the machine slept.
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("peak-resume", "cc-wf-peak-resume",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("peak-resume", "cc-wf-peak-resume",
     [started("a1"), started("a2"), result("a1"), result("a2")]); // wf_a: done=2
   const journalB = path.join(path.dirname(path.dirname(journalPath)), "wf_b", "journal.jsonl");
   fs.mkdirSync(path.dirname(journalB), { recursive: true });
   fs.writeFileSync(journalB, JSON.stringify(started("b1")) + "\n"); // wf_b: running=1
-  const id = resolveHookSession({ session_id: "cc-wf-peak-resume", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-peak-resume", sdkSessionId: "cc-wf-peak-resume", cwd });
+  const id = "cc-wf-peak-resume";
   const old = new Date(Date.now() - 2 * STALE_MS);
   try {
     markWorkflowActivity(id);
@@ -930,12 +815,13 @@ test("a watch re-arm never regresses the peak done — a sibling dir finished be
 });
 
 test("watching survives multiple silent stretches — every false stale re-arms on the next resume (#108)", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("resume-twice", "cc-wf-resume-twice",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("resume-twice", "cc-wf-resume-twice",
     [started("a1")]); // running=1
-  const id = resolveHookSession({ session_id: "cc-wf-resume-twice", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-resume-twice", sdkSessionId: "cc-wf-resume-twice", cwd });
+  const id = "cc-wf-resume-twice";
   const old = new Date(Date.now() - 2 * STALE_MS);
   try {
     markWorkflowActivity(id);
@@ -1009,12 +895,13 @@ test("watching ends with the slot's life: an ended session's resumed tree re-arm
 });
 
 test("a genuinely dead tree stays at the explicit zero forever — watching never fabricates a resurrection (#108)", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("dead-forever", "cc-wf-dead-forever",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("dead-forever", "cc-wf-dead-forever",
     [started("k1")]); // started, never finished — a killed workflow's shape
-  const id = resolveHookSession({ session_id: "cc-wf-dead-forever", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-dead-forever", sdkSessionId: "cc-wf-dead-forever", cwd });
+  const id = "cc-wf-dead-forever";
   try {
     markWorkflowActivity(id);
     const slot = sessions.get(id);
@@ -1043,16 +930,14 @@ test("a genuinely dead tree stays at the explicit zero forever — watching neve
 });
 
 test("a launch signal with no tree gives up WITHOUT watching — no-tree sessions cost the poll nothing (#108)", async () => {
-  const { sessions, resolveHookSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, markWorkflowActivity, pollWorkflowActivity } = await import("../sessions.js");
 
-  // A transcript whose journal tree never materializes (same shape as the
+  // A session whose journal tree never materializes (same shape as the
   // give-up test above): there is nothing to stat, so watching it would put a
   // per-tick readdir on a session that never ran a workflow.
-  const dir = path.join(fixturesRoot, "never-watch");
-  fs.mkdirSync(dir, { recursive: true });
-  const transcriptPath = path.join(dir, "cc-wf-never-watch.jsonl");
-  fs.writeFileSync(transcriptPath, "");
-  const id = resolveHookSession({ session_id: "cc-wf-never-watch", cwd: dir, transcript_path: transcriptPath, tool_name: "Bash" });
+  const { cwd } = makeAcpWorkflowTree("never-watch", "cc-wf-never-watch", null);
+  registerAcpSession({ sessionId: "cc-wf-never-watch", sdkSessionId: "cc-wf-never-watch", cwd });
+  const id = "cc-wf-never-watch";
   try {
     markWorkflowActivity(id);
     const slot = sessions.get(id);
@@ -1065,13 +950,13 @@ test("a launch signal with no tree gives up WITHOUT watching — no-tree session
 });
 
 test("restart onto a stale tree that later resumes: registration's zero is watched, not final (#68 x #108)", async () => {
-  const { sessions, resolveHookSession, pollWorkflowActivity } = await import("../sessions.js");
+  const { sessions, registerAcpSession, pollWorkflowActivity } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   // The machine slept through a bridge restart: at re-registration the tree is
   // stale, so reconcile broadcasts the clearing zero — but the workflow
   // survived the sleep and resumes writing afterwards.
-  const { cwd, transcriptPath, journalPath } = makeWorkflowTree("restart-resume", "cc-wf-restart-resume",
+  const { cwd, transcriptPath, journalPath } = makeAcpWorkflowTree("restart-resume", "cc-wf-restart-resume",
     [started("k1")]);
   const old = new Date(Date.now() - 2 * STALE_MS);
   fs.utimesSync(journalPath, old, old);
@@ -1079,7 +964,8 @@ test("restart onto a stale tree that later resumes: registration's zero is watch
   // test proves reconcile's stale branch RAISES it for the watch — without
   // that the poll would never visit the watching slot.
   pollWorkflowActivity(Date.now());
-  const id = resolveHookSession({ session_id: "cc-wf-restart-resume", cwd, transcript_path: transcriptPath, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-wf-restart-resume", sdkSessionId: "cc-wf-restart-resume", cwd });
+  const id = "cc-wf-restart-resume";
   try {
     const slot = sessions.get(id);
     assert.deepEqual(slot.agents, { running: 0, done: 0 }, "reconciled to the explicit zero (#68 unchanged)");

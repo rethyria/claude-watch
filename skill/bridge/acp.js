@@ -11,10 +11,9 @@
 // one place; this module owns only the transport: the inbox connections, the
 // session -> connection routing, and pushing dictation to the fork.
 //
-// Every endpoint is loopback-only, mirroring /hooks/* and /admin/*: the fork
-// runs on this machine, and a LAN peer must never be able to register phantom
-// sessions or inject prompts. It is NOT part of the versioned /v1 client
-// protocol.
+// Every endpoint is loopback-only, mirroring /admin/*: the fork runs on this
+// machine, and a LAN peer must never be able to register phantom sessions or
+// inject prompts. It is NOT part of the versioned /v1 client protocol.
 import { jsonResponse, readBody, log, isLoopbackAddress } from "./util.js";
 import {
   registerAcpSession, endAcpSession, sessions, markSessionIdle, markSessionWorking, sessionEventPayload,
@@ -388,12 +387,11 @@ registerSessionCleanupHook((sessionId) => {
 // update variant for.
 //
 // S3 could ack-and-discard because working/idle rode the settings.json hooks
-// the SDK fires (hook-twin correlation resolves them onto this same slot —
-// verified live 2026-07-25). That channel is being retired, so this handler is
-// now the SOLE authority for an ACP slot's turn state: `kind: "turn"` drives
-// `slot.idle`, and `agent_message_chunk` is fanned out as assistant prose —
-// the one capability hooks never had. Interactive permissions from the wrist
-// are #80, so `kind: "permission"` stays ack-only for now.
+// the SDK fires (hook-twin correlation resolved them onto this same slot).
+// That channel is retired (#87), so this handler is the SOLE authority for an
+// ACP slot's turn state: `kind: "turn"` drives `slot.idle`, and
+// `agent_message_chunk` is fanned out as assistant prose — a capability the
+// hooks never had.
 export async function handleAcpUpdate(req, res) {
   if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
   if (!requireLoopback(req, res)) return;
@@ -414,11 +412,10 @@ export async function handleAcpUpdate(req, res) {
   // Turn boundary (#79 / #83). The ACP `sessionUpdate` union has no turn-end
   // variant — turn end is the session/prompt RPC's `stopReason`, which never
   // flows through the client tee — so the fork forwards it explicitly. This is
-  // the ONLY driver of turn-level state for an ACP slot: every writer of
-  // `slot.idle` is otherwise the hook channel or the headless path, and the
-  // hooks block is being retired. `state` is deliberately left alone: it stays
-  // "running" across a finished turn by design (issue #60), and `idle` is the
-  // turn-level truth that rides the next session event.
+  // the ONLY driver of turn-level state for an ACP slot. `state` is
+  // deliberately left alone: it stays "running" across a finished turn by
+  // design (issue #60), and `idle` is the turn-level truth that rides the
+  // next session event.
   if (body.kind === "turn" && sessions.has(sessionId)) {
     const phase = body.payload?.phase;
     if (phase === "end") {
@@ -463,11 +460,11 @@ export async function handleAcpUpdate(req, res) {
     // transcript of the whole turn.
     if (update?.sessionUpdate === "tool_call") proseBuffers.delete(sessionId);
     // Workflow launch signal (issue #105) — the ACP-era replacement for the
-    // PostToolUse arming in hooks.js, which no ACP session ever fires. The
-    // adapter stamps the RAW tool name on every tool_call it emits
-    // (`_meta.claudeCode.toolName`, exactly once per tool_use — its
-    // emittedToolCalls dedup demotes later surfaces to tool_call_update), so
-    // this is the same "the Workflow tool was called" fact the hook carried.
+    // retired hook channel's PostToolUse arming. The adapter stamps the RAW
+    // tool name on every tool_call it emits (`_meta.claudeCode.toolName`,
+    // exactly once per tool_use — its emittedToolCalls dedup demotes later
+    // surfaces to tool_call_update), so this is the same "the Workflow tool
+    // was called" fact the hook used to carry.
     // It just arrives BEFORE execution rather than after: the immediate scan
     // usually sees no journal yet and the poll picks the tree up as it
     // materializes — and a Workflow that never runs (permission denied) is the
@@ -479,9 +476,9 @@ export async function handleAcpUpdate(req, res) {
       markWorkflowActivity(sessionId);
     }
     // The SDK auto-generates a thread title in the background and the adapter
-    // polls it at turn end, pushing `session_info_update`. Without this the slot
-    // has no title at all — the transcript-scraping path that titles hook
-    // sessions is never fed for ACP — so the watch fell back to the raw uuid.
+    // polls it at turn end, pushing `session_info_update`. This is the ONLY
+    // title source for an ACP slot — the bridge never scrapes the transcript
+    // — so without it the watch fell back to the raw uuid.
     if (update?.sessionUpdate === "session_info_update" && typeof update.title === "string") {
       const slot = sessions.get(sessionId);
       const title = update.title.trim();
@@ -758,19 +755,19 @@ function raiseAcpPermission(sessionId, payload) {
   void decision.then((answer) => {
     acpPermissionsByToolCall.delete(toolCallId);
     // A no-decision (expiry, or the prompt voided) is NOT an answer: say
-    // nothing and let Zed's own prompt keep the decision, exactly as the hook
-    // path does. Fabricating a deny here would cancel the dialog on screen.
+    // nothing and let Zed's own prompt keep the decision. Fabricating a deny
+    // here would cancel the dialog on screen (issue #63's doctrine).
     if (!answer || answer.noDecision) return;
     // A decision naming one of THIS request's optionIds is exact — take it
     // verbatim (#110). Otherwise fall back to the behavior map, keyed on the
-    // behavior the user actually CHOSE: commands.js rewrites allow-always to
-    // allow for the hook path (recording the original in requestedBehavior),
-    // and keying on the rewritten value sent the wrist's "Always Allow" to
-    // the agent as its allow_once option. Behaviors the guard dropped have no
-    // entry, so an unnamed ambiguous answer stays unsent rather than guessed.
+    // behavior the user actually CHOSE (commands.js normalizes the legacy
+    // allowAll flag into behavior "allow-always" so the wrist's "Always
+    // Allow" lands on the agent's allow_always option, never allow_once).
+    // Behaviors the guard dropped have no entry, so an unnamed ambiguous
+    // answer stays unsent rather than guessed.
     const chosen =
       (typeof answer.optionId === "string" ? optionsById.get(answer.optionId) : undefined) ??
-      optionByBehavior.get(answer.requestedBehavior ?? answer.behavior);
+      optionByBehavior.get(answer.behavior);
     if (!chosen) return;
     writeAcpFrame(sessionId, "permission-decision", {
       sessionId, toolCallId, optionId: chosen.optionId, behavior: chosen.behavior,
@@ -832,9 +829,9 @@ function raiseAcpInputRequest(sessionId, payload) {
 }
 
 /** One positional answers array aligned with the questions, from any of the
- *  /v1 decision forms (collectAskUserQuestionAnswers' vocabulary in hooks.js):
- *  the wear client's aligned array verbatim, the object form keyed by question
- *  text, or the legacy single selectedOption answering the first question.
+ *  /v1 decision forms: the wear client's aligned array verbatim, the object
+ *  form keyed by question text, or the legacy single selectedOption answering
+ *  the first question.
  *  Positional is the frame's contract because the ADAPTER re-keys by question
  *  text against the very list it raised — the bridge must not collapse
  *  duplicate texts before it gets there. `null` marks an unanswered slot;

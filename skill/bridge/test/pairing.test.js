@@ -71,14 +71,14 @@ test("two devices pair sequentially; both tokens work concurrently", { timeout: 
   assert.equal(await sseA.statusCode(), 200);
   assert.equal(await sseB.statusCode(), 200);
 
-  const posted = await request(port, "POST", "/hooks/tool-output", {
-    body: { tool_name: "Read", cwd: "/tmp/pairing-test", tool_output: "both devices see this" },
+  const posted = await request(port, "POST", "/acp/register", {
+    body: { connection: "conn-pairing", sessionId: "acp-pairing", cwd: "/tmp/pairing-test" },
   });
   assert.equal(posted.status, 200);
-  const eventA = await sseA.waitFor((e) => e.event === "tool-output");
-  const eventB = await sseB.waitFor((e) => e.event === "tool-output");
-  assert.equal(eventA.parsed.tool_output, "both devices see this");
-  assert.equal(eventB.parsed.tool_output, "both devices see this");
+  const eventA = await sseA.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-pairing");
+  const eventB = await sseB.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-pairing");
+  assert.equal(eventA.parsed.state, "running");
+  assert.equal(eventB.parsed.state, "running");
 });
 
 test("after a successful pair, both pairing surfaces 403 until reopen, then lock again", { timeout: 60_000 }, async (t) => {

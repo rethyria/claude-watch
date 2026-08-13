@@ -1,8 +1,8 @@
 // Machine-readable permission semantics (issue #10), in-process: the
 // canonical option-builder contract and the Codex synthetic exec-approval
 // menu, which cannot be driven black-box without a real Codex install
-// writing ~/.codex session/log files. Black-box coverage of the Claude hook
-// path lives in permission-semantics.test.js.
+// writing ~/.codex session/log files. Black-box coverage of the ACP-raised
+// prompts lives in acp.test.js.
 //
 // Env overrides must be set before any bridge module loads (config.js and
 // credentials.js read them at evaluation), hence the dynamic imports inside
@@ -63,19 +63,16 @@ function fakeCodexSession(sessions, id, writes) {
   });
 }
 
-test("canonical option builders tag every option with a machine-readable behavior", async () => {
-  const { canonicalPermissionOptions, defaultPermissionOptions } = await import("../permissions.js");
+test("canonical option builder tags every option with a machine-readable behavior", async () => {
+  const { canonicalPermissionOptions } = await import("../permissions.js");
 
-  assert.deepEqual(
-    defaultPermissionOptions({ canAllowAlways: true }).map((o) => o.behavior),
-    ["allow", "allow-always", "deny"],
-  );
-  assert.deepEqual(
-    defaultPermissionOptions().map((o) => o.behavior),
-    ["allow", "deny"],
-    "no allow-always option without suggestions to persist",
-  );
-  for (const option of defaultPermissionOptions({ canAllowAlways: true })) {
+  const built = canonicalPermissionOptions([
+    { behavior: "allow", label: "Yes", description: "Allow this once" },
+    { behavior: "allow-always", label: "Yes, don't ask again" },
+    { behavior: "deny", label: "No" },
+  ]);
+  assert.deepEqual(built.map((o) => o.behavior), ["allow", "allow-always", "deny"]);
+  for (const option of built) {
     assert.equal(typeof option.label, "string");
     assert.ok(option.label.length > 0);
   }
@@ -208,14 +205,13 @@ test("the authoritative permission-sync frame lists Codex synthetic approvals to
       timer: setTimeout(() => {}, 60_000),
       sessionId: "claude-unit",
       payload: null,
-      toolUseId: null,
     });
 
     const frames = [...pendingPermissionsSync()];
     const sync = frames.find((f) => f.event === "permission-sync");
     assert.ok(sync, "connect-time sync must emit an authoritative permission-sync frame");
     const ids = JSON.parse(sync.data).permissionIds;
-    assert.ok(ids.includes("claude-live-perm"), "hook permissions must be listed");
+    assert.ok(ids.includes("claude-live-perm"), "core pending permissions must be listed");
     assert.ok(ids.includes("codex-live-perm"), "Codex synthetic approvals must be listed");
     // Retraction-only: the frame must come first, so the per-prompt re-sends
     // that follow can restore payloads for everything it retained.

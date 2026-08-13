@@ -61,11 +61,12 @@ function makeWorktree(mainName, wtName, headContent) {
 }
 
 test("a main-checkout session carries branch and no worktree/repoRoot claim", async () => {
-  const { sessions, resolveHookSession } = await import("../sessions.js");
+  const { sessions, registerAcpSession } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   const root = makeMainCheckout("plain", "ref: refs/heads/main\n");
-  const id = resolveHookSession({ session_id: "cc-git-main", cwd: root, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-git-main", sdkSessionId: "cc-git-main", cwd: root });
+  const id = "cc-git-main";
   try {
     const slot = sessions.get(id);
     assert.equal(slot.branch, "main");
@@ -83,11 +84,12 @@ test("a main-checkout session carries branch and no worktree/repoRoot claim", as
 });
 
 test("a linked-worktree session carries branch + worktree + the main repoRoot", async () => {
-  const { sessions, resolveHookSession, getSessionsSnapshot } = await import("../sessions.js");
+  const { sessions, registerAcpSession, getSessionsSnapshot } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   const { mainRoot, wtRoot } = makeWorktree("mainrepo", "wt1", "ref: refs/heads/feature/x\n");
-  const id = resolveHookSession({ session_id: "cc-git-wt", cwd: wtRoot, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-git-wt", sdkSessionId: "cc-git-wt", cwd: wtRoot });
+  const id = "cc-git-wt";
   try {
     const slot = sessions.get(id);
     assert.equal(slot.branch, "feature/x");
@@ -108,15 +110,17 @@ test("a linked-worktree session carries branch + worktree + the main repoRoot", 
 });
 
 test("a detached HEAD yields the 7-char short sha; a non-git root yields nothing", async () => {
-  const { sessions, resolveHookSession } = await import("../sessions.js");
+  const { sessions, registerAcpSession } = await import("../sessions.js");
 
   const sha = "0123456789abcdef0123456789abcdef01234567";
   const detachedRoot = makeMainCheckout("detached", `${sha}\n`);
-  const detachedId = resolveHookSession({ session_id: "cc-git-detached", cwd: detachedRoot, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-git-detached", sdkSessionId: "cc-git-detached", cwd: detachedRoot });
+  const detachedId = "cc-git-detached";
 
   const bareRoot = path.join(fixturesRoot, "not-a-repo");
   fs.mkdirSync(bareRoot, { recursive: true });
-  const bareId = resolveHookSession({ session_id: "cc-git-none", cwd: bareRoot, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-git-none", sdkSessionId: "cc-git-none", cwd: bareRoot });
+  const bareId = "cc-git-none";
 
   try {
     assert.equal(sessions.get(detachedId).branch, sha.slice(0, 7));
@@ -130,12 +134,13 @@ test("a detached HEAD yields the 7-char short sha; a non-git root yields nothing
   }
 });
 
-test("a HEAD change is picked up at the Stop refresh point and broadcast; unchanged HEAD is a no-op", async () => {
-  const { sessions, resolveHookSession, refreshHookSessionTitle, refreshGitMetadata } = await import("../sessions.js");
+test("a HEAD change is picked up at the re-register refresh point and broadcast; unchanged HEAD is a no-op", async () => {
+  const { sessions, registerAcpSession, refreshGitMetadata } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
 
   const root = makeMainCheckout("switching", "ref: refs/heads/main\n");
-  const id = resolveHookSession({ session_id: "cc-git-switch", cwd: root, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-git-switch", sdkSessionId: "cc-git-switch", cwd: root });
+  const id = "cc-git-switch";
   try {
     assert.equal(sessions.get(id).branch, "main");
 
@@ -143,7 +148,8 @@ test("a HEAD change is picked up at the Stop refresh point and broadcast; unchan
     // ("other" vs "main" differ in length), so no sleep is needed here.
     fs.writeFileSync(path.join(root, ".git", "HEAD"), "ref: refs/heads/other\n");
     const before = sseBuffer.length;
-    refreshHookSessionTitle(id, {}); // the Stop hook's opportunistic refresh
+    // The fork's idempotent re-register is the opportunistic refresh point.
+    registerAcpSession({ sessionId: id, sdkSessionId: id, cwd: root });
     assert.equal(sessions.get(id).branch, "other");
     const event = lastSessionEvent(sseBuffer.slice(before), id);
     assert.ok(event, "the branch change was broadcast");
@@ -158,13 +164,14 @@ test("a HEAD change is picked up at the Stop refresh point and broadcast; unchan
 });
 
 test("a malformed .git file or a non-worktree gitdir never yields a wrong repoRoot", async () => {
-  const { sessions, resolveHookSession } = await import("../sessions.js");
+  const { sessions, registerAcpSession } = await import("../sessions.js");
 
   // No `gitdir:` prefix at all → not a checkout, nothing derived.
   const junkRoot = path.join(fixturesRoot, "junk-pointer");
   fs.mkdirSync(junkRoot, { recursive: true });
   fs.writeFileSync(path.join(junkRoot, ".git"), "this is not a gitdir pointer\n");
-  const junkId = resolveHookSession({ session_id: "cc-git-junk", cwd: junkRoot, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-git-junk", sdkSessionId: "cc-git-junk", cwd: junkRoot });
+  const junkId = "cc-git-junk";
 
   // A submodule-style pointer (…/.git/modules/<sub>) has a readable HEAD but
   // is NOT a linked worktree: branch may derive, repoRoot must not.
@@ -175,7 +182,8 @@ test("a malformed .git file or a non-worktree gitdir never yields a wrong repoRo
   const subRoot = path.join(fixturesRoot, "sub-root");
   fs.mkdirSync(subRoot, { recursive: true });
   fs.writeFileSync(path.join(subRoot, ".git"), `gitdir: ${moduleGitdir}\n`);
-  const subId = resolveHookSession({ session_id: "cc-git-sub", cwd: subRoot, tool_name: "Bash" });
+  registerAcpSession({ sessionId: "cc-git-sub", sdkSessionId: "cc-git-sub", cwd: subRoot });
+  const subId = "cc-git-sub";
 
   try {
     const junk = sessions.get(junkId);

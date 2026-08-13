@@ -199,7 +199,7 @@ export function handleEvents(req, res) {
   }
 
   // Connect-time snapshot, part 2: authoritative current state, sent on EVERY
-  // connect (replay or not) — running sessions (sessions.js), pending hook
+  // connect (replay or not) — running sessions (sessions.js), pending
   // permissions (permissions.js), and pending Codex synthetic permissions
   // (codex.js). Pending permissions in particular must not rely on the ring
   // buffer: ordinary pty-output can evict a permission-request before a

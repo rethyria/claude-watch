@@ -2,10 +2,10 @@
 // used to stay `running` forever.
 //
 // pruneEndedSessions only ever considered `ended`, so nothing aged out a slot
-// stuck in `running`. The live report: a slot whose last hook was a Stop at
-// 10:01 was still being announced as an active session at 20:20 — no owning
-// process the bridge could see, and no path to ever leave the map, so every
-// connect re-sent it to every client.
+// stuck in `running`. The live report: a slot whose last observed signal was a
+// turn end at 10:01 was still being announced as an active session at 20:20 —
+// no owning process the bridge could see, and no path to ever leave the map,
+// so every connect re-sent it to every client.
 //
 // The ageing is deliberately evidence-first (issue #53 is binding: never
 // fabricate an end for a session that may be alive). A bridge-owned PTY is
@@ -55,53 +55,70 @@ async function installProbe() {
   probeInstalled = true;
 }
 
-test("a hook session silent past the window is ENDED — visibly, and revivably", async () => {
-  const { sessions, resolveHookSession, ageOutZombieSessions } = await import("../sessions.js");
+// A Codex-scanner-shaped slot: no PTY, no connection — the class only the
+// silence window can speak for. Created directly (the scanner's
+// touchExternalSession is module-private) with the same fields it writes.
+function codexSlot(sessions, markSessionObserved, id, extra = {}) {
+  const slot = {
+    id,
+    agent: "codex",
+    cwd: `/tmp/aging-65-${id}`,
+    folderName: `aging-65-${id}`,
+    ptyProcess: null,
+    state: "running",
+    createdAt: Date.now(),
+    idle: false,
+    ...extra,
+  };
+  markSessionObserved(slot);
+  sessions.set(id, slot);
+  return slot;
+}
+
+test("a scanner session silent past the window is ENDED — visibly, and non-authoritatively", async () => {
+  const { sessions, markSessionObserved, ageOutZombieSessions } = await import("../sessions.js");
   const { sseBuffer } = await import("../transport-sse.js");
   await installProbe();
 
-  const id = resolveHookSession({ session_id: "cc-zombie", cwd: "/tmp/aging-65-zombie", tool_name: "Bash" });
-  assert.equal(sessions.get(id).state, "running");
+  const slot = codexSlot(sessions, markSessionObserved, "cdx-zombie");
+  assert.equal(slot.state, "running");
 
   // Well inside the window nothing happens: the whole point is that a session
   // simply waiting on its user is not a zombie.
   ageOutZombieSessions(Date.now() + 6 * HOUR);
-  assert.equal(sessions.get(id).state, "running", "a few hours of silence is not evidence of death");
+  assert.equal(slot.state, "running", "a few hours of silence is not evidence of death");
 
   ageOutZombieSessions(Date.now() + 13 * HOUR);
-  const slot = sessions.get(id);
   assert.equal(slot.state, "ended", "a slot nothing can vouch for eventually ends");
 
   // ENDING, not deleting: the client observes the transition instead of
   // watching a row vanish (the issue asks for exactly this).
-  const event = lastSessionEvent(sseBuffer, id);
+  const event = lastSessionEvent(sseBuffer, "cdx-zombie");
   assert.equal(event.state, "ended");
   assert.equal(event.reason, "no-liveness", `the end names its evidence; got ${JSON.stringify(event)}`);
 
-  // And it is an absence of evidence, never a verdict: the still-alive session
-  // proves us wrong with its next hook and the slot comes back (issue #53).
+  // And it is an absence of evidence, never a verdict: the scanner's next
+  // observed write revives the slot (touchExternalSession's revive branch),
+  // which this non-authoritative flag is what permits (issue #53).
   assert.notEqual(slot.endedAuthoritatively, true, "an ageing end must never be authoritative");
-  const revived = resolveHookSession({ session_id: "cc-zombie", cwd: "/tmp/aging-65-zombie", tool_name: "Bash" });
-  assert.equal(revived, id, "the same slot, not a fresh one");
-  assert.equal(sessions.get(id).state, "running", "any proof of life revives it");
 });
 
-test("a session that keeps speaking is never aged out, however quiet its transcript", async () => {
-  const { sessions, resolveHookSession, ageOutZombieSessions } = await import("../sessions.js");
+test("a session that keeps being observed is never aged out, however quiet its transcript", async () => {
+  const { sessions, markSessionObserved, ageOutZombieSessions } = await import("../sessions.js");
   await installProbe();
 
-  const id = resolveHookSession({ session_id: "cc-chatty", cwd: "/tmp/aging-65-chatty", tool_name: "Bash" });
-  // 20 hours pass, but the session is still firing hooks: the window measures
-  // silence, not age.
+  const slot = codexSlot(sessions, markSessionObserved, "cdx-chatty");
+  // 20 hours pass, but the scanner keeps seeing the session write: the window
+  // measures silence, not age.
   for (let i = 0; i < 4; i++) {
-    resolveHookSession({ session_id: "cc-chatty", cwd: "/tmp/aging-65-chatty", tool_name: "Bash" });
+    markSessionObserved(slot);
     ageOutZombieSessions(Date.now() + 5 * HOUR);
   }
-  assert.equal(sessions.get(id).state, "running");
+  assert.equal(slot.state, "running");
 });
 
 test("a transcript written recently is liveness evidence — the timeout never overrules it", async () => {
-  const { sessions, resolveHookSession, ageOutZombieSessions } = await import("../sessions.js");
+  const { sessions, markSessionObserved, ageOutZombieSessions } = await import("../sessions.js");
   await installProbe();
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-aging-transcript-"));
@@ -109,26 +126,20 @@ test("a transcript written recently is liveness evidence — the timeout never o
   const transcriptPath = path.join(dir, "session.jsonl");
   fs.writeFileSync(transcriptPath, "{}\n");
 
-  const id = resolveHookSession({
-    session_id: "cc-writing",
-    cwd: "/tmp/aging-65-writing",
-    transcript_path: transcriptPath,
-    tool_name: "Bash",
-  });
+  const slot = codexSlot(sessions, markSessionObserved, "cdx-writing", { transcriptPath });
 
-  // Hooks stopped (a partial hook config, a settings.json the user emptied),
-  // but the session is plainly still running: its transcript is being written.
-  // Ageing it out here would be the opposite bug — a live session vanishing
-  // off the wrist.
+  // Every other signal stopped, but the session is plainly still running: its
+  // transcript is being written. Ageing it out here would be the opposite bug
+  // — a live session vanishing off the wrist.
   fs.utimesSync(transcriptPath, new Date(), new Date(Date.now() + 13 * HOUR));
   ageOutZombieSessions(Date.now() + 13 * HOUR);
-  assert.equal(sessions.get(id).state, "running", "a live transcript is proof something is running the session");
+  assert.equal(slot.state, "running", "a live transcript is proof something is running the session");
 
   // Once even the transcript goes quiet for the whole window, nothing can
   // speak for the session any more.
   fs.utimesSync(transcriptPath, new Date(), new Date());
   ageOutZombieSessions(Date.now() + 13 * HOUR);
-  assert.equal(sessions.get(id).state, "ended");
+  assert.equal(slot.state, "ended");
 });
 
 test("a bridge-owned PTY slot is never aged out: its process object IS the evidence", async () => {

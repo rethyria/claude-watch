@@ -115,36 +115,6 @@ test("dictation to an ACP session whose fork is not connected is refused honestl
   assert.match(resp.body.error, /not reachable|not connected/i);
 });
 
-test("hook-twin correlation: one ACP session yields exactly one bridge slot", { timeout: 60_000 }, async (t) => {
-  const bridge = await startBridge(t);
-  const token = await pair(bridge);
-  const cwd = realCwd(t, "dedup");
-
-  const inbox = connectInbox(bridge, "conn-dedup");
-  t.after(() => inbox.close());
-  assert.equal(await inbox.statusCode(), 200);
-  await registerAcp(bridge, { connection: "conn-dedup", sessionId: "acp-dedup", cwd });
-
-  // The fork's SDK session fires the settings.json hooks with the SAME
-  // session_id (== the ACP session id). Without correlation this would mint a
-  // SECOND external slot. It must resolve to the one ACP slot instead.
-  const toolOut = await request(bridge.port, "POST", "/hooks/tool-output", {
-    body: { session_id: "acp-dedup", cwd, tool_name: "Read", tool_output: "hi" },
-  });
-  assert.equal(toolOut.status, 200);
-
-  const status = await request(bridge.port, "GET", "/status", { token });
-  const forThisCwd = status.body.sessions.filter((s) => s.cwd === cwd);
-  assert.equal(forThisCwd.length, 1, `exactly one slot for the ACP session; got ${JSON.stringify(forThisCwd)}`);
-  assert.equal(forThisCwd[0].id, "acp-dedup");
-  assert.equal(forThisCwd[0].kind, "acp");
-
-  // And the hook drives its turn state: a Stop idles the SAME slot.
-  await request(bridge.port, "POST", "/hooks/stop", { body: { session_id: "acp-dedup", cwd } });
-  const entry = await statusEntry(bridge, token, "acp-dedup");
-  assert.equal(entry.idle, true, "the ACP slot's idle is driven by its correlated hooks");
-});
-
 test("explicit deregister ends the ACP slot", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   const token = await pair(bridge);
@@ -194,14 +164,19 @@ test("a fork whose inbox drops (Zed quit / crash) strands no zombie slot", { tim
   assert.match(ended.parsed.reason, /disconnect/i);
 });
 
-test("dictatable is live-delivery only: PTY yes+killable, hook no, ACP yes+hide (S4 #78)", { timeout: 60_000 }, async (t) => {
-  // A stub codex so a spawn produces a real, bridge-owned PTY session.
+test("dictatable is live-delivery only: PTY yes+killable, scanner no, ACP yes+hide (S4 #78)", { timeout: 60_000 }, async (t) => {
+  // A stub codex so a spawn produces a real, bridge-owned PTY session, plus a
+  // scanner rollout fixture for the PTY-less external class.
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-fakebin-"));
   t.after(() => { try { fs.rmSync(binDir, { recursive: true, force: true }); } catch { /* ignore */ } });
   const bin = path.join(binDir, "codex");
   fs.writeFileSync(bin, "#!/bin/sh\necho READY\nexec cat\n", { mode: 0o755 });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "acp-scanner-home-"));
+  t.after(() => { try { fs.rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ } });
+  const rolloutDir = path.join(home, ".codex", "sessions", "2026", "08", "07");
+  fs.mkdirSync(rolloutDir, { recursive: true });
 
-  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin, HOME: home } });
   const token = await pair(bridge);
 
   // (1) A bridge-owned PTY session: dictatable (stdin), NOT external (real
@@ -216,16 +191,22 @@ test("dictatable is live-delivery only: PTY yes+killable, hook no, ACP yes+hide 
   assert.equal(ptyEntry.dictatable, true, "a bridge-owned PTY session is dictatable");
   assert.notEqual(ptyEntry.external, true, "a PTY session is NOT external (real kill)");
 
-  // (2) A PTY-less external hook session: NOT dictatable (only the retired
-  // headless fork could reach it), external (Hide).
-  const hookCwd = realCwd(t, "hook");
-  await request(bridge.port, "POST", "/hooks/tool-output", {
-    body: { session_id: "hook-1", cwd: hookCwd, tool_name: "Read", tool_output: "hi" },
-  });
-  const hookEntry = (await request(bridge.port, "GET", "/status", { token })).body.sessions.find((s) => s.cwd === hookCwd);
-  assert.ok(hookEntry, "hook session present");
-  assert.notEqual(hookEntry.dictatable, true, "a PTY-less hook session is NOT dictatable");
-  assert.equal(hookEntry.external, true, "a hook session is external (Hide)");
+  // (2) A PTY-less Codex-scanner session: NOT dictatable (the bridge owns no
+  // input channel into it — only the retired headless fork could pretend to).
+  // Written AFTER the spawn above, so the no-session-id fallback there could
+  // not resolve to this PTY-less slot instead of auto-spawning.
+  fs.appendFileSync(
+    path.join(rolloutDir, "rollout-disc.jsonl"),
+    `${JSON.stringify({ type: "session_meta", payload: { id: "cdx-disc", cwd: home, timestamp: new Date().toISOString() } })}\n`,
+  );
+  const scannerDeadline = Date.now() + 30_000;
+  let scannerEntry = null;
+  while (Date.now() < scannerDeadline && !scannerEntry) {
+    scannerEntry = await statusEntry(bridge, token, "cdx-disc");
+    if (!scannerEntry) await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.ok(scannerEntry, "scanner session present");
+  assert.notEqual(scannerEntry.dictatable, true, "a PTY-less scanner session is NOT dictatable");
 
   // (3) An ACP session: dictatable (inject) AND external — the bridge owns no
   // process of its own here; a kill goes out as a close frame (#88).
@@ -252,12 +233,11 @@ test("ACP endpoints validate their inputs (routes are wired, not 404)", { timeou
 
 // --- Turn-level idle for ACP slots (#79 re-scope / #83) ----------------------
 // The ACP `sessionUpdate` union carries no turn-boundary variant (turn end is
-// the session/prompt RPC's `stopReason`), so the fork forwards it explicitly as
-// kind:"turn". Without it an ACP slot is never flagged idle or working — the
-// only writers of `slot.idle` are the hook channel and the headless path, and
-// the user has removed the hooks block. NOTE: `state` deliberately stays
-// "running" across a finished turn (issue #60); `idle` is the turn-level truth.
-test("an ACP slot is flagged idle at turn end, with no hook traffic (#83)", { timeout: 60_000 }, async (t) => {
+// the session/prompt RPC's `stopReason`), so the fork forwards it explicitly
+// as kind:"turn" — the SOLE writer of an ACP slot's `slot.idle` since the
+// hook channel's retirement (#87). NOTE: `state` deliberately stays "running"
+// across a finished turn (issue #60); `idle` is the turn-level truth.
+test("an ACP slot is flagged idle at turn end (#83)", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   const token = await pair(bridge);
   const cwd = realCwd(t, "turn");
@@ -1028,10 +1008,10 @@ test("an ambiguous behavior loses its canonical button; unambiguous ones survive
   assert.equal(frame.parsed.behavior, "allow");
 });
 
-// The behavior fallback must key on the behavior the user CHOSE: commands.js
-// rewrites allow-always to allow for the hook response, and keying the echo on
-// the rewritten value sent a wrist "Always Allow" to the agent as its
-// allow_once option — an allow-once masquerading as a standing grant.
+// The behavior fallback must key on the behavior the user CHOSE — the
+// hook-era rewrite of allow-always into allow once leaked into this echo and
+// sent a wrist "Always Allow" to the agent as its allow_once option: an
+// allow-once masquerading as a standing grant.
 test("a behavior-only allow-always answer names the agent's allow_always option (#110)", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   const token = await pair(bridge);
@@ -1210,17 +1190,17 @@ test("register seeds model/mode/contextPct, and SSE + REST agree — 0% included
   assert.equal(entry.mode, "default");
   assert.equal(entry.contextPct, 0);
 
-  // A hook session never carries the fields — there is no signal to derive
-  // them from, and a fabricated value would be a lie.
-  const hookCwd = realCwd(t, "metahook");
-  await request(bridge.port, "POST", "/hooks/tool-output", {
-    body: { session_id: "hook-meta", cwd: hookCwd, tool_name: "Read", tool_output: "hi" },
+  // A register with no meta carries none of the fields — there is no signal
+  // to derive them from, and a fabricated value would be a lie.
+  const bareCwd = realCwd(t, "metabare");
+  await request(bridge.port, "POST", "/acp/register", {
+    body: { connection: "conn-meta", sessionId: "acp-meta-bare", sdkSessionId: "acp-meta-bare", cwd: bareCwd },
   });
-  const hookEntry = (await request(bridge.port, "GET", "/status", { token })).body.sessions.find((s) => s.cwd === hookCwd);
-  assert.ok(hookEntry, "hook session present");
-  assert.equal(hookEntry.model, undefined);
-  assert.equal(hookEntry.mode, undefined);
-  assert.equal(hookEntry.contextPct, undefined);
+  const bareEntry = await statusEntry(bridge, token, "acp-meta-bare");
+  assert.ok(bareEntry, "meta-less session present");
+  assert.equal(bareEntry.model, undefined);
+  assert.equal(bareEntry.mode, undefined);
+  assert.equal(bareEntry.contextPct, undefined);
 });
 
 test("teed usage_update announces contextPct only when the integer changes (#97)", { timeout: 60_000 }, async (t) => {

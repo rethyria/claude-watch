@@ -1,6 +1,6 @@
 // Crash resilience (issue #4): malformed pre-auth input and stray async
 // faults must never kill the bridge — a dead bridge tears down every PTY
-// session and strands every in-flight permission hook.
+// session and strands every pending permission.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -24,7 +24,7 @@ test("malformed Host header gets 400; bridge, sessions, and pending permissions 
   const { port, pairingCode } = bridge;
 
   // Establish real state that must survive the attack: a paired device with
-  // an SSE stream and an in-flight (blocked) permission hook.
+  // an SSE stream and a pending ACP permission whose fork holds its inbox.
   const pair = await request(port, "POST", "/pair", { body: { code: pairingCode } });
   assert.equal(pair.status, 200);
   const token = pair.body.token;
@@ -33,9 +33,27 @@ test("malformed Host header gets 400; bridge, sessions, and pending permissions 
   t.after(() => sse.close());
   assert.equal(await sse.statusCode(), 200);
 
-  const hookResponse = request(port, "POST", "/hooks/permission", {
-    body: { tool_name: "Bash", cwd: "/tmp/crash-test", tool_input: { command: "ls" } },
-  });
+  const inbox = connectSse(port, undefined, { path: "/acp/inbox?connection=conn-crash" });
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  assert.equal((await request(port, "POST", "/acp/register", {
+    body: { connection: "conn-crash", sessionId: "acp-crash", cwd: "/tmp/crash-test" },
+  })).status, 200);
+  assert.equal((await request(port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-crash",
+      sessionId: "acp-crash",
+      kind: "permission",
+      payload: {
+        sessionId: "acp-crash",
+        toolCall: { toolCallId: "tc-crash", title: "Bash", rawInput: { command: "ls" } },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" },
+        ],
+      },
+    },
+  })).status, 200);
   const promptEvent = await sse.waitFor(
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "Bash",
   );
@@ -54,15 +72,17 @@ test("malformed Host header gets 400; bridge, sessions, and pending permissions 
   assert.equal(status.status, 200);
   assert.ok(status.body.bridgeId, "well-formed request served after the attack");
 
-  // The pending permission is still resolvable end to end.
+  // The pending permission is still resolvable end to end: the decision frame
+  // reaches the fork's inbox.
   const decision = await request(port, "POST", "/command", {
     token,
     body: { permissionId: promptEvent.parsed.permissionId, decision: { behavior: "allow" } },
   });
   assert.equal(decision.status, 200);
-  const hook = await hookResponse;
-  assert.equal(hook.status, 200);
-  assert.equal(hook.body.hookSpecificOutput.decision.behavior, "allow");
+  const frame = await inbox.waitFor(
+    (e) => e.event === "permission-decision" && e.parsed?.toolCallId === "tc-crash",
+  );
+  assert.equal(frame.parsed.optionId, "allow");
 });
 
 test("unhandledRejection guard logs and keeps the bridge alive", { timeout: 60_000 }, async (t) => {

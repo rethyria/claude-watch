@@ -11,30 +11,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-# The bridge shells out to a `claude` binary for headless prompts
-# (`claude -p <prompt> --continue` against the hook-created, PTY-less session
-# — must exit). Claude spawns from the watch's Spawn action no longer reach
-# any binary: since the ACP-only spawn pivot they are born in the Zed fork,
-# played in this harness by the fake fork below (issue #107) — the stub's
-# stay-alive PTY branch remains for the codex-shaped PTY path and for the
-# bridge's binary discovery. CI has no real Claude Code install, so provide a
-# stub that echoes, then keeps its PTY open unless invoked headless.
-# The stub lives in a PRIVATE temp dir — never in $HOME/.local/bin, where it
-# would clobber a developer's real `claude` launcher on every local run (it
-# did, silently, for weeks). And it is handed to the bridge via the
-# CLAUDE_WATCH_CLAUDE_BIN test override, NOT via PATH: the bridge's findBinary
-# checks well-known locations like ~/.local/bin/claude ahead of PATH, so on a
-# dev machine with a real launcher there a PATH-prepended stub silently loses
-# and the e2e spawns the REAL Claude Code (no stub output, hung feed wait).
-STUB_BIN="$(mktemp -d "${TMPDIR:-/tmp}/wear-e2e-stub.XXXXXX")"
-cat > "$STUB_BIN/claude" <<'EOF'
-#!/usr/bin/env bash
-echo "stub-claude invoked: $*"
-case " $* " in *" -p "*) exit 0 ;; esac
-exec cat
-EOF
-chmod +x "$STUB_BIN/claude"
-export CLAUDE_WATCH_CLAUDE_BIN="$STUB_BIN/claude"
+# No stub `claude` binary: nothing in this run ever execs one. The harness's
+# stub existed for the hook-era headless prompt path (`claude -p --continue`
+# against a hook-created, PTY-less session — retired in #81) and for PTY
+# claude spawns (retired in the ACP-only spawn pivot: a watch spawn is born in
+# the Zed fork, played here by the fake fork below, issue #107). The skeleton
+# fabricates its own sessions over the ACP wire (#87), no codex leg PTY-spawns
+# anything, and the wear app never reads the /ping agents list — so binary
+# discovery finding nothing on CI costs only a startup warning.
 
 # Throwaway-bridge isolation (issue #107; environment finding from #99's
 # review): pin the bridge into a TEST-ONLY port range, UNCONDITIONALLY. The

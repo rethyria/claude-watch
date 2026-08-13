@@ -36,12 +36,10 @@ import {
   findMostRecentActiveSession,
   findMostRecentRunningSession,
   getSessionsSnapshot,
-  markSessionIdle,
-  sessionEventPayload,
   waitForFirstPtyOutput,
   writeToSessionStdin,
 } from "./sessions.js";
-import { pendingPermissions, pendingPermissionBodies, resolvePermission } from "./permissions.js";
+import { pendingPermissions, resolvePermission } from "./permissions.js";
 import { codexSyntheticPermissions, resolveCodexSyntheticPermission } from "./codex.js";
 import { injectToAcpSession, requestAcpSpawn, requestAcpClose } from "./acp.js";
 
@@ -309,34 +307,25 @@ export async function handleCommand(req, res) {
   if (permissionId && (decision || selectedOption !== undefined || Number.isInteger(optionIndex))) {
     // Capture the machine-readable behavior before normalization: the Codex
     // fallthrough below resolves it against the synthetic menu's canonical
-    // option list, and allow-always is rewritten to allow for the hook.
+    // option list.
     const requestedBehavior = typeof decision?.behavior === "string" ? decision.behavior : undefined;
     if (decision) {
-      // allow-always is the machine-readable form of the legacy allowAll
-      // flag: both collapse to an allow that applies the permission
-      // suggestions stored when the hook arrived.
-      const allowAlways = decision.behavior === "allow-always" || (allowAll && decision.behavior === "allow");
-      if (allowAlways) {
-        decision.behavior = "allow";
-        decision.updatedPermissions = pendingPermissionBodies.get(permissionId) || [];
-        // The rewrite is the HOOK response's contract, but the resolved
-        // decision also reaches the ACP echo (acp.js), which must map the
-        // behavior the user CHOSE — keyed on the rewritten value, a wrist
-        // "Always Allow" landed on the agent as its allow_once option (#110).
-        decision.requestedBehavior = requestedBehavior;
-      }
-      pendingPermissionBodies.delete(permissionId);
+      // The legacy allowAll flag is the pre-/v1 spelling of allow-always:
+      // normalize it so the ACP echo (acp.js) maps the behavior the user
+      // actually CHOSE onto the agent's allow_always option (#110).
+      if (allowAll && decision.behavior === "allow") decision.behavior = "allow-always";
 
-      // Forward the watch's selected option so the hook response can include it
+      // Forward the watch's selected option alongside the behavior
       if (selectedOption !== undefined) decision.selectedOption = selectedOption;
       if (Number.isInteger(optionIndex)) decision.optionIndex = optionIndex;
       // AskUserQuestion answers for every question (array aligned with the
-      // questions, or an object keyed by question text — see hooks.js).
+      // questions, or an object keyed by question text — see
+      // positionalAskAnswers in acp.js).
       if (answers !== undefined && decision.answers === undefined) decision.answers = answers;
 
       const resolved = resolvePermission(permissionId, decision);
       if (resolved) {
-        log("info", `Permission ${permissionId} resolved: ${decision.behavior}${allowAll || requestedBehavior === "allow-always" ? " (allow all)" : ""}`);
+        log("info", `Permission ${permissionId} resolved: ${decision.behavior}`);
         return jsonResponse(res, 200, { ok: true });
       }
     }
@@ -378,8 +367,8 @@ export async function handleCommand(req, res) {
           sessionId: targetSession.id,
         });
       }
-      // The injected turn's working/idle rides the settings.json hooks the SDK
-      // fires, which resolve to this same slot (hook-twin correlation).
+      // The injected turn's working/idle rides the fork's explicit turn
+      // boundaries (kind: "turn" on /acp/update), which drive this same slot.
       return jsonResponse(res, 200, { ok: true, sessionId: targetSession.id, agent: targetSession.agent, prompt: true });
     }
 

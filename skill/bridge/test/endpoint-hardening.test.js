@@ -1,7 +1,8 @@
 // Endpoint hardening (issue #6), black-box against the real bridge process:
-// hook endpoints only accept loopback sources, /status requires the bearer
-// token, GET /ping answers discovery probes unauthenticated with the bridge
-// identity only, and a Host-header allow-list closes the DNS-rebinding hole.
+// the server-local ACP endpoints only accept loopback sources, /status
+// requires the bearer token, GET /ping answers discovery probes
+// unauthenticated with the bridge identity only, and a Host-header allow-list
+// closes the DNS-rebinding hole.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -60,13 +61,13 @@ test("isLoopbackAddress: loopback forms pass, everything else fails", () => {
   assert.equal(isLoopbackAddress(undefined), false);
 });
 
-test("hook endpoints reject non-loopback sources; loopback keeps working", { timeout: 60_000 }, async (t) => {
+test("ACP endpoints reject non-loopback sources; loopback keeps working", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   const { port } = bridge;
 
-  // Loopback control: the same request Claude Code hooks send succeeds.
-  const local = await request(port, "POST", "/hooks/tool-output", {
-    body: { tool_name: "Read", cwd: "/tmp/hardening", tool_output: "from localhost" },
+  // Loopback control: the same request the Zed-launched fork sends succeeds.
+  const local = await request(port, "POST", "/acp/register", {
+    body: { connection: "conn-hardening", sessionId: "acp-local", cwd: "/tmp/hardening" },
   });
   assert.equal(local.status, 200);
 
@@ -76,55 +77,62 @@ test("hook endpoints reject non-loopback sources; loopback keeps working", { tim
     return;
   }
 
-  // The attack: a LAN peer POSTs to the hook surface. Connecting to our own
+  // The attack: a LAN peer POSTs to the ACP surface. Connecting to our own
   // LAN address gives the bridge a genuine non-loopback remoteAddress. Every
-  // hook route must 403 — a single unguarded handler (regression: /hooks/
-  // notification shipped without requireLoopback) lets a LAN peer push
-  // spoofed events to the trusted watch UI. A spoofed Host header must not
-  // help either: requireLoopback keys off remoteAddress, not Host.
-  const hookPaths = [
-    "/hooks/tool-output",
-    "/hooks/permission",
-    "/hooks/stop",
-    "/hooks/session-end",
-    "/hooks/task-complete",
-    "/hooks/error",
-    "/hooks/notification",
-    "/v1/hooks/notification",
+  // ACP route must 403 — a single unguarded handler would let a LAN peer
+  // register phantom sessions or spoof prompts onto the trusted watch UI. A
+  // spoofed Host header must not help either: requireLoopback keys off
+  // remoteAddress, not Host.
+  const acpPaths = [
+    "/acp/register",
+    "/acp/update",
+    "/acp/deregister",
+    "/acp/spawn-result",
+    "/acp/claim",
+    "/v1/acp/register",
   ];
-  for (const path of hookPaths) {
+  for (const path of acpPaths) {
     const res = await fetch(`http://${lanIP}:${port}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Host: "localhost" },
       body: JSON.stringify({
-        tool_name: "Bash",
-        tool_input: { command: "rm -rf /" },
-        notification_type: "permission_prompt",
-        message: "spoofed from the LAN",
+        connection: "conn-spoof",
+        sessionId: "acp-spoofed",
+        cwd: "/tmp/spoofed",
+        kind: "permission",
+        payload: { sessionId: "acp-spoofed", toolCall: { toolCallId: "tc-spoof" }, options: [] },
       }),
       signal: AbortSignal.timeout(10_000),
     });
     assert.equal(res.status, 403, `${path} must reject a non-loopback source`);
     const body = await res.json();
-    assert.equal(body.error, "Hooks are only accepted from localhost");
+    assert.equal(body.error, "ACP endpoints are only accepted from localhost");
   }
+  // The held inbox SSE is gated the same way.
+  const inboxRes = await fetch(`http://${lanIP}:${port}/acp/inbox?connection=conn-spoof`, {
+    headers: { Accept: "text/event-stream", Host: "localhost" },
+    signal: AbortSignal.timeout(10_000),
+  });
+  assert.equal(inboxRes.status, 403, "/acp/inbox must reject a non-loopback source");
 
   // The spoof attempt must not have reached the trusted watch UI: pair, then
-  // check no permission-request or tool-output from the LAN peer is replayed.
+  // check no spoofed session ever entered the event stream.
   const pair = await request(port, "POST", "/pair", { body: { code: bridge.pairingCode } });
   assert.equal(pair.status, 200);
   const sse = connectSse(port, pair.body.token, { lastEventId: 0 });
   t.after(() => sse.close());
   assert.equal(await sse.statusCode(), 200);
-  const spoofed = await sse.waitFor((e) => e.event === "tool-output");
-  assert.equal(spoofed.parsed.tool_output, "from localhost", "only the loopback hook was broadcast");
+  const localSession = await sse.waitFor(
+    (e) => e.event === "session" && e.parsed?.sessionId === "acp-local",
+  );
+  assert.equal(localSession.parsed.state, "running", "only the loopback register was broadcast");
+  assert.ok(
+    !sse.events.some((e) => e.parsed?.sessionId === "acp-spoofed"),
+    "spoofed session must never reach the watch",
+  );
   assert.ok(
     !sse.events.some((e) => e.event === "permission-request"),
     "spoofed permission prompt must never reach the watch",
-  );
-  assert.ok(
-    !sse.events.some((e) => e.event === "notification"),
-    "spoofed notification must never reach the watch",
   );
 });
 

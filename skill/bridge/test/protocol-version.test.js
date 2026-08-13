@@ -5,7 +5,9 @@
 // is asserted through the same bonjourTxtRecord() helper server.js publishes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { startBridge, request, connectSse, rawRequest } from "./helpers.js";
 import {
   PROTOCOL_VERSION,
@@ -171,7 +173,13 @@ test("absolute-form /v1 request targets stay on the /v1 surface: gate enforced, 
 // a client deduping by id — a strategy the guarantee invites — silently
 // dropped the first snapshot event on every connect.
 test("SSE event ids are strictly increasing across the backlog/snapshot boundary on a fresh connect", { timeout: 60_000 }, async (t) => {
-  const bridge = await startBridge(t);
+  // A codex stub supplies the terminal backlog (pty-output); the pending
+  // permission rides the ACP lane.
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "proto-ver-bin-"));
+  t.after(() => { try { fs.rmSync(binDir, { recursive: true, force: true }); } catch { /* ignore */ } });
+  const bin = path.join(binDir, "codex");
+  fs.writeFileSync(bin, "#!/bin/sh\necho sse-id-marker\nexec cat\n", { mode: 0o755 });
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
   const { port, pairingCode } = bridge;
 
   const pair = await request(port, "POST", "/v1/pair", {
@@ -188,28 +196,45 @@ test("SSE event ids are strictly increasing across the backlog/snapshot boundary
   t.after(() => sseA.close());
   assert.equal(await sseA.statusCode(), 200);
 
-  // Buffered activity, terminal output LAST: a blocking permission prompt
-  // (creates the session), then a tool-output. The connect-time backlog
-  // replays only terminal events, so the last id the fresh client sees
-  // before the snapshot is the tool-output's — the counter's current value.
-  const hookResponse = request(port, "POST", "/hooks/permission", {
-    body: { tool_name: "Bash", cwd: "/tmp/sse-id-project", tool_input: { command: "true" } },
-  });
+  // Buffered activity, terminal output LAST: a pending ACP permission prompt
+  // (creates the session), then a codex spawn's pty-output. The connect-time
+  // backlog replays only terminal events, so the last id the fresh client
+  // sees before the snapshot is the pty-output's — the counter's current
+  // value.
+  assert.equal((await request(port, "POST", "/acp/register", {
+    body: { connection: "conn-sse-id", sessionId: "acp-sse-id", cwd: "/tmp/sse-id-project" },
+  })).status, 200);
+  assert.equal((await request(port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-sse-id",
+      sessionId: "acp-sse-id",
+      kind: "permission",
+      payload: {
+        sessionId: "acp-sse-id",
+        toolCall: { toolCallId: "tc-sse-id", title: "Bash", rawInput: { command: "true" } },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" },
+        ],
+      },
+    },
+  })).status, 200);
   const prompt = await sseA.waitFor(
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "Bash",
   );
-  const posted = await request(port, "POST", "/hooks/tool-output", {
-    body: { tool_name: "Read", cwd: "/tmp/sse-id-project", tool_output: "sse-id-marker" },
+  const spawned = await request(port, "POST", "/v1/command", {
+    token,
+    body: { spawn: "codex", cwd: os.homedir() },
   });
-  assert.equal(posted.status, 200);
-  await sseA.waitFor((e) => e.event === "tool-output" && e.parsed?.tool_output === "sse-id-marker");
+  assert.equal(spawned.status, 200, JSON.stringify(spawned.body));
+  await sseA.waitFor((e) => e.event === "pty-output" && e.parsed?.text?.includes("sse-id-marker"));
 
   // Fresh client (no Last-Event-ID): receives backlog, then the snapshot
   // (session running + re-sent permission-request).
   const sseB = connectSse(port, token, { path: "/v1/events" });
   t.after(() => sseB.close());
   assert.equal(await sseB.statusCode(), 200);
-  await sseB.waitFor((e) => e.event === "tool-output" && e.parsed?.tool_output === "sse-id-marker");
+  await sseB.waitFor((e) => e.event === "pty-output" && e.parsed?.text?.includes("sse-id-marker"));
   await sseB.waitFor((e) => e.event === "session" && e.parsed?.state === "running");
   await sseB.waitFor(
     (e) => e.event === "permission-request" && e.parsed?.permissionId === prompt.parsed.permissionId,
@@ -227,11 +252,10 @@ test("SSE event ids are strictly increasing across the backlog/snapshot boundary
     }
   }
 
-  // Unblock the hook so teardown is clean.
+  // Resolve the pending permission so teardown is clean.
   const decision = await request(port, "POST", "/v1/command", {
     token,
     body: { permissionId: prompt.parsed.permissionId, decision: { behavior: "allow" } },
   });
   assert.equal(decision.status, 200);
-  await hookResponse;
 });

@@ -187,24 +187,28 @@ test("auto-spawn whose PTY dies immediately surfaces an error and leaves the bri
 
 test("a text command that resolves to an external PTY-less session is refused, never forked headlessly (issue #69)", { timeout: 60_000 }, async (t) => {
   // If the bridge DID fork, this stub would run and echo a marker; the test
-  // proves it never does.
+  // proves it never does. The external PTY-less session is a Codex-scanner
+  // slot: observed through its rollout file, no process the bridge owns.
   const bin = makeFakeAgent(t, "claude", '#!/bin/sh\necho "HEADLESS-RAN $@"\n');
-  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin } });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-headless-home-"));
+  t.after(() => {
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+  const rolloutDir = path.join(home, ".codex", "sessions", "2026", "08", "07");
+  fs.mkdirSync(rolloutDir, { recursive: true });
+  const externalSessionId = "cdx-headless-69";
+  fs.appendFileSync(
+    path.join(rolloutDir, "rollout-headless.jsonl"),
+    `${JSON.stringify({ type: "session_meta", payload: { id: externalSessionId, cwd: home, timestamp: new Date().toISOString() } })}\n`,
+  );
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CLAUDE_BIN: bin, HOME: home } });
   const { token, sse } = await pairAndConnect(t, bridge);
 
-  // A hook from an external Claude instance auto-creates a session the bridge
-  // owns no PTY for.
-  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-watch-headless-project-"));
-  t.after(() => {
-    try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore */ }
-  });
-  const hook = await request(bridge.port, "POST", "/hooks/tool-output", {
-    body: { tool_name: "Read", cwd: projectDir, tool_output: "file contents" },
-  });
-  assert.equal(hook.status, 200);
-  const toolEvent = await sse.waitFor((e) => e.event === "tool-output" && e.parsed?.tool_name === "Read");
-  const externalSessionId = toolEvent.parsed.sessionId;
-  assert.ok(externalSessionId, "hook must be attributed to a session");
+  // The scanner announces the external session the bridge owns no PTY for.
+  await sse.waitFor(
+    (e) => e.event === "session" && e.parsed?.sessionId === externalSessionId && e.parsed?.state === "running",
+    30_000,
+  );
 
   // No session id: the fallback selects that PTY-less external session. It must
   // be REFUSED (409), never turned into a `claude -p --continue` fork of the

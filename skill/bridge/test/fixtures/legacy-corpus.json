@@ -134,6 +134,8 @@
         "cwd": "/tmp/legacy-project",
         "folderName": "legacy-project",
         "external": true,
+        "kind": "acp",
+        "dictatable": true,
         "sessionId": "<session-1>"
       }
     }
@@ -144,43 +146,25 @@
       "event": "permission-request",
       "data": {
         "permissionId": "<permission-1>",
+        "sessionId": "<session-1>",
         "tool_name": "Bash",
-        "session_id": "legacy-hook-session-1",
-        "cwd": "/tmp/legacy-project",
         "tool_input": {
           "command": "git status"
         },
-        "permission_suggestions": [
-          {
-            "type": "addRules",
-            "rules": [
-              {
-                "toolName": "Bash",
-                "ruleContent": "git status"
-              }
-            ],
-            "behavior": "allow",
-            "destination": "session"
-          }
-        ],
         "options": [
           {
-            "behavior": "allow",
-            "label": "Yes",
-            "description": "Allow this once"
+            "behavior": "allow-always",
+            "label": "Always Allow"
           },
           {
-            "behavior": "allow-always",
-            "label": "Yes, don't ask again",
-            "description": "Allow and apply the suggested permission rules"
+            "behavior": "allow",
+            "label": "Allow"
           },
           {
             "behavior": "deny",
-            "label": "No",
-            "description": "Deny this request"
+            "label": "Reject"
           }
-        ],
-        "sessionId": "<session-1>"
+        ]
       }
     }
   },
@@ -206,46 +190,13 @@
     }
   },
   {
-    "name": "hook response: allowAll applies suggestions",
-    "request": {
-      "method": "POST",
-      "path": "/hooks/permission",
-      "blocking": true
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "hookSpecificOutput": {
-          "hookEventName": "PermissionRequest",
-          "decision": {
-            "behavior": "allow",
-            "updatedPermissions": [
-              {
-                "type": "addRules",
-                "rules": [
-                  {
-                    "toolName": "Bash",
-                    "ruleContent": "git status"
-                  }
-                ],
-                "behavior": "allow",
-                "destination": "session"
-              }
-            ]
-          }
-        }
-      }
-    }
-  },
-  {
     "name": "sse: permission-request AskUserQuestion",
     "event": {
       "event": "permission-request",
       "data": {
         "permissionId": "<permission-2>",
+        "sessionId": "<session-1>",
         "tool_name": "AskUserQuestion",
-        "session_id": "legacy-hook-session-1",
-        "cwd": "/tmp/legacy-project",
         "tool_input": {
           "questions": [
             {
@@ -275,8 +226,7 @@
               "multiSelect": false
             }
           ]
-        },
-        "sessionId": "<session-1>"
+        }
       }
     }
   },
@@ -302,116 +252,16 @@
     }
   },
   {
-    "name": "hook response: selectedOption answers first question only",
-    "request": {
-      "method": "POST",
-      "path": "/hooks/permission",
-      "blocking": true
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "hookSpecificOutput": {
-          "hookEventName": "PermissionRequest",
-          "decision": {
-            "behavior": "allow",
-            "updatedInput": {
-              "questions": [
-                {
-                  "header": "Color",
-                  "question": "Favorite color?",
-                  "options": [
-                    {
-                      "label": "Blue"
-                    },
-                    {
-                      "label": "Red"
-                    }
-                  ],
-                  "multiSelect": false
-                },
-                {
-                  "header": "Style",
-                  "question": "Tabs or spaces?",
-                  "options": [
-                    {
-                      "label": "Tabs"
-                    },
-                    {
-                      "label": "Spaces"
-                    }
-                  ],
-                  "multiSelect": false
-                }
-              ],
-              "answers": {
-                "Favorite color?": "Blue"
-              }
-            }
-          }
-        }
-      }
-    }
-  },
-  {
-    "name": "hook tool-output",
-    "request": {
-      "method": "POST",
-      "path": "/hooks/tool-output",
-      "authenticated": false,
-      "body": {
-        "session_id": "legacy-hook-session-1",
-        "cwd": "/tmp/legacy-project",
-        "tool_name": "Read",
-        "tool_output": "legacy file contents"
-      }
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "ok": true
-      }
-    }
-  },
-  {
-    "name": "sse: tool-output",
+    "name": "sse: session ended",
     "event": {
-      "event": "tool-output",
+      "event": "session",
       "data": {
-        "session_id": "legacy-hook-session-1",
-        "cwd": "/tmp/legacy-project",
-        "tool_name": "Read",
-        "tool_output": "legacy file contents",
-        "source": "claude",
-        "sessionId": "<session-1>"
-      }
-    }
-  },
-  {
-    "name": "hook stop",
-    "request": {
-      "method": "POST",
-      "path": "/hooks/stop",
-      "authenticated": false,
-      "body": {
-        "session_id": "legacy-hook-session-1",
-        "cwd": "/tmp/legacy-project"
-      }
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "ok": true
-      }
-    }
-  },
-  {
-    "name": "sse: stop",
-    "event": {
-      "event": "stop",
-      "data": {
-        "session_id": "legacy-hook-session-1",
-        "cwd": "/tmp/legacy-project",
+        "state": "ended",
+        "agent": "claude",
+        "folderName": "legacy-project",
+        "reason": "query-closed",
+        "external": true,
+        "kind": "acp",
         "sessionId": "<session-1>"
       }
     }
@@ -423,12 +273,16 @@
     }
   },
   {
-    "name": "sse replay: stop",
+    "name": "sse replay: session ended",
     "event": {
-      "event": "stop",
+      "event": "session",
       "data": {
-        "session_id": "legacy-hook-session-1",
-        "cwd": "/tmp/legacy-project",
+        "state": "ended",
+        "agent": "claude",
+        "folderName": "legacy-project",
+        "reason": "query-closed",
+        "external": true,
+        "kind": "acp",
         "sessionId": "<session-1>"
       }
     }

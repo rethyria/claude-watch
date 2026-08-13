@@ -166,6 +166,8 @@
         "cwd": "/tmp/fixture-project",
         "folderName": "fixture-project",
         "external": true,
+        "kind": "acp",
+        "dictatable": true,
         "sessionId": "<session-1>"
       }
     }
@@ -176,43 +178,25 @@
       "event": "permission-request",
       "data": {
         "permissionId": "<permission-1>",
+        "sessionId": "<session-1>",
         "tool_name": "Bash",
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
         "tool_input": {
           "command": "ls -la"
         },
-        "permission_suggestions": [
-          {
-            "type": "addRules",
-            "rules": [
-              {
-                "toolName": "Bash",
-                "ruleContent": "ls:*"
-              }
-            ],
-            "behavior": "allow",
-            "destination": "session"
-          }
-        ],
         "options": [
           {
-            "behavior": "allow",
-            "label": "Yes",
-            "description": "Allow this once"
+            "behavior": "allow-always",
+            "label": "Always Allow"
           },
           {
-            "behavior": "allow-always",
-            "label": "Yes, don't ask again",
-            "description": "Allow and apply the suggested permission rules"
+            "behavior": "allow",
+            "label": "Allow"
           },
           {
             "behavior": "deny",
-            "label": "No",
-            "description": "Deny this request"
+            "label": "Reject"
           }
-        ],
-        "sessionId": "<session-1>"
+        ]
       }
     }
   },
@@ -237,46 +221,13 @@
     }
   },
   {
-    "name": "hook response: allow-always applies suggestions",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/permission",
-      "blocking": true
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "hookSpecificOutput": {
-          "hookEventName": "PermissionRequest",
-          "decision": {
-            "behavior": "allow",
-            "updatedPermissions": [
-              {
-                "type": "addRules",
-                "rules": [
-                  {
-                    "toolName": "Bash",
-                    "ruleContent": "ls:*"
-                  }
-                ],
-                "behavior": "allow",
-                "destination": "session"
-              }
-            ]
-          }
-        }
-      }
-    }
-  },
-  {
     "name": "sse: permission-request AskUserQuestion (no top-level options)",
     "event": {
       "event": "permission-request",
       "data": {
         "permissionId": "<permission-2>",
+        "sessionId": "<session-1>",
         "tool_name": "AskUserQuestion",
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
         "tool_input": {
           "questions": [
             {
@@ -306,8 +257,7 @@
               "multiSelect": false
             }
           ]
-        },
-        "sessionId": "<session-1>"
+        }
       }
     }
   },
@@ -336,84 +286,31 @@
     }
   },
   {
-    "name": "hook response: AskUserQuestion answers",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/permission",
-      "blocking": true
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "hookSpecificOutput": {
-          "hookEventName": "PermissionRequest",
-          "decision": {
-            "behavior": "allow",
-            "updatedInput": {
-              "questions": [
-                {
-                  "header": "Color",
-                  "question": "Favorite color?",
-                  "options": [
-                    {
-                      "label": "Blue"
-                    },
-                    {
-                      "label": "Red"
-                    }
-                  ],
-                  "multiSelect": false
-                },
-                {
-                  "header": "Style",
-                  "question": "Tabs or spaces?",
-                  "options": [
-                    {
-                      "label": "Tabs"
-                    },
-                    {
-                      "label": "Spaces"
-                    }
-                  ],
-                  "multiSelect": false
-                }
-              ],
-              "answers": {
-                "Favorite color?": "Blue",
-                "Tabs or spaces?": "Tabs"
-              }
-            }
-          }
-        }
-      }
-    }
-  },
-  {
-    "name": "sse: permission-request Write (no allow-always without suggestions)",
+    "name": "sse: permission-request Write",
     "event": {
       "event": "permission-request",
       "data": {
         "permissionId": "<permission-3>",
+        "sessionId": "<session-1>",
         "tool_name": "Write",
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
         "tool_input": {
           "file_path": "notes.txt",
           "content": "hello"
         },
         "options": [
           {
+            "behavior": "allow-always",
+            "label": "Always Allow"
+          },
+          {
             "behavior": "allow",
-            "label": "Yes",
-            "description": "Allow this once"
+            "label": "Allow"
           },
           {
             "behavior": "deny",
-            "label": "No",
-            "description": "Deny this request"
+            "label": "Reject"
           }
-        ],
-        "sessionId": "<session-1>"
+        ]
       }
     }
   },
@@ -439,198 +336,30 @@
     }
   },
   {
-    "name": "hook response: deny carries message",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/permission",
-      "blocking": true
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "hookSpecificOutput": {
-          "hookEventName": "PermissionRequest",
-          "decision": {
-            "behavior": "deny",
-            "message": "Denied from fixture"
-          }
-        }
-      }
-    }
-  },
-  {
-    "name": "hook notification",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/notification",
-      "authenticated": false,
-      "body": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "notification_type": "permission_prompt",
-        "message": "Claude needs your permission"
-      }
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "ok": true
-      }
-    }
-  },
-  {
-    "name": "sse: notification carries notification_type",
+    "name": "sse: message (coalesced prose)",
     "event": {
-      "event": "notification",
+      "event": "message",
       "data": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "notification_type": "permission_prompt",
-        "message": "Claude needs your permission",
+        "role": "assistant",
+        "text": "fixture prose",
         "sessionId": "<session-1>"
       }
     }
   },
   {
-    "name": "hook tool-output",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/tool-output",
-      "authenticated": false,
-      "body": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "tool_name": "Read",
-        "tool_output": "fixture file contents"
-      }
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "ok": true
-      }
-    }
-  },
-  {
-    "name": "sse: tool-output",
+    "name": "sse: session running carries idle after the turn end",
     "event": {
-      "event": "tool-output",
+      "event": "session",
       "data": {
-        "session_id": "fixture-hook-session-1",
+        "state": "running",
+        "agent": "claude",
         "cwd": "/tmp/fixture-project",
-        "tool_name": "Read",
-        "tool_output": "fixture file contents",
-        "source": "claude",
+        "folderName": "fixture-project",
+        "external": true,
+        "kind": "acp",
+        "dictatable": true,
+        "idle": true,
         "sessionId": "<session-1>"
-      }
-    }
-  },
-  {
-    "name": "hook stop",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/stop",
-      "authenticated": false,
-      "body": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project"
-      }
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "ok": true
-      }
-    }
-  },
-  {
-    "name": "sse: stop",
-    "event": {
-      "event": "stop",
-      "data": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "sessionId": "<session-1>"
-      }
-    }
-  },
-  {
-    "name": "hook task-complete",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/task-complete",
-      "authenticated": false,
-      "body": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "summary": "fixture task done"
-      }
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "ok": true
-      }
-    }
-  },
-  {
-    "name": "sse: task-complete",
-    "event": {
-      "event": "task-complete",
-      "data": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "summary": "fixture task done",
-        "sessionId": "<session-1>"
-      }
-    }
-  },
-  {
-    "name": "hook error",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/error",
-      "authenticated": false,
-      "body": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "error": "fixture error"
-      }
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "ok": true
-      }
-    }
-  },
-  {
-    "name": "sse: error",
-    "event": {
-      "event": "error",
-      "data": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "error": "fixture error",
-        "sessionId": "<session-1>"
-      }
-    }
-  },
-  {
-    "name": "hook session-end",
-    "request": {
-      "method": "POST",
-      "path": "/v1/hooks/session-end",
-      "authenticated": false,
-      "body": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project"
-      }
-    },
-    "response": {
-      "status": 200,
-      "body": {
-        "ok": true
       }
     }
   },
@@ -642,8 +371,9 @@
         "state": "ended",
         "agent": "claude",
         "folderName": "fixture-project",
-        "reason": "session-end",
+        "reason": "query-closed",
         "external": true,
+        "kind": "acp",
         "idle": true,
         "sessionId": "<session-1>"
       }
@@ -656,18 +386,6 @@
     }
   },
   {
-    "name": "sse replay: error",
-    "event": {
-      "event": "error",
-      "data": {
-        "session_id": "fixture-hook-session-1",
-        "cwd": "/tmp/fixture-project",
-        "error": "fixture error",
-        "sessionId": "<session-1>"
-      }
-    }
-  },
-  {
     "name": "sse replay: session ended",
     "event": {
       "event": "session",
@@ -675,8 +393,9 @@
         "state": "ended",
         "agent": "claude",
         "folderName": "fixture-project",
-        "reason": "session-end",
+        "reason": "query-closed",
         "external": true,
+        "kind": "acp",
         "idle": true,
         "sessionId": "<session-1>"
       }

@@ -10,8 +10,10 @@
 //                                       clients keep working
 //
 // The fixtures were derived from real bridge responses. To regenerate after a
-// DELIBERATE contract change (a PROTOCOL.md version bump for /v1; never for
-// legacy, which is frozen):
+// DELIBERATE contract change (a PROTOCOL.md change for /v1; the legacy
+// surface is frozen for CLIENTS — its one non-client edit was #87's removal
+// of the server-local hook steps, whose stimulus role the ACP uplink now
+// plays):
 //
 //   CLAUDE_WATCH_UPDATE_FIXTURES=1 node --test test/protocol-fixtures.test.js
 //
@@ -143,6 +145,39 @@ function createRecorder(port) {
 }
 
 // ---------------------------------------------------------------------------
+// ACP-side stimulus. The corpus records the CLIENT wire only; the fork's
+// server-local /acp/* uplink is the stimulus that produces it (the hook
+// surface that used to play this role was retired in #87), so these calls are
+// deliberately NOT recorded as corpus steps.
+// ---------------------------------------------------------------------------
+
+async function acpRegister(port, sessionId, cwd) {
+  const res = await request(port, "POST", "/acp/register", {
+    body: { connection: "conn-fixture", sessionId, sdkSessionId: sessionId, cwd },
+  });
+  assert.equal(res.status, 200);
+}
+
+async function acpUpdate(port, sessionId, kind, payload) {
+  const res = await request(port, "POST", "/acp/update", {
+    body: { connection: "conn-fixture", sessionId, kind, payload },
+  });
+  assert.equal(res.status, 200);
+}
+
+function acpPermissionPayload(sessionId, toolCallId, title, rawInput) {
+  return {
+    sessionId,
+    toolCall: { toolCallId, title, rawInput },
+    options: [
+      { optionId: "allow_always", name: "Always Allow", kind: "allow_always" },
+      { optionId: "allow", name: "Allow", kind: "allow_once" },
+      { optionId: "reject", name: "Reject", kind: "reject_once" },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
 // /v1 corpus
 // ---------------------------------------------------------------------------
 
@@ -183,22 +218,15 @@ test("recorded /v1 fixture corpus replays green against the current bridge", { t
   t.after(() => sse.close());
   rec.record("events connect", { response: { status: await sse.statusCode() } });
 
-  // --- Permission round-trip: behavior-tagged options, allow-always ---
-  const suggestions = [
-    { type: "addRules", rules: [{ toolName: "Bash", ruleContent: "ls:*" }], behavior: "allow", destination: "session" },
-  ];
-  const bashHook = request(port, "POST", "/v1/hooks/permission", {
-    body: {
-      tool_name: "Bash",
-      session_id: "fixture-hook-session-1",
-      cwd: "/tmp/fixture-project",
-      tool_input: { command: "ls -la" },
-      permission_suggestions: suggestions,
-    },
-  });
+  // --- An ACP session registers and its running event reaches the wire ---
+  await acpRegister(port, "fixture-acp-session-1", "/tmp/fixture-project");
   await rec.sseEvent("sse: session running", sse,
     (e) => e.event === "session" && e.parsed?.state === "running",
     (parsed) => rec.learn(parsed?.sessionId, "<session-1>"));
+
+  // --- Permission round-trip: behavior-tagged options, allow-always ---
+  await acpUpdate(port, "fixture-acp-session-1", "permission",
+    acpPermissionPayload("fixture-acp-session-1", "fixture-tool-call-1", "Bash", { command: "ls -la" }));
   await rec.sseEvent("sse: permission-request Bash", sse,
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "Bash",
     (parsed) => rec.learn(parsed?.permissionId, "<permission-1>"));
@@ -207,23 +235,14 @@ test("recorded /v1 fixture corpus replays green against the current bridge", { t
     token,
     body: { permissionId: bashPermissionId, decision: { behavior: "allow-always" } },
   });
-  rec.recordResponse("hook response: allow-always applies suggestions",
-    { request: { method: "POST", path: "/v1/hooks/permission", blocking: true } },
-    await bashHook);
 
   // --- AskUserQuestion: multi-question answers ---
   const questions = [
     { header: "Color", question: "Favorite color?", options: [{ label: "Blue" }, { label: "Red" }], multiSelect: false },
     { header: "Style", question: "Tabs or spaces?", options: [{ label: "Tabs" }, { label: "Spaces" }], multiSelect: false },
   ];
-  const askHook = request(port, "POST", "/v1/hooks/permission", {
-    body: {
-      tool_name: "AskUserQuestion",
-      session_id: "fixture-hook-session-1",
-      cwd: "/tmp/fixture-project",
-      tool_input: { questions },
-    },
-  });
+  await acpUpdate(port, "fixture-acp-session-1", "input-request",
+    { sessionId: "fixture-acp-session-1", toolCallId: "fixture-tool-call-2", questions });
   await rec.sseEvent("sse: permission-request AskUserQuestion (no top-level options)", sse,
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "AskUserQuestion",
     (parsed) => rec.learn(parsed?.permissionId, "<permission-2>"));
@@ -234,20 +253,11 @@ test("recorded /v1 fixture corpus replays green against the current bridge", { t
     token,
     body: { permissionId: askPermissionId, decision: { behavior: "allow" }, answers: ["Blue", "Tabs"] },
   });
-  rec.recordResponse("hook response: AskUserQuestion answers",
-    { request: { method: "POST", path: "/v1/hooks/permission", blocking: true } },
-    await askHook);
 
   // --- Deny with a message ---
-  const writeHook = request(port, "POST", "/v1/hooks/permission", {
-    body: {
-      tool_name: "Write",
-      session_id: "fixture-hook-session-1",
-      cwd: "/tmp/fixture-project",
-      tool_input: { file_path: "notes.txt", content: "hello" },
-    },
-  });
-  await rec.sseEvent("sse: permission-request Write (no allow-always without suggestions)", sse,
+  await acpUpdate(port, "fixture-acp-session-1", "permission",
+    acpPermissionPayload("fixture-acp-session-1", "fixture-tool-call-3", "Write", { file_path: "notes.txt", content: "hello" }));
+  await rec.sseEvent("sse: permission-request Write", sse,
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "Write",
     (parsed) => rec.learn(parsed?.permissionId, "<permission-3>"));
   const writePermissionId = sse.events.find(
@@ -257,46 +267,30 @@ test("recorded /v1 fixture corpus replays green against the current bridge", { t
     token,
     body: { permissionId: writePermissionId, decision: { behavior: "deny", message: "Denied from fixture" } },
   });
-  rec.recordResponse("hook response: deny carries message",
-    { request: { method: "POST", path: "/v1/hooks/permission", blocking: true } },
-    await writeHook);
 
   // --- The rest of the event catalog ---
-  await rec.step("hook notification", "POST", "/v1/hooks/notification", {
-    body: { session_id: "fixture-hook-session-1", cwd: "/tmp/fixture-project", notification_type: "permission_prompt", message: "Claude needs your permission" },
+  // Assistant prose, coalesced and flushed at the turn end.
+  await acpUpdate(port, "fixture-acp-session-1", "turn", { phase: "start" });
+  await acpUpdate(port, "fixture-acp-session-1", "session_update", {
+    sessionId: "fixture-acp-session-1",
+    update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "fixture prose" } },
   });
-  await rec.sseEvent("sse: notification carries notification_type", sse, (e) => e.event === "notification");
+  await acpUpdate(port, "fixture-acp-session-1", "turn", { phase: "end" });
+  await rec.sseEvent("sse: message (coalesced prose)", sse, (e) => e.event === "message");
+  const idleEvent = await rec.sseEvent("sse: session running carries idle after the turn end", sse,
+    (e) => e.event === "session" && e.parsed?.state === "running" && e.parsed?.idle === true);
 
-  await rec.step("hook tool-output", "POST", "/v1/hooks/tool-output", {
-    body: { session_id: "fixture-hook-session-1", cwd: "/tmp/fixture-project", tool_name: "Read", tool_output: "fixture file contents" },
+  // The fork's deregister ends the slot.
+  const dereg = await request(port, "POST", "/acp/deregister", {
+    body: { connection: "conn-fixture", sessionId: "fixture-acp-session-1", reason: "query-closed" },
   });
-  await rec.sseEvent("sse: tool-output", sse, (e) => e.event === "tool-output");
-
-  await rec.step("hook stop", "POST", "/v1/hooks/stop", {
-    body: { session_id: "fixture-hook-session-1", cwd: "/tmp/fixture-project" },
-  });
-  await rec.sseEvent("sse: stop", sse, (e) => e.event === "stop");
-
-  await rec.step("hook task-complete", "POST", "/v1/hooks/task-complete", {
-    body: { session_id: "fixture-hook-session-1", cwd: "/tmp/fixture-project", summary: "fixture task done" },
-  });
-  const taskCompleteEvent = await rec.sseEvent("sse: task-complete", sse, (e) => e.event === "task-complete");
-
-  await rec.step("hook error", "POST", "/v1/hooks/error", {
-    body: { session_id: "fixture-hook-session-1", cwd: "/tmp/fixture-project", error: "fixture error" },
-  });
-  await rec.sseEvent("sse: error", sse, (e) => e.event === "error");
-
-  await rec.step("hook session-end", "POST", "/v1/hooks/session-end", {
-    body: { session_id: "fixture-hook-session-1", cwd: "/tmp/fixture-project" },
-  });
+  assert.equal(dereg.status, 200);
   await rec.sseEvent("sse: session ended", sse, (e) => e.event === "session" && e.parsed?.state === "ended");
 
   // --- Last-Event-ID replay: a reconnecting client catches up ---
-  const replaySse = connectSse(port, token, { path: "/v1/events", lastEventId: taskCompleteEvent.id });
+  const replaySse = connectSse(port, token, { path: "/v1/events", lastEventId: idleEvent.id });
   t.after(() => replaySse.close());
   rec.record("events reconnect with Last-Event-ID", { response: { status: await replaySse.statusCode() } });
-  await rec.sseEvent("sse replay: error", replaySse, (e) => e.event === "error");
   await rec.sseEvent("sse replay: session ended", replaySse, (e) => e.event === "session" && e.parsed?.state === "ended");
 
   // --- Command surface error shapes ---
@@ -338,22 +332,15 @@ test("frozen legacy fixtures replay green against the current bridge", { timeout
   t.after(() => sse.close());
   rec.record("events connect", { response: { status: await sse.statusCode() } });
 
-  // --- Legacy permission round-trip with the allowAll flag ---
-  const suggestions = [
-    { type: "addRules", rules: [{ toolName: "Bash", ruleContent: "git status" }], behavior: "allow", destination: "session" },
-  ];
-  const bashHook = request(port, "POST", "/hooks/permission", {
-    body: {
-      tool_name: "Bash",
-      session_id: "legacy-hook-session-1",
-      cwd: "/tmp/legacy-project",
-      tool_input: { command: "git status" },
-      permission_suggestions: suggestions,
-    },
-  });
+  // --- A session registers; the legacy stream carries its running event ---
+  await acpRegister(port, "legacy-acp-session-1", "/tmp/legacy-project");
   await rec.sseEvent("sse: session running", sse,
     (e) => e.event === "session" && e.parsed?.state === "running",
     (parsed) => rec.learn(parsed?.sessionId, "<session-1>"));
+
+  // --- Legacy permission round-trip with the allowAll flag ---
+  await acpUpdate(port, "legacy-acp-session-1", "permission",
+    acpPermissionPayload("legacy-acp-session-1", "legacy-tool-call-1", "Bash", { command: "git status" }));
   await rec.sseEvent("sse: permission-request (options field is additive)", sse,
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "Bash",
     (parsed) => rec.learn(parsed?.permissionId, "<permission-1>"));
@@ -362,24 +349,15 @@ test("frozen legacy fixtures replay green against the current bridge", { timeout
     token,
     body: { permissionId: bashPermissionId, decision: { behavior: "allow" }, allowAll: true },
   });
-  rec.recordResponse("hook response: allowAll applies suggestions",
-    { request: { method: "POST", path: "/hooks/permission", blocking: true } },
-    await bashHook);
 
   // --- Legacy AskUserQuestion: single selectedOption answers question 1 ---
   const questions = [
     { header: "Color", question: "Favorite color?", options: [{ label: "Blue" }, { label: "Red" }], multiSelect: false },
     { header: "Style", question: "Tabs or spaces?", options: [{ label: "Tabs" }, { label: "Spaces" }], multiSelect: false },
   ];
-  const askHook = request(port, "POST", "/hooks/permission", {
-    body: {
-      tool_name: "AskUserQuestion",
-      session_id: "legacy-hook-session-1",
-      cwd: "/tmp/legacy-project",
-      tool_input: { questions },
-    },
-  });
-  await rec.sseEvent("sse: permission-request AskUserQuestion", sse,
+  await acpUpdate(port, "legacy-acp-session-1", "input-request",
+    { sessionId: "legacy-acp-session-1", toolCallId: "legacy-tool-call-2", questions });
+  const askEvent = await rec.sseEvent("sse: permission-request AskUserQuestion", sse,
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "AskUserQuestion",
     (parsed) => rec.learn(parsed?.permissionId, "<permission-2>"));
   const askPermissionId = sse.events.find(
@@ -389,26 +367,18 @@ test("frozen legacy fixtures replay green against the current bridge", { timeout
     token,
     body: { permissionId: askPermissionId, decision: { behavior: "allow" }, selectedOption: "Blue" },
   });
-  rec.recordResponse("hook response: selectedOption answers first question only",
-    { request: { method: "POST", path: "/hooks/permission", blocking: true } },
-    await askHook);
 
-  // --- Frozen event shapes ---
-  await rec.step("hook tool-output", "POST", "/hooks/tool-output", {
-    body: { session_id: "legacy-hook-session-1", cwd: "/tmp/legacy-project", tool_name: "Read", tool_output: "legacy file contents" },
+  // --- Frozen event shapes: the ended session, and Last-Event-ID replay ---
+  const dereg = await request(port, "POST", "/acp/deregister", {
+    body: { connection: "conn-fixture", sessionId: "legacy-acp-session-1", reason: "query-closed" },
   });
-  const toolOutputEvent = await rec.sseEvent("sse: tool-output", sse, (e) => e.event === "tool-output");
+  assert.equal(dereg.status, 200);
+  await rec.sseEvent("sse: session ended", sse, (e) => e.event === "session" && e.parsed?.state === "ended");
 
-  await rec.step("hook stop", "POST", "/hooks/stop", {
-    body: { session_id: "legacy-hook-session-1", cwd: "/tmp/legacy-project" },
-  });
-  await rec.sseEvent("sse: stop", sse, (e) => e.event === "stop");
-
-  // --- Last-Event-ID replay on the legacy stream ---
-  const replaySse = connectSse(port, token, { lastEventId: toolOutputEvent.id });
+  const replaySse = connectSse(port, token, { lastEventId: askEvent.id });
   t.after(() => replaySse.close());
   rec.record("events reconnect with Last-Event-ID", { response: { status: await replaySse.statusCode() } });
-  await rec.sseEvent("sse replay: stop", replaySse, (e) => e.event === "stop");
+  await rec.sseEvent("sse replay: session ended", replaySse, (e) => e.event === "session" && e.parsed?.state === "ended");
 
   await rec.step("command unauthenticated", "POST", "/command", { body: { command: "hello\n" } });
 

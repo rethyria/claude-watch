@@ -24,16 +24,18 @@ async function pair(bridge) {
   return res.body.token;
 }
 
-// Create an external session via a hook and return its bridge session id.
-async function createSession(bridge, token, hookSessionId, cwd) {
-  const res = await request(bridge.port, "POST", "/hooks/tool-output", {
-    body: { session_id: hookSessionId, cwd, tool_name: "Read", tool_output: "hello" },
+// Create a session the way the product creates one — an ACP register from
+// the Zed-launched fork — and return its (caller-chosen) session id.
+// `active: true` reports a turn in flight, seeding the working verdict.
+async function createSession(bridge, sessionId, cwd, { active } = {}) {
+  const res = await request(bridge.port, "POST", "/acp/register", {
+    body: {
+      connection: `conn-${sessionId}`, sessionId, sdkSessionId: sessionId, cwd,
+      ...(active === undefined ? {} : { active }),
+    },
   });
   assert.equal(res.status, 200);
-  const status = await request(bridge.port, "GET", "/status", { token });
-  const slot = status.body.sessions.find((s) => s.cwd === cwd && s.state === "running");
-  assert.ok(slot, `session for ${cwd} was created`);
-  return slot.id;
+  return sessionId;
 }
 
 // The Codex lane is driven by a file scanner on its own interval, so its state
@@ -70,8 +72,8 @@ test("the connect-time snapshot closes with an authoritative session-sync listin
   const bridge = await startBridge(t);
   const token = await pair(bridge);
 
-  const a = await createSession(bridge, token, "cc-sync-a", "/tmp/sync-66-a");
-  const b = await createSession(bridge, token, "cc-sync-b", "/tmp/sync-66-b");
+  const a = await createSession(bridge, "acp-sync-a", "/tmp/sync-66-a");
+  const b = await createSession(bridge, "acp-sync-b", "/tmp/sync-66-b");
 
   const { sync, frames } = await snapshot(t, bridge, token);
   assert.equal(sync.complete, true, "this bridge enumerates one in-memory map, so it always claims completeness");
@@ -97,14 +99,15 @@ test("a session the bridge no longer runs is absent from the next sync — the r
   const bridge = await startBridge(t);
   const token = await pair(bridge);
 
-  const kept = await createSession(bridge, token, "cc-sync-kept", "/tmp/sync-66-kept");
-  const gone = await createSession(bridge, token, "cc-sync-gone", "/tmp/sync-66-gone");
+  const kept = await createSession(bridge, "acp-sync-kept", "/tmp/sync-66-kept");
+  const gone = await createSession(bridge, "acp-sync-gone", "/tmp/sync-66-gone");
   assert.deepEqual((await snapshot(t, bridge, token)).sync.sessions.map((s) => s.id).sort(), [kept, gone].sort());
 
-  // SessionEnd is the observed death; the point here is what the NEXT connect
-  // says, because that is all a client that was offline for it ever gets.
-  const ended = await request(bridge.port, "POST", "/hooks/session-end", {
-    body: { session_id: "cc-sync-gone", cwd: "/tmp/sync-66-gone" },
+  // The fork's deregister is the observed death; the point here is what the
+  // NEXT connect says, because that is all a client that was offline for it
+  // ever gets.
+  const ended = await request(bridge.port, "POST", "/acp/deregister", {
+    body: { connection: "conn-acp-sync-gone", sessionId: "acp-sync-gone", reason: "query-closed" },
   });
   assert.equal(ended.status, 200);
 
@@ -124,14 +127,13 @@ test("the sync says out loud whether each session is idle, working, or unobserve
   const token = await pair(bridge);
 
   // Idle: its last lifecycle signal was a turn end.
-  const idle = await createSession(bridge, token, "cc-tri-idle", "/tmp/sync-60-idle");
-  assert.equal((await request(bridge.port, "POST", "/hooks/stop", {
-    body: { session_id: "cc-tri-idle", cwd: "/tmp/sync-60-idle" },
+  const idle = await createSession(bridge, "acp-tri-idle", "/tmp/sync-60-idle", { active: true });
+  assert.equal((await request(bridge.port, "POST", "/acp/update", {
+    body: { connection: "conn-acp-tri-idle", sessionId: idle, kind: "turn", payload: { phase: "end" } },
   })).status, 200);
 
-  // Working: a completed tool use is the bridge-side markWorking signal, and
-  // createSession already fired one.
-  const working = await createSession(bridge, token, "cc-tri-working", "/tmp/sync-60-working");
+  // Working: the fork reports a turn in flight.
+  const working = await createSession(bridge, "acp-tri-working", "/tmp/sync-60-working", { active: true });
 
   // Unobserved: an ACP session registered by a fork that reports no `active`
   // has never produced a turn signal at all. The bridge must not invent one.

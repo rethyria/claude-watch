@@ -25,7 +25,7 @@ MockWebServer tests) should feed themselves from the same corpus.
 - [Event stream — `GET /v1/events`](#event-stream--get-v1events)
 - [SSE event catalog](#sse-event-catalog)
 - [Permission decision semantics](#permission-decision-semantics)
-- [Hook surface (server-local)](#hook-surface-server-local)
+- [ACP uplink (server-local)](#acp-uplink-server-local)
 - [Legacy surface (frozen)](#legacy-surface-frozen)
 - [Fixture corpus](#fixture-corpus)
 
@@ -118,9 +118,10 @@ machine.
   Operators add entries via `CLAUDE_WATCH_ALLOWED_HOSTS` or
   `--allow-host=<host>`. Unknown Host → `403 {"error": "Forbidden Host
   header"}`; malformed Host → `400 {"error": "Bad request"}`.
-- **`/hooks/*` is loopback-only** (see [Hook surface](#hook-surface-server-local)):
-  non-loopback sources get `403 {"error": "Hooks are only accepted from
-  localhost"}` before the body is read.
+- **`/acp/*` and `/admin/*` are loopback-only** (see
+  [ACP uplink](#acp-uplink-server-local) and
+  [Admin surface](#admin-surface-server-local-operator)): non-loopback
+  sources get a `403` before the body is read.
 - Request bodies are capped at 1 MiB: oversized requests get `413` and a
   destroyed socket.
 
@@ -191,7 +192,7 @@ locked; a corrupt credential store also locks (fail closed).
 ## Authentication
 
 Everything except `GET /ping`, `POST /pair`/`/v1/pair`, and the loopback-only
-`/hooks/*` requires:
+server-local surfaces (`/acp/*`, `/admin/*`) requires:
 
 ```
 Authorization: Bearer <token>
@@ -243,15 +244,17 @@ Authenticated snapshot:
 - `sessions[].state`: `"running"` | `"ended"`. Ended sessions linger in
   snapshots for a grace period (~5 min), then get pruned.
 - `sessions[].title` (string, **optional, additive**): the session's
-  human-readable title, present only once the bridge has derived it from the
-  session's Claude Code transcript (see the [`session`](#session) event for
-  the derivation order). Clients must tolerate its absence.
+  human-readable title, present only once the bridge has one (pushed by the
+  Zed adapter — see the [`session`](#session) event). Clients must tolerate
+  its absence.
 - `sessions[].external` (boolean, **optional, additive**): `true` only for a
-  hook-created (external, PTY-less) session whose process the bridge does not
-  own; **omitted** for bridge-owned PTY slots. Clients must treat its absence
-  as `external: false` (killable). See the [`session`](#session) event.
+  session whose process the bridge does not own (an ACP session — Zed's
+  process); **omitted** for bridge-owned PTY slots. Clients must treat its
+  absence as `external: false` (killable). See the [`session`](#session)
+  event.
 - `sessions[].idle` (boolean, **optional, additive**): `true` when the
-  session's last lifecycle signal was a turn end (`Stop`/`TaskCompleted`);
+  session's last lifecycle signal was a turn end (an ACP turn end, a Codex
+  `task_complete`);
   **omitted** while it is producing work, and by bridges predating the field.
   Unlike every other additive field, absence does NOT mean "preserve" — see
   the [`session`](#session) event for the one-direction consumption rule.
@@ -268,7 +271,7 @@ Authenticated snapshot:
 - `sessions[].model` / `sessions[].mode` / `sessions[].contextPct`
   (**optional, additive** — issue #97): the subheading meta of an ACP
   session — model display name, permission-mode id, integer context-used
-  percent. Omitted for hook/PTY sessions, which never carry them. See the
+  percent. Omitted for PTY/Codex sessions, which never carry them. See the
   [`session`](#session) event.
 - `loggingDegraded` (boolean, **additive** — issue #93): `true` once a write
   to the bridge's primary log sink (stdout/stderr) has failed — typically the
@@ -408,8 +411,8 @@ from the option's `kind`) so logs and behavior-keyed consumers stay honest.
   into the LIVE session over the loopback channel → `200 { "ok": true,
   "sessionId": ..., "agent": ..., "prompt": true }`. A session whose adapter is
   not connected answers **502** so the client can keep the text as a draft.
-- With `sessionId` naming any other PTY-less session (hook-created/external, or
-  a bridge-owned session that has ended): **409**, and nothing is run. The
+- With `sessionId` naming any other PTY-less session (a Codex-scanner slot,
+  or a bridge-owned session that has ended): **409**, and nothing is run. The
   bridge owns no input channel into it. This used to spawn `claude -p <text>
   --continue` — a detached headless FORK of the live session, concurrently
   editing the same working tree — which is why it was retired (#69/#81). The
@@ -491,41 +494,37 @@ expected to reconnect with replay; TCP keepalive probes run every 30 s.
 
 ## SSE event catalog
 
-Hook-originated payloads are the hook's JSON body **plus** the
-bridge-injected fields noted below; unknown keys must be tolerated on every
-event.
+Unknown keys must be tolerated on every event.
 
 ### `permission-request`
-An agent wants approval (blocking). Claude Code shape:
+An agent wants approval (blocking). ACP shape (raised from the Zed adapter's
+teed request — see the [ACP notes](#permission-request-from-an-acp-session-80)
+below):
 
 ```json
 {
   "permissionId": "<uuid>",
   "tool_name": "Bash",
-  "session_id": "<claude code's own session uuid>",
-  "cwd": "/home/u/proj",
   "tool_input": { "command": "ls -la" },
-  "permission_suggestions": [ ... ],
   "options": [
-    { "behavior": "allow",        "label": "Yes", "description": "Allow this once" },
-    { "behavior": "allow-always", "label": "Yes, don't ask again", "description": "Allow and apply the suggested permission rules" },
-    { "behavior": "deny",         "label": "No",  "description": "Deny this request" }
+    { "behavior": "allow-always", "label": "Always Allow" },
+    { "behavior": "allow",        "label": "Allow" },
+    { "behavior": "deny",         "label": "Reject" }
   ],
   "sessionId": "<slot uuid>"
 }
 ```
 
-- `options` is the server-normalized menu; every option carries a
-  machine-readable `behavior` (see
-  [Permission decision semantics](#permission-decision-semantics)).
-  `allow-always` is offered only when `permission_suggestions` exist.
+- `options` is the server-normalized menu built from the agent's own option
+  list; every option carries a machine-readable `behavior` (see
+  [Permission decision semantics](#permission-decision-semantics)). Labels are
+  the agent's own wording.
 - **`AskUserQuestion`** prompts (content questions, not permission gates)
   carry **no top-level `options`**; render `tool_input.questions[]` instead —
   each `{header, question, options: [{label, description?}], multiSelect}` —
-  and answer every question. ACP sessions raise the same shape (#111: the
-  adapter mirrors its Zed form elicitation to the bridge), so clients need no
-  source-specific handling; answering in Zed retracts the card via
-  `permission-cleared`, exactly like an answered-elsewhere permission.
+  and answer every question. They are raised via #111: the adapter mirrors
+  its Zed form elicitation to the bridge; answering in Zed retracts the card
+  via `permission-cleared`, exactly like a permission settled in Zed.
 - **Codex synthetic approvals** (`source: "codex"`, `tool_name:
   "ExecApproval"`): top-level `options` present and mirrored in
   `tool_input.questions[0].options`; `tool_input` also carries `command` and
@@ -535,27 +534,25 @@ An agent wants approval (blocking). Claude Code shape:
 
 ### `permission-cleared`
 The prompt identified by `permissionId` is void — dismiss it.
-`{ "permissionId": "<uuid>", "reason": "hook-aborted" | "answered-elsewhere" | "expired" | "resolved" | "...", "sessionId": ... }`
+`{ "permissionId": "<uuid>", "reason": "hook-aborted" | "expired" | "resolved" | "...", "sessionId": ... }`
 
 `reason` is an OPEN set; an unrecognised value must never fail the frame (the
 drop is the contract, the wording is a courtesy). Known values:
 
-- `hook-aborted` — the agent withdrew the request; nothing to say.
-- `answered-elsewhere` — a `PostToolUse`/`PostToolUseFailure` for this prompt's
-  `tool_use_id` proved the tool ran, so it was approved on the computer.
+- `hook-aborted` — the request was settled somewhere else (answered in Zed,
+  withdrawn by the agent, or its session ended); nothing left to say. The
+  wire value predates the retired hook channel and is kept frozen for
+  existing clients.
 - `expired` — the bridge's window closed without a decision reaching it. The
-  bridge returned NO DECISION: nothing was allowed and nothing was denied here.
-  This one reason covers three outcomes the bridge cannot tell apart — a genuine
-  no-answer (the agent's own prompt is still live on the computer), a DENY made
-  in the IDE (Claude Code fires no `PostToolUse` for a tool it never ran, so the
-  deny never reaches the bridge), and an approve-and-long-run whose `PostToolUse`
-  lands after the window. A client MUST NOT tell the user the prompt went
-  "unanswered" or must still be answered; whatever the outcome, it lives on the
-  computer, which is all a client can honestly say.
+  bridge returned NO DECISION: nothing was allowed and nothing was denied
+  here — the agent's own prompt (Zed's dialog) keeps the answer. A client
+  MUST NOT tell the user the prompt went "unanswered" or must still be
+  answered; whatever the outcome, it lives on the computer, which is all a
+  client can honestly say.
 - `resolved` — a Codex synthetic approval was answered.
 
-The bridge never fabricates a decision. A `deny` in a bridge log or a hook
-response is always a decision a human made.
+The bridge never fabricates a decision. A `deny` in a bridge log is always a
+decision a human made.
 
 ### `permission-sync`
 The authoritative set of live prompt ids, emitted on every connect (see
@@ -584,9 +581,9 @@ than announcing it as an active session forever:
 
 - `"host-gone"` — the process hosting the session is demonstrably gone (an ACP
   slot whose fork connection has no live inbox).
-- `"no-liveness"` — nothing could speak for the session at all (a hook-created
-  or Codex slot: no process handle, no connection) and it has been silent, with
-  an untouched transcript, for the whole (generous) window.
+- `"no-liveness"` — nothing could speak for the session at all (a
+  Codex-scanner slot: no process handle, no connection) and it has been
+  silent, with an untouched transcript, for the whole (generous) window.
 
 Both are honest about their uncertainty and neither is authoritative: they say
 "no evidence", not "it is dead", so the session's next sign of life **revives**
@@ -597,27 +594,11 @@ process is running.
 
 **`title`** (string, **optional, additive**): the session's human-readable
 title, carried on `running`/`ended` payloads (and the `/v1/status` and pair
-snapshots) once the bridge can derive it. Derivation order, from the Claude
-Code transcript that hook payloads reference via `transcript_path`:
+snapshots) once the bridge has one. Absent until then (`codex` sessions never
+have one); per the additive-field rules this does not bump the protocol
+version, and clients fall back to their own label when it is absent.
 
-1. the **last** `{"type": "ai-title", "aiTitle": "…"}` record in the
-   transcript (Claude Code re-emits it as the title evolves);
-2. otherwise the first real user prompt, truncated to ~60 chars.
-
-The field is absent until a hook event has pointed the bridge at a readable
-transcript that yields a title (external `codex` sessions, unreadable or
-empty transcripts, and PTY sessions that have not emitted a hook yet have
-none). The title is refreshed opportunistically (session creation, `Stop`,
-`SessionEnd` hooks, plus a rate-limited scan on any hook of a session that
-does not yet have an AI-derived title — so a session the bridge knew about
-BEFORE its first turn, such as an ACP one, is labeled during that turn
-instead of at the end of it); a mid-session change is broadcast as a re-sent
-idempotent `running` event. Per the additive-field rules this does not bump
-the protocol version; clients fall back to their own label when it is
-absent.
-
-For **ACP** (Zed-hosted) sessions the transcript-scan derivation above is
-never fed — the title arrives from the adapter instead, which polls the CLI
+The title arrives from the Zed adapter, which polls the CLI
 transcript's `customTitle` (the SDK folds a user `/rename` and its
 auto-generated title into that one field) and pushes `session_info_update`;
 the bridge re-announces on every change, mid-session included. A manual
@@ -632,19 +613,19 @@ agent-pushed titles in its own UI. The wrist-visible rename for a Zed thread
 is the in-thread **`/rename`** slash command, which lands in `customTitle`
 and propagates on the next turn end.
 
-**`external`** (boolean, **optional, additive**): `true` for a HOOK-CREATED
-(external, PTY-less) session the bridge does not own the process of — it was
-observed via hooks, not spawned into a bridge PTY. Carried uniformly on
-EVERY session event of such a slot (`running`/`ended` and the connect-time
-sync), and OMITTED entirely for bridge-owned PTY slots. Clients must treat
-its absence as `external: false`: a PTY session is killable (`kill` command),
-whereas an external session has no bridge-owned process to stop, so a client
-should offer an honest "hide from view" instead of a kill. Additive: this
+**`external`** (boolean, **optional, additive**): `true` for a session the
+bridge does not own the process of — an ACP session, hosted by Zed's forked
+adapter. Carried uniformly on EVERY session event of such a slot
+(`running`/`ended` and the connect-time sync), and OMITTED entirely for
+bridge-owned PTY slots. Clients must treat its absence as `external: false`
+(a PTY session is killable with the `kill` command); an ACP session is
+external AND really killable — its kill rides the adapter's own teardown
+(see [Killing an ACP session](#killing-an-acp-session-88)). Additive: this
 does not bump the protocol version and older clients ignore it.
 
 **`idle`** (boolean, **optional, additive** — issue #60): PRESENT (`true`)
 when the bridge's **last lifecycle signal** for the session was a turn **end**
-— a `Stop` or `TaskCompleted` hook. **OMITTED** when the bridge considers the
+— an ACP turn boundary, or a Codex `task_complete`. **OMITTED** when the bridge considers the
 session to be producing work (tool output, PTY output, a dictated prompt run),
 and also, necessarily, by any bridge predating this field. Carried uniformly on
 EVERY session event of the slot (`running`/`ended`, the metadata refresh, and
@@ -659,13 +640,14 @@ learning of it and on a later re-send), while its **absence must never wake a
 session up**. The asymmetry matters — the connect-time re-send arrives on every
 reconnect, so treating it as a wake signal would restart elapsed clocks
 routinely, whereas treating a present `true` as an idle signal only freezes a
-span that had in fact already stopped. Live `stop`/`task-complete`/output
-events remain the authority for every other transition.
+span that had in fact already stopped. Live `task-complete`/output events and
+the idempotent `session` push at an ACP turn boundary remain the authority
+for every other transition.
 
-The field exists because `state` cannot express it: `Stop` fires per turn and
+The field exists because `state` cannot express it: a turn ends per TURN and
 must NOT end a session, so an idle session stays `state: "running"` forever.
 Before this flag, a client seeing such a session for the first time had to
-guess WORKING — and the `stop` that had idled it hours earlier was long gone
+guess WORKING — and the event that had idled it hours earlier was long gone
 from the SSE replay ring, so nothing ever corrected the guess. Additive: no
 protocol-version bump, and older clients ignore it.
 
@@ -675,12 +657,12 @@ transition: there, `idle: false` is said out loud and an OMITTED verdict means
 "no turn signal ever observed" — which clients render idle, not green. See
 [`session-sync`](#session-sync).
 
-A `kill` on an external session is therefore best-effort and non-authoritative:
-the bridge marks the slot `ended`, but if the still-alive process emits another
-hook the bridge **revives** it — re-broadcasting the idempotent `running` event
-(and clearing the zombie `ended` state) rather than swallowing the event.
-Only an authoritative end (the `SessionEnd` hook, or a bridge-owned PTY exit)
-is final and never revives.
+A `kill` on a Codex-scanner session is best-effort and non-authoritative: the
+bridge marks the slot `ended`, but if the scanner observes the still-alive
+session write again the bridge **revives** it — re-broadcasting the
+idempotent `running` event (and clearing the zombie `ended` state) rather
+than swallowing the observation. Only an authoritative end (an ACP
+deregister, or a bridge-owned PTY exit) is final and never revives.
 
 **`branch`** / **`worktree`** / **`repoRoot`** (**optional, additive** — issue
 #54): git metadata of the session's project root, derived from **file reads
@@ -700,15 +682,14 @@ re-derives them together, emitting `worktree`/`repoRoot` iff true), so a
 branch-bearing payload that omits `worktree`/`repoRoot` DROPS a
 previously-known worktree claim — that is how a session rebound from a
 worktree onto its main checkout sheds the stale `wt` badge. Only a payload
-with no `branch` at all preserves the whole trio. Refreshed at the same
-opportunistic points as `title`; a change is broadcast as the idempotent
-`running` event.
+with no `branch` at all preserves the whole trio. Refreshed at opportunistic
+points (session creation, an ACP re-register, a PTY re-attach); a change is
+broadcast as the idempotent `running` event.
 
 **`agents`** (object `{ "running": n, "done": n }`, **optional, additive** —
 issue #55): multi-agent workflow activity observed for this session. The
 bridge learns a workflow **started** from the wire that names the Workflow
-tool — its PostToolUse hook for hook sessions, the teed ACP `tool_call` for
-ACP sessions (issue #105) —
+tool — the teed ACP `tool_call` (issue #105) —
 and then watches the session's workflow journals on a slow poll; `running`
 counts agents started without a result, `done` counts completed agents of
 currently-live workflows. Completion is signaled by the **explicit**
@@ -725,8 +706,7 @@ bridge restarted mid-workflow loses its in-memory arming, but re-derives
 `agents` from the on-disk journal when the surviving session re-registers —
 re-arming a still-live workflow, or broadcasting the explicit zero for one that
 finished during the downtime — so a re-registering session's stale blue is
-corrected rather than stranded (issue #68); a session that fires no further hook
-after the restart is left to the authoritative sync (#66). Clients should render
+corrected rather than stranded (issue #68). Clients should render
 an indicator only while
 `running > 0`, and must not offer any control affordance (a workflow cannot
 be stopped from a client).
@@ -736,8 +716,8 @@ be stopped from a client).
 every session event of a slot that has them (`running`/`ended`, the
 idempotent refresh, the connect-time sync) and mirrored on
 `sessions[].model` / `sessions[].mode` / `sessions[].contextPct` in
-`/v1/status`. Only **ACP** (Zed-hosted) sessions ever have them — the hook
-and PTY paths carry no equivalent signal, so those sessions simply omit all
+`/v1/status`. Only **ACP** (Zed-hosted) sessions ever have them — the PTY
+and Codex paths carry no equivalent signal, so those sessions simply omit all
 three. Absent means **preserve what you knew** (the `title` doctrine); per
 the additive-field rules there is no protocol-version bump and older clients
 ignore them.
@@ -812,14 +792,13 @@ Raw terminal output from a bridge-owned PTY (ANSI escapes included) or from a
 `{ "text": "...", "sessionId": ... }`.
 
 ### `tool-output`
-A completed tool use, forwarded from the PostToolUse hook: hook body (e.g.
-`tool_name`, `tool_output`, `cwd`, `session_id`) plus `source`
-(`"claude"`/`"codex"`) and `sessionId`.
+A completed tool use observed by the Codex rollout scanner: `tool_name`,
+`tool_input`, `tool_output`, plus `source` (`"codex"`) and `sessionId`.
 
 ### `permission-request` from an ACP session (#80)
-An ACP session's permission requests reach the wrist through the SAME
-`permission-request` / `permission-cleared` events and the same `POST
-/v1/command` answer path as a hook session's — clients need no ACP-specific
+An ACP session's permission requests reach the wrist through the
+`permission-request` / `permission-cleared` events and the `POST
+/v1/command` answer path described above — clients need no ACP-specific
 handling.
 
 Two behaviours are specific to ACP and worth knowing:
@@ -858,9 +837,8 @@ Two behaviours are specific to ACP and worth knowing:
   to the agent verbatim; a client that ignores the field still answers safely
   through the surviving canonical buttons.
 
-Expiry keeps the hook path's no-decision semantics: nothing is sent back to
-the agent, so Zed's own dialog keeps the answer. The bridge never fabricates a
-`deny`.
+Expiry keeps the no-decision semantics: nothing is sent back to the agent, so
+Zed's own dialog keeps the answer. The bridge never fabricates a `deny`.
 
 ### `message`
 Assistant prose from an ACP (Zed-hosted) session: `{ "role": "assistant",
@@ -870,7 +848,7 @@ unknown events, so an older watch is unaffected.
 Sourced from the ACP `agent_message_chunk` update, which is **assistant-only**:
 the adapter emits no `user_message_chunk`, so a client's own local echo stays
 the single authority for the user's dictated text and there is no double-echo.
-Only ACP sessions produce this; the hook channel never carried prose at all.
+Only ACP sessions produce this.
 
 **Coalesced, not streamed.** ACP delivers prose as dozens of small deltas per
 turn; one frame each would be that many radio wakeups on a watch. The bridge
@@ -887,26 +865,17 @@ rather than a transcript of the whole turn. Buffer is capped at 4000 chars
 (tail kept). Clients wanting live token-by-token output should not use this
 event.
 
-### `stop`
-The agent finished a turn and is idle (fires per turn — NOT session end).
-Hook body plus `sessionId`.
-
-Note: an ACP session emits no `stop` event — ACP carries no turn-end update
-variant, so its turn end arrives over the server-local `/acp/update` channel
-as `kind: "turn"`. The bridge then pushes one idempotent **`session` running
-event carrying `idle: true`**, so an already-connected client learns the turn
-ended without a new event type. (Setting the flag alone is not enough for a
-live client: `idle` is designed to ride the next `session` event, and for a
-hook session that push came from the Stop hook.)
-
-### `notification`
-Claude Code Notification hook events, always with a `notification_type` key
-(string or `null`; e.g. `"permission_prompt"`, `"idle_prompt"`) so clients
-can render "waiting on you" instead of "stopped". Body plus `sessionId`.
+### `stop` (retired emitter; clients keep the handler)
+No current bridge lane emits `stop` — it was the retired hook channel's
+turn-end event (#87). An ACP session's turn end arrives instead as one
+idempotent **`session` running event carrying `idle: true`** (ACP carries no
+turn-end update variant, so the fork forwards the boundary over the
+server-local `/acp/update` channel and the bridge folds it into the flag), so
+an already-connected client learns the turn ended without a new event type.
+Clients that still fold a received `stop` into their idle state lose nothing.
 
 ### `task-complete`
-A long-running task finished (TaskCompleted hook / Codex `turn.completed`).
-Body plus `sessionId`.
+A long-running task finished (Codex `task_complete`). Body plus `sessionId`.
 
 ### `error`
 An error the agent surfaced: `{ "error": "...", ..., "sessionId": ... }`.
@@ -921,7 +890,7 @@ from option position or label wording.
 | `behavior` | Meaning |
 |---|---|
 | `allow` | approve this request once |
-| `allow-always` | approve AND persist the hook's `permission_suggestions` (the legacy `allowAll` path) |
+| `allow-always` | the standing grant: forwarded to the agent as its own `allow_always` option (ACP) or trust entry (Codex); the legacy `allowAll` path |
 | `deny` | reject the request |
 
 Decision request (`POST /v1/command`):
@@ -947,20 +916,24 @@ Decision request (`POST /v1/command`):
 - Codex synthetic approvals accept the same behaviors (`allow-always`
   degrades to `allow` when the menu offers no trust entry).
 
-Unanswered permissions are auto-denied by the bridge shortly before the
-agent-side hook timeout (~10 min).
+An unanswered permission expires after ~9.5 min with **no decision** — the
+prompt is retracted (`permission-cleared`, reason `expired`), nothing is sent
+to the agent, and the agent's own dialog keeps the answer.
 
-## Hook surface (server-local)
+## ACP uplink (server-local)
 
-`POST /hooks/{permission, tool-output, stop, session-end, task-complete,
-error, notification}` (also reachable under `/v1/`) is how Claude Code hook
-scripts and the Codex wrapper feed the bridge **on the same machine**. It is
-unauthenticated but **loopback-only**. Watch clients never call it; it is
-documented because its request bodies define the hook-originated SSE payloads
-above. The permission hook blocks until a decision (or answers immediately
-with no decision when zero SSE clients are connected). Permission state is
-shared across surfaces: a `/v1/command` decision resolves a hook received on
-either surface.
+`POST /acp/{register, update, deregister, spawn-result, claim}` plus the held
+`GET /acp/inbox` SSE (also reachable under `/v1/`) is how the forked
+`claude-agent-acp` Zed launches feeds the bridge **on the same machine**: it
+registers/updates/deregisters its sessions, tees session updates and
+permission requests, and holds the inbox the bridge writes
+`inject`/`permission-decision`/`input-decision`/`spawn`/`close` frames down.
+It is unauthenticated but **loopback-only** (`403 {"error": "ACP endpoints
+are only accepted from localhost"}` for any non-loopback source). Watch
+clients never call it, and it is NOT part of this versioned client protocol —
+it is documented here because it is the stimulus behind the ACP-originated
+SSE payloads above. Permission state is shared across surfaces: a
+`/v1/command` decision resolves a prompt raised on the uplink.
 
 ## Admin surface (server-local, operator)
 
@@ -968,7 +941,7 @@ either surface.
 are **operator tooling on the running bridge**, not part of this versioned client
 protocol — a watch client never calls them, and `PROTOCOL_VERSION` does not gate
 them. They are
-**loopback-only** (same operator-on-machine trust as the hook surface: no
+**loopback-only** (same operator-on-machine trust as the ACP uplink: no
 bearer token; a non-loopback source gets `403 {"error": "Admin endpoints are
 only accepted from localhost"}`), because the running bridge owns the token set
 in memory and rewrites `credentials.json` on every change — a separate CLI
@@ -1032,8 +1005,10 @@ Both are recorded from a **real bridge process** by
 timestamps — normalized to stable placeholders like `<token>`,
 `<bridge-id>`, `<session-1>`) and replayed green on every `npm test`.
 
-Regenerate — only after a deliberate, versioned `/v1` contract change (the
-legacy corpus is frozen; a legacy diff means you broke the freeze):
+Regenerate — only after a deliberate `/v1` contract change (the legacy corpus
+is frozen for CLIENT-visible shapes; a legacy diff means you broke the freeze
+— its one recorded exception is #87's removal of the server-local hook steps,
+whose stimulus role the ACP uplink now plays):
 
 ```sh
 CLAUDE_WATCH_UPDATE_FIXTURES=1 node --test test/protocol-fixtures.test.js
@@ -1066,9 +1041,8 @@ Both refusals leave the session **exactly as it was** — still `running`, still
 `dictatable`. That is issue #53's doctrine at the wire: a kill the bridge
 cannot perform must never look performed, because a slot marked ended under a
 live agent goes on absorbing its events invisibly. Clients should offer a real
-kill only where one exists — a bridge-owned PTY, or an ACP session — and an
-honest local "hide" for a hook-observed (`external`, non-`acp`) session, whose
-process nothing in this system can stop.
+kill only where one exists — a bridge-owned PTY, or an ACP session; a
+Codex-scanner session's process is one nothing in this system can stop.
 
 An already-ended ACP slot needs no frame: it answers `200` directly, since
 marking an over session over invents nothing.

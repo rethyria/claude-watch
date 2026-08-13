@@ -1,175 +1,69 @@
-// Permission delivery reliability, black-box (issue #9): fast no-decision
-// when nobody is connected, close-cleanup of aborted hook requests, the
-// bridge-side auto-deny landing before the hook's client-side timeout, and
-// the connect-time snapshot (sessions + terminal backlog + ALL pending
-// permissions) that survives ring-buffer eviction.
+// Permission delivery reliability, black-box (issues #9/#63): the connect-time
+// snapshot (sessions + terminal backlog + ALL pending permissions) that
+// survives ring-buffer eviction, and the authoritative permission-sync frame
+// that retracts prompts which died while a client was away. Prompts are
+// raised the way the product raises them — over the ACP loopback channel, as
+// the Zed-launched fork does.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { startBridge, request, connectSse } from "./helpers.js";
 
-// Raw fetch for the blocking permission hook so tests can abort it (simulating
-// Claude Code answering in the terminal / Esc / its own hook timeout).
-function postPermissionHook(port, body, signal) {
-  return fetch(`http://127.0.0.1:${port}/hooks/permission`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
+async function pairAndToken(bridge) {
+  const pair = await request(bridge.port, "POST", "/pair", { body: { code: bridge.pairingCode } });
+  assert.equal(pair.status, 200);
+  return pair.body.token;
 }
 
-test("zero connected clients: hook gets an immediate no-decision response", { timeout: 60_000 }, async (t) => {
-  const bridge = await startBridge(t);
-  const { port, pairingCode } = bridge;
-
-  const pair = await request(port, "POST", "/pair", { body: { code: pairingCode } });
-  assert.equal(pair.status, 200);
-  const token = pair.body.token;
-
-  // No SSE client is connected. The hook must NOT block for the auto-deny
-  // window (production default is minutes) — it returns right away with no
-  // decision, so the terminal dialog appears normally.
-  const startedAt = Date.now();
-  const hook = await request(port, "POST", "/hooks/permission", {
-    body: { tool_name: "Bash", cwd: "/tmp/no-clients-project", tool_input: { command: "ls" } },
+// Open the fork's inbox and register an ACP session on it.
+async function forkWithSession(t, bridge, connection, sessionId, cwd) {
+  const inbox = connectSse(bridge.port, undefined, { path: `/acp/inbox?connection=${connection}` });
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  const reg = await request(bridge.port, "POST", "/acp/register", {
+    body: { connection, sessionId, sdkSessionId: sessionId, cwd },
   });
-  const elapsed = Date.now() - startedAt;
+  assert.equal(reg.status, 200);
+  return inbox;
+}
 
-  assert.equal(hook.status, 200);
-  assert.equal(hook.body.hookSpecificOutput?.decision, undefined, "response must carry no decision");
-  assert.deepEqual(hook.body, {}, "no-decision response is an empty object");
-  assert.ok(elapsed < 10_000, `no-decision must be immediate, took ${elapsed}ms`);
-  await bridge.waitForOutput(/no connected clients, returning no-decision/);
-
-  // Nothing was registered: no zombie pending permission survives.
-  const status = await request(port, "GET", "/status", { token });
-  assert.equal(status.body.pendingPermissions, 0);
-
-  // A client connecting afterwards sees no ghost permission-request either
-  // (the hook request is long gone — an answer would go nowhere).
-  const sse = connectSse(port, token);
-  t.after(() => sse.close());
-  assert.equal(await sse.statusCode(), 200);
-  await new Promise((r) => setTimeout(r, 500).unref());
-  assert.ok(
-    !sse.events.some((e) => e.event === "permission-request"),
-    "no permission-request must reach a late-connecting client",
-  );
-});
-
-test("aborted hook request: pending entry removed, permission-cleared emitted, late answer 404s", { timeout: 60_000 }, async (t) => {
-  const bridge = await startBridge(t);
-  const { port, pairingCode } = bridge;
-
-  const pair = await request(port, "POST", "/pair", { body: { code: pairingCode } });
-  assert.equal(pair.status, 200);
-  const token = pair.body.token;
-
-  const sse = connectSse(port, token);
-  t.after(() => sse.close());
-  assert.equal(await sse.statusCode(), 200);
-
-  // Claude Code blocks on the permission hook...
-  const controller = new AbortController();
-  const hookResult = postPermissionHook(port, {
-    tool_name: "Bash",
-    cwd: "/tmp/abort-project",
-    tool_input: { command: "rm -rf ./build" },
-    permission_suggestions: [{ type: "rule", value: "Bash(rm:*)" }],
-  }, controller.signal).then(
-    () => "resolved",
-    () => "aborted",
-  );
-
-  const promptEvent = await sse.waitFor(
-    (e) => e.event === "permission-request" && e.parsed?.tool_name === "Bash",
-  );
-  const permissionId = promptEvent.parsed.permissionId;
-  assert.ok(permissionId);
-
-  // ...then gives up (terminal answer, Esc, or its own timeout) and aborts.
-  controller.abort();
-  assert.equal(await hookResult, "aborted");
-
-  // The watch is told to dismiss the now-dead prompt.
-  const cleared = await sse.waitFor(
-    (e) => e.event === "permission-cleared" && e.parsed?.permissionId === permissionId,
-  );
-  assert.equal(cleared.parsed.reason, "hook-aborted");
-  await bridge.waitForOutput(/aborted by Claude Code, clearing pending prompt/);
-
-  // The pending entry is gone: a late answer finds nothing instead of feeding
-  // a dead socket.
-  const late = await request(port, "POST", "/command", {
-    token,
-    body: { permissionId, decision: { behavior: "allow" }, allowAll: true },
+// Raise a permission request exactly as the adapter's forwardPermissionRequest
+// does (a teed RequestPermissionRequest on /acp/update).
+async function raisePermission(bridge, connection, sessionId, toolCallId, title, rawInput) {
+  const res = await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection,
+      sessionId,
+      kind: "permission",
+      payload: {
+        sessionId,
+        toolCall: { toolCallId, title, rawInput },
+        options: [
+          { optionId: "allow_always", name: "Always Allow", kind: "allow_always" },
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" },
+        ],
+      },
+    },
   });
-  assert.equal(late.status, 404);
-
-  const status = await request(port, "GET", "/status", { token });
-  assert.equal(status.body.pendingPermissions, 0, "aborted permission must not stay pending");
-});
-
-test("bridge no-decision lands before the hook-side timeout window", { timeout: 60_000 }, async (t) => {
-  // Shrink only the HOOK-side window; the bridge must derive its own expiry
-  // to fire deterministically before it (previously both were exactly 600s
-  // and expiry raced).
-  const hookWindowMs = 4000;
-  const bridge = await startBridge(t, {
-    env: { CLAUDE_WATCH_HOOK_PERMISSION_TIMEOUT_MS: String(hookWindowMs) },
-  });
-  const { port, pairingCode } = bridge;
-
-  const pair = await request(port, "POST", "/pair", { body: { code: pairingCode } });
-  assert.equal(pair.status, 200);
-  const token = pair.body.token;
-
-  const sse = connectSse(port, token);
-  t.after(() => sse.close());
-  assert.equal(await sse.statusCode(), 200);
-
-  // The hook client gives up (aborts) after its window, exactly like Claude
-  // Code's hook timeout. The watch never answers.
-  const startedAt = Date.now();
-  const hookRes = await postPermissionHook(port, {
-    tool_name: "Bash",
-    cwd: "/tmp/deconflict-project",
-    tool_input: { command: "make deploy" },
-  }, AbortSignal.timeout(hookWindowMs));
-  const elapsed = Date.now() - startedAt;
-
-  // The bridge answered BEFORE the hook-side window elapsed — the fetch above
-  // would have thrown TimeoutError otherwise. The answer is NO DECISION, not
-  // a deny: the bridge never fabricates a refusal the user did not choose
-  // (issue #63), so the agent's own prompt keeps the answer.
-  assert.equal(hookRes.status, 200);
-  const hookBody = await hookRes.json();
-  assert.deepEqual(hookBody, {}, "expiry must return no decision, never a deny");
-  assert.ok(
-    elapsed < hookWindowMs,
-    `expiry must land inside the hook window (${hookWindowMs}ms), took ${elapsed}ms`,
-  );
-  await bridge.waitForOutput(/expired after .*s unanswered/);
-});
+  assert.equal(res.status, 200);
+}
 
 test("client connecting after ring-buffer eviction still receives pending permissions", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t, {
     env: { CLAUDE_WATCH_SSE_BUFFER_SIZE: "8" },
   });
-  const { port, pairingCode } = bridge;
-
-  const pair = await request(port, "POST", "/pair", { body: { code: pairingCode } });
-  assert.equal(pair.status, 200);
-  const token = pair.body.token;
+  const { port } = bridge;
+  const token = await pairAndToken(bridge);
 
   // A watch is connected while the prompt fires...
   const sseA = connectSse(port, token);
   assert.equal(await sseA.statusCode(), 200);
 
-  const hookResponse = request(port, "POST", "/hooks/permission", {
-    body: { tool_name: "Write", cwd: "/tmp/evict-project", tool_input: { file_path: "/tmp/x" } },
-  });
+  const inbox = await forkWithSession(t, bridge, "conn-evict", "acp-evict", "/tmp/evict-project");
+  await raisePermission(bridge, "conn-evict", "acp-evict", "tc-evict", "Write", { file_path: "/tmp/x" });
   const promptEvent = await sseA.waitFor(
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "Write",
   );
@@ -179,13 +73,17 @@ test("client connecting after ring-buffer eviction still receives pending permis
   // ...then disconnects without answering.
   sseA.close();
 
-  // Ordinary terminal traffic rolls the 8-slot ring buffer over, evicting the
-  // buffered permission-request.
-  for (let i = 0; i < 12; i++) {
-    const posted = await request(port, "POST", "/hooks/tool-output", {
-      body: { tool_name: "Read", cwd: "/tmp/evict-project", tool_output: `filler ${i}` },
+  // Ordinary session traffic (the fork's teed turns) rolls the 8-slot ring
+  // buffer over, evicting the buffered permission-request.
+  for (let i = 0; i < 8; i++) {
+    const turnStart = await request(port, "POST", "/acp/update", {
+      body: { connection: "conn-evict", sessionId: "acp-evict", kind: "turn", payload: { phase: "start" } },
     });
-    assert.equal(posted.status, 200);
+    assert.equal(turnStart.status, 200);
+    const turnEnd = await request(port, "POST", "/acp/update", {
+      body: { connection: "conn-evict", sessionId: "acp-evict", kind: "turn", payload: { phase: "end" } },
+    });
+    assert.equal(turnEnd.status, 200);
   }
 
   // A fresh client (no Last-Event-ID — replay can't help) must still receive
@@ -198,57 +96,66 @@ test("client connecting after ring-buffer eviction still receives pending permis
   );
   assert.equal(resent.parsed.tool_name, "Write");
 
-  // And answering it still unblocks the original hook.
+  // And answering it still reaches the fork as a decision frame.
   const decision = await request(port, "POST", "/command", {
     token,
     body: { permissionId, decision: { behavior: "allow" } },
   });
   assert.equal(decision.status, 200);
-  const hook = await hookResponse;
-  assert.equal(hook.status, 200);
-  assert.equal(hook.body.hookSpecificOutput.decision.behavior, "allow");
+  const frame = await inbox.waitFor(
+    (e) => e.event === "permission-decision" && e.parsed?.toolCallId === "tc-evict",
+  );
+  assert.equal(frame.parsed.optionId, "allow");
 });
 
 test("connect-time snapshot includes sessions, terminal backlog, and pending permissions", { timeout: 60_000 }, async (t) => {
-  const bridge = await startBridge(t);
-  const { port, pairingCode } = bridge;
-
-  const pair = await request(port, "POST", "/pair", { body: { code: pairingCode } });
-  assert.equal(pair.status, 200);
-  const token = pair.body.token;
+  // Terminal backlog is pty-output/tool-output only, so a codex stub PTY
+  // supplies it; the pending prompt rides the ACP lane.
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "perm-rel-bin-"));
+  t.after(() => { try { fs.rmSync(binDir, { recursive: true, force: true }); } catch { /* ignore */ } });
+  const bin = path.join(binDir, "codex");
+  fs.writeFileSync(bin, "#!/bin/sh\necho snapshot-marker-output\nexec cat\n", { mode: 0o755 });
+  const bridge = await startBridge(t, { env: { CLAUDE_WATCH_CODEX_BIN: bin } });
+  const { port } = bridge;
+  const token = await pairAndToken(bridge);
 
   // First client online while activity happens.
   const sseA = connectSse(port, token);
   t.after(() => sseA.close());
   assert.equal(await sseA.statusCode(), 200);
 
-  // Terminal output + a blocking permission prompt.
-  const posted = await request(port, "POST", "/hooks/tool-output", {
-    body: { tool_name: "Read", cwd: "/tmp/snapshot-project", tool_output: "snapshot-marker-output" },
+  // Terminal output from a bridge-owned PTY...
+  const spawned = await request(port, "POST", "/v1/command", {
+    token,
+    body: { spawn: "codex", cwd: os.homedir() },
   });
-  assert.equal(posted.status, 200);
-  const hookResponse = request(port, "POST", "/hooks/permission", {
-    body: { tool_name: "Bash", cwd: "/tmp/snapshot-project", tool_input: { command: "npm test" } },
-  });
+  assert.equal(spawned.status, 200, JSON.stringify(spawned.body));
+  await sseA.waitFor(
+    (e) => e.event === "pty-output" && e.parsed?.text?.includes("snapshot-marker-output"),
+  );
+
+  // ...and a pending ACP permission prompt.
+  await forkWithSession(t, bridge, "conn-snap", "acp-snap", "/tmp/snapshot-project");
+  await raisePermission(bridge, "conn-snap", "acp-snap", "tc-snap", "Bash", { command: "npm test" });
   const promptEvent = await sseA.waitFor(
     (e) => e.event === "permission-request" && e.parsed?.tool_name === "Bash",
   );
   const permissionId = promptEvent.parsed.permissionId;
 
   // A brand-new client (fresh pair: no Last-Event-ID) connects afterwards and
-  // must be told everything: the running session, the recent terminal
+  // must be told everything: the running sessions, the recent terminal
   // backlog, and the prompt still awaiting an answer.
   const sseB = connectSse(port, token);
   t.after(() => sseB.close());
   assert.equal(await sseB.statusCode(), 200);
 
   const sessionEvent = await sseB.waitFor(
-    (e) => e.event === "session" && e.parsed?.folderName === "snapshot-project",
+    (e) => e.event === "session" && e.parsed?.sessionId === "acp-snap",
   );
   assert.equal(sessionEvent.parsed.state, "running");
 
   const backlogEvent = await sseB.waitFor(
-    (e) => e.event === "tool-output" && e.parsed?.tool_output === "snapshot-marker-output",
+    (e) => e.event === "pty-output" && e.parsed?.text?.includes("snapshot-marker-output"),
   );
   assert.ok(backlogEvent.parsed.sessionId, "backlog terminal event keeps its session attribution");
 
@@ -256,37 +163,69 @@ test("connect-time snapshot includes sessions, terminal backlog, and pending per
     (e) => e.event === "permission-request" && e.parsed?.permissionId === permissionId,
   );
   assert.equal(pendingEvent.parsed.tool_input.command, "npm test");
-
-  // Unblock the hook so teardown is clean.
-  const decision = await request(port, "POST", "/command", {
-    token,
-    body: { permissionId, decision: { behavior: "deny", message: "test done" } },
-  });
-  assert.equal(decision.status, 200);
-  const hook = await hookResponse;
-  assert.equal(hook.body.hookSpecificOutput.decision.behavior, "deny");
 });
 
-test("installer hook timeout and bridge auto-deny share one constant, bridge fires first", async () => {
-  const script = fs.readFileSync(new URL("../../setup-hooks.sh", import.meta.url), "utf-8");
-  const match = script.match(/^PERMISSION_HOOK_TIMEOUT_S=(\d+)$/m);
-  assert.ok(match, "setup-hooks.sh must define PERMISSION_HOOK_TIMEOUT_S");
-  const installerTimeoutMs = parseInt(match[1], 10) * 1000;
-  assert.ok(
-    script.includes("'timeout': PERMISSION_TIMEOUT_S"),
-    "the PermissionRequest hook entry must use the shared constant",
-  );
+test("connect-time sync retracts a prompt that died while the client was away", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t, {
+    env: { CLAUDE_WATCH_PERMISSION_TIMEOUT_MS: "1000" },
+  });
+  const { port } = bridge;
+  const token = await pairAndToken(bridge);
 
-  // This test file's process has no CLAUDE_WATCH_* overrides, so config.js
-  // yields the production values here.
-  const { HOOK_PERMISSION_TIMEOUT_MS, PERMISSION_TIMEOUT_MS } = await import("../config.js");
-  assert.equal(
-    HOOK_PERMISSION_TIMEOUT_MS,
-    installerTimeoutMs,
-    "bridge's view of the hook-side timeout must match the installer",
+  const sseA = connectSse(port, token);
+  assert.equal(await sseA.statusCode(), 200);
+
+  await forkWithSession(t, bridge, "conn-retract", "acp-retract", "/tmp/retract-project");
+  await raisePermission(bridge, "conn-retract", "acp-retract", "tc-retract", "Bash", { command: "true" });
+  const promptEvent = await sseA.waitFor(
+    (e) => e.event === "permission-request" && e.parsed?.tool_name === "Bash",
   );
+  const permissionId = promptEvent.parsed.permissionId;
+
+  // The client goes away; the prompt then dies (expiry) and its
+  // permission-cleared is unobservable to the absent client.
+  sseA.close();
+  await bridge.waitForOutput(/expired after 1s unanswered/);
+
+  // On reconnect the authoritative permission-sync must NOT list the dead id
+  // — that absence is what tells the client to drop the card it still holds.
+  const sseB = connectSse(port, token);
+  t.after(() => sseB.close());
+  assert.equal(await sseB.statusCode(), 200);
+  const sync = await sseB.waitFor((e) => e.event === "permission-sync");
+  assert.ok(Array.isArray(sync.parsed.permissionIds));
   assert.ok(
-    PERMISSION_TIMEOUT_MS < HOOK_PERMISSION_TIMEOUT_MS,
-    `bridge auto-deny (${PERMISSION_TIMEOUT_MS}ms) must fire before the hook-side timeout (${HOOK_PERMISSION_TIMEOUT_MS}ms)`,
+    !sync.parsed.permissionIds.includes(permissionId),
+    `the dead prompt must be absent from the sync; got ${JSON.stringify(sync.parsed)}`,
+  );
+});
+
+test("connect-time sync lists a still-live prompt so clients keep it", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const { port } = bridge;
+  const token = await pairAndToken(bridge);
+
+  const sseA = connectSse(port, token);
+  t.after(() => sseA.close());
+  assert.equal(await sseA.statusCode(), 200);
+
+  await forkWithSession(t, bridge, "conn-live", "acp-live", "/tmp/live-project");
+  await raisePermission(bridge, "conn-live", "acp-live", "tc-live", "Edit", { file_path: "a.txt" });
+  const promptEvent = await sseA.waitFor(
+    (e) => e.event === "permission-request" && e.parsed?.tool_name === "Edit",
+  );
+  const permissionId = promptEvent.parsed.permissionId;
+
+  const sseB = connectSse(port, token);
+  t.after(() => sseB.close());
+  assert.equal(await sseB.statusCode(), 200);
+  const sync = await sseB.waitFor((e) => e.event === "permission-sync");
+  assert.ok(
+    sync.parsed.permissionIds.includes(permissionId),
+    `a live prompt must be listed by the sync; got ${JSON.stringify(sync.parsed)}`,
+  );
+  // ...and its payload follows as a re-sent permission-request.
+  await sseB.waitFor(
+    (e) => e.event === "permission-request" && e.parsed?.permissionId === permissionId,
   );
 });

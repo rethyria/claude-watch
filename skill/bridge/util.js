@@ -83,9 +83,10 @@ export function jsonResponse(res, status, body) {
 }
 
 // Loopback detection for socket remote addresses. Used to restrict the
-// /hooks/* surface to callers on this machine: Claude Code hook scripts
-// always POST from localhost, so any other source is a LAN peer trying to
-// spoof permission prompts or terminal output onto the trusted watch UI.
+// server-local surfaces (/acp/*, /admin/*) to callers on this machine: the
+// Zed-launched fork and operator tooling always connect from localhost, so
+// any other source is a LAN peer trying to spoof sessions, prompts, or admin
+// actions onto the trusted watch UI.
 // Handles plain IPv4 loopback (the whole 127.0.0.0/8 block), IPv6 loopback,
 // and IPv4-mapped IPv6 addresses ("::ffff:127.0.0.1") as Node reports them.
 export function isLoopbackAddress(addr) {
@@ -97,33 +98,8 @@ export function isLoopbackAddress(addr) {
   return m !== null && m.slice(1).every((octet) => Number(octet) <= 255);
 }
 
-// Deterministic JSON for fingerprinting hook payloads (issue #63). Claude Code
-// re-serializes hook bodies between the PreToolUse and PermissionRequest that
-// describe the same tool call, and JSON key order is not contractual — plain
-// JSON.stringify would hash two identical tool_inputs differently and silently
-// lose the correlation. Object keys are sorted recursively; array order is
-// preserved because it is semantic (argv, questions).
-export function stableStringify(value) {
-  if (value === null || typeof value !== "object") {
-    // JSON.stringify returns undefined for undefined/function/symbol; a
-    // fingerprint must always be a string, and "null" is the same thing
-    // JSON.stringify writes for those inside an array.
-    return JSON.stringify(value) ?? "null";
-  }
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  const parts = [];
-  for (const key of Object.keys(value).sort()) {
-    // Mirror JSON.stringify: a key whose value is undefined is absent from
-    // the output entirely, rather than serialized as null. Otherwise
-    // {a: undefined} and {a: null} would fingerprint identically.
-    if (value[key] === undefined) continue;
-    parts.push(`${JSON.stringify(key)}:${stableStringify(value[key])}`);
-  }
-  return `{${parts.join(",")}}`;
-}
-
 // Maximum request body size. Bodies are buffered in memory before JSON.parse
-// on unauthenticated endpoints (/pair, /hooks/*), so without a cap a single
+// on unauthenticated endpoints (/pair, /acp/*), so without a cap a single
 // multi-GB POST OOMs the bridge before auth even runs. No legitimate client
 // payload comes anywhere near 1 MiB. The constant lives here rather than in
 // config.js because util.js sits at the bottom of the dependency graph and

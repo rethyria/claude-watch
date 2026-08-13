@@ -152,9 +152,9 @@ open class BridgeClient(
      * POST /v1/command — resolve a pending AskUserQuestion prompt with an
      * answer for EVERY question. [answers] is POSITIONAL: one entry per
      * question, aligned with the prompt's `tool_input.questions` order — the
-     * bridge's /v1 array form (`collectAskUserQuestionAnswers()` in hooks.js
-     * zips it with the questions into `updatedInput.answers` for the blocked
-     * hook). The array form is deliberate: the alternative object form is
+     * bridge's /v1 array form (`positionalAskAnswers()` in acp.js aligns it
+     * with the questions into the `input-decision` frame it sends back down
+     * the fork's inbox). The array form is deliberate: the object form is
      * keyed by question text, which collapses questions that share the same
      * text into one entry and cannot express distinct answers for them. The
      * legacy single-`selectedOption` form answers only the first question and
