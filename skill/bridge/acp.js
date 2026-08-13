@@ -1007,6 +1007,15 @@ registerSessionLivenessProbe((slot) => {
   return Boolean(connectionId && acpInboxes.has(connectionId));
 });
 
+/** How many fork inboxes are live right now. The idle self-reap in server.js
+ *  (#92) keys on this: a held inbox IS a running Zed-launched adapter — the
+ *  same liveness fact the probe above trusts — so zero of them for the grace
+ *  window means Zed is gone and the bridge should be too. A gauge, not an
+ *  event hook: the reaper polls, so there is no transition to miss. */
+export function acpInboxCount() {
+  return acpInboxes.size;
+}
+
 /** End every inbox (graceful shutdown). */
 export function closeAllAcpInboxes() {
   for (const requestId of [...pendingAcpSpawns.keys()]) {

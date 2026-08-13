@@ -21,7 +21,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import type { AcpClient, Logger } from "./acp-agent.js";
 import type {
   RequestPermissionRequest,
@@ -186,7 +188,8 @@ export interface BridgeChannel {
     cwd?: string;
     error?: string;
   }): void;
-  /** Open the inbox SSE and begin its reconnect loop. */
+  /** Ensure a bridge exists (spawning one when nothing answers, #92), then
+   *  open the inbox SSE and begin its reconnect loop. */
   start(): void;
   /** Stop the inbox loop and release the connection. */
   stop(): void;
@@ -206,6 +209,137 @@ function readBridgePort(): number | null {
     return Number.isInteger(port) && port > 0 ? port : null;
   } catch {
     return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge lifecycle (#92): the adapter is the bridge's launcher.
+// ---------------------------------------------------------------------------
+// "If Zed isn't running, the bridge shouldn't be running" — and the converse:
+// Zed launching this adapter is the signal a bridge should exist. The adapter
+// probes for one and spawns it when nothing answers; the bridge's own idle
+// self-reap (zero fork inboxes for a grace window, see the bridge's config.js)
+// is what ends it after the last Zed window closes. Nothing here waits for the
+// spawned bridge to come up: the inbox loop's retry and the register
+// replay-on-reconnect already absorb the boot window.
+
+/** The port range the bridge walks (config.js PORT_RANGE_START/END). Mirrored
+ *  here — same env overrides, same fallbacks — because when the port file is
+ *  missing or stale the probe must look everywhere a bridge could have bound.
+ *  Read per call, not at module load, matching how tests relocate the range. */
+function bridgePortRange(): [number, number] {
+  const readPort = (name: string, fallback: number): number => {
+    const parsed = Number.parseInt(process.env[name] ?? "", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  };
+  const start = readPort("CLAUDE_WATCH_PORT_RANGE_START", 7860);
+  return [start, Math.max(start, readPort("CLAUDE_WATCH_PORT_RANGE_END", 7869))];
+}
+
+/** Whether a BRIDGE — not just some listener; 7860 is Gradio's default —
+ *  answers on `port`. GET /ping is the bridge's unauthenticated discovery
+ *  probe, and nothing else answers it with a bridgeId. */
+async function pingIsBridge(port: number): Promise<boolean> {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/ping`, {
+      signal: AbortSignal.timeout(1000),
+    });
+    if (!resp.ok) return false;
+    const body = (await resp.json()) as { bridgeId?: unknown };
+    return typeof body.bridgeId === "string" && body.bridgeId.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Find a live bridge: the port file's port first (the single source of
+ *  truth), then the walk range — a bridge whose port file was wiped is still a
+ *  bridge, and spawning a second one next to it helps nobody. `null` means
+ *  nothing answers like a bridge anywhere one could be. */
+export async function findRunningBridgePort(): Promise<number | null> {
+  const filed = readBridgePort();
+  if (filed !== null && (await pingIsBridge(filed))) return filed;
+  const [start, end] = bridgePortRange();
+  const ports = Array.from({ length: end - start + 1 }, (_, i) => start + i).filter(
+    (p) => p !== filed,
+  );
+  // Probed in parallel: refused connections answer instantly on loopback, so
+  // a hung non-bridge occupant costs its 1 s timeout once, not per port.
+  const answers = await Promise.all(ports.map((p) => pingIsBridge(p)));
+  const found = answers.indexOf(true);
+  return found === -1 ? null : ports[found];
+}
+
+/** Spawn the bridge: detached in its own session, so a Zed quit never takes it
+ *  down mid-grace — the bridge's idle self-reap is the only thing that ends it
+ *  (#92) — with stdout+stderr appended to the #93 bridge.log beside the
+ *  credentials, so a bridge nobody launched from a terminal still has a log to
+ *  read. Deliberately WITHOUT --allow-pairing: pairing a device is a human act
+ *  at a terminal, never a side effect of opening an editor. WITH
+ *  --exit-if-sibling: several Zed windows starting at once all reach this
+ *  spawn, and the bridge's port bind is that race's mutex — a spawned bridge
+ *  that loses the bind to a sibling exits 0, and its adapter simply connects
+ *  to the winner. Returns the child pid, or null when the bridge entry is not
+ *  where the repo layout puts it (an out-of-tree install of this fork:
+ *  best-effort, like every other bridge touch). */
+export function spawnDetachedBridge(logger: Logger): number | null {
+  try {
+    const serverJs = fileURLToPath(new URL("../../bridge/server.js", import.meta.url));
+    if (!fs.existsSync(serverJs)) {
+      logger.error(`claude-watch: no bridge running and ${serverJs} does not exist — not spawning one`);
+      return null;
+    }
+    const dir = credentialsDir();
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const logPath = path.join(dir, "bridge.log");
+    const logFd = fs.openSync(logPath, "a", 0o600);
+    try {
+      const child = spawn(process.execPath, [serverJs, "--exit-if-sibling"], {
+        cwd: path.dirname(serverJs),
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+      });
+      child.unref();
+      logger.error(`claude-watch: no bridge answering — spawned one (pid ${child.pid}, log ${logPath})`);
+      return child.pid ?? null;
+    } finally {
+      // The child holds its own copies of the descriptor.
+      fs.closeSync(logFd);
+    }
+  } catch (err) {
+    logger.error(`claude-watch: bridge spawn failed: ${String(err)}`);
+    return null;
+  }
+}
+
+/** Probe for a bridge; spawn one when nothing answers. The pre-spawn probe is
+ *  an optimisation, not the guard — the guard is the port bind (see
+ *  spawnDetachedBridge): N racing adapters may all probe-miss and all spawn,
+ *  and exactly one spawned bridge survives it. Never throws.
+ *  `spawnImpl` is injectable so tests can pin "a live bridge means no spawn"
+ *  without watching for processes; production always uses the real one. */
+export async function ensureBridgeRunning(
+  logger: Logger,
+  spawnImpl: (logger: Logger) => number | null = spawnDetachedBridge,
+): Promise<{ outcome: "found" | "spawned" | "unavailable" | "disabled"; port?: number; pid?: number }> {
+  // Test/operator opt-out, the launcher-side twin of the bridge's
+  // CLAUDE_WATCH_NO_IDLE_EXIT. Skips the PROBE too, not just the spawn: the
+  // probe walks the production port range, and the adapter's test suite (whose
+  // fake bridges sit on ephemeral ports) must never knock on a developer's
+  // live bridge — tests/setup.ts pins this for every test, and the
+  // bridge-spawn suite unpins it around its own isolated range.
+  if (process.env.CLAUDE_WATCH_NO_BRIDGE_SPAWN === "1") return { outcome: "disabled" };
+  try {
+    const port = await findRunningBridgePort();
+    if (port !== null) {
+      logger.log(`claude-watch: bridge already running on port ${port}`);
+      return { outcome: "found", port };
+    }
+    const pid = spawnImpl(logger);
+    return pid === null ? { outcome: "unavailable" } : { outcome: "spawned", pid };
+  } catch (err) {
+    logger.error(`claude-watch: bridge probe failed: ${String(err)}`);
+    return { outcome: "unavailable" };
   }
 }
 
@@ -464,7 +598,13 @@ export class HttpBridgeChannel implements BridgeChannel {
 
   start(): void {
     if (this.stopped) return;
-    void this.runInbox();
+    void (async () => {
+      // #92: Zed launching this adapter is also what launches the bridge.
+      // Inside start(), not the constructor, so building a channel stays free
+      // of side effects (tests construct channels they never start).
+      await ensureBridgeRunning(this.logger);
+      await this.runInbox();
+    })();
   }
 
   stop(): void {

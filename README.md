@@ -85,11 +85,22 @@ cd skill/bridge
 npm install
 ```
 
-### 2. Start the bridge server
+### 2. The bridge server starts (and stops) with Zed
+
+There is normally nothing to start by hand: the bridge's lifetime is coupled
+to Zed (#92). The Zed-launched ACP adapter spawns the bridge when it finds
+none running (its output goes to `~/.claude-watch/bridge.log`), and the
+bridge exits on its own once no Zed adapter has been connected for the grace
+window (15 minutes) — a closed editor shows as an honest offline on the
+watch, not a bridge serving nothing. Pairing is deliberately NOT part of the
+auto-spawn; see the manual start below for that.
+
+For debugging (or the first pairing), start it manually — `CLAUDE_WATCH_NO_IDLE_EXIT=1`
+keeps a Zed-less bridge from reaping itself while you poke at it:
 
 ```bash
 cd skill/bridge
-node server.js
+CLAUDE_WATCH_NO_IDLE_EXIT=1 node server.js
 ```
 
 You'll see:
@@ -260,7 +271,10 @@ Same as permission flow, but the card carries `tool_input.questions` with dynami
 ## Troubleshooting
 
 ### Watch shows "Bridge not found"
-- Ensure `node server.js` is running on your Mac
+- Ensure Zed is running — its adapter spawns the bridge, and the bridge exits
+  on purpose ~15 minutes after the last Zed adapter disconnects (#92); check
+  `~/.claude-watch/bridge.log`. For a bridge without Zed, run
+  `CLAUDE_WATCH_NO_IDLE_EXIT=1 node server.js` by hand
 - Check that your watch is on the same Wi-Fi network
 - Use the "Enter IP manually" option with the IP shown in the bridge banner
 

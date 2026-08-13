@@ -37,6 +37,12 @@ export CLAUDE_WATCH_PORT_RANGE_START=7970
 export CLAUDE_WATCH_PORT_RANGE_END=7999
 export CLAUDE_WATCH_DISABLE_MDNS=1
 
+# The bridge self-reaps once no fork inbox is connected for the grace window
+# (#92). The fake fork below holds its inbox for the whole run, and the
+# 15-minute default dwarfs the pre-fork scrape loop anyway — but this run's
+# verdict must never depend on runner speed, so the reaper is pinned off.
+export CLAUDE_WATCH_NO_IDLE_EXIT=1
+
 # Fresh credentials dir: the bridge must start unpaired and print a code.
 export CLAUDE_WATCH_CREDENTIALS_DIR="$(mktemp -d)"
 

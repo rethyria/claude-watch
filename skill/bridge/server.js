@@ -13,6 +13,9 @@ import {
   CLAUDE_BIN,
   CODEX_BIN,
   ALLOW_PAIRING_FLAG,
+  EXIT_IF_SIBLING_FLAG,
+  IDLE_EXIT_MS,
+  NO_IDLE_EXIT,
   EXTRA_ALLOWED_HOSTS,
   CREDENTIALS_DIR,
   PORT_FILE,
@@ -35,6 +38,7 @@ import {
   handleAcpInbox,
   handleAcpSpawnResult,
   handleAcpClaim,
+  acpInboxCount,
   closeAllAcpInboxes,
 } from "./acp.js";
 import { handlePair, handleCommand, handleStatus, handlePing } from "./commands.js";
@@ -242,6 +246,28 @@ function tryListen(server, port) {
   });
 }
 
+// --exit-if-sibling support (issue #92): to an adapter-spawned bridge an
+// EADDRINUSE means one of two very different things. A sibling spawn that won
+// the race — several Zed windows starting at once each spawn a bridge, and the
+// port bind is that race's mutex — makes THIS process redundant: exactly one
+// bridge must serve, so the loser exits. An unrelated squatter (7860 is
+// Gradio's default) means the walk must continue exactly as a manual start
+// would. /ping tells them apart: it is unauthenticated, loopback-reachable the
+// instant the winner's listen succeeds, and nothing else answers it with a
+// bridgeId.
+async function isSiblingBridge(port) {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/ping`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!resp.ok) return false;
+    const body = await resp.json();
+    return typeof body?.bridgeId === "string" && body.bridgeId.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function startServer() {
   const server = http.createServer(onRequest);
 
@@ -252,6 +278,10 @@ async function startServer() {
       break;
     } catch (err) {
       if (err.code === "EADDRINUSE") {
+        if (EXIT_IF_SIBLING_FLAG && (await isSiblingBridge(port))) {
+          log("info", `Port ${port} already answers as a bridge — a sibling won the bind race; exiting (--exit-if-sibling)`);
+          process.exit(0);
+        }
         log("warn", `Port ${port} in use, trying next...`);
         continue;
       }
@@ -414,6 +444,39 @@ async function startServer() {
     // The listening server already holds the loop open; never let the watchdog
     // be the reason a process that is otherwise done lingers.
     orphanWatchdog.unref();
+  }
+
+  // Idle self-reap (issue #92): the bridge lives and dies with Zed. The
+  // Zed-launched adapter spawns a bridge when none answers (its
+  // ensureBridgeRunning), and this is the other half of that coupling: with
+  // ZERO fork inboxes for IDLE_EXIT_MS the editor is gone, so the bridge
+  // leaves through the same graceful shutdown a SIGTERM takes (port file
+  // removed, prompts voided as no-decision, sessions ended). Fork inboxes are
+  // the ONLY liveness counted — a connected watch SSE client deliberately is
+  // not a hold, because with Zed closed nothing behind the bridge is real and
+  // keeping the wrist "online" against a dead editor is precisely the #53 lie;
+  // the watch's offline screen owns that state. See config.js for why the
+  // window is generous enough that a Zed restart never trips it. Polled, not
+  // event-driven: acpInboxCount() is a gauge acp.js already owns, and a poll
+  // has no transition to miss.
+  if (NO_IDLE_EXIT) {
+    log("info", "Idle self-reap disabled (CLAUDE_WATCH_NO_IDLE_EXIT=1): this bridge outlives Zed until stopped by hand");
+  } else {
+    let forklessSince = Date.now();
+    const idlePollMs = Math.max(50, Math.min(Math.ceil(IDLE_EXIT_MS / 4), 30_000));
+    const idleReaper = setInterval(() => {
+      if (acpInboxCount() > 0) {
+        forklessSince = null;
+        return;
+      }
+      if (forklessSince === null) forklessSince = Date.now();
+      if (Date.now() - forklessSince < IDLE_EXIT_MS) return;
+      clearInterval(idleReaper);
+      log("info", `No ACP fork inbox for ${IDLE_EXIT_MS}ms: Zed is gone, so the bridge goes too (idle self-reap, #92; CLAUDE_WATCH_NO_IDLE_EXIT=1 opts out)`);
+      shutdown("idle-exit");
+    }, idlePollMs);
+    // Like the watchdog above: the reaper must never be what holds the loop open.
+    idleReaper.unref();
   }
 
   const agents = [];

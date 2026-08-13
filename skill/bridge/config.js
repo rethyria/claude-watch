@@ -57,6 +57,14 @@ if (CODEX_BIN) {
 // a cwd.
 const cliArgs = process.argv.slice(2);
 export const ALLOW_PAIRING_FLAG = cliArgs.includes("--allow-pairing");
+// --exit-if-sibling (issue #92): passed ONLY by the ACP adapter when it spawned
+// this bridge. Several Zed windows starting at once all probe for a bridge,
+// all find nothing, and all spawn one — the port bind is that race's natural
+// mutex, so a spawned bridge that loses it (EADDRINUSE from a port that
+// answers /ping like a bridge) exits 0 instead of walking on and serving as a
+// duplicate. A manual start never passes it: an operator starting a second
+// bridge on purpose keeps the walk.
+export const EXIT_IF_SIBLING_FLAG = cliArgs.includes("--exit-if-sibling");
 export const CLI_CWD = cliArgs.find((a) => !a.startsWith("--")) || null;
 
 // Protocol version of the /v1 surface (see PROTOCOL.md for the versioning
@@ -135,6 +143,22 @@ export const SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 // Heartbeat + TCP keepalive on the loopback ACP fork inbox (S3 #77). Doubles as
 // the liveness probe that surfaces a dead fork so its zombie slots are reaped.
 export const ACP_INBOX_HEARTBEAT_MS = 15_000;
+
+// Idle self-reap (issue #92): the bridge's lifetime is coupled to Zed. The
+// Zed-launched adapter is what spawns the bridge (ensureBridgeRunning in the
+// fork's bridge-channel.ts), so ZERO fork inboxes held for this long means no
+// Zed — and a Zed-less bridge serving on is exactly the state #92 retired.
+// GENEROUS on purpose: a Zed restart or crash-relaunch (which conversations
+// survive) re-holds its inbox within seconds — the window only has to dwarf
+// the adapter's capped 10 s reconnect backoff, and fifteen minutes is ninety
+// times it — so the bridge is never bounced out from under a connected watch.
+// A watch SSE client deliberately does NOT extend the window: with Zed closed
+// nothing behind the bridge is real, and the wrist's offline screen owns that
+// state honestly. Overridable via CLAUDE_WATCH_IDLE_EXIT_MS (test-only);
+// CLAUDE_WATCH_NO_IDLE_EXIT=1 opts out entirely (manual debugging of a bridge
+// with no editor attached — the pre-#92 behavior).
+export const IDLE_EXIT_MS = testOverridable("CLAUDE_WATCH_IDLE_EXIT_MS", 15 * 60 * 1000);
+export const NO_IDLE_EXIT = process.env.CLAUDE_WATCH_NO_IDLE_EXIT === "1";
 
 // Test-only override hook: lets the test suite shorten long production
 // timeouts/bounds (and relocate/widen the port range) via environment

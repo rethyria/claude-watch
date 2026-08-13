@@ -60,10 +60,16 @@ export async function startBridge(t, { credentialsDir, args = [], env: extraEnv 
   // on their own, and they keep holding ports in the production range. This
   // tells each bridge to watch its parent and shut itself down once we're gone,
   // so the worst case is a few seconds of stray bridge instead of forever.
+  // CLAUDE_WATCH_NO_IDLE_EXIT: the bridge self-reaps once no fork inbox has
+  // been connected for the grace window (#92). Most tests never connect one,
+  // and while the 15-minute production default cannot fire inside a
+  // seconds-long test, the suite must not depend on its own speed to stay
+  // green. idle-exit.test.js re-enables the reaper explicitly.
   const env = {
     CLAUDE_WATCH_PORT_RANGE_END: "7929",
     CLAUDE_WATCH_DISABLE_MDNS: "1",
     CLAUDE_WATCH_EXIT_WHEN_ORPHANED: "1",
+    CLAUDE_WATCH_NO_IDLE_EXIT: "1",
     ...process.env,
     ...extraEnv,
   };
