@@ -1,8 +1,14 @@
 package dev.claudewatch.wear
 
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasScrollAction
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeDown
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.claudewatch.shared.protocol.SseFrame
@@ -228,8 +234,28 @@ class HaloPreviewScreens {
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         drillToList()
         // Alpha is the drill's resolved selection (the scope's first card):
-        // the chrome-free masked feed inside the full-circle state ring.
+        // the chrome-free masked feed inside the full-circle state ring —
+        // resting at the tail, i.e. the scrolled-to-BOTTOM extreme whose
+        // last line #116 requires whole inside the legibility band.
         openFeedFromCard(alpha)
+        hold()
+    }
+
+    /** The other #116 extreme: the feed scrolled all the way into history,
+     *  so the capture proves the TOP-most reachable line rests complete
+     *  inside the legibility band. */
+    @Test
+    fun sessionFeedScrolledToTop() {
+        previewEnabled()
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drillToList()
+        openFeedFromCard(alpha)
+        // Dragging down walks into history on the reversed list; overshoot
+        // so the tail rests hard against its end.
+        repeat(4) {
+            compose.onNodeWithTag("haloFeed-$alpha").performTouchInput { swipeDown() }
+            compose.waitForIdle()
+        }
         hold()
     }
 
@@ -238,9 +264,25 @@ class HaloPreviewScreens {
         previewEnabled()
         compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
         drillToList()
-        // Alpha is bridge-owned: the menu's reference capture with the live
-        // red ✕ "end session" row (#114) over the "open feed" row and stubs.
+        // Alpha is bridge-owned: the menu's reference capture — "open feed"
+        // still first; the live red ✕ "end session" row sits LAST, below the
+        // stubs (#116), so it is off this at-rest frame.
         compose.onNodeWithTag("haloPagerCard-$alpha").performClick()
+        hold()
+    }
+
+    /** The menu's tail (#116): scrolled to its end, so the capture shows the
+     *  destructive close row rendering LAST, under the stubs. */
+    @Test
+    fun sessionMenuScrolledToClose() {
+        previewEnabled()
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drillToList()
+        compose.onNodeWithTag("haloPagerCard-$alpha").performClick()
+        compose.waitForIdle()
+        compose.onNode(
+            hasScrollAction() and hasAnyAncestor(hasTestTag("haloSessionMenu")),
+        ).performScrollToNode(hasTestTag("haloRowClose"))
         hold()
     }
 

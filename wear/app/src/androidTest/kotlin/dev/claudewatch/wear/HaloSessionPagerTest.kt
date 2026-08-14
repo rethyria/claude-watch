@@ -42,8 +42,9 @@ import org.junit.runner.RunWith
  * prompt OVER the pager (never falling through to the menu), the menu's
  * close row carries honest close semantics (✕ kill wherever the bridge can
  * really end the session — owned PTY or ACP via #88's close frame — ⊘ hide
- * for a hook-observed one, stubs visible but dead, every row finger-sized),
- * and a session killed under the cursor self-heals to the remembered-index
+ * for a hook-observed one, stubs visible but dead, every row finger-sized)
+ * and renders LAST below the stubs (#116: destructive at the bottom), and a
+ * session killed under the cursor self-heals to the remembered-index
  * neighbour instead of stranding the pager on a ghost.
  */
 @RunWith(AndroidJUnit4::class)
@@ -139,6 +140,12 @@ class HaloSessionPagerTest {
 
     private fun textCount(text: String): Int =
         compose.onAllNodes(hasText(text)).fetchSemanticsNodes().size
+
+    /** The open menu's scrollable list. The close row is the menu's LAST row
+     *  now (#116: destructive at the bottom, below the stubs) and the list is
+     *  LAZY — scroll a row into composition before matching on it. */
+    private fun menuList() =
+        compose.onNode(hasScrollAction() and hasAnyAncestor(hasTestTag("haloSessionMenu")))
 
     @Test
     fun entryLandsOnTheScopesFirstCardFromHomeAndProjectPages() {
@@ -333,6 +340,7 @@ class HaloSessionPagerTest {
         // Owned session: the red ✕ row, wired to a REAL kill.
         compose.onNodeWithTag("haloPagerCard-s-a1").performClick()
         compose.waitForIdle()
+        menuList().performScrollToNode(hasTestTag("haloRowClose"))
         compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
         fireClose("s-a1")
         assertEquals(listOf("s-a1"), kills)
@@ -343,6 +351,7 @@ class HaloSessionPagerTest {
         next()
         compose.onNodeWithTag("haloPagerCard-s-b1").performClick()
         compose.waitForIdle()
+        menuList().performScrollToNode(hasTestTag("haloRowClose"))
         compose.onNode(hasTestTag("haloRowClose") and hasText("⊘")).assertIsDisplayed()
         assertEquals(
             "a hook-observed session must not offer a kill",
@@ -359,6 +368,7 @@ class HaloSessionPagerTest {
         next()
         compose.onNodeWithTag("haloPagerCard-s-b2").performClick()
         compose.waitForIdle()
+        menuList().performScrollToNode(hasTestTag("haloRowClose"))
         compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
         fireClose("s-b2")
         assertEquals(listOf("s-a1", "s-b2"), kills)
@@ -372,23 +382,42 @@ class HaloSessionPagerTest {
         compose.onNodeWithTag("haloPagerCard-s-a1").performClick()
         compose.waitForIdle()
 
-        // The issue's headline acceptance: every action row is a full-width
+        // #114's headline acceptance: every action row is a full-width
         // fingertip target — ≥48dp tall — where the arc's 33dp cells could
-        // not reach the minimum without overlapping.
+        // not reach the minimum without overlapping. The menu list is LAZY
+        // (and the close row its LAST, #116), so rows scroll into
+        // composition before they are measured.
         val minPx = 48f * compose.density.density - 1f
         for (tag in listOf("haloMenuFeed", "haloRowClose")) {
+            menuList().performScrollToNode(hasTestTag(tag))
             val row = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
             assertTrue("$tag must be finger-sized (${row.height} < $minPx)", row.height >= minPx)
         }
 
-        // The stubs keep their arc treatment: visible, dead, dimmed. The
-        // menu list is LAZY, so the tail rows need the scroll to compose.
+        // The stubs keep their arc treatment: visible, dead, dimmed.
         for (tag in listOf("haloMenu-model", "haloMenu-mode", "haloMenu-compact", "haloMenu-handover")) {
-            compose.onNode(
-                hasScrollAction() and hasAnyAncestor(hasTestTag("haloSessionMenu")),
-            ).performScrollToNode(hasTestTag(tag))
+            menuList().performScrollToNode(hasTestTag(tag))
             compose.onNodeWithTag(tag).assertExists().assertIsNotEnabled()
         }
+    }
+
+    @Test
+    fun theCloseRowRendersLastBelowTheStubs() {
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        drill()
+        compose.onNodeWithTag("haloPagerCard-s-a1").performClick()
+        compose.waitForIdle()
+
+        // #116 (user feedback): destructive last. Resting on the close row
+        // after the scroll, the LAST stub sits above it — this pins the
+        // ORDER, not just the row's survival.
+        menuList().performScrollToNode(hasTestTag("haloRowClose"))
+        val close = compose.onNodeWithTag("haloRowClose").fetchSemanticsNode().boundsInRoot
+        val lastStub = compose.onNodeWithTag("haloMenu-handover").fetchSemanticsNode().boundsInRoot
+        assertTrue(
+            "the close row (top ${close.top}) must render below the last stub (top ${lastStub.top})",
+            close.top > lastStub.top,
+        )
     }
 
     @Test

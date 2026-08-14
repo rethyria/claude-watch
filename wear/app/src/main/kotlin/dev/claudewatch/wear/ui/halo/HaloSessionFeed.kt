@@ -1,8 +1,10 @@
 // The v2 session feed (Halo v2 S6, epic #94): chrome-free — no header, no
-// arrows, no waiting banner. The terminal tail fills the screen inside a soft
-// circular mask (offscreen compositing + radial DstIn fade, so a line
-// dissolves before it can reach the ring channel at any scroll position) and
-// scrolls by TOUCH and rotary on a reversed list. Navigation is gestural:
+// arrows, no waiting banner. The terminal tail fills the screen inside a
+// soft-edged legibility band (offscreen compositing + vertical DstIn fade,
+// #116 — sized so every line in the band reads edge to edge on the round
+// face, while a scrolling line still dissolves before it can reach the ring
+// channel at any scroll position) and scrolls by TOUCH and rotary on a
+// reversed list. Navigation is gestural:
 // swipe right = back to the session list (sibling cycling died with the
 // header — position lives in the list pager now; the at-top pull-down back
 // died in the v3 vertical purge, #109 — vertical drags are scroll and ONLY
@@ -22,7 +24,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -79,23 +80,38 @@ private const val BACK_SWIPE_FRACTION = 60f / HALO_REF_PX
 private const val TAP_GUARD_MS = 300L
 
 /**
- * The circular feed mask (epic #94 constants): fully opaque inside 168 ref-px
- * of centre, faded to transparent by 194 — inside the ring channel's inner
- * stroke edge (214 − 6/2 = 211), so text can NEVER clip the ring, whatever
- * the scroll position. Drawn as a radial DstIn over the offscreen-composited
- * list layer: DstIn against the layer's own alpha, not the black beneath.
+ * The feed's legibility band (#116, superseding the epic's radial mask): on
+ * the round face the radial fade kept ink off the ring but not on the glass —
+ * a full-width line's ENDS left the readable circle as the line left the
+ * vertical centre, and at the resting extremes the corners sat beyond even
+ * the fade's end (the user's "parts of the top and bottom are not visible").
+ * What a circle actually grants full-width text is a horizontal band: with
+ * lines spanning ±163 ref-px of centre (the side insets), ink may reach at
+ * most √(211² − 163²) ≈ 134 of the vertical centre before its corners cross
+ * the ring channel's inner stroke edge (214 − 6/2 = 211). So the mask is a
+ * VERTICAL fade — fully opaque within ±114 of centre, gone by ±133 — making
+ * every line inside the band legible edge to edge, while a scrolling line
+ * still dissolves before it can clip the ring, whatever the scroll position.
+ * Still drawn as a DstIn over the offscreen-composited list layer: DstIn
+ * against the layer's own alpha, not the black beneath.
  */
-private const val MASK_OPAQUE_PX = 168f
-private const val MASK_FADE_PX = 194f
+private const val MASK_OPAQUE_PX = 114f
+private const val MASK_CLEAR_PX = 133f
 
 /**
- * v2 feed insets (epic constants): where content RESTS. contentPadding, not
- * outer padding, on purpose — an outer pad would hard-clip lines at the inset
- * edge, while resting insets let a mid-scroll line ride through them into the
- * mask's fade band and dissolve instead of shearing.
+ * v2 feed insets, vertical pair re-derived for #116: where content RESTS.
+ * contentPadding, not outer padding, on purpose — an outer pad would
+ * hard-clip lines at the inset edge, while resting insets let a mid-scroll
+ * line ride through them into the mask's fade band and dissolve instead of
+ * shearing. Top/bottom sit the resting extreme lines 112 ref-px from centre,
+ * just inside the mask's ±114 opaque band, so scrolled-to-top and
+ * scrolled-to-bottom both show a COMPLETE first/last line — the epic's
+ * 30/48dp rested them in (top: beyond) the old fade. Sides stay at the
+ * epic's 31dp: the user's clipping is vertical, and narrowing the lines
+ * would shrink the feed beyond what the fix needs.
  */
-private val FEED_TOP_INSET = 30.dp
-private val FEED_BOTTOM_INSET = 48.dp
+private val FEED_TOP_INSET = 56.dp
+private val FEED_BOTTOM_INSET = 56.dp
 private val FEED_SIDE_INSET = 31.dp
 
 @Composable
@@ -273,17 +289,22 @@ private fun FeedTail(
             ),
             modifier = modifier
                 // The mask: composite the whole list offscreen, then keep only
-                // what the radial gradient covers (DstIn) — opaque well inside
-                // the ring channel, gone before the stroke. Layer alpha, not
-                // the black background, is what the blend erases into.
+                // what the vertical gradient covers (DstIn) — the legibility
+                // band, gone before the ring stroke. Layer alpha, not the
+                // black background, is what the blend erases into. Clamped
+                // tiling keeps everything above/below the band erased too.
                 .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
                 .drawWithCache {
                     val scale = size.minDimension / HALO_REF_PX
-                    val mask = Brush.radialGradient(
-                        MASK_OPAQUE_PX / MASK_FADE_PX to Color.White,
+                    val half = MASK_CLEAR_PX * scale
+                    val fade = (MASK_CLEAR_PX - MASK_OPAQUE_PX) / (2f * MASK_CLEAR_PX)
+                    val mask = Brush.verticalGradient(
+                        0f to Color.Transparent,
+                        fade to Color.White,
+                        1f - fade to Color.White,
                         1f to Color.Transparent,
-                        center = Offset(size.width / 2f, size.height / 2f),
-                        radius = MASK_FADE_PX * scale,
+                        startY = size.height / 2f - half,
+                        endY = size.height / 2f + half,
                     )
                     onDrawWithContent {
                         drawContent()
@@ -445,7 +466,6 @@ private fun DictateUnavailablePill(modifier: Modifier = Modifier) {
             modifier = Modifier
                 .padding(bottom = 8.dp)
                 .background(Halo.Palette.InsetWell, RoundedCornerShape(50))
-                .defaultMinSize(minWidth = 88.dp)
                 .padding(horizontal = 14.dp, vertical = 5.dp),
         ) {
             Icon(
@@ -498,23 +518,32 @@ private fun DictatePill(onDictate: () -> Unit, modifier: Modifier = Modifier) {
             .clickable(onClick = onDictate)
             .testTag("haloDictate"),
     ) {
-        // The visual pill is smaller than the 48dp-tall full-width tap area.
+        // The visual pill is smaller than the 48dp-tall full-width tap area,
+        // and hugs its icon (#116 user feedback: "much wider than it needs to
+        // be" — the 88dp floor was the retired TEXT pill's footprint,
+        // outliving its label when #104 swapped in the icon). The icon sits
+        // in a cell the ⊘ overlay's size, so this pill and the unavailable
+        // variant keep one footprint.
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
                 .padding(bottom = 8.dp)
                 .background(Halo.Palette.Surface2, RoundedCornerShape(50))
-                .defaultMinSize(minWidth = 88.dp)
                 .padding(horizontal = 14.dp, vertical = 5.dp),
         ) {
-            // A real microphone icon (#104 user feedback, superseding the
-            // hand-drawn Canvas glyph that held this slot pre-v2).
-            Icon(
-                painter = painterResource(R.drawable.halo_mic),
-                contentDescription = "Dictate",
-                tint = Halo.Palette.TextPrimary,
-                modifier = Modifier.size(Halo.Geo.MicGlyph).testTag("haloDictateMic"),
-            )
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier.size(Halo.Geo.MicOffOverlay),
+            ) {
+                // A real microphone icon (#104 user feedback, superseding the
+                // hand-drawn Canvas glyph that held this slot pre-v2).
+                Icon(
+                    painter = painterResource(R.drawable.halo_mic),
+                    contentDescription = "Dictate",
+                    tint = Halo.Palette.TextPrimary,
+                    modifier = Modifier.size(Halo.Geo.MicGlyph).testTag("haloDictateMic"),
+                )
+            }
         }
     }
 }

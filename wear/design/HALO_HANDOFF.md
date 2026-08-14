@@ -569,7 +569,9 @@ of truth. Reference captures: `wear/design/halo-v2-current-*.png`
   by 194 — inside the ring channel's inner edge, so text can never clip the
   ring at any scroll position) with resting insets top 30 / bottom 48 /
   sides 31dp as contentPadding (lines dissolve in the fade band instead of
-  shearing). Touch scrolling joins rotary on the reversed list; swipe right
+  shearing). _Mask shape and vertical insets superseded by the #116
+  legibility band — see its section; the mechanism and the side insets
+  stand._ Touch scrolling joins rotary on the reversed list; swipe right
   = back (the at-top pull-down back died in the v3 purge — see the gesture
   model v3 section); while the session waits the WHOLE feed surface is the
   prompt's tap target (no pending → no click handler at all). Dictate
@@ -783,7 +785,9 @@ survives; its ROUTE changed). The model:
    `answerPillRidesTheCardGroupAndClearsTheActionArc` pinning the geometric
    clearance itself. Related capture note: on the feed, the inset clock
    sits over the mask's fade band at 12 o'clock — lines there are already
-   dissolving, and the ring stays clear; left to the design pass.
+   dissolving, and the ring stays clear; left to the design pass. (#116
+   settled it further: the clock's slot is fully OUTSIDE the legibility
+   band now — nothing dissolves under it.)
 
 ### #104 user design feedback (2026-08-01, binding) — as built
 
@@ -840,7 +844,8 @@ user's binding direction replaced them with a MENU. As built:
   alpha (implementer's call, recorded: the arc showed this roadmap and the
   menu has the room the arc lacked). The close keeps the stable
   `haloRowClose` tag; kill/hide semantics are untouched (#88 close frame
-  for fork-owned AND acp, #53 honest hide for hook-observed).
+  for fork-owned AND acp, #53 honest hide for hook-observed). _Row order
+  superseded by #116: the close renders LAST, below the stubs._
 - **Navigation (gesture model v3 intact):** the menu is nav state
   (`HaloNavState.menuOpen`, a flag like `cardOpen` — a pass-through
   launcher, not a depth). Swipe-right/system back from the menu returns to
@@ -861,6 +866,47 @@ still holds for the base; the lift is the deliberate departure, kept as its
 own token). Dots only: ring, clock group and content geometry take nothing
 from it. Before/after captures: `halo-dots-before.png` /
 `halo-dots-after.png` (uncommitted, design dir).
+
+### Post-epic refinement: feed polish (#116, 2026-08-14)
+
+On-wrist feedback on the #114-era build, verbatim: *"1. Parts of the bottom
+and top of the feed text are not visible because the watchface is a circle
+2. The microphone button is much wider than it needs to be 3. end session
+button can be move to the bottom of the list"*. As built:
+
+- **Feed legibility band (the round-face clipping fix).** The epic's radial
+  mask kept ink off the ring but not on the glass: a full-width line's ENDS
+  left the readable circle as the line left the vertical centre, and at the
+  resting extremes (top 30 / bottom 48dp) the corners sat beyond even the
+  fade's end — item 1, exactly. What a circle actually grants full-width
+  text is a horizontal band: with lines spanning ±163 ref-px of centre (the
+  31dp side insets, kept), ink may reach at most √(211² − 163²) ≈ 134
+  ref-px of the vertical centre before its corners cross the ring channel's
+  inner stroke edge. So the mask is now a **vertical** DstIn fade — opaque
+  within ±114, clear by ±133 — and the resting insets are top/bottom 56dp
+  (112 ref-px): the scrolled-to-top first line and scrolled-to-bottom last
+  line rest whole inside the opaque band, every line in the band reads edge
+  to edge, and a mid-scroll line still dissolves before the ring at any
+  position. Same offscreen-composited DstIn mechanism; the S6 radial
+  numbers are superseded (note left in place). Side effects, both wins: the
+  inset clock at 12 o'clock and the dictate pill at 6 now sit over ERASED
+  band, not dissolving text.
+- **Icon-sized dictate pill.** The pill's 88dp minimum width was the
+  retired v1 TEXT pill's footprint, outliving its label when #104 swapped
+  in the icon. Dropped: both variants hug a shared 24dp icon cell (the ⊘
+  overlay's size, so available and unavailable keep one footprint) inside
+  the same 14/5dp padding. Position, the full-width 48dp-tall tap target,
+  and the muted-mic ⊘ unavailable state are all unchanged.
+- **Destructive last in the actions menu.** The close row ("✕ end session"
+  / "⊘ hide session") renders LAST, below the four stubs; "open feed" stays
+  first. Tag (`haloRowClose`), kill/hide semantics (#88/#53) and row
+  geometry are byte-identical — only the order moved. Tests that reach the
+  close row now scroll the lazy menu to its end first (the e2e's
+  kill-through-menu leg included).
+
+Captures: `halo-feedfix-*.png` (uncommitted, design dir) — feed at both
+scroll extremes, the narrow mic (available + unavailable), the reordered
+menu at rest and scrolled to its close row.
 
 ### Pending on-wrist live checks (post-epic, user steps)
 

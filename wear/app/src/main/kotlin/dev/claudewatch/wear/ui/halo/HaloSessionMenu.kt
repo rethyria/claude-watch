@@ -1,13 +1,14 @@
 // The session-actions menu (issue #114, from the user's on-wrist verdict on
 // the v2 action arc: "too small but even so take up too much space"): tapping
 // a pager card opens THIS instead of the feed. Every action the arc carried
-// becomes a full-width finger-sized row — the live close with its exact
-// semantics (✕ kill wherever the bridge can really end the session, its own
-// PTY or an ACP session via the adapter's close frame #88; ⊘ honest hide for
-// a hook-observed one it cannot stop, #53) plus the four stubs, kept visible
-// but dead at the arc's 0.35 alpha — and the feed moved behind the menu's
-// own "open feed" row, first because it is the old tap's destination and the
-// most-travelled path. The menu is a pass-through launcher, not a resting
+// becomes a full-width finger-sized row — the four stubs, kept visible but
+// dead at the arc's 0.35 alpha, then the live close with its exact semantics
+// (✕ kill wherever the bridge can really end the session, its own PTY or an
+// ACP session via the adapter's close frame #88; ⊘ honest hide for a
+// hook-observed one it cannot stop, #53) LAST (#116 user feedback:
+// destructive at the bottom of the list) — and the feed moved behind the
+// menu's own "open feed" row, first because it is the old tap's destination
+// and the most-travelled path. The menu is a pass-through launcher, not a resting
 // place: swipe-right / system back returns to the pager card that summoned
 // it, an action tap closes it (the caller's job), and the feed's back skips
 // it entirely. Round-safe ScalingLazyColumn over the spawn picker's idiom;
@@ -146,11 +147,30 @@ fun HaloSessionMenu(
                 MenuRow(glyph = "›", label = "open feed", tag = "haloMenuFeed", onClick = onOpenFeed)
             }
 
+            // The stubs, kept as disabled rows rather than dropped: the arc
+            // showed this roadmap and the menu has the room the arc lacked —
+            // dropping them would silently shrink the visible surface beyond
+            // #114's ask.
+            item(key = "menu:model") {
+                MenuRow(glyph = "◇", label = "model", tag = "haloMenu-model", onClick = null)
+            }
+            item(key = "menu:mode") {
+                MenuRow(glyph = "◐", label = "mode", tag = "haloMenu-mode", onClick = null)
+            }
+            item(key = "menu:compact") {
+                MenuRow(glyph = "▤", label = "compact", tag = "haloMenu-compact", onClick = null)
+            }
+            item(key = "menu:handover") {
+                MenuRow(glyph = "⇄", label = "handover", tag = "haloMenu-handover", onClick = null)
+            }
+
             // The live close, honest either way (issue #53): the red ✕ only
             // where the bridge can REALLY end the session — its own PTY, or
             // an ACP session through the adapter's close frame (#88) — and ⊘,
             // the local hide that never claims to have stopped anything, for
-            // a hook-observed one. The stable "haloRowClose" testTag rides
+            // a hook-observed one. LAST, below even the stubs (#116 user
+            // feedback): the one row that ends something never sits where a
+            // thumb reaches first. The stable "haloRowClose" testTag rides
             // along from the arc (and the row strip before it) on purpose:
             // every close-semantics test finds it unmoved.
             item(key = "menu:close") {
@@ -165,23 +185,6 @@ fun HaloSessionMenu(
                 } else {
                     MenuRow(glyph = "⊘", label = "hide session", tag = "haloRowClose", onClick = onHide)
                 }
-            }
-
-            // The stubs, kept as disabled rows rather than dropped: the arc
-            // showed this roadmap and the menu has the room the arc lacked —
-            // dropping them would silently shrink the visible surface beyond
-            // the issue's ask. Dead weight sinks below the live rows.
-            item(key = "menu:model") {
-                MenuRow(glyph = "◇", label = "model", tag = "haloMenu-model", onClick = null)
-            }
-            item(key = "menu:mode") {
-                MenuRow(glyph = "◐", label = "mode", tag = "haloMenu-mode", onClick = null)
-            }
-            item(key = "menu:compact") {
-                MenuRow(glyph = "▤", label = "compact", tag = "haloMenu-compact", onClick = null)
-            }
-            item(key = "menu:handover") {
-                MenuRow(glyph = "⇄", label = "handover", tag = "haloMenu-handover", onClick = null)
             }
         }
     }

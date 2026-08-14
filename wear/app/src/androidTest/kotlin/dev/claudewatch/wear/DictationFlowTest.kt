@@ -4,12 +4,15 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.test.assertHasNoClickAction
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToNode
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.claudewatch.wear.data.AesGcmTokenCipher
@@ -206,6 +209,16 @@ class DictationFlowTest {
     private fun nodeCount(tag: String): Int =
         compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().size
 
+    /** Scroll the open menu to its close row: the row is the menu's LAST now
+     *  (#116, destructive at the bottom) and the list is LAZY — it does not
+     *  compose, let alone match, until scrolled to. */
+    private fun scrollMenuToClose() {
+        waitForNode("haloSessionMenu")
+        compose.onNode(
+            hasScrollAction() and hasAnyAncestor(hasTestTag("haloSessionMenu")),
+        ).performScrollToNode(hasTestTag("haloRowClose"))
+    }
+
     private fun terminalLines(sessionId: String): List<String> =
         viewModel.state.value.bridge.sessions[sessionId]?.terminal?.items?.map { it.text }
             ?: emptyList()
@@ -364,7 +377,7 @@ class DictationFlowTest {
         compose.onNodeWithTag("haloPagerCard-s-acp").assertIsDisplayed().performClick()
         compose.waitForIdle()
 
-        waitForNode("haloRowClose")
+        scrollMenuToClose()
         compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
 
         server.enqueue(MockResponse().setBody("""{"ok":true,"kind":"acp"}"""))
@@ -395,7 +408,7 @@ class DictationFlowTest {
         compose.onNodeWithTag("haloPagerCard-s-ext").assertIsDisplayed().performClick()
         compose.waitForIdle()
 
-        waitForNode("haloRowClose")
+        scrollMenuToClose()
         compose.onNode(hasTestTag("haloRowClose") and hasText("⊘")).assertIsDisplayed()
         assertEquals(
             "a hook-observed card must not offer a Kill the bridge cannot perform",

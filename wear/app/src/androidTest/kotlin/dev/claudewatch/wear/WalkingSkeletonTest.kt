@@ -823,7 +823,12 @@ class WalkingSkeletonTest {
         compose.onNodeWithTag("haloFeed-$spawnedId").performTouchInput { swipeRight() }
         compose.waitForIdle()
         compose.onNodeWithTag("haloPagerCard-$spawnedId").assertIsDisplayed().performClick()
-        compose.waitUntil(10_000) { tagExists("haloRowClose") }
+        compose.waitUntil(10_000) { tagExists("haloMenuFeed") }
+        // #116 sank the close to the menu's LAST row, below the stubs, and
+        // the list is lazy: the row composes only once scrolled to.
+        compose.onNode(
+            hasScrollAction() and hasAnyAncestor(hasTestTag("haloSessionMenu")),
+        ).performScrollToNode(hasTestTag("haloRowClose"))
         compose.onNode(hasTestTag("haloRowClose") and hasText("✕")).assertIsDisplayed()
         compose.onNodeWithTag("haloRowClose").performClick()
         compose.waitUntil(30_000) { !tagExists("haloPagerCard-$spawnedId") }
