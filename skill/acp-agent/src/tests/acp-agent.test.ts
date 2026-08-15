@@ -2555,6 +2555,112 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(boundaries[1]!.stopReason).toBe("end_turn");
   });
 
+  /** Bridge stub that records turn boundaries — the #117 assertions' only
+   *  concern. Shared by the failure-lane tests below. */
+  function boundaryBridge() {
+    const boundaries: Array<{ sessionId: string; phase: string; stopReason?: string }> = [];
+    const bridge = {
+      registerSession: () => {},
+      deregisterSession: () => {},
+      forwardSessionUpdate: () => {},
+      forwardPermissionRequest: () => {},
+      forwardTurnBoundary: (p: { sessionId: string; phase: string; stopReason?: string }) =>
+        boundaries.push(p),
+      onInject: () => {},
+      onPermissionDecision: () => {},
+      start: () => {},
+      stop: () => {},
+    } as unknown as BridgeChannel;
+    return { bridge, boundaries };
+  }
+
+  // #117: settleActive is not the only turn terminator. An is_error result
+  // rejects the prompt via failActive, and the bridge must still see
+  // phase:"end" — kind:"turn" is its ONLY turn-state channel, so a skipped
+  // boundary leaves the wrist showing "working" forever (idle:false replays
+  // across watch reconnects AND bridge restarts) until an unrelated later
+  // turn completes.
+  it("reports the turn end to the watch bridge when the turn fails (is_error result)", async () => {
+    const { bridge, boundaries } = boundaryBridge();
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      bridge,
+    );
+    injectGeneratorSession(
+      agent,
+      makeGenerator([{ ...successResult(), is_error: true, result: "usage limit reached" }]),
+    );
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] }),
+    ).rejects.toThrow();
+
+    expect(boundaries.map((b) => b.phase)).toEqual(["start", "end"]);
+    expect(boundaries[1]!.stopReason).toBe("error");
+  });
+
+  // Same invariant through the stream-death lane (failAllTurns): the active
+  // turn emitted a start, so its rejection owes an end even though today's
+  // callers deregister the session right after.
+  it("reports the turn end when the stream dies mid-turn", async () => {
+    const { bridge, boundaries } = boundaryBridge();
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      bridge,
+    );
+    injectGeneratorSession(agent, (input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value } = await iter.next();
+        yield userEcho(value);
+        throw new Error("stream torn");
+      })(),
+    );
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] }),
+    ).rejects.toThrow("stream torn");
+
+    expect(boundaries.map((b) => b.phase)).toEqual(["start", "end"]);
+  });
+
+  // cancel()'s inline settle of a held turn (deferredSettle) is that turn's
+  // ONLY settle — the consumer may never see another idle — so the boundary
+  // has to be emitted right there (#117).
+  it("closes the turn boundary when cancel() settles a held turn inline", async () => {
+    const { bridge, boundaries } = boundaryBridge();
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      bridge,
+    );
+    const resolve = vi.fn();
+    const turn = {
+      promptUuid: "held-uuid",
+      isLocalOnlyCommand: false,
+      settled: false,
+      resolve,
+      reject: vi.fn(),
+      // Result recorded, settlement deferred for a live background subagent.
+      deferredSettle: { stopReason: "end_turn", usage: cancelledTurnUsage },
+    };
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery((async function* () {})()),
+      input: new Pushable<any>(),
+      activeTurn: turn,
+      turnQueue: [turn],
+    });
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    expect(boundaries).toEqual([
+      { sessionId: "test-session", phase: "end", stopReason: "cancelled" },
+    ]);
+    expect(resolve).toHaveBeenCalledWith(expect.objectContaining({ stopReason: "cancelled" }));
+  });
+
   it("records task_started's task_id → tool_use_id mapping while consuming the stream", async () => {
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,

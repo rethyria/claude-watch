@@ -2568,6 +2568,18 @@ export class ClaudeAcpAgent {
         return;
       }
       turn.settled = true;
+      // claude-watch: a failed turn ends too. These boundaries are the ONLY
+      // turn-state channel the bridge has — without one the wrist keeps
+      // showing the session as working (surviving reconnects, and bridge
+      // restarts via the active:true replay) until an unrelated later turn
+      // completes, and the bridge's end-of-turn prose flush never fires
+      // (#117). The bridge acts on the phase alone; "error" is the honest
+      // informational label for a lane with no PromptResponse stop reason.
+      this.bridge?.forwardTurnBoundary({
+        sessionId: session.sessionId,
+        phase: "end",
+        stopReason: "error",
+      });
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
       streamedToolInputs.clear();
@@ -2582,6 +2594,21 @@ export class ClaudeAcpAgent {
     /** Reject every in-flight turn — used when the stream dies. */
     const failAllTurns = (error: unknown) => {
       disarmForceCancel(session);
+      // claude-watch: the active turn is the only one that ever emitted a
+      // phase:"start" (activateTurn), so it is the only one owed an end here.
+      // Today both callers deregister the session right after (which also
+      // clears the wrist), but the every-started-turn-ends invariant must not
+      // lean on that ordering (#117). A held turn's recorded outcome is the
+      // honest stop reason, mirroring the resolve below.
+      if (session.activeTurn && !session.activeTurn.settled) {
+        this.bridge?.forwardTurnBoundary({
+          sessionId: session.sessionId,
+          phase: "end",
+          stopReason: isHeldOpen(session.activeTurn)
+            ? session.activeTurn.deferredSettle.stopReason
+            : "error",
+        });
+      }
       const turns = session.activeTurn
         ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
         : [...(session.turnQueue ?? [])];
@@ -4336,6 +4363,14 @@ export class ClaudeAcpAgent {
         // unreachable from here): disarm the backstop — none should be
         // armed for a held turn, but a drift here must not leave a timer
         // firing on a settled turn — and drop the turn from the queue.
+        // claude-watch: the turn-end boundary is one of those invariants
+        // (#117) — this inline settle is the held turn's ONLY settle, so
+        // skipping it here would leave the wrist showing "working" forever.
+        this.bridge?.forwardTurnBoundary({
+          sessionId: session.sessionId,
+          phase: "end",
+          stopReason: "cancelled",
+        });
         disarmForceCancel(session);
         session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== active);
         session.activeTurn = null;
