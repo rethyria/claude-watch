@@ -388,7 +388,14 @@ private fun droppedCount(old: List<TerminalLine>, new: List<TerminalLine>): Int 
  * line type: assistant text arrives as OUTPUT with the formatter's "[codex] "
  * source prefix (ToolOutputFormatter's CodexMessage branch), so that prefix
  * is the discriminator; all other OUTPUT is tool results. "> " marks the
- * user's own dictated/echoed commands (BridgeState.echoCommand).
+ * user's own dictated/echoed commands (BridgeState.echoCommand) — a check
+ * that runs on COMMAND/SYSTEM lines only, so an agent's "> " blockquote in
+ * PROSE (rendered as a quote glyph by the parser anyway) can never collide
+ * with it.
+ *
+ * The PROSE roles — and ONLY those — run the #128 markdown parser: agents
+ * speak markdown and the wire carries it verbatim. Tool results are terminal
+ * text; a result containing `**` keeps its asterisks byte for byte.
  */
 @Composable
 private fun FeedLine(line: TerminalLine) {
@@ -412,11 +419,11 @@ private fun FeedLine(line: TerminalLine) {
             }
         TerminalLineType.OUTPUT ->
             if (line.text.startsWith("[codex] ")) { // agent prose: 25px Roboto
-                text = AnnotatedString(line.text.removePrefix("[codex] "))
+                text = rememberProseText(line.text.removePrefix("[codex] "))
                 color = Halo.Palette.TextPrimary
                 family = null
                 size = Halo.Type.Body
-            } else { // result
+            } else { // result — verbatim terminal text, asterisks and all
                 text = highlightPassCounts(line.text)
                 color = Halo.Palette.TextSecondary
             }
@@ -424,7 +431,7 @@ private fun FeedLine(line: TerminalLine) {
         // branch above applies, but chosen from the line's TYPE instead of
         // sniffing its text — proportional, brightest role, body size.
         TerminalLineType.PROSE -> {
-            text = AnnotatedString(line.text)
+            text = rememberProseText(line.text)
             color = Halo.Palette.TextPrimary
             family = null
             size = Halo.Type.Body

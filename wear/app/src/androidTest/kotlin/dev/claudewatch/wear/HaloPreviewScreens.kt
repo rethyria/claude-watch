@@ -360,4 +360,69 @@ class HaloPreviewScreens {
         openFeedFromCard(delta)
         hold()
     }
+
+    /** A lone ACP session whose feed tail is [lastFrame] — the #128 rich-text
+     *  fixtures. Its own fixture, same doctrine as [externalSessionUi]: the
+     *  main captures' three-session ring stays untouched. */
+    private fun richTextUi(rho: String, lastFrame: SseFrame): BridgeViewModel.UiState {
+        val frames = listOf(
+            SseFrame("1", "session", """{"state":"connected"}"""),
+            SseFrame(
+                "2",
+                "session",
+                """{"state":"running","agent":"claude","cwd":"/home/dev/projects/claude-watch","folderName":"claude-watch",""" +
+                    """"kind":"acp","dictatable":true,"sessionId":"$rho"}""",
+            ),
+            lastFrame,
+        )
+        return BridgeViewModel.UiState(
+            status = "paired, stream open",
+            paired = true,
+            bridge = fold(frames),
+        )
+    }
+
+    /** #128's prose reference: one coalesced turn flush carrying the whole
+     *  vocabulary — heading, bold/italic/strike, code chip, list, quote,
+     *  link — rendered styled with the raw markers gone. */
+    @Test
+    fun richProseFeed() {
+        previewEnabled()
+        val rho = "e4a1b7c9-2d5f-4e8a-9b3c-6f1d8e2a7b44"
+        val ui = richTextUi(
+            rho,
+            SseFrame(
+                "3",
+                "message",
+                """{"role":"assistant","text":"## Test report\n**All green** on the *first* rerun\n""" +
+                    """`RingBuffer` keeps ~~199~~ 200 lines\n- masks stay put\n1. rotary reclaimed\n""" +
+                    """> ship it\nsee [the notes](https://example.com)","sessionId":"$rho"}""",
+            ),
+        )
+        compose.setContent { HaloApp(ui = ui, actions = HaloActions()) }
+        drillToList()
+        openFeedFromCard(rho)
+        hold()
+    }
+
+    /** #128's verbatim control: a tool RESULT keeps its asterisks (and the
+     *  pass-count highlight) — rich parsing is a prose-role privilege. */
+    @Test
+    fun richProseToolResultVerbatim() {
+        previewEnabled()
+        val rho = "e4a1b7c9-2d5f-4e8a-9b3c-6f1d8e2a7b44"
+        val ui = richTextUi(
+            rho,
+            SseFrame(
+                "3",
+                "tool-output",
+                """{"tool_name":"Bash","tool_input":{"command":"npm test"},""" +
+                    """"tool_output":"12 passed, 2 **quarantined** — see *notes*","sessionId":"$rho"}""",
+            ),
+        )
+        compose.setContent { HaloApp(ui = ui, actions = HaloActions()) }
+        drillToList()
+        openFeedFromCard(rho)
+        hold()
+    }
 }
