@@ -350,11 +350,24 @@ export const CLAUDE_PROJECTS_ROOT = testOverridableString(
   "CLAUDE_WATCH_CLAUDE_PROJECTS_ROOT",
   path.join(os.homedir(), ".claude", "projects"),
 );
-export const CODEX_SESSION_SCAN_INTERVAL_MS = 1_500;
+// The scan interval and both scan targets are overridable (test-only, same
+// contract as CLAUDE_PROJECTS_ROOT above): the codex lane's tests write REAL
+// rollout files and log lines into a fixture tree — the only way that suite
+// can run without touching the operator's actual ~/.codex.
+export const CODEX_SESSION_SCAN_INTERVAL_MS = testOverridable(
+  "CLAUDE_WATCH_CODEX_SCAN_INTERVAL_MS",
+  1_500,
+);
 export const CODEX_SESSION_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 export const CODEX_SESSION_SCAN_LIMIT = 25;
-export const CODEX_SESSION_ROOT = path.join(os.homedir(), ".codex", "sessions");
-export const CODEX_LOG_FILE = path.join(os.homedir(), ".codex", "log", "codex-tui.log");
+export const CODEX_SESSION_ROOT = testOverridableString(
+  "CLAUDE_WATCH_CODEX_SESSION_ROOT",
+  path.join(os.homedir(), ".codex", "sessions"),
+);
+export const CODEX_LOG_FILE = testOverridableString(
+  "CLAUDE_WATCH_CODEX_LOG_FILE",
+  path.join(os.homedir(), ".codex", "log", "codex-tui.log"),
+);
 
 // The bridge's stable identity, served by the unauthenticated /ping endpoint.
 // Clients PIN this id at pair time and verify it on every reconnect preflight
