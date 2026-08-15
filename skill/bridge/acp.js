@@ -548,7 +548,12 @@ export async function handleAcpUpdate(req, res) {
   // fork's late teardown updates still name the old connection, and letting
   // them steal a LIVE binding would re-route dictation at a fork that already
   // gave the session up — and hang its liveness on an inbox about to close.
-  if (typeof connection === "string" && connection && sessions.has(sessionId)) {
+  // And only for a RUNNING slot (#127): a fire-and-forget update legally
+  // reordered behind the fork's deregister (separate pooled sockets) would
+  // otherwise re-bind an ENDED slot — still visible through the prune grace —
+  // to a live inbox, and dictation into it would be 200-okayed into a fork
+  // that already tore the session down.
+  if (typeof connection === "string" && connection && sessions.get(sessionId)?.state === "running") {
     const owner = sessionConnection.get(sessionId);
     if (!owner || owner === connection || !acpInboxes.has(owner)) {
       sessionConnection.set(sessionId, connection);
@@ -597,7 +602,12 @@ export async function handleAcpUpdate(req, res) {
     if (update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") {
       const text = update.content.text;
       if (typeof text === "string" && text) {
-        proseBuffers.set(sessionId, (proseBuffers.get(sessionId) ?? "") + text);
+        // Capped at APPEND (#127), not just at flush: the flush's slice made
+        // the cap true on the wire but not in memory — a long uninterrupted
+        // message held its full text per session until the next boundary.
+        // Behaviour-neutral by construction: flushProse emits the same last
+        // PROSE_BUFFER_MAX characters either way.
+        proseBuffers.set(sessionId, ((proseBuffers.get(sessionId) ?? "") + text).slice(-PROSE_BUFFER_MAX));
       }
     }
     // A tool call supersedes whatever was being narrated before it: "let me
@@ -1009,6 +1019,22 @@ registerSessionCleanupHook((sessionId) => {
       cancelPermission(pending.permissionId);
     }
   }
+});
+
+// A session's end also releases its transport state (#127). The binding: only
+// the deregister and inbox-close paths deleted it, so an age-out ending kept
+// its sessionConnection entry — and once that fork's inbox reconnected (the
+// adapter reuses its connection id), dictation into the ENDED slot passed
+// every routing check and was 200-okayed into a fork that no longer serves
+// the session. The prose buffer: only the deregister path deleted it, so
+// fork-death and age-out endings stranded each dead session's accumulated
+// prose for the bridge's lifetime — and a revival then flushed the old copy's
+// interrupted narration merged into its first fresh message. A re-register
+// rebuilds both (registerAcpSession's caller re-binds; prose starts empty),
+// so dying with the slot loses nothing a revival needs.
+registerSessionCleanupHook((sessionId) => {
+  sessionConnection.delete(sessionId);
+  proseBuffers.delete(sessionId);
 });
 
 /** Re-announce an ACP slot as one idempotent `session` running event. The

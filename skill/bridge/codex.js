@@ -28,8 +28,19 @@ import {
   writeToSessionStdin,
 } from "./sessions.js";
 
-/** @type {Map<string, {offset: number, remainder: string, sessionId: string | null, cwd?: string, createdAt?: number, initialized: boolean}>} */
+/** @type {Map<string, {offset: number, remainder: string, sessionId: string | null, cwd?: string, createdAt?: number, initialized: boolean, scanFailureLogged?: boolean}>} */
 const codexSessionFiles = new Map();
+/** Rollout thread id -> the watch-spawned PTY slot that IS that session
+ *  (issue #122). A spawn mints a bridge uuid for the PTY slot, but the codex
+ *  process inside it writes its rollout under codex's OWN thread id — two
+ *  names for one conversation. Without the linkage the scanner registered the
+ *  thread id as a second slot (two rows on the wrist for one spawn) and every
+ *  turn signal in the rollout — the only source of task_started/task_complete
+ *  — was addressed to the twin, so the PTY slot's idle could never become
+ *  true. The alias routes the rollout's whole event stream onto the PTY slot
+ *  instead: one row, whose turn truth works. Entries die with their slot
+ *  (resolveCodexSessionId's lazy sweep + the orphan sweep in the scan tick). */
+const codexRolloutAliases = new Map();
 /** @type {Map<string, {sessionId: string, name: string, args: Record<string, any>}>} */
 const codexPendingToolCalls = new Map();
 /** @type {Map<string, {command: string, justification: string, workdir: string, prefixRule: string[], createdAt: number}>} */
@@ -90,12 +101,80 @@ function readFileSlice(filePath, start, length) {
   }
 }
 
+// How far a rollout's birth may sit from its twin's spawn and still match
+// (issue #122). The rollout is written moments after the PTY spawn — process
+// startup plus one scan tick — so the forward window only has to cover a slow
+// codex boot on a loaded machine; the small backward slack absorbs the
+// second-granularity of the file's own timestamp against the bridge clock.
+// Tighter is safer than wider: an unrelated terminal-started codex in the
+// SAME directory inside this window is the one mis-link shape, and two
+// minutes of exposure for a user-driven coincidence is the accepted cost of
+// never leaving the common case (every watch spawn) split in two.
+const CODEX_TWIN_MATCH_SLACK_MS = 15 * 1000;
+const CODEX_TWIN_MATCH_WINDOW_MS = 2 * 60 * 1000;
+
+/** The slot id a rollout thread's events should land on: its watch-spawned
+ *  twin while that slot exists, else the thread id itself. Aliases whose slot
+ *  has been pruned are dropped here — whatever writes that thread AFTER the
+ *  twin's death-and-grace is a session the bridge holds no slot for, and it
+ *  must register honestly under its own id. */
+function resolveCodexSessionId(rolloutId) {
+  const slotId = codexRolloutAliases.get(rolloutId);
+  if (!slotId) return rolloutId;
+  if (!sessions.has(slotId)) {
+    codexRolloutAliases.delete(rolloutId);
+    return rolloutId;
+  }
+  return slotId;
+}
+
+/** Adopt a fresh rollout into the live watch-spawned PTY slot it belongs to
+ *  (issue #122), or return null when no twin matches. A candidate must be a
+ *  bridge-owned codex PTY (never an ACP slot, never a scanner slot), still
+ *  running, in the SAME directory, unlinked (one rollout per PTY), and born
+ *  within the match window; among several the closest birth wins. No session
+ *  event goes out on a link — the slot was announced at spawn, and the whole
+ *  point is that no second row ever exists to announce. */
+function linkRolloutToSpawnedTwin(rolloutId, cwd, createdAt) {
+  if (codexRolloutAliases.has(rolloutId) || sessions.has(rolloutId)) return null;
+  if (typeof cwd !== "string" || !cwd || !createdAt) return null;
+  const rolloutCwd = path.resolve(cwd);
+  const aliasedSlotIds = new Set(codexRolloutAliases.values());
+  let best = null;
+  for (const [, slot] of sessions) {
+    if (slot.agent !== "codex" || slot.state !== "running" || !slot.ptyProcess || slot.kind) continue;
+    if (aliasedSlotIds.has(slot.id)) continue;
+    if (typeof slot.cwd !== "string" || !slot.cwd || path.resolve(slot.cwd) !== rolloutCwd) continue;
+    const lag = createdAt - slot.createdAt;
+    if (lag < -CODEX_TWIN_MATCH_SLACK_MS || lag > CODEX_TWIN_MATCH_WINDOW_MS) continue;
+    if (!best || Math.abs(lag) < Math.abs(best.lag)) best = { slot, lag };
+  }
+  if (!best) return null;
+  codexRolloutAliases.set(rolloutId, best.slot.id);
+  // The rollout appearing is the scanner OBSERVING the spawned session (the
+  // same liveness fact touchExternalSession records for scanner slots) — but
+  // NOT a turn signal, so idle is left alone: a spawned codex sits waiting
+  // for its first prompt, and the rollout's own task_started/task_complete
+  // are the turn authority from here on.
+  markSessionObserved(best.slot);
+  log("info", `Linked Codex rollout ${rolloutId} to watch-spawned session ${best.slot.id} (${best.slot.folderName})`);
+  return best.slot;
+}
+
 function touchExternalSession(sessionId, cwd, createdAt) {
   const resolvedCwd = cwd || process.env.HOME || process.cwd();
   const folderName = path.basename(resolvedCwd) || resolvedCwd;
   const existing = sessions.get(sessionId);
 
   if (existing) {
+    // An authoritative ending stands (issue #53's contract, load-bearing here
+    // since #122): a linked twin's PTY exit is a death the bridge WATCHED, and
+    // the rollout's trailing flush — task_complete, the shutdown lines — lands
+    // on the scanner a tick later. Reviving off those would resurrect a slot
+    // for a process that is demonstrably gone, on every kill. Scanner slots
+    // are untouched: their enders (a watch kill, an age-out) are deliberately
+    // non-authoritative, so their revive path works exactly as before.
+    if (existing.endedAuthoritatively) return existing;
     const wasEnded = existing.state !== "running";
     // The scanner just saw this session write, which is the only liveness
     // signal a Codex slot has: it owns no PTY and holds no connection, so
@@ -147,11 +226,36 @@ function touchExternalSession(sessionId, cwd, createdAt) {
 function endExternalSession(sessionId, reason = "codex-exit") {
   const slot = sessions.get(sessionId);
   if (!slot || slot.state === "ended") return;
+  // A slot with a live PTY dies by its PTY (issue #122): the shutdown log line
+  // means the process is exiting, and the close handler that fires moments
+  // later owns the ending — authoritative, endedAt-stamped, cleanup-hooked.
+  // Ending here first would null the process reference out from under it and
+  // broadcast the same death twice.
+  if (slot.ptyProcess) return;
   slot.state = "ended";
-  slot.ptyProcess = null;
+  // Without the stamp pruneEndedSessions falls back to createdAt — which for a
+  // scanner slot is the rollout FILE's birth, routinely hours old — so any
+  // codex session older than the grace window was pruned on the first tick
+  // after ending instead of staying observable through it (#127).
+  slot.endedAt = Date.now();
   clearCodexSyntheticPermissionForSession(sessionId, reason);
+  purgeCodexSessionScanState(sessionId);
   pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, reason }, sessionId);
   log("info", `Marked external session ${sessionId} as ended (${reason})`);
+}
+
+/** Drop the per-session scan bookkeeping a session's end strands (#127):
+ *  pending tool calls whose output will never be matched (some large —
+ *  apply_patch entries hold the full patch text) and the exec-approval
+ *  candidate parked for a prompt that can no longer be raised. Reached from
+ *  every ending path — endExternalSession above, the shared cleanup hook
+ *  (PTY exits, age-outs), and the orphan sweep in the scan tick for slots
+ *  pruned without either. */
+function purgeCodexSessionScanState(sessionId) {
+  codexExecApprovalCandidates.delete(sessionId);
+  for (const [callId, pending] of codexPendingToolCalls) {
+    if (pending.sessionId === sessionId) codexPendingToolCalls.delete(callId);
+  }
 }
 
 function parseJsonLine(line) {
@@ -270,7 +374,10 @@ function recordCodexExecApprovalCandidate(line) {
 
   if (args?.sandbox_permissions !== "require_escalated") return;
 
-  codexExecApprovalCandidates.set(match[2], {
+  // Keyed by the RESOLVED id (issue #122): the log names codex's thread id,
+  // but for a watch-spawned session the approval must surface on — and its
+  // keystrokes must resolve into — the PTY slot that actually hosts the menu.
+  codexExecApprovalCandidates.set(resolveCodexSessionId(match[2]), {
     command: args.cmd || "",
     justification: args.justification || "Would you like to run this command?",
     workdir: args.workdir || "",
@@ -380,23 +487,51 @@ function handleCodexJsonlLine(line, fileState, options = {}) {
   const bootstrap = options.bootstrap === true;
 
   if (parsed.type === "session_meta") {
-    const sessionId = parsed.payload?.id;
-    if (!sessionId) return;
+    const rolloutId = parsed.payload?.id;
+    if (!rolloutId) return;
 
-    fileState.sessionId = sessionId;
+    fileState.sessionId = rolloutId;
     fileState.cwd = parsed.payload?.cwd || fileState.cwd;
     fileState.createdAt = Date.parse(parsed.payload?.timestamp || parsed.timestamp || "") || fileState.createdAt || Date.now();
 
     if (bootstrap && options.allowBootstrap !== true) return;
 
-    touchExternalSession(sessionId, fileState.cwd, fileState.createdAt);
+    // Issue #122: a rollout freshly written by a watch-spawned codex PTY is
+    // that slot's OWN conversation, not a new external session — link instead
+    // of registering a twin row. An already-linked thread (a truncation
+    // re-init, the file re-entering the recent list) just re-observes its
+    // slot; touchExternalSession is reserved for genuinely external rollouts.
+    if (linkRolloutToSpawnedTwin(rolloutId, fileState.cwd, fileState.createdAt)) return;
+    const resolved = resolveCodexSessionId(rolloutId);
+    if (resolved !== rolloutId) {
+      markSessionObserved(sessions.get(resolved));
+      return;
+    }
+    touchExternalSession(rolloutId, fileState.cwd, fileState.createdAt);
     return;
   }
 
-  const sessionId = fileState.sessionId;
-  if (!sessionId || bootstrap) return;
-  if (!sessions.has(sessionId) || sessions.get(sessionId)?.state !== "running") {
+  if (!fileState.sessionId || bootstrap) return;
+  // Every event line lands on the resolved slot (issue #122): the linked twin
+  // when one exists, the thread id itself otherwise — so tool output, turn
+  // starts and task_complete all address the ONE row the wrist shows.
+  const sessionId = resolveCodexSessionId(fileState.sessionId);
+  if (sessionId !== fileState.sessionId) {
+    // A linked twin's lifecycle is PTY-owned end to end: the close handler is
+    // its only honest ender, and rollout lines must never create OR revive it.
+    // The gap this closes is real and two seconds wide — a wrist kill marks
+    // the slot ended, the dying process's rollout flush lands on the next
+    // scan tick, and `script` takes that long to deliver the PTY exit — so a
+    // revive here flapped every kill ended→running→ended on the watch. If the
+    // process genuinely outlives the slot (a kill it shrugged off), the prune
+    // drops the alias and the thread re-registers below as the external
+    // session it now honestly is.
+    if (sessions.get(sessionId)?.state !== "running") return;
+  } else if (!sessions.has(sessionId) || sessions.get(sessionId)?.state !== "running") {
     touchExternalSession(sessionId, fileState.cwd, fileState.createdAt);
+    // Still not running: an authoritative end refused the revive, and a dead
+    // slot must not be narrated back to clients.
+    if (sessions.get(sessionId)?.state !== "running") return;
   }
 
   if (parsed.type === "response_item" && parsed.payload?.type === "function_call") {
@@ -503,13 +638,25 @@ function scanCodexSessionFiles() {
       initialized: false,
     };
 
-    if (!fileState.initialized) {
-      initializeCodexSessionFile(entry.filePath, entry, fileState);
-      codexSessionFiles.set(entry.filePath, fileState);
-      continue;
+    // Per-file guard (#127): one unopenable rollout — root-owned from a sudo
+    // codex run, or deleted between the stat and the open — must not starve
+    // the other files this tick, nor (via the shared tick's catch) the log
+    // scan behind it, which is the only path that surfaces exec approvals and
+    // detects Codex shutdowns. Logged once per file, not per tick: a
+    // persistently-broken file at the 1.5 s cadence would be pure log spam.
+    try {
+      if (!fileState.initialized) {
+        initializeCodexSessionFile(entry.filePath, entry, fileState);
+      } else {
+        readCodexSessionFileDelta(entry.filePath, entry, fileState);
+      }
+      fileState.scanFailureLogged = false;
+    } catch (err) {
+      if (!fileState.scanFailureLogged) {
+        fileState.scanFailureLogged = true;
+        log("warn", `Codex session file scan failed for ${entry.filePath}: ${err.message}`);
+      }
     }
-
-    readCodexSessionFileDelta(entry.filePath, entry, fileState);
     codexSessionFiles.set(entry.filePath, fileState);
   }
 
@@ -530,8 +677,10 @@ function consumeCodexLogChunk(text) {
 
     const approvalMatch = line.match(/thread_id=([0-9a-f-]+).*codex\.op="exec_approval".*codex_core::codex: (new|close)/i);
     if (approvalMatch) {
-      const [, sessionId, state] = approvalMatch;
-      if (state === "new") {
+      // Resolved (issue #122): a watch-spawned session's approvals belong to
+      // its PTY slot, same as the candidate record above.
+      const sessionId = resolveCodexSessionId(approvalMatch[1]);
+      if (approvalMatch[2] === "new") {
         surfaceCodexExecApproval(sessionId);
       } else {
         clearCodexSyntheticPermissionForSession(sessionId, "closed");
@@ -541,8 +690,9 @@ function consumeCodexLogChunk(text) {
     if (line.includes("Shutting down Codex instance")) {
       const match = line.match(/thread_id=([0-9a-f-]+)/i);
       if (match) {
-        clearCodexSyntheticPermissionForSession(match[1], "codex-shutdown");
-        endExternalSession(match[1], "codex-shutdown");
+        const sessionId = resolveCodexSessionId(match[1]);
+        clearCodexSyntheticPermissionForSession(sessionId, "codex-shutdown");
+        endExternalSession(sessionId, "codex-shutdown");
       }
     }
   }
@@ -576,20 +726,43 @@ function scanCodexLog() {
   consumeCodexLogChunk(text);
 }
 
+// One tick of the monitor, shared by the boot scan and the interval so the
+// two can never diverge in what a failure costs (#126: the boot calls ran
+// bare, so an fs race during startup — a rollout rotated between the listing
+// and the open — threw out of startServer() into the .catch that exits the
+// bridge with code 1, stranding the already-written port file; a scan
+// failure must degrade codex mirroring, never kill the bridge). The two
+// scans are guarded SEPARATELY: the session-file scan failing is no reason
+// to skip the log scan behind it (#127 — see the per-file guard above).
+function runCodexScanTick() {
+  try {
+    scanCodexSessionFiles();
+  } catch (err) {
+    log("warn", `Codex session scan failed: ${err.message}`);
+  }
+  try {
+    scanCodexLog();
+  } catch (err) {
+    log("warn", `Codex log scan failed: ${err.message}`);
+  }
+  // Orphan sweep (#127): pending tool calls and aliases whose session left
+  // the map without a cleanup hook firing (pruneEndedSessions deletes
+  // silently, and a wrist-killed scanner slot's end runs no hooks). Cheap —
+  // both maps are small — and it makes the bookkeeping bounded no matter
+  // which path a session died through.
+  for (const [callId, pending] of codexPendingToolCalls) {
+    if (!sessions.has(pending.sessionId)) codexPendingToolCalls.delete(callId);
+  }
+  for (const [rolloutId, slotId] of codexRolloutAliases) {
+    if (!sessions.has(slotId)) codexRolloutAliases.delete(rolloutId);
+  }
+}
+
 export function startCodexMonitor() {
   if (codexMonitorInterval) return;
 
-  scanCodexSessionFiles();
-  scanCodexLog();
-
-  codexMonitorInterval = setInterval(() => {
-    try {
-      scanCodexSessionFiles();
-      scanCodexLog();
-    } catch (err) {
-      log("warn", `Codex monitor scan failed: ${err.message}`);
-    }
-  }, CODEX_SESSION_SCAN_INTERVAL_MS);
+  runCodexScanTick();
+  codexMonitorInterval = setInterval(runCodexScanTick, CODEX_SESSION_SCAN_INTERVAL_MS);
 }
 
 export function stopCodexMonitor() {
@@ -599,9 +772,15 @@ export function stopCodexMonitor() {
   }
 }
 
-// When a PTY-backed session ends, clear any synthetic permission tied to it
-// (registered as a callback to avoid a sessions.js → codex.js import cycle).
-registerSessionCleanupHook(clearCodexSyntheticPermissionForSession);
+// When a session ends through the shared hooks (a PTY exit, an age-out, an
+// ACP deregister), clear any synthetic permission tied to it and drop its
+// scan bookkeeping — pending tool calls and approval candidates otherwise
+// outlive the session forever (#127). Registered as a callback to avoid a
+// sessions.js → codex.js import cycle.
+registerSessionCleanupHook((sessionId, reason) => {
+  clearCodexSyntheticPermissionForSession(sessionId, reason);
+  purgeCodexSessionScanState(sessionId);
+});
 
 // The authoritative permission-sync frame in permissions.js retracts every id
 // it does NOT list, so synthetic Codex approvals must be in that list or a
