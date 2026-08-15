@@ -123,6 +123,14 @@ fun HaloSessionFeed(
     onDictate: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * False while an overlay (card, voice, offline takeover) owns rotary
+     * focus above this feed (#121). Keyed into the tail's focus claim so the
+     * bezel is re-requested when the overlay closes — the pager's reclaim
+     * pattern; a one-shot claim left the crown dead after any card or voice
+     * round trip while touch kept working.
+     */
+    rotaryActive: Boolean = true,
 ) {
     val session = model.sessions.firstOrNull { it.id == sessionId }
     if (session == null) {
@@ -200,6 +208,7 @@ fun HaloSessionFeed(
             FeedTail(
                 lines = bridgeSession?.terminal?.items ?: emptyList(),
                 thinking = bridgeSession?.thinking == true,
+                rotaryActive = rotaryActive,
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -225,6 +234,7 @@ fun HaloSessionFeed(
 private fun FeedTail(
     lines: List<TerminalLine>,
     thinking: Boolean,
+    rotaryActive: Boolean,
     modifier: Modifier = Modifier,
 ) {
     // The empty state composes INSTEAD of the LazyColumn below, so it must be
@@ -245,7 +255,10 @@ private fun FeedTail(
 
     val listState = rememberLazyListState()
     val focusRequester = remember { FocusRequester() }
-    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    // Keyed on the reclaim flag, NOT one-shot (#121): the overlays above this
+    // feed take rotary focus while up, and their unmount clears focus without
+    // restoring it — only the flag flipping true re-arms the crown.
+    LaunchedEffect(rotaryActive) { if (rotaryActive) focusRequester.requestFocus() }
 
     // Stable per-line keys, so a reading position held in history survives the
     // stream appending (and the 200-line ring dropping) lines: without keys
