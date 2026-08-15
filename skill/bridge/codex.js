@@ -694,20 +694,32 @@ function scanCodexLog() {
   consumeCodexLogChunk(text);
 }
 
+// One tick of the monitor, shared by the boot scan and the interval so the
+// two can never diverge in what a failure costs (#126: the boot calls ran
+// bare, so an fs race during startup — a rollout rotated between the listing
+// and the open — threw out of startServer() into the .catch that exits the
+// bridge with code 1, stranding the already-written port file; a scan
+// failure must degrade codex mirroring, never kill the bridge). The two
+// scans are guarded SEPARATELY: the session-file scan failing is no reason
+// to skip the log scan behind it.
+function runCodexScanTick() {
+  try {
+    scanCodexSessionFiles();
+  } catch (err) {
+    log("warn", `Codex session scan failed: ${err.message}`);
+  }
+  try {
+    scanCodexLog();
+  } catch (err) {
+    log("warn", `Codex log scan failed: ${err.message}`);
+  }
+}
+
 export function startCodexMonitor() {
   if (codexMonitorInterval) return;
 
-  scanCodexSessionFiles();
-  scanCodexLog();
-
-  codexMonitorInterval = setInterval(() => {
-    try {
-      scanCodexSessionFiles();
-      scanCodexLog();
-    } catch (err) {
-      log("warn", `Codex monitor scan failed: ${err.message}`);
-    }
-  }, CODEX_SESSION_SCAN_INTERVAL_MS);
+  runCodexScanTick();
+  codexMonitorInterval = setInterval(runCodexScanTick, CODEX_SESSION_SCAN_INTERVAL_MS);
 }
 
 export function stopCodexMonitor() {
