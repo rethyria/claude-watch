@@ -832,6 +832,121 @@ class ConnectionEngineTest {
     }
 
     /**
+     * Issue #123: the #106 RESUME verification must target the endpoint the
+     * user just TAPPED, never the persisted one. DHCP handed the old address
+     * to a FOREIGN bridge (the terminal BridgeMismatch), the user finds the
+     * real bridge at its new address and taps it; its window is locked → 403
+     * AlreadyPaired. Resuming against the STALE persisted endpoint meets the
+     * foreign bridge again and bounces straight back to BridgeMismatch — the
+     * correct re-pair swallowed with zero explanation, the user wedged until
+     * SIGUSR1 or an unpair. The resume must follow the just-verified address
+     * (and persist it via the cursor-preserving endpoint save).
+     */
+    @Test
+    fun a403AlreadyPairedResumeTargetsTheTappedEndpointNotTheStalePersistedOne() {
+        // The squatter: a foreign bridge (b-2) on the persisted address.
+        val squatted = MockWebServer().also { it.start() }
+        try {
+            runBlocking {
+                store.saveCredentials(BridgeCredentials("tok-old", "127.0.0.1", squatted.port, "b-1"))
+                store.saveLastEventId("42")
+            }
+            // Before the fix the resume preflighted the SQUATTED address and
+            // landed BridgeMismatch; honest b-2 pings keep that wrong path a
+            // deterministic failure rather than a hang.
+            repeat(4) {
+                squatted.enqueue(
+                    MockResponse().setBody("""{"proto":"3","bridgeId":"b-2","machineName":"squat"}"""),
+                )
+            }
+            // The REAL bridge (b-1) at its new address: pair preflight OK,
+            // window locked, then the resume's preflight + stream.
+            server.enqueue(pingResponse())
+            server.enqueue(alreadyPaired403())
+            server.enqueue(pingResponse())
+            server.enqueue(sseHeld(":connected\n\n"))
+
+            val engine = newEngine() // stopped: BridgeMismatch tore the engine down
+            assertNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+
+            // The verification resumes AT THE TAPPED ADDRESS: Connected,
+            // never BridgeMismatch, with the held token offered there.
+            awaitCondition { engine.state.value == ConnectionState.Connected }
+
+            assertEquals("/v1/ping", takeRequest().path)
+            assertEquals("/v1/pair", takeRequest().path)
+            assertEquals("/v1/ping", takeRequest().path)
+            takeRequest().let {
+                assertEquals("/v1/events", it.path)
+                assertEquals("Bearer tok-old", it.getHeader("Authorization"))
+                // Same bridge, new address: the replay cursor must SURVIVE
+                // the endpoint move — resume from the persisted ack, never a
+                // full replay.
+                assertEquals("42", it.getHeader("Last-Event-ID"))
+            }
+            // The verified endpoint is persisted; token, bridgeId and the
+            // cursor all survive (saveEndpoint, not saveCredentials).
+            val creds = credentialsInStore()!!
+            assertEquals(server.port, creds.port)
+            assertEquals("tok-old", creds.token)
+            assertEquals("b-1", creds.bridgeId)
+            assertEquals("42", runBlocking { store.read().lastEventId })
+            assertEquals("nothing may reach the squatter", 0, squatted.requestCount)
+        } finally {
+            squatted.shutdown()
+        }
+    }
+
+    /**
+     * Issue #123's live-engine half: the #106 RECONNECT verification must
+     * follow the tapped endpoint too. The engine is mid-backoff against the
+     * stale address (the bridge moved; the stream is down); the user taps the
+     * bridge at its new address and the locked window 403s. The verification
+     * connect must target the tapped address — reconnecting to the stale one
+     * just fails into another backoff round.
+     */
+    @Test
+    fun a403AlreadyPairedOnALiveButDownEngineVerifiesAtTheTappedEndpoint() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse()) // tok-1 at the ORIGINAL address
+        server.enqueue(sseEnding(":connected\n\n")) // opens, then dies → backoff
+        // Before the fix the verification reconnected to THIS stale address —
+        // fail it fast so the wrong path lands in Reconnecting, not a hang.
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
+
+        // Backoff far past the test horizon: only the verification kick may
+        // produce the reconnect below (the #106 tests' discipline).
+        val engine = newEngine(backoff = BackoffPolicy(baseMs = 300_000, maxMs = 300_000))
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value is ConnectionState.Reconnecting }
+
+        // The bridge now lives at a NEW address; the old one is dark.
+        val moved = MockWebServer().also { it.start() }
+        try {
+            moved.enqueue(pingResponse()) // the tap's pair preflight (same b-1)
+            moved.enqueue(alreadyPaired403())
+            moved.enqueue(pingResponse()) // the verification connect's preflight
+            moved.enqueue(sseHeld(":connected\n\n"))
+
+            assertNull(runBlocking { engine.pair("127.0.0.1", moved.port, "123456", "wear-test") })
+            awaitCondition { engine.state.value == ConnectionState.Connected }
+
+            assertEquals("/v1/ping", moved.takeRequest(10, TimeUnit.SECONDS)?.path)
+            assertEquals("/v1/pair", moved.takeRequest(10, TimeUnit.SECONDS)?.path)
+            assertEquals("/v1/ping", moved.takeRequest(10, TimeUnit.SECONDS)?.path)
+            (moved.takeRequest(10, TimeUnit.SECONDS) ?: throw AssertionError("no stream")).let {
+                assertEquals("/v1/events", it.path)
+                assertEquals("Bearer tok-1", it.getHeader("Authorization"))
+            }
+            // The move is persisted through the cursor-preserving save.
+            awaitCondition { credentialsInStore()?.port == moved.port }
+            assertEquals("tok-1", credentialsInStore()?.token)
+        } finally {
+            moved.shutdown()
+        }
+    }
+
+    /**
      * Issue #106's genuine-failure guard: the SAME 403 lockout with NO stored
      * credential for that bridge is a real refusal — the operator must reopen
      * pairing on the bridge — and surfaces exactly as before. Nothing is

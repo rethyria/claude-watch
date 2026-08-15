@@ -419,7 +419,7 @@ class ConnectionEngine(
             // surface (Connected dismisses the screen; a revoked token lands
             // in the honest AuthExpired).
             if (result.status == 403 && holdsCredentialFor(ping.bridgeId)) {
-                verifyProbablyConnected(myPairGeneration)
+                verifyProbablyConnected(myPairGeneration, hostIp, port)
                 return@withContext PairOutcome.AlreadyPaired
             }
             failPair(myPairGeneration, ConnectionState.PairFailed("${result.status} $error".trim()))
@@ -572,8 +572,19 @@ class ConnectionEngine(
      * from the persisted credential. Every path ends in an honest state:
      * Connected dismisses the pairing screen, a dead token lands in
      * AuthExpired, an unreachable bridge keeps the ordinary retry loop.
+     *
+     * [hostIp]/[port] are the ATTEMPT's endpoint — the address whose ping
+     * just answered with the pinned bridgeId (issue #123). The verification
+     * targets THAT address, never the remembered one: after DHCP hands the
+     * stale address to a foreign bridge (BridgeMismatch), the remembered
+     * endpoint is exactly what verifying against would bounce off — the user
+     * tapped the real bridge at its new home, and resuming anywhere else
+     * re-manufactures the mismatch the tap was meant to fix. The move rides
+     * the same cursor-preserving endpoint save as every same-bridge
+     * relocation; connect()'s preflight still re-verifies the pinned
+     * identity there before the token is offered.
      */
-    private fun verifyProbablyConnected(myPairGeneration: Int) {
+    private suspend fun verifyProbablyConnected(myPairGeneration: Int, hostIp: String, port: Int) {
         val action = synchronized(lock) {
             // A stop() or another pair()'s commit raced this outcome:
             // whatever won owns the engine now — nothing to verify.
@@ -588,6 +599,14 @@ class ConnectionEngine(
                     // backoff wait; a failure re-enters the retry loop.
                     reconnectJob?.cancel()
                     reconnectJob = null
+                    // Follow the pinned bridge to the attempt's address
+                    // (issue #123). Cannot throw: the same hostIp/port
+                    // already built doPair's candidate client.
+                    if (pairedHost != hostIp || pairedPort != port) {
+                        client = clientFactory(hostIp, port)
+                        pairedHost = hostIp
+                        pairedPort = port
+                    }
                     Verify.RECONNECT
                 }
                 else -> {
@@ -600,8 +619,22 @@ class ConnectionEngine(
         }
         when (action) {
             Verify.NONE -> Unit
-            Verify.RECONNECT -> connect()
-            Verify.RESUME -> start()
+            Verify.RECONNECT -> {
+                persistSelfHealedEndpoint(hostIp, port)
+                connect()
+            }
+            Verify.RESUME -> {
+                // Point the resume at the attempt's endpoint BEFORE start()
+                // reads the store back (issue #123) — awaited, not launched,
+                // so the read can never outrun the write. Same mutex +
+                // liveness discipline as every persist; saveEndpoint keeps
+                // token, bridgeId and the replay cursor (same bridge).
+                persistMutex.withLock {
+                    val current = synchronized(lock) { pairGeneration == myPairGeneration }
+                    if (current) store.saveEndpoint(hostIp, port)
+                }
+                start()
+            }
         }
     }
 
