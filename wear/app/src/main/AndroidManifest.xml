@@ -32,6 +32,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Android's local-network gate (issue #29): from API 37 every LAN
+         socket — NSD multicast, the pairing POST, the SSE stream — needs
+         this runtime permission. Below 37 the name is unknown to the
+         platform and ignored at install, so declaring it changes nothing on
+         today's watches; the declaration is load-bearing for the runtime ask
+         (an undeclared permission auto-denies with no dialog). The ask
+         itself lives on the pairing surface (HaloOfflineScreen) and fires
+         only when the platform gates AND the grant is missing — see
+         net/LocalNetworkPermission.kt, including why Android 16's adb-only
+         NEARBY_WIFI_DEVICES opt-in vehicle is deliberately not wired. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
 
     <!-- Predictive-back opt-in (issue #109): on Wear the system back gesture
          is the LEFT-BEZEL edge swipe, and for a non-opted-in app the system
