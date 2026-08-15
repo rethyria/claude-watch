@@ -173,7 +173,15 @@ class ConnectionEngine(
     private val probePorts: List<Int> = DEFAULT_PROBE_PORTS,
 ) {
 
-    data class SseEvent(val id: String?, val type: String, val data: String)
+    /**
+     * One SSE frame as delivered to the collector. [generation] is the pair
+     * generation the frame was emitted under (issue #127): the collector is
+     * process-lifetime and keeps draining a torn-down stream's buffered
+     * frames after a re-pair commits, so [ackApplied] needs to know which
+     * pairing a frame's ack belongs to — an old pairing's ack must never
+     * move the fresh pairing's replay cursor.
+     */
+    data class SseEvent(val id: String?, val type: String, val data: String, val generation: Int)
 
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Stopped)
     val state: StateFlow<ConnectionState> = _state
@@ -741,11 +749,26 @@ class ConnectionEngine(
      * reconnect (a Rejected frame never acks — see BridgeViewModel.handleEvent).
      * Empty/keepalive ids carry nothing to resume from and are ignored.
      * Ordering is preserved by the single [persistCursor] collector.
+     *
+     * Generation-guarded (issue #127), the same idiom failPair and the pair
+     * commit stand behind: the collector keeps draining a torn-down stream's
+     * buffered frames after a re-pair commits, and an ack earned under the
+     * OLD pairing landing around the commit's FULL_REPLAY reset would either
+     * skip the fresh pairing's full ring replay (the exact loss the reset
+     * exists to prevent) or re-advance the persisted cursor behind its back.
+     * An ack whose emit-time generation is no longer current changes
+     * nothing. The trade: frames still buffered when a disconnect() lands
+     * are no longer acked either, so a later resume replays them — a
+     * bounded duplicate, against an unbounded skip.
      */
-    fun ackApplied(id: String) {
+    fun ackApplied(event: SseEvent) {
+        val id = event.id ?: return
         if (id.isEmpty()) return
-        lastEventId = id
-        persistCursor.tryEmit(id)
+        synchronized(lock) {
+            if (event.generation != pairGeneration) return
+            lastEventId = id
+            persistCursor.tryEmit(id)
+        }
     }
 
     private suspend fun authedCall(
@@ -1073,7 +1096,14 @@ class ConnectionEngine(
         }
 
         override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-            if (!isCurrent(myEpoch)) return
+            // The currency check also captures the pair generation this frame
+            // is emitted under (issue #127) — the collector may only drain it
+            // after a re-pair, and its ack must be attributable to THIS
+            // pairing, not whichever one is current by then.
+            val generation = synchronized(lock) {
+                if (stopped || epoch != myEpoch) return
+                pairGeneration
+            }
             // Issue #48: do NOT advance/persist the replay cursor on mere
             // receipt. The collector ACKs a frame back via [ackApplied] only
             // after the reducer has APPLIED it, so a reducer-REJECTED frame is
@@ -1087,7 +1117,7 @@ class ConnectionEngine(
             // not being read, so the heartbeat watchdog pauses too; honest,
             // because data IS flowing and the consumer is the bottleneck.
             // Only a closed channel fails the send, and nothing closes it.
-            _events.trySendBlocking(SseEvent(id, type ?: "message", data))
+            _events.trySendBlocking(SseEvent(id, type ?: "message", data, generation))
         }
 
         override fun onClosed(eventSource: EventSource) {

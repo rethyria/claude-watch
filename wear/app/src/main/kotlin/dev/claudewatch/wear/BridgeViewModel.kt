@@ -215,7 +215,10 @@ class BridgeViewModel(
          * Session ids the user honest-hid (issue #53): EXTERNAL, hook-created
          * sessions the bridge cannot kill, dropped from the derived Halo model
          * LOCALLY (no network). Cleared per id when any applied event for that
-         * session arrives ("until it speaks again" — see [handleEvent]).
+         * session arrives ("until it speaks again" — see [handleEvent]), and
+         * RELEASED when the session leaves bridge state (issue #127): ids are
+         * stable across restarts, so a hide outliving its session would
+         * pre-hide the same id's next registration.
          */
         val hiddenSessions: Set<String> = emptySet(),
         /** The usage page's fetch-on-open state (issue #57); see [UsageUi]. */
@@ -292,7 +295,7 @@ class BridgeViewModel(
             }
         }
         engineScope.launch {
-            engine.events.collect { handleEvent(it.id, it.type, it.data) }
+            engine.events.collect { handleEvent(it) }
         }
         engine.start()
     }
@@ -999,8 +1002,8 @@ class BridgeViewModel(
         }
     }
 
-    private fun handleEvent(id: String?, type: String, data: String) {
-        val frame = SseFrame(id, type, data)
+    private fun handleEvent(event: ConnectionEngine.SseEvent) {
+        val frame = SseFrame(event.id, event.type, event.data)
         // Whether the reducer APPLIED this frame — decided purely by parse, so
         // it is stable across any update()-retry (the flag reflects the
         // committed run). Only an applied frame is acked back to the engine.
@@ -1020,10 +1023,28 @@ class BridgeViewModel(
                     // prompt are what reveal a hidden external session again —
                     // and a revive always rides in with one of those.
                     val sid = result.event.sessionId
-                    if (result.event !is SessionEvent && sid != null && sid in next.hiddenSessions) {
+                    val spoke = if (result.event !is SessionEvent && sid != null && sid in next.hiddenSessions) {
                         next.copy(hiddenSessions = next.hiddenSessions - sid)
                     } else {
                         next
+                    }
+                    // Issue #127: a session's END releases its hidden id. ACP
+                    // ids are stable across Zed restarts (#89), so an id that
+                    // outlived its session would pre-hide the same id's next
+                    // registration — whose bare `running` announce deliberately
+                    // does not un-hide (above), and an idle session never
+                    // speaks: invisible on the wrist with no un-hide UI. Keyed
+                    // on the session LEAVING bridge state (its `ended`, or an
+                    // authoritative session-sync dropping it) — reconnect
+                    // resends keep a hidden LIVE session listed, so its hide
+                    // survives exactly as #53 demands.
+                    if (spoke.hiddenSessions.any { it !in result.state.sessions }) {
+                        spoke.copy(
+                            hiddenSessions =
+                                spoke.hiddenSessions.filterTo(mutableSetOf()) { it in result.state.sessions },
+                        )
+                    } else {
+                        spoke
                     }
                 }
                 // Contract violation: drop the frame, leave state (incl.
@@ -1034,8 +1055,11 @@ class BridgeViewModel(
         // Issue #48: ACK only APPLIED frames back to the engine, so its
         // persisted + reconnect cursor never runs ahead of what the reducer
         // applied — a frame rejected during a reconnect window is then replayed.
-        // A Rejected frame is deliberately NOT acked.
-        if (applied && !id.isNullOrEmpty()) engine.ackApplied(id)
+        // A Rejected frame is deliberately NOT acked. The whole event travels
+        // back so the engine can pin the ack to the pairing that emitted the
+        // frame (issue #127) — a torn-down stream's backlog, drained late,
+        // must not move a fresh pairing's cursor.
+        if (applied && !event.id.isNullOrEmpty()) engine.ackApplied(event)
     }
 
     /** Mirror the reduced bridge state into the flat fields the screen renders. */

@@ -290,6 +290,19 @@ private fun HaloAppBody(
     // was summoned from and closing must land exactly there.
     var spawnPickerOpen by remember { mutableStateOf(false) }
 
+    // Issue #127: the offline takeover's sub-pane state, hoisted from
+    // HaloOfflineScreen so the root back handler below can drive the
+    // takeover's OWN one-step back (sub-pane → Choose → the quiet
+    // reconnecting headline) instead of walking the invisible hierarchy
+    // underneath. Reset whenever the takeover leaves, so every offline
+    // episode opens on its entry pane exactly as the screen-local state did.
+    var offlinePane by remember { mutableStateOf(OfflinePane.Choose) }
+    var offlineRevealed by remember { mutableStateOf(false) }
+    if (!ui.isOffline() && (offlinePane != OfflinePane.Choose || offlineRevealed)) {
+        offlinePane = OfflinePane.Choose
+        offlineRevealed = false
+    }
+
     // §5/§6 result flash: an answered prompt leaves ui.permissionQueue at ACK
     // time, but its card must stay composed while the 1.4s ✓/✕ flash plays.
     // Once the shown prompt vanishes from the queue it is held here until the
@@ -303,6 +316,11 @@ private fun HaloAppBody(
     // blip) and composition-local state would restart a half-answered prompt
     // at question 1. Entries are pruned once their prompt is resolved.
     val answerDrafts = remember { mutableStateMapOf<String, SnapshotStateList<String?>>() }
+    // The chain step's shown/exiting card ids (issue #127) — see the draft
+    // prune below, which must keep the EXITING layer's draft alive for the
+    // 300ms it is still composed.
+    var shownCardId by remember { mutableStateOf<String?>(null) }
+    var exitingCardId by remember { mutableStateOf<String?>(null) }
 
     // §7 voice overlay. The listening phase is the system recognizer activity
     // (it covers the screen; see HaloVoiceScreen's header), so the overlay's
@@ -461,7 +479,23 @@ private fun HaloAppBody(
         systemBackInFlight.value = true
         try {
             progress.collect { event -> systemBackProgress = event.progress }
-            when (val route = systemBack(nav, overlayOpen = voiceOpen || spawnPickerOpen, currentModel)) {
+            if (currentUi.isOffline()) {
+                // Issue #127: the offline takeover is MODAL — routing the
+                // completion through systemBack here walked the INVISIBLE
+                // hierarchy underneath (closing hidden cards, stepping hidden
+                // pages, finally finishing the activity blind from a
+                // fresh-install takeover). Back addresses the TAKEOVER
+                // instead: a sub-pane steps back to Choose, a revealed
+                // chooser lowers to the quiet reconnecting headline, and at
+                // the takeover's root the gesture is consumed whole —
+                // gesture model v3 admits no new exit paths (the settings
+                // exit stands, and settings is unreachable under a modal).
+                when {
+                    offlinePane != OfflinePane.Choose -> offlinePane = OfflinePane.Choose
+                    offlineRevealed -> offlineRevealed = false
+                    else -> Unit
+                }
+            } else when (val route = systemBack(nav, overlayOpen = voiceOpen || spawnPickerOpen, currentModel)) {
                 SystemBack.DismissOverlay -> when {
                     // The voice overlay renders ABOVE the picker (both can be
                     // up: an armed send can fail while the picker is open), so
@@ -743,12 +777,28 @@ private fun HaloAppBody(
             }
         }
         val display = if (nav.cardOpen) cardHold else null
+        // Issue #127: the id of the card AnimatedContent's EXITING layer.
+        // Queue chaining swaps `display` while the just-resolved card is
+        // still composed for its 300ms exit slide, and that layer's content
+        // lambda keeps reading its draft via getOrPut — with the id already
+        // pruned, every read became a write, every write re-armed the prune,
+        // and the pair recomposed the whole body per frame until the layer
+        // disposed. Retaining the exiting id keeps the read a plain hit (and
+        // the exit frames render the real answers, not a blank rebuild).
+        // Bounded to ONE stale entry, released by the next swap or the
+        // overlay closing — whose layers unmount with no exit pass.
+        if (shownCardId != display?.permissionId) {
+            exitingCardId = shownCardId
+            shownCardId = display?.permissionId
+        }
+        if (display == null && exitingCardId != null) exitingCardId = null
         // Prune resolved prompts' answer drafts (idempotent: only writes when
         // something is actually stale). The held prompt's draft survives its
         // result flash, during which it has already left the queue.
         run {
             val liveIds = ui.permissionQueue.mapTo(mutableSetOf()) { it.permissionId }
             cardHold?.let { liveIds += it.permissionId }
+            exitingCardId?.let { liveIds += it }
             if (answerDrafts.keys.any { it !in liveIds }) answerDrafts.keys.retainAll(liveIds)
         }
         // The card composable reports done: after its result flash (resolved
@@ -918,6 +968,10 @@ private fun HaloAppBody(
                     onDiscoverForPairing = actions.onDiscoverForPairing,
                     onDiscoverBridges = actions.onDiscoverBridges,
                     onPairByDiscovery = actions.onPairByDiscovery,
+                    pane = offlinePane,
+                    onPane = { offlinePane = it },
+                    revealed = offlineRevealed,
+                    onReveal = { offlineRevealed = true },
                 )
             }
         }

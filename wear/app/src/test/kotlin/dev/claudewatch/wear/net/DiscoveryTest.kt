@@ -199,7 +199,7 @@ class DiscoveryTest {
         // so the relocated stream below resumes from the last SEEN + acked id.
         scope.launch {
             engine.events.collect {
-                it.id?.let { id -> engine.ackApplied(id) }
+                engine.ackApplied(it)
                 events.add(it)
             }
         }
@@ -506,7 +506,7 @@ class DiscoveryTest {
         val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
         scope.launch {
             engine.events.collect {
-                it.id?.let { id -> engine.ackApplied(id) }
+                engine.ackApplied(it)
                 events.add(it)
             }
         }
@@ -583,7 +583,7 @@ class DiscoveryTest {
         val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
         scope.launch {
             engine.events.collect {
-                it.id?.let { id -> engine.ackApplied(id) }
+                engine.ackApplied(it)
                 events.add(it)
             }
         }

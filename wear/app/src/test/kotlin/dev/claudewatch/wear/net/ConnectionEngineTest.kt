@@ -187,7 +187,7 @@ class ConnectionEngineTest {
         // so the reconnect below must resume from the last SEEN + acked event.
         scope.launch {
             engine.events.collect {
-                it.id?.let { id -> engine.ackApplied(id) }
+                engine.ackApplied(it)
                 events.add(it)
             }
         }
@@ -259,7 +259,7 @@ class ConnectionEngineTest {
         scope.launch {
             engine.events.collect {
                 val n = it.id?.toIntOrNull()
-                if (n != null && n >= 6) engine.ackApplied(it.id!!)
+                if (n != null && n >= 6) engine.ackApplied(it)
                 seen.add(it)
             }
         }
@@ -289,6 +289,73 @@ class ConnectionEngineTest {
         takeRequest().let {
             assertEquals("/v1/events", it.path)
             assertEquals("6", it.getHeader("Last-Event-ID"))
+        }
+    }
+
+    // -- Late acks across a re-pair (issue #127 wear-net-3) -----------------
+
+    /**
+     * Issue #127 (wear-net-3): an ack for a frame emitted under an OLD
+     * pairing, drained from the collector's backlog after a re-pair commits,
+     * must never move the fresh pairing's replay cursor. The commit resets
+     * the cursor to FULL_REPLAY exactly so the new stream replays the ring +
+     * terminal backlog; an unguarded late ack overwrote that reset (or, past
+     * openEvents, re-advanced the persisted cursor) — skipping the fresh
+     * replay this engine's own war stories built the reset for. The resume
+     * after a disconnect reads the PERSISTED cursor back, which is where the
+     * stale ack would surface: it must still say full-replay "0", never the
+     * dead backlog's "5".
+     */
+    @Test
+    fun aLateAckFromTheOldPairingsBacklogCannotMoveTheFreshPairingsCursor() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse()) // tok-1
+        // Pairing 1's stream delivers event 5, then dies → frozen backoff.
+        server.enqueue(sseEnding("id: 5\nevent: tool-output\ndata: {}\n\n"))
+        // The re-pair: fresh token, fresh FULL_REPLAY cursor, held stream.
+        server.enqueue(pingResponse())
+        server.enqueue(MockResponse().setBody("""{"token":"tok-2","bridgeId":"b-1","sessions":[]}"""))
+        server.enqueue(sseHeld(":connected\n\n"))
+
+        val engine = newEngine(backoff = BackoffPolicy(baseMs = 300_000, maxMs = 300_000))
+        val seen = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
+        scope.launch { engine.events.collect { seen.add(it) } } // acks withheld
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { seen.any { it.id == "5" } }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "654321", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        awaitCondition { credentialsInStore()?.token == "tok-2" }
+
+        // Only NOW does the old stream's frame ack — the late drain landing
+        // after the commit. Generation-stale: it must change nothing.
+        engine.ackApplied(seen.first { it.id == "5" })
+        Thread.sleep(500) // window for a wrongful cursor write/persist to land
+
+        // Resume from the persisted cursor: still the fresh pairing's full
+        // replay, never the dead backlog's id.
+        engine.disconnect()
+        awaitCondition { engine.state.value == ConnectionState.Stopped }
+        server.enqueue(pingResponse())
+        server.enqueue(sseHeld(":connected\n\n"))
+        engine.start()
+
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("0", takeRequest().getHeader("Last-Event-ID"))
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("0", takeRequest().getHeader("Last-Event-ID"))
+        assertEquals("/v1/ping", takeRequest().path)
+        takeRequest().let {
+            assertEquals("/v1/events", it.path)
+            assertEquals(
+                "a stale-generation ack must not survive into the fresh pairing's cursor",
+                "0",
+                it.getHeader("Last-Event-ID"),
+            )
+            assertEquals("Bearer tok-2", it.getHeader("Authorization"))
         }
     }
 
@@ -394,7 +461,7 @@ class ConnectionEngineTest {
         val engine = newEngine(heartbeatMs = 1_500)
         // ACK applied frames like the ViewModel does (issue #48): the reconnect
         // cursor advances to the last SEEN event only because it was acked.
-        scope.launch { engine.events.collect { it.id?.let { id -> engine.ackApplied(id) } } }
+        scope.launch { engine.events.collect { engine.ackApplied(it) } }
         assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
 
         assertEquals("/v1/ping", takeRequest().path)
@@ -659,7 +726,7 @@ class ConnectionEngineTest {
         val engine = newEngine()
         // ACK applied frames like the ViewModel does (issue #48): only the
         // ack advances the persisted cursor the resume below must honor.
-        scope.launch { engine.events.collect { it.id?.let { id -> engine.ackApplied(id) } } }
+        scope.launch { engine.events.collect { engine.ackApplied(it) } }
 
         assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
         awaitCondition { engine.state.value == ConnectionState.Connected }

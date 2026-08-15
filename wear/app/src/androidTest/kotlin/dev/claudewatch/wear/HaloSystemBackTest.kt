@@ -366,6 +366,83 @@ class HaloSystemBackTest {
         awaitDestroyed()
     }
 
+    /** The offline takeover fixture: unpaired, nothing live behind it. */
+    private fun offlineUi() = BridgeViewModel.UiState(status = "unpaired", paired = false)
+
+    /**
+     * Issue #127 (wear-ui-3): the offline takeover is MODAL — system back
+     * must never walk the hierarchy hidden under it, and it must never exit
+     * (gesture model v3 admits no new exit paths; the settings exit is
+     * unreachable under a modal). Before the fix, four backs on a
+     * fresh-install takeover walked the INVISIBLE pages home → usage →
+     * settings and then finished the activity blind.
+     */
+    @Test
+    fun backUnderTheOfflineTakeoverNeverWalksTheHiddenHierarchyOrExits() {
+        compose.setContent { HaloApp(ui = offlineUi(), actions = HaloActions()) }
+        compose.onNodeWithTag("manualButton").assertIsDisplayed()
+
+        repeat(4) {
+            Espresso.pressBackUnconditionally()
+            compose.waitForIdle()
+        }
+        assertFalse("back must never exit under the takeover", compose.activity.isFinishing)
+        compose.onNodeWithTag("manualButton").assertIsDisplayed()
+        assertTrue(compose.activity.onBackPressedDispatcher.hasEnabledCallbacks())
+    }
+
+    /** Back drives the takeover's OWN one-step walk: Manual → Choose. */
+    @Test
+    fun backUnderTheTakeoverStepsItsOwnPanesManualToChoose() {
+        compose.setContent { HaloApp(ui = offlineUi(), actions = HaloActions()) }
+        compose.onNodeWithTag("manualButton").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("pairButton").assertIsDisplayed()
+
+        dispatchSystemBack()
+        assertEquals("back closes the Manual pane", 0, nodeCount("pairButton"))
+        compose.onNodeWithTag("manualButton").assertIsDisplayed()
+        assertFalse(compose.activity.isFinishing)
+    }
+
+    /**
+     * A reconnect blip raises the takeover OVER a live position: back walks
+     * the TAKEOVER's own hierarchy (the revealed chooser lowers to the quiet
+     * reconnecting headline, then back is consumed at the root) and the
+     * hidden halo position survives untouched — the stream healing must land
+     * exactly where the drop interrupted.
+     */
+    @Test
+    fun backUnderTheTakeoverLeavesTheHiddenHierarchyWhereItWas() {
+        var state by mutableStateOf(ui())
+        compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
+        drillToList()
+        stepTo("haloPagerCard-s-2")
+        openFeed("s-2")
+        compose.onNodeWithTag("haloFeed-s-2").assertIsDisplayed()
+
+        // The stream drops: the takeover covers the feed.
+        state = state.copy(status = "paired, reconnecting (stream failure)")
+        compose.waitForIdle()
+        compose.onNodeWithTag("repairButton").assertIsDisplayed()
+
+        // Reveal the chooser, then back down the takeover's own hierarchy:
+        // chooser → quiet headline, then consumed whole at its root.
+        compose.onNodeWithTag("repairButton").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("manualButton").assertIsDisplayed()
+        dispatchSystemBack()
+        compose.onNodeWithTag("repairButton").assertIsDisplayed()
+        dispatchSystemBack()
+        dispatchSystemBack()
+        assertFalse(compose.activity.isFinishing)
+
+        // The stream heals: the feed is EXACTLY where the drop left it.
+        state = state.copy(status = "paired, stream open")
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloFeed-s-2").assertIsDisplayed()
+    }
+
     private fun shell(cmd: String) {
         val pfd = InstrumentationRegistry.getInstrumentation().uiAutomation
             .executeShellCommand(cmd)
