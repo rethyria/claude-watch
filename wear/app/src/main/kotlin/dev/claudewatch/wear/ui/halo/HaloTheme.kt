@@ -18,6 +18,12 @@ object Halo {
         val DocBase = Color(0xFF0D0D0F)
         val Surface = Color(0xFF191B20)
         val Surface2 = Color(0xFF23262D)
+        // Code-chip fill (#128, user-tuned): Surface2 reads as barely-there on
+        // the watch's pure-black OLED at wrist distance, and readability beats
+        // tonal-ramp purity — a dedicated step above the surface ramp so the
+        // "highlight" actually highlights, without brightening Surface2's
+        // other pill/chip uses.
+        val CodeChip = Color(0xFF363B45)
         val InsetWell = Color(0xFF16181D)
 
         val TextPrimary = Color(0xFFF4F1EA)

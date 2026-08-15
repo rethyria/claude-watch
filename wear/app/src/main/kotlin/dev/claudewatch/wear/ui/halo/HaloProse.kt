@@ -37,10 +37,11 @@ import dev.claudewatch.shared.terminal.ProseMarkup
  */
 private val LIST_HANG_INDENT = 10.sp
 
-/** The inline-code chip: monospace on a faint background rect — the issue's
- *  "highlight" treatment. Surface2 is the pill/chip fill role; the text
+/** The inline-code chip: monospace on a background rect — the issue's
+ *  "highlight" treatment. CodeChip, not Surface2: the user field-tested
+ *  Surface2 as too faint against the black watchface (2026-08-15). The text
  *  keeps whatever colour role its line already has (data stays TextPrimary). */
-private val CODE_CHIP = SpanStyle(fontFamily = FontFamily.Monospace, background = Halo.Palette.Surface2)
+private val CODE_CHIP = SpanStyle(fontFamily = FontFamily.Monospace, background = Halo.Palette.CodeChip)
 
 private val BOLD = SpanStyle(fontWeight = FontWeight.Bold)
 private val ITALIC = SpanStyle(fontStyle = FontStyle.Italic)
