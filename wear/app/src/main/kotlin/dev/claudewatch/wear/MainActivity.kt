@@ -146,8 +146,9 @@ fun WatchApp(
             }
         }
     }
-    // Swap the no-op default for the real vibrator grammar (issue #20).
-    LaunchedEffect(viewModel) { viewModel.haptics = VibratorHaptics(context) }
+    // No haptics swap here: BridgeViewModel.singleton installs the real
+    // grammar at construction (#129) — a composition-scoped swap would leave
+    // a sticky-service-revived process on the silent no-op.
     val state by viewModel.state.collectAsState()
     // Voice input rides the system recognizer activity
     // (RecognizerIntent.ACTION_RECOGNIZE_SPEECH) — never a raw

@@ -1348,11 +1348,53 @@ class BridgeViewModelTest {
         )
     }
 
-    /** Records the haptic grammar so JVM tests can assert ack vs failure verbs. */
+    /** Records the haptic grammar so JVM tests can assert which verb spoke. */
     private class RecordingHaptics : Haptics {
         val events = java.util.concurrent.CopyOnWriteArrayList<String>()
         override fun commandAcked() { events += "acked" }
         override fun commandFailed() { events += "failed" }
+        override fun needsYou() { events += "needsYou" }
+        override fun workFinished() { events += "workFinished" }
+        override fun wentWrong() { events += "wentWrong" }
+    }
+
+    /**
+     * Issue #129 wiring: a permission-request arriving over the LIVE SSE
+     * stream speaks needsYou from the EVENT path — handleEvent, after the
+     * reducer applies the frame — with no composition anywhere in this test
+     * (there is no UI here at all, which is the point: the buzz must not
+     * need a screen). Exactly ONE buzz: the frame that raised the card is
+     * the rising edge, and the pad frames that follow re-deliver nothing.
+     * The dedupe rules themselves are tabled in AttentionHapticsTest; this
+     * pins that the observer is actually attached to the stream.
+     */
+    @Test
+    fun permissionRequestOverTheStreamSpeaksNeedsYouFromTheEventPath() {
+        val haptics = RecordingHaptics()
+        viewModel.haptics = haptics
+        enqueuePing() // the engine's discovery preflight precedes every pair
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append(sessionRunningFrame(1, "s-1", "proj"))
+            append(permissionRequestFrame(2, "perm-buzz", "Bash"))
+            // Keep the stream open while the assertions below run.
+            append(":pad\n\n".repeat(40))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 250, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+
+        awaitState { it.permissionQueue.any { p -> p.permissionId == "perm-buzz" } }
+        awaitState { haptics.events.isNotEmpty() }
+        assertEquals(listOf("needsYou"), haptics.events.toList())
     }
 
     /**

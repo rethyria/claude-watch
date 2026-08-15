@@ -3,6 +3,7 @@ package dev.claudewatch.wear
 import android.content.Context
 import dev.claudewatch.shared.protocol.AgentPermissionOption
 import dev.claudewatch.shared.protocol.AskUserQuestion
+import dev.claudewatch.shared.protocol.ErrorEvent
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.protocol.PermissionRequestEvent
 import dev.claudewatch.shared.protocol.SessionEvent
@@ -244,13 +245,24 @@ class BridgeViewModel(
     val state: StateFlow<UiState> = _state
 
     /**
-     * The haptic grammar spoken on command outcomes. Defaults to the no-op so
-     * plain-JVM unit tests can construct the ViewModel; [MainActivity] swaps
-     * in [VibratorHaptics], tests may swap in a recorder. Volatile: outcomes
-     * fire from the IO dispatcher.
+     * The haptic grammar spoken on command outcomes and attention events.
+     * Defaults to the no-op so plain-JVM unit tests can construct the
+     * ViewModel; [singleton] installs [VibratorHaptics] at construction —
+     * PROCESS layer, not composition, because the attention verbs (#129)
+     * must speak from a sticky-service-revived process no activity ever
+     * joined — and tests may swap in a recorder. Volatile: outcomes fire
+     * from the IO dispatcher.
      */
     @Volatile
     var haptics: Haptics = Haptics.None
+
+    // The attention-verb discipline (issue #129): diffs applied reducer
+    // output and connection transitions into needsYou/workFinished/wentWrong.
+    // Provider-backed so it always speaks whatever grammar [haptics] holds at
+    // fire time. Lives and dies with this class — process lifetime (#24), so
+    // it keeps firing screen-off under the FGS and forgets only at process
+    // death or [unpair].
+    private val attention = AttentionHaptics({ haptics })
 
     // Owns the engine's lifetime; viewModelScope was avoided even before the
     // ViewModel base class went (it requires Dispatchers.Main, which plain
@@ -272,6 +284,10 @@ class BridgeViewModel(
     init {
         engineScope.launch {
             engine.state.collect { connection ->
+                // Outside the update lambda (which may retry): a connection
+                // edge is judged once. The observer's own latches make the
+                // collector's replays/conflation harmless.
+                attention.onConnection(connection)
                 _state.update {
                     it.copy(
                         status = statusText(connection),
@@ -439,6 +455,11 @@ class BridgeViewModel(
     fun unpair() {
         engine.stop()
         _state.update { UiState(status = it.status, paired = false) }
+        // The screen model reset above must take the buzz memory with it:
+        // stale per-session activity surviving into a re-pair would turn the
+        // new bridge's first idle re-announce of a remembered id into a
+        // phantom WORKING→IDLE buzz.
+        attention.reset()
     }
 
     /**
@@ -1008,10 +1029,19 @@ class BridgeViewModel(
         // it is stable across any update()-retry (the flag reflects the
         // committed run). Only an applied frame is acked back to the engine.
         var applied = false
+        // The attention observer's inputs, captured from the COMMITTED run
+        // and judged after the update returns — never inside the lambda,
+        // which update() may retry (a buzz is not retryable). The error flag
+        // rides separately because an appended terminal line is not a
+        // diffable edge (see AttentionHaptics.onApplied).
+        var attentionState: BridgeState? = null
+        var errorEvent = false
         _state.update { ui ->
             when (val result = BridgeEventReducer.reduce(ui.bridge, frame, System.currentTimeMillis())) {
                 is BridgeEventReducer.Applied -> {
                     applied = true
+                    attentionState = result.state
+                    errorEvent = result.event is ErrorEvent
                     val next = ui.withBridge(result.state)
                     // Issue #53: a GENUINE-ACTIVITY event for a hidden session
                     // un-hides it ("until it speaks again"). A bare `session`
@@ -1052,6 +1082,10 @@ class BridgeViewModel(
                 is BridgeEventReducer.Rejected -> ui
             }
         }
+        // Attention verbs (#129) speak from the EVENT path, here — the FGS
+        // keeps this collector alive with the screen off and every activity
+        // gone, which is exactly when the buzz matters.
+        attentionState?.let { attention.onApplied(it, errorEvent) }
         // Issue #48: ACK only APPLIED frames back to the engine, so its
         // persisted + reconnect cursor never runs ahead of what the reducer
         // applied — a frame rejected during a reconnect window is then replayed.
@@ -1181,7 +1215,15 @@ class BridgeViewModel(
                     // Issue #23: real mDNS/NSD discovery for zero-typing pairing
                     // and the DHCP self-heal, over the actual Wi-Fi transport.
                     discovery = NsdBridgeDiscovery(context.applicationContext),
-                ).also { instance = it }
+                ).also {
+                    // The real grammar rides construction, NOT MainActivity's
+                    // composition (#129): a sticky service restart revives
+                    // this singleton with no activity ever attached, and the
+                    // attention verbs must buzz from exactly that posture —
+                    // screen off, app gone, only the FGS holding the stream.
+                    it.haptics = VibratorHaptics(context.applicationContext)
+                    instance = it
+                }
             }
 
         /**
