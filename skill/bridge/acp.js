@@ -55,9 +55,11 @@ const PROSE_BUFFER_MAX = 4000;
  *  the result, the timeout, or the owning inbox closing. */
 const pendingAcpSpawns = new Map();
 /** In-flight wrist kills awaiting the fork's teardown (#88):
- *  sessionId -> { promise, resolve, timer }. Settled exactly once — by the
- *  session actually ending (the fork's deregister, or its inbox dying), or by
- *  the timeout. */
+ *  sessionId -> { promise, resolve, timer, reason }. Settled exactly once —
+ *  by the session actually ending (the fork's deregister, or its inbox
+ *  dying), or by the timeout. A #89 handoff settling mid-wait re-aims the
+ *  kill at the new owner instead (#125, see forwardPendingCloseTo): the kill
+ *  is an intent against the SESSION, and the migration must not consume it. */
 const pendingAcpCloses = new Map();
 /** Sessions the wrist ASKED to end, held until they actually do (#88). Kept
  *  SEPARATE from pendingAcpCloses because that entry dies at the timeout while
@@ -152,10 +154,11 @@ export async function handleAcpRegister(req, res) {
   // inbox needs no release either — the inbox close already ended that copy,
   // and this register is the ordinary revival.
   const priorConnection = sessionConnection.get(sessionId);
-  if (
+  const migrating = Boolean(
     priorConnection && priorConnection !== connection && acpInboxes.has(priorConnection) &&
-    sessions.get(sessionId)?.state === "running"
-  ) {
+    sessions.get(sessionId)?.state === "running",
+  );
+  if (migrating) {
     const released = await releaseAcpSession(sessionId, priorConnection);
     if (!released.ok) {
       log("warn", `ACP session ${sessionId} re-registered by connection ${connection} without the old fork's release (${released.error}) — proceeding; the old copy is orphaned until that fork dies`);
@@ -172,6 +175,15 @@ export async function handleAcpRegister(req, res) {
     contextPct: contextPctOf(body.contextUsed, body.contextSize),
   });
   sessionConnection.set(sessionId, connection);
+  // A wrist kill that raced the handoff (#125): its close frame went to the
+  // OLD fork, whose deregister the release above consumed as the migration —
+  // no session ended, so the waiter would starve to a 504 that blames the
+  // adapter while the session lives on right here. The kill is the user's
+  // intent against the SESSION, not against whichever fork hosted it at the
+  // tap, so it follows the session to its new owner. Gated on `migrating`: a
+  // same-fork re-announce (the #68 replay) mid-kill consumed no deregister,
+  // and re-sending there would only reset a clock the fork is already racing.
+  if (migrating) forwardPendingCloseTo(sessionId, connection);
   // Pickup registry maintenance. A register WITH the flag (spawn, or the
   // fork's replay after a bridge restart) marks the session claimable; one
   // WITHOUT it (a normal Zed session, or the attach-time re-register after a
@@ -376,19 +388,26 @@ export function requestAcpClose(sessionId, reason = "watch-kill") {
 
   let settle;
   const promise = new Promise((resolve) => { settle = resolve; });
-  const timer = setTimeout(() => {
+  const timer = armCloseTimeout(sessionId, connectionId);
+  pendingAcpCloses.set(sessionId, { promise, resolve: settle, timer, reason });
+  log("info", `ACP close requested for session ${sessionId} (${reason}) → connection ${connectionId}`);
+  if (!writeAcpFrameToConnection(connectionId, "close", { sessionId, reason })) {
+    settlePendingClose(sessionId, { ok: false, error: "Zed agent connection lost" });
+  }
+  return promise;
+}
+
+/** The bounded wait for a close frame's only ack — the session actually
+ *  ending. One arming site for the initial send and the post-handoff re-route
+ *  below, so the two cannot drift in what a starved kill is told. */
+function armCloseTimeout(sessionId, connectionId) {
+  return setTimeout(() => {
     log("warn", `ACP close of session ${sessionId} unacknowledged after ${ACP_CLOSE_TIMEOUT_MS}ms (connection ${connectionId})`);
     settlePendingClose(sessionId, {
       ok: false,
       error: "Zed's agent did not end the session — if Zed is open, the claude-watch adapter may need a rebuild",
     });
   }, ACP_CLOSE_TIMEOUT_MS);
-  pendingAcpCloses.set(sessionId, { promise, resolve: settle, timer });
-  log("info", `ACP close requested for session ${sessionId} (${reason}) → connection ${connectionId}`);
-  if (!writeAcpFrameToConnection(connectionId, "close", { sessionId, reason })) {
-    settlePendingClose(sessionId, { ok: false, error: "Zed agent connection lost" });
-  }
-  return promise;
 }
 
 /** Settle (exactly once) an in-flight wrist kill. */
@@ -398,6 +417,25 @@ function settlePendingClose(sessionId, result) {
   pendingAcpCloses.delete(sessionId);
   clearTimeout(pending.timer);
   pending.resolve(result);
+}
+
+/** Re-aim an in-flight wrist kill at the fork that NOW owns the session, after
+ *  a #89 handoff consumed the old fork's teardown as the migration (#125).
+ *  Without this the kill starved: its close frame went to the old fork, whose
+ *  deregister settled only the release, so nothing ever ended and the watch
+ *  was told a 504 while the session lived on migrated. The clock restarts with
+ *  the re-send — the frame below is the FIRST the real owner has seen, and
+ *  measuring its teardown against a window the handoff already spent would
+ *  just rebuild the starve one fork later. */
+function forwardPendingCloseTo(sessionId, connectionId) {
+  const pending = pendingAcpCloses.get(sessionId);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pending.timer = armCloseTimeout(sessionId, connectionId);
+  log("info", `ACP close of session ${sessionId} follows the handoff (${pending.reason}) → connection ${connectionId}`);
+  if (!writeAcpFrameToConnection(connectionId, "close", { sessionId, reason: pending.reason })) {
+    settlePendingClose(sessionId, { ok: false, error: "Zed agent connection lost" });
+  }
 }
 
 /** Tear down the OLD fork's copy of a session that is re-registering from a
