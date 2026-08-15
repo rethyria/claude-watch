@@ -22,7 +22,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { ensureBridgeRunning, findRunningBridgePort } from "../bridge-channel.js";
+import { ensureBridgeRunning, findRunningBridgePort, spawnDetachedBridge } from "../bridge-channel.js";
 
 const quietLogger = { log() {}, error() {} };
 
@@ -199,6 +199,40 @@ describe("ensureBridgeRunning (claude-watch, #92 launcher half)", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("an async spawn failure is logged, never an adapter-killing uncaughtException (#127)", async () => {
+    // spawn(2) reports most launch failures (ENOENT/EAGAIN/EMFILE — exactly
+    // the resource-pressure class) asynchronously on the child's 'error'
+    // event, NOT through the try/catch around spawn(). Unlistened, that event
+    // is an uncaughtException on the unref'd child that kills the whole
+    // adapter. A doomed execPath makes the REAL event fire; the pin is that
+    // it lands as a logged line (and vitest would surface the crash as an
+    // unhandled error if the listener ever went missing again).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-spawn-"));
+    const errors: string[] = [];
+    const logger = {
+      log() {},
+      error(msg: string) {
+        errors.push(msg);
+      },
+    };
+    const savedExecPath = process.execPath;
+    process.execPath = path.join(dir, "no-such-node");
+    const restore = setEnv({ CLAUDE_WATCH_CREDENTIALS_DIR: dir });
+    try {
+      // The failed spawn has no pid, so the caller is told "unavailable".
+      expect(spawnDetachedBridge(logger)).toBeNull();
+      await waitFor(
+        () => errors.some((line) => /bridge spawn failed/.test(line)),
+        5_000,
+        "the async spawn failure to be logged",
+      );
+    } finally {
+      process.execPath = savedExecPath;
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("racing adapters converge on exactly ONE bridge (the port-bind mutex)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-spawn-"));

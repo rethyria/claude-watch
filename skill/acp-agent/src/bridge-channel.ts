@@ -299,6 +299,15 @@ export function spawnDetachedBridge(logger: Logger): number | null {
         detached: true,
         stdio: ["ignore", logFd, logFd],
       });
+      // Most launch failures (ENOENT/EAGAIN/EMFILE — exactly the
+      // resource-pressure cases) arrive HERE asynchronously, not in the catch
+      // below; an unlistened 'error' on the unref'd child is an
+      // uncaughtException that takes the whole adapter down. Logged no-op
+      // instead: the connect loop's "no bridge answering" handling already
+      // owns the aftermath.
+      child.on("error", (err) => {
+        logger.error(`claude-watch: bridge spawn failed: ${String(err)}`);
+      });
       child.unref();
       logger.error(`claude-watch: no bridge answering — spawned one (pid ${child.pid}, log ${logPath})`);
       return child.pid ?? null;

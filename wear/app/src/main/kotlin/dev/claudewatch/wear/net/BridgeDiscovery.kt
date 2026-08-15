@@ -119,6 +119,10 @@ interface BridgeDiscovery {
 class NsdBridgeDiscovery internal constructor(
     private val platform: Platform,
     private val confirm: suspend (hostIp: String, port: Int) -> String?,
+    // Third seam (issue #29): the local-network grant, read per scan. Defaults
+    // open so every pre-#29 test and call site is untouched; production wires
+    // the real check below.
+    private val granted: () -> Boolean = { true },
 ) : BridgeDiscovery {
 
     constructor(context: Context) : this(
@@ -128,6 +132,9 @@ class NsdBridgeDiscovery internal constructor(
         // once it answers like a bridge NOW and yields its authoritative
         // bridgeId — the same [BridgePing] shape gate pairing/preflight use.
         confirm = { hostIp, port -> withContext(Dispatchers.IO) { pingBridgeId(hostIp, port) } },
+        // Read LIVE per scan (not captured at construction): the discovery
+        // singleton outlives any grant/revoke round trip through settings.
+        granted = { !LocalNetworkPermission.needsRequest(context.applicationContext) },
     )
 
     /**
@@ -194,6 +201,13 @@ class NsdBridgeDiscovery internal constructor(
         empty: T,
         block: suspend (List<Candidate>) -> T,
     ): T {
+        // Issue #29: on a platform that gates LAN access (API 37+), a scan
+        // without the ACCESS_LOCAL_NETWORK grant can only come back empty —
+        // multicast RX is dropped at the socket. Refuse up front rather than
+        // burn the multi-second Wi-Fi bind + browse proving it: the pairing
+        // surface owns the ask, and the self-heal path (which retries on the
+        // engine's backoff clock) stays cheap until the user grants.
+        if (!granted()) return empty
         if (!inFlight.compareAndSet(false, true)) return empty
         try {
             // Holders declared BEFORE the try so a partial acquisition (e.g.

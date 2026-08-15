@@ -397,4 +397,61 @@ class NsdBridgeDiscoveryTest {
         first.cancelAndJoin()
         scope.coroutineContext[Job]!!.cancelAndJoin()
     }
+
+    // == The #29 local-network gate ===========================================
+    // On an API 37+ platform without the ACCESS_LOCAL_NETWORK grant a scan can
+    // only come back empty (multicast RX is EPERM-blocked at the socket), so
+    // withScan refuses UP FRONT — no multicast lock, no process Wi-Fi bind, no
+    // browse burnt proving a foregone conclusion. The grant is read per scan:
+    // the discovery singleton outlives a settings grant/revoke round trip.
+
+    // -- P1: an ungranted scan touches no platform resource -------------------
+
+    @Test
+    fun ungrantedDiscoverRefusesWithoutTouchingThePlatform() = runBlocking {
+        val platform = RecordingPlatform(candidates = listOf(cand("10.0.0.5", 7860, "b-1")))
+        val discovery = NsdBridgeDiscovery(
+            platform,
+            RecordingConfirm(mapOf("10.0.0.5:7860" to "b-1")).fn,
+            granted = { false },
+        )
+
+        assertNull(discovery.discover("b-1", 1_000))
+        assertTrue("no resource may be acquired without the grant", platform.events.isEmpty())
+    }
+
+    @Test
+    fun ungrantedDiscoverAllRefusesWithoutTouchingThePlatform() = runBlocking {
+        val platform = RecordingPlatform(candidates = listOf(cand("10.0.0.5", 7860, "b-1", "Deck")))
+        val discovery = NsdBridgeDiscovery(
+            platform,
+            RecordingConfirm(emptyMap()).fn,
+            granted = { false },
+        )
+
+        assertTrue(discovery.discoverAll(1_000).isEmpty())
+        assertTrue("no resource may be acquired without the grant", platform.events.isEmpty())
+    }
+
+    // -- P2: the grant is read LIVE per scan (a settings grant needs no
+    //        reconstruction of the singleton) ---------------------------------
+
+    @Test
+    fun grantFlippingOnUnblocksTheNextScan() = runBlocking {
+        var granted = false
+        val platform = RecordingPlatform(candidates = listOf(cand("10.0.0.5", 7860, "b-1")))
+        val discovery = NsdBridgeDiscovery(
+            platform,
+            RecordingConfirm(mapOf("10.0.0.5:7860" to "b-1")).fn,
+            granted = { granted },
+        )
+
+        assertNull("blocked while ungranted", discovery.discover("b-1", 1_000))
+        granted = true
+        assertEquals(
+            "the very next scan runs on the live grant",
+            BridgeDiscovery.Discovered("10.0.0.5", 7860, "b-1"),
+            discovery.discover("b-1", 1_000),
+        )
+    }
 }
