@@ -35,8 +35,12 @@ const sessionConnection = new Map();
  *  Flushed as ONE `message` event at a turn boundary or a pause (see
  *  flushProse), never per delta. */
 const proseBuffers = new Map();
-/** ACP toolCallId -> the bridge permissionId raised for it (#80), so a request
- *  answered in Zed can retract the wrist prompt for the SAME tool call. */
+/** ACP toolCallId -> the pending wrist prompt raised for it (#80):
+ *  { permissionId, sessionId }. The permissionId lets a request answered in
+ *  Zed retract the wrist prompt for the SAME tool call; the sessionId lets the
+ *  session's end expire the card (#119) — a fork that died (Zed quit, SIGKILL)
+ *  can never send permission-resolved, so without it the card replayed to
+ *  every reconnecting watch and took answers into a void. */
 const acpPermissionsByToolCall = new Map();
 /** ACP toolCallId -> the pending AskUserQuestion card raised for it (#111):
  *  the input-request twin of acpPermissionsByToolCall. Entries carry the
@@ -656,10 +660,10 @@ export async function handleAcpUpdate(req, res) {
   // no-decision rather than hanging until expiry.
   if (body.kind === "permission-resolved") {
     const toolCallId = body.payload?.toolCallId;
-    const permissionId = toolCallId ? acpPermissionsByToolCall.get(toolCallId) : null;
-    if (permissionId) {
+    const pending = toolCallId ? acpPermissionsByToolCall.get(toolCallId) : null;
+    if (pending) {
       acpPermissionsByToolCall.delete(toolCallId);
-      cancelPermission(permissionId);
+      cancelPermission(pending.permissionId);
     }
   }
 
@@ -832,7 +836,7 @@ function raiseAcpPermission(sessionId, payload) {
   const unambiguous = options.filter((o) => countByBehavior.get(o.behavior) === 1);
 
   const permissionId = crypto.randomUUID();
-  acpPermissionsByToolCall.set(toolCallId, permissionId);
+  acpPermissionsByToolCall.set(toolCallId, { permissionId, sessionId });
   const eventPayload = {
     permissionId,
     sessionId,
@@ -952,15 +956,20 @@ function positionalAskAnswers(questions, decision) {
   return answers.some((a) => a !== null) ? answers : null;
 }
 
-// A session's end expires its pending question cards (#111): the fork-side
-// elicitation died with the session, so nobody is left to consume an answer.
-// cancelPermission both retracts the wrist card (permission-cleared) and
-// resolves the waiter as a no-decision, keeping the frame above unsent.
+// A session's end expires its pending cards — question cards (#111) and
+// permission cards (#119) alike: the fork-side request died with the session,
+// so nobody is left to consume an answer, and a card left standing would
+// replay to every reconnecting watch until its ~9.5-minute expiry while
+// 200-okaying answers into a void. cancelPermission both retracts the wrist
+// card (permission-cleared) and resolves the waiter as a no-decision, keeping
+// the decision frames above unsent.
 registerSessionCleanupHook((sessionId) => {
-  for (const [toolCallId, pending] of acpInputsByToolCall) {
-    if (pending.sessionId !== sessionId) continue;
-    acpInputsByToolCall.delete(toolCallId);
-    cancelPermission(pending.permissionId);
+  for (const byToolCall of [acpInputsByToolCall, acpPermissionsByToolCall]) {
+    for (const [toolCallId, pending] of byToolCall) {
+      if (pending.sessionId !== sessionId) continue;
+      byToolCall.delete(toolCallId);
+      cancelPermission(pending.permissionId);
+    }
   }
 });
 
