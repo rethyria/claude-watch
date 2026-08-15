@@ -453,6 +453,16 @@ type Session = {
    *  hanging (or silently restarting a consumer that resolves `end_turn`
    *  without ever reaching the model). */
   queryClosed?: boolean;
+  /** Set by `teardownSession` BEFORE it awaits cancel() — an unbounded
+   *  `query.interrupt()` round-trip during which the session is still in the
+   *  map and `queryClosed` is not yet set. A `prompt()`/`steer()` landing in
+   *  that window must be refused: its Turn would be enqueued after cancel()'s
+   *  entry-time sweep, the consumer's abort branch settles only the active
+   *  turn, and teardown then deletes the session — nothing left can ever
+   *  settle it, so the client's session/prompt RPC would hang forever (#124).
+   *  Never cleared: teardown always ends in the session's removal (or leaves
+   *  a half-dead session that must stay refused). */
+  tearingDown?: boolean;
   cwd: string;
   /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
    *  detect when loadSession/resumeSession is called with changed values. */
@@ -2037,10 +2047,12 @@ export class ClaudeAcpAgent {
     if (!session) {
       throw new Error("Session not found");
     }
-    // The SDK query stream already terminated (see `queryClosed`); its iterator
-    // can't be revived, so enqueueing here would hang on a deferred that never
-    // settles. Fail clearly and let the client start a fresh session.
-    if (session.queryClosed) {
+    // The SDK query stream already terminated (see `queryClosed`), or teardown
+    // has begun and is mid-await (`tearingDown` — cancel()'s sweep already ran,
+    // so a Turn enqueued now would never be settled, #124). Either way
+    // enqueueing here would hang on a deferred that never settles. Fail
+    // clearly and let the client start a fresh session.
+    if (session.queryClosed || session.tearingDown) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
@@ -2143,7 +2155,11 @@ export class ClaudeAcpAgent {
     if (!session) {
       throw new Error("Session not found");
     }
-    if (session.queryClosed) {
+    // `tearingDown` too (#124): a steer landing mid-teardown would either
+    // start a new turn prompt() refuses anyway, or push a message the
+    // in-flight interrupt is about to drop — an honest error beats a silent
+    // "injected" for input that can never be acted on.
+    if (session.queryClosed || session.tearingDown) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
     // "A turn is running" = the queue holds an unsettled turn. This covers both
@@ -4515,6 +4531,13 @@ export class ClaudeAcpAgent {
     if (!session) {
       return;
     }
+    // Gate new prompts BEFORE the await below: cancel() blocks on an unbounded
+    // query.interrupt() round-trip during which the session still looks live
+    // (`queryClosed` unset), and a prompt() enqueued then is a Turn cancel()'s
+    // entry-time sweep never saw and nothing later can settle — the client's
+    // session/prompt RPC would hang forever (#124). prompt()/steer() refuse
+    // while this is set.
+    session.tearingDown = true;
     await this.cancel({ sessionId });
     // cancel() arms the force-cancel floor and interrupts gracefully, but a
     // wedged consumer only wakes when `cancelController` aborts — closeQueryStream
@@ -4525,6 +4548,19 @@ export class ClaudeAcpAgent {
     // until it fires).
     disarmForceCancel(session);
     session.cancelController?.abort();
+    // Belt and braces for the same race the gate closes: reject anything that
+    // still reached the queue unsettled during the await (a lane the gate
+    // doesn't cover yet). Honest rejection, mirroring the consumer's done-path
+    // treatment of never-run queued turns. The ACTIVE turn is excluded — its
+    // settle belongs to the consumer (the abort wake-up above, or the
+    // stream-done path once closeQueryStream ends the input), which resolves
+    // it "cancelled" per the ACP cancellation contract.
+    for (const turn of session.turnQueue ?? []) {
+      if (turn !== session.activeTurn && !turn.settled) {
+        turn.settled = true;
+        turn.reject(RequestError.internalError(undefined, SESSION_ENDED_MESSAGE));
+      }
+    }
     this.closeQueryStream(session);
     // Abort the SDK abort signal only on explicit destroy. closeQueryStream
     // leaves it alone (it may be a client-owned controller — see its doc), but

@@ -12608,3 +12608,190 @@ describe("HttpBridgeChannel over real loopback (claude-watch, S3 #77)", () => {
     });
   }, 20_000);
 });
+
+// A prompt racing teardownSession's awaited cancel()/interrupt() round-trip
+// (#124): the session still looks live (queryClosed unset), cancel()'s
+// entry-time sweep already ran, and the consumer's abort branch settles only
+// the active turn — so a Turn enqueued in that window could never be settled
+// and Zed's session/prompt RPC hung forever. teardown now gates prompts up
+// front (tearingDown) and sweeps stragglers after the await.
+describe("teardownSession prompt race (claude-watch #124)", () => {
+  function makeAgent() {
+    const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  /** Session whose query.interrupt() blocks until released — the unbounded
+   *  round-trip teardown awaits. The stream itself never yields (like a real
+   *  interrupt window), so a wrongly-enqueued Turn has no done-path bailout:
+   *  pre-fix, the raced prompt hangs instead of being accidentally rescued by
+   *  a mock stream that ends immediately. */
+  function injectBlockedInterruptSession(agent: ClaudeAcpAgent) {
+    let releaseInterrupt!: () => void;
+    const interruptGate = new Promise<void>((r) => {
+      releaseInterrupt = r;
+    });
+    const input = new Pushable<any>();
+    async function* wedged() {
+      await new Promise(() => {});
+      yield undefined as unknown;
+    }
+    const gen = Object.assign(wedged(), {
+      interrupt: vi.fn(() => interruptGate),
+      close: vi.fn(),
+    });
+    agent.sessions["test-session"] = mockSessionState({ query: gen, input });
+    return { releaseInterrupt };
+  }
+
+  it("refuses a prompt that lands while teardown awaits the interrupt", async () => {
+    const agent = makeAgent();
+    const { releaseInterrupt } = injectBlockedInterruptSession(agent);
+
+    const teardown = agent.closeSession({ sessionId: "test-session" });
+    // The desk user hits Enter in the still-open Zed thread while the wrist
+    // kill's interrupt is in flight. Before the gate this enqueued a Turn
+    // nothing could settle: this expectation hung until the test timed out.
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "one more" }] }),
+    ).rejects.toThrow(/ended/i);
+
+    releaseInterrupt();
+    await teardown;
+    expect(agent.sessions["test-session"]).toBeUndefined();
+  });
+
+  it("sweeps (rejects) a turn that still reached the queue during the await", async () => {
+    const agent = makeAgent();
+    const { releaseInterrupt } = injectBlockedInterruptSession(agent);
+
+    const teardown = agent.closeSession({ sessionId: "test-session" });
+    // Simulate a lane the gate doesn't cover: a Turn enqueued behind
+    // cancel()'s entry sweep while the interrupt is still pending.
+    const turn = {
+      promptUuid: "raced-uuid",
+      isLocalOnlyCommand: false,
+      settled: false,
+      resolve: vi.fn(),
+      reject: vi.fn(),
+    };
+    (agent.sessions["test-session"]!.turnQueue ??= []).push(turn as any);
+
+    releaseInterrupt();
+    await teardown;
+
+    expect(turn.settled).toBe(true);
+    expect(turn.reject).toHaveBeenCalled();
+    expect(turn.resolve).not.toHaveBeenCalled();
+  });
+});
+
+// The three cancel/teardown contracts land TOGETHER on a watch kill (#88)
+// caught mid-turn with a permission card up: the turn must end on the wrist
+// (#117), the card must be retracted (#118), and a prompt racing the teardown
+// must be refused honestly (#124) — each visibly, in one sequence.
+describe("watch kill during a turn with a pending permission (#117/#118/#124)", () => {
+  it("ends the turn, retracts the card, and refuses the racing prompt", async () => {
+    const boundaries: Array<{ sessionId: string; phase: string; stopReason?: string }> = [];
+    const retracted: Array<{ sessionId: string; toolCallId: string }> = [];
+    const bridge = {
+      registerSession: () => {},
+      deregisterSession: () => {},
+      forwardSessionUpdate: () => {},
+      forwardPermissionRequest: () => {},
+      forwardPermissionResolved: (p: { sessionId: string; toolCallId: string }) =>
+        retracted.push(p),
+      forwardTurnBoundary: (p: { sessionId: string; phase: string; stopReason?: string }) =>
+        boundaries.push(p),
+      onInject: () => {},
+      onPermissionDecision: () => {},
+      start: () => {},
+      stop: () => {},
+    } as unknown as BridgeChannel;
+
+    // Zed's permission dialog: pending until aborted, then the SDK-native
+    // requestCancelled rejection.
+    let zedSignal: AbortSignal | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: (_p: any, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          zedSignal = signal;
+          signal?.addEventListener("abort", () => reject(new Error("requestCancelled")), {
+            once: true,
+          });
+        }),
+    } as unknown as AcpClient;
+
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
+    // The backstop must never be what settles anything here.
+    agent.forceCancelGraceMs = 60_000;
+
+    // Mid-turn wedge: the SDK is blocked inside the tool call awaiting the
+    // permission answer; only the teardown's cancelController wake-up (or the
+    // input ending) moves the consumer again.
+    const toolAbort = new AbortController();
+    let releaseInterrupt!: () => void;
+    const interruptGate = new Promise<void>((r) => {
+      releaseInterrupt = r;
+    });
+    const input = new Pushable<any>();
+    async function* gen() {
+      const iter = input[Symbol.asyncIterator]();
+      const first = await iter.next();
+      if (!first.done && first.value) {
+        yield userEcho(first.value);
+      }
+      await new Promise(() => {});
+    }
+    const query = Object.assign(gen(), {
+      // The real SDK aborts in-flight tool calls when interrupted — that abort
+      // is what cascades into the permission RPC's rejection.
+      interrupt: vi.fn(() => {
+        toolAbort.abort();
+        return interruptGate;
+      }),
+      close: vi.fn(),
+    });
+    agent.sessions["test-session"] = mockSessionState({ query, input });
+
+    const turnPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run the deploy" }],
+    });
+    await waitForCondition(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const toolPending = agent.canUseTool("test-session")("Bash", { command: "deploy" }, {
+      signal: toolAbort.signal,
+      suggestions: [],
+      toolUseID: "tc-kill",
+    } as any);
+    // Handled here so the teardown-time rejection can't trip the unhandled
+    // tracker before the assertion below attaches; the assertion still sees it.
+    toolPending.catch(() => {});
+    await waitForCondition(() => zedSignal !== undefined);
+
+    // The wrist kills the session while the card is up.
+    const teardown = agent.closeSessionFromWatch("test-session", "watch-kill");
+
+    // …and the desk user hits Enter while teardown awaits the interrupt.
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "also this" }] }),
+    ).rejects.toThrow(/ended/i);
+
+    releaseInterrupt();
+    expect(await teardown).toBe(true);
+
+    // The permission leg died as an aborted tool use and the card came down.
+    await expect(toolPending).rejects.toThrow("Tool use aborted");
+    expect(retracted).toEqual([{ sessionId: "test-session", toolCallId: "tc-kill" }]);
+
+    // The turn settled "cancelled" per the ACP contract and the wrist saw the
+    // full start→end boundary pair.
+    await expect(turnPromise).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(boundaries.map((b) => b.phase)).toEqual(["start", "end"]);
+    expect(boundaries[1]!.stopReason).toBe("cancelled");
+
+    expect(agent.sessions["test-session"]).toBeUndefined();
+  });
+});
