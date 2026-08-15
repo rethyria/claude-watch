@@ -11611,6 +11611,120 @@ describe("injectUserPrompt (claude-watch dictation, S3 #77)", () => {
     expect(resolved).toEqual([{ sessionId: "s2", toolCallId: "tc-8" }]);
   });
 
+  /** Bridge stub recording only permission retractions — the #118 assertions'
+   *  sole concern. */
+  function retractionBridge() {
+    const resolved: Array<{ sessionId: string; toolCallId: string }> = [];
+    const bridge = {
+      registerSession: () => {},
+      deregisterSession: () => {},
+      forwardSessionUpdate: () => {},
+      forwardPermissionRequest: () => {},
+      forwardTurnBoundary: () => {},
+      forwardPermissionResolved: (p: { sessionId: string; toolCallId: string }) => resolved.push(p),
+      onInject: () => {},
+      onPermissionDecision: () => {},
+      start: () => {},
+      stop: () => {},
+    } as unknown as BridgeChannel;
+    return { bridge, resolved };
+  }
+
+  // #118: the retraction must ride EVERY exit, not only the Zed-answered
+  // resolve. A cancelled turn settles Zed's RPC as a requestCancelled
+  // REJECTION (the SDK-native shape, and the deterministic outcome of a
+  // watch-kill teardown aborting the tool signal); before the finally-based
+  // retract the card sat on the wrist for the full expiry while a late Allow
+  // landed in the disposed waiter map — a 200 ok for a tool that never ran.
+  it("retracts the wrist card when the permission RPC is cancelled (turn cancel/teardown abort)", async () => {
+    let zedSignal: AbortSignal | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: (_p: any, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          zedSignal = signal;
+          signal?.addEventListener("abort", () => reject(new Error("requestCancelled")), {
+            once: true,
+          });
+        }),
+    } as unknown as AcpClient;
+    const { bridge, resolved } = retractionBridge();
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
+    agent.sessions["s3"] = mockSessionState({});
+
+    const toolAbort = new AbortController();
+    const pending = agent.canUseTool("s3")("Bash", { command: "ls" }, {
+      signal: toolAbort.signal,
+      suggestions: [],
+      toolUseID: "tc-9",
+    } as any);
+
+    await waitForCondition(() => zedSignal !== undefined);
+    toolAbort.abort();
+
+    await expect(pending).rejects.toThrow("Tool use aborted");
+    expect(resolved).toEqual([{ sessionId: "s3", toolCallId: "tc-9" }]);
+  });
+
+  it("retracts the wrist card when the client's permission RPC fails outright", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => {
+        throw new Error("client exploded");
+      },
+    } as unknown as AcpClient;
+    const { bridge, resolved } = retractionBridge();
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
+    agent.sessions["s4"] = mockSessionState({});
+
+    await expect(
+      agent.canUseTool("s4")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tc-10",
+      } as any),
+    ).rejects.toThrow("client exploded");
+
+    expect(resolved).toEqual([{ sessionId: "s4", toolCallId: "tc-10" }]);
+  });
+
+  it("does NOT retract after a wrist win — the wrist already knows", async () => {
+    let zedSignal: AbortSignal | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      // Zed never answers; its RPC rejects when the wrist win aborts it.
+      requestPermission: (_p: any, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          zedSignal = signal;
+          signal?.addEventListener("abort", () => reject(new Error("requestCancelled")), {
+            once: true,
+          });
+        }),
+    } as unknown as AcpClient;
+    const { bridge, resolved } = retractionBridge();
+    let notify: ((d: any) => void) | undefined;
+    (bridge as any).onPermissionDecision = (h: (d: any) => void) => {
+      notify = h;
+    };
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} }, bridge);
+    agent.sessions["s5"] = mockSessionState({});
+
+    const pending = agent.canUseTool("s5")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tc-11",
+    } as any);
+
+    // The RPC being in flight is the proof the wrist waiter is registered —
+    // a decision sent earlier would land in an empty waiter map and be lost.
+    await waitForCondition(() => notify !== undefined && zedSignal !== undefined);
+    notify!({ sessionId: "s5", toolCallId: "tc-11", optionId: "allow", behavior: "allow" });
+
+    const result = await pending;
+    expect(result?.behavior).toBe("allow");
+    expect(resolved).toEqual([]);
+  });
+
   it("refuses an ended (queryClosed) session honestly instead of desyncing", async () => {
     const agent = makeAgent();
     agent.sessions["test-session"] = mockSessionState({ queryClosed: true });

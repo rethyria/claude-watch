@@ -4814,6 +4814,7 @@ export class ClaudeAcpAgent {
     const zedAbort = new AbortController();
     const chain = () => zedAbort.abort();
     signal.addEventListener("abort", chain, { once: true });
+    let wristWon = false;
 
     try {
       const zed = this.client.requestPermission(params, zedAbort.signal);
@@ -4825,12 +4826,10 @@ export class ClaudeAcpAgent {
       ]);
 
       if (winner.from === "zed") {
-        // Retract the wrist card: the decision is made, and a prompt left on
-        // the watch would either mislead or be answered into a dead request.
-        this.bridge?.forwardPermissionResolved?.({ sessionId: params.sessionId, toolCallId });
         return winner.response;
       }
 
+      wristWon = true;
       zedAbort.abort();
       return { outcome: { outcome: "selected", optionId: winner.d.optionId } };
     } catch (error) {
@@ -4841,6 +4840,17 @@ export class ClaudeAcpAgent {
     } finally {
       signal.removeEventListener("abort", chain);
       wrist?.dispose();
+      // Retract the wrist card on EVERY exit except a wrist win (the wrist
+      // already knows) — handleAskUserQuestion's pattern, adopted here
+      // (#118). The rethrow exits matter as much as the Zed resolve: a
+      // cancelled turn settles Zed's RPC as a requestCancelled REJECTION
+      // (the SDK-native shape, and the deterministic outcome of a watch-kill
+      // teardown aborting the tool signal), and without this the card sits
+      // on the watch until its expiry while a late answer lands in the
+      // disposed waiter map — an Allow the user believes was honored.
+      if (wrist && !wristWon) {
+        this.bridge?.forwardPermissionResolved?.({ sessionId: params.sessionId, toolCallId });
+      }
     }
   }
 
