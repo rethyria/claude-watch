@@ -358,7 +358,11 @@ export async function handleCommand(req, res) {
     // the loopback channel — the fork's injectUserPrompt wakes it if idle. No
     // detached `claude -p` (that corrupts the tree); a fork that is not
     // connected is surfaced honestly so the wear side keeps the text as a draft.
-    if (targetSession && targetSession.kind === "acp") {
+    // LIVE only, mirroring the kill path's guard above (#127): an ended ACP
+    // slot — visible through the prune grace — has no session behind its
+    // binding, so it falls through to the 409 ended refusal below instead of
+    // answering 502 and blaming a Zed adapter that did nothing wrong.
+    if (targetSession && targetSession.kind === "acp" && targetSession.state !== "ended") {
       const promptText = command.replace(/\n$/, "").trim();
       if (!promptText) return jsonResponse(res, 400, { error: "Empty command" });
       if (!injectToAcpSession(targetSession.id, promptText, "watch")) {

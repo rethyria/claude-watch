@@ -28,7 +28,7 @@ import {
   writeToSessionStdin,
 } from "./sessions.js";
 
-/** @type {Map<string, {offset: number, remainder: string, sessionId: string | null, cwd?: string, createdAt?: number, initialized: boolean}>} */
+/** @type {Map<string, {offset: number, remainder: string, sessionId: string | null, cwd?: string, createdAt?: number, initialized: boolean, scanFailureLogged?: boolean}>} */
 const codexSessionFiles = new Map();
 /** Rollout thread id -> the watch-spawned PTY slot that IS that session
  *  (issue #122). A spawn mints a bridge uuid for the PTY slot, but the codex
@@ -39,7 +39,7 @@ const codexSessionFiles = new Map();
  *  — was addressed to the twin, so the PTY slot's idle could never become
  *  true. The alias routes the rollout's whole event stream onto the PTY slot
  *  instead: one row, whose turn truth works. Entries die with their slot
- *  (resolveCodexSessionId's lazy sweep). */
+ *  (resolveCodexSessionId's lazy sweep + the orphan sweep in the scan tick). */
 const codexRolloutAliases = new Map();
 /** @type {Map<string, {sessionId: string, name: string, args: Record<string, any>}>} */
 const codexPendingToolCalls = new Map();
@@ -233,9 +233,29 @@ function endExternalSession(sessionId, reason = "codex-exit") {
   // broadcast the same death twice.
   if (slot.ptyProcess) return;
   slot.state = "ended";
+  // Without the stamp pruneEndedSessions falls back to createdAt — which for a
+  // scanner slot is the rollout FILE's birth, routinely hours old — so any
+  // codex session older than the grace window was pruned on the first tick
+  // after ending instead of staying observable through it (#127).
+  slot.endedAt = Date.now();
   clearCodexSyntheticPermissionForSession(sessionId, reason);
+  purgeCodexSessionScanState(sessionId);
   pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName, reason }, sessionId);
   log("info", `Marked external session ${sessionId} as ended (${reason})`);
+}
+
+/** Drop the per-session scan bookkeeping a session's end strands (#127):
+ *  pending tool calls whose output will never be matched (some large —
+ *  apply_patch entries hold the full patch text) and the exec-approval
+ *  candidate parked for a prompt that can no longer be raised. Reached from
+ *  every ending path — endExternalSession above, the shared cleanup hook
+ *  (PTY exits, age-outs), and the orphan sweep in the scan tick for slots
+ *  pruned without either. */
+function purgeCodexSessionScanState(sessionId) {
+  codexExecApprovalCandidates.delete(sessionId);
+  for (const [callId, pending] of codexPendingToolCalls) {
+    if (pending.sessionId === sessionId) codexPendingToolCalls.delete(callId);
+  }
 }
 
 function parseJsonLine(line) {
@@ -618,13 +638,25 @@ function scanCodexSessionFiles() {
       initialized: false,
     };
 
-    if (!fileState.initialized) {
-      initializeCodexSessionFile(entry.filePath, entry, fileState);
-      codexSessionFiles.set(entry.filePath, fileState);
-      continue;
+    // Per-file guard (#127): one unopenable rollout — root-owned from a sudo
+    // codex run, or deleted between the stat and the open — must not starve
+    // the other files this tick, nor (via the shared tick's catch) the log
+    // scan behind it, which is the only path that surfaces exec approvals and
+    // detects Codex shutdowns. Logged once per file, not per tick: a
+    // persistently-broken file at the 1.5 s cadence would be pure log spam.
+    try {
+      if (!fileState.initialized) {
+        initializeCodexSessionFile(entry.filePath, entry, fileState);
+      } else {
+        readCodexSessionFileDelta(entry.filePath, entry, fileState);
+      }
+      fileState.scanFailureLogged = false;
+    } catch (err) {
+      if (!fileState.scanFailureLogged) {
+        fileState.scanFailureLogged = true;
+        log("warn", `Codex session file scan failed for ${entry.filePath}: ${err.message}`);
+      }
     }
-
-    readCodexSessionFileDelta(entry.filePath, entry, fileState);
     codexSessionFiles.set(entry.filePath, fileState);
   }
 
@@ -701,7 +733,7 @@ function scanCodexLog() {
 // bridge with code 1, stranding the already-written port file; a scan
 // failure must degrade codex mirroring, never kill the bridge). The two
 // scans are guarded SEPARATELY: the session-file scan failing is no reason
-// to skip the log scan behind it.
+// to skip the log scan behind it (#127 — see the per-file guard above).
 function runCodexScanTick() {
   try {
     scanCodexSessionFiles();
@@ -712,6 +744,17 @@ function runCodexScanTick() {
     scanCodexLog();
   } catch (err) {
     log("warn", `Codex log scan failed: ${err.message}`);
+  }
+  // Orphan sweep (#127): pending tool calls and aliases whose session left
+  // the map without a cleanup hook firing (pruneEndedSessions deletes
+  // silently, and a wrist-killed scanner slot's end runs no hooks). Cheap —
+  // both maps are small — and it makes the bookkeeping bounded no matter
+  // which path a session died through.
+  for (const [callId, pending] of codexPendingToolCalls) {
+    if (!sessions.has(pending.sessionId)) codexPendingToolCalls.delete(callId);
+  }
+  for (const [rolloutId, slotId] of codexRolloutAliases) {
+    if (!sessions.has(slotId)) codexRolloutAliases.delete(rolloutId);
   }
 }
 
@@ -729,9 +772,15 @@ export function stopCodexMonitor() {
   }
 }
 
-// When a PTY-backed session ends, clear any synthetic permission tied to it
-// (registered as a callback to avoid a sessions.js → codex.js import cycle).
-registerSessionCleanupHook(clearCodexSyntheticPermissionForSession);
+// When a session ends through the shared hooks (a PTY exit, an age-out, an
+// ACP deregister), clear any synthetic permission tied to it and drop its
+// scan bookkeeping — pending tool calls and approval candidates otherwise
+// outlive the session forever (#127). Registered as a callback to avoid a
+// sessions.js → codex.js import cycle.
+registerSessionCleanupHook((sessionId, reason) => {
+  clearCodexSyntheticPermissionForSession(sessionId, reason);
+  purgeCodexSessionScanState(sessionId);
+});
 
 // The authoritative permission-sync frame in permissions.js retracts every id
 // it does NOT list, so synthetic Codex approvals must be in that list or a
