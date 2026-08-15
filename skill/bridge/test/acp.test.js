@@ -734,6 +734,70 @@ test("answering in Zed retracts the wrist prompt (#80)", { timeout: 60_000 }, as
   assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
 });
 
+// A fork death is the one exit where the adapter can never send
+// permission-resolved (Zed quit, SIGKILL — the inbox just drops), so the
+// session's end is the only signal left to void the card by. Without it the
+// card sat pending the full expiry window, replayed to every reconnecting
+// watch from the connect-time snapshot, and answering it 200-ok'd a decision
+// frame into a connection that no longer existed.
+test("a session's death expires its pending permission card (#119)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t);
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "permdead");
+
+  const inbox = connectInbox(bridge, "conn-permdead");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-permdead", sessionId: "acp-permdead", cwd });
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  await sse.waitFor((e) => e.event === "session" && e.parsed?.sessionId === "acp-permdead");
+
+  await request(bridge.port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-permdead", sessionId: "acp-permdead", kind: "permission",
+      payload: {
+        sessionId: "acp-permdead",
+        toolCall: { toolCallId: "tc-dead", title: "Bash", rawInput: { command: "ls" } },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" },
+        ],
+      },
+    },
+  });
+  const prompt = await sse.waitFor((e) => e.event === "permission-request");
+
+  // Zed quits: the fork's inbox drops with no graceful deregister.
+  inbox.close();
+  await sse.waitFor(
+    (e) => e.event === "session" && e.parsed?.sessionId === "acp-permdead" && e.parsed?.state === "ended",
+  );
+
+  const cleared = await sse.waitFor((e) => e.event === "permission-cleared");
+  assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
+
+  // A watch connecting after the death gets the authoritative snapshot with
+  // the card already gone — not a replayed prompt for a dead session.
+  const late = connectSse(bridge.port, token);
+  t.after(() => late.close());
+  assert.equal(await late.statusCode(), 200);
+  const sync = await late.waitFor((e) => e.event === "permission-sync");
+  assert.equal(
+    sync.parsed.permissionIds.includes(prompt.parsed.permissionId), false,
+    "the dead session's card must not replay to reconnecting watches",
+  );
+
+  // And answering the voided card is refused, never 200-ok'd into the void.
+  const answer = await request(bridge.port, "POST", "/command", {
+    token,
+    body: { permissionId: prompt.parsed.permissionId, decision: { behavior: "allow" } },
+  });
+  assert.equal(answer.status, 404, "an answer to a dead session's card must not report success");
+});
+
 // --- AskUserQuestion input-requests (#111) ----------------------------------
 // AskUserQuestion rides Zed's form elicitation, which is a client-bound
 // REQUEST the adapter's client tee never mirrors — so the adapter raises an
