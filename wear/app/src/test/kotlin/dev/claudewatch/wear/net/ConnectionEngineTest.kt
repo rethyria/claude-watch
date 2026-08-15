@@ -292,6 +292,62 @@ class ConnectionEngineTest {
         }
     }
 
+    // -- Bursts larger than the event buffer (issue #120) -------------------
+
+    /**
+     * Issue #120: a wire-legal burst BIGGER than the client-side event buffer
+     * — the fresh-pair full replay, a radio stall unloading the bridge's
+     * socket buffering in one TCP burst — must lose NOTHING. The old
+     * SharedFlow buffer evicted the oldest frames under exactly this shape,
+     * and the ack cursor then advanced past the loss, so a permission-request
+     * in the dropped window vanished with no trace and no replay. The
+     * collector here is deliberately SLOW (a stand-in for the per-frame JSON
+     * parse + immutable state rebuild on watch-class cores) so the reader
+     * outruns it by hundreds of frames: backpressure must park the reader
+     * instead of dropping, and the permission-request near the burst's end
+     * still arrives — on the SAME stream, no forced resync.
+     */
+    @Test
+    fun aBurstLargerThanTheEventBufferDeliversEveryFrameInOrder() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        val burst = buildString {
+            for (n in 1..600) {
+                val type = if (n == 599) "permission-request" else "pty-output"
+                append("id: $n\nevent: $type\ndata: {\"n\":$n}\n\n")
+            }
+        }
+        server.enqueue(sseHeld(burst, pads = 300))
+
+        val engine = newEngine()
+        val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
+        scope.launch {
+            engine.events.collect {
+                Thread.sleep(2) // the watch-class per-frame reduce cost, scaled down
+                events.add(it)
+            }
+        }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { events.size >= 600 }
+
+        assertEquals("no frame may be dropped under a wire-legal burst", 600, events.size)
+        assertEquals(
+            "frames arrive in wire order",
+            (1..600).map { it.toString() },
+            events.map { it.id },
+        )
+        assertEquals(
+            "the permission-request near the burst's end survives",
+            "permission-request",
+            events[598].type,
+        )
+        // The stream itself survived the burst — backpressure, not a forced
+        // reconnect: one ping, one pair, ONE events connect.
+        assertEquals(ConnectionState.Connected, engine.state.value)
+        assertEquals(3, server.requestCount)
+    }
+
     // -- Connect-tail race --------------------------------------------------
 
     @Test

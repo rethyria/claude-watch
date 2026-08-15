@@ -8,11 +8,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.trySendBlocking
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -175,11 +178,22 @@ class ConnectionEngine(
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Stopped)
     val state: StateFlow<ConnectionState> = _state
 
-    private val _events = MutableSharedFlow<SseEvent>(
-        extraBufferCapacity = 256,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
-    )
-    val events: SharedFlow<SseEvent> = _events
+    // Issue #120: a bounded Channel with a BLOCKING producer, not a shared
+    // flow with DROP_OLDEST. Wire-legal bursts exceed any fixed buffer (the
+    // fresh-pair full replay alone runs hundreds of frames; a sub-heartbeat
+    // radio stall unloads the bridge's per-client socket buffering in one
+    // TCP burst), and an evicting buffer silently discarded the overflow —
+    // permission-requests and session ends included — while later acks moved
+    // the replay cursor PAST the loss, so not even a reconnect could restore
+    // it. When the collector lags now, the reader thread parks in
+    // trySendBlocking instead: the socket stops being read, TCP flow control
+    // pushes back to the bridge, and every frame still arrives in order.
+    // Deliberately NOT drop-detect-and-force-a-reconnect: the burst that
+    // overflows is usually the replay itself, and a reconnect just replays
+    // it again — Reconnecting churn on screen with no convergence guarantee
+    // the backpressure doesn't already give.
+    private val _events = Channel<SseEvent>(capacity = EVENT_BUFFER)
+    val events: Flow<SseEvent> = _events.receiveAsFlow()
 
     private val lock = Any()
     private var epoch = 0
@@ -1034,7 +1048,13 @@ class ConnectionEngine(
             // restoring #16's replay-on-rejection guarantee across reconnects
             // (it had degraded to in-process only, because this engine cursor
             // won on reconnect regardless of what the reducer accepted).
-            _events.tryEmit(SseEvent(id, type ?: "message", data))
+            //
+            // The send BLOCKS this (OkHttp reader) thread when the collector
+            // lags (issue #120) — see [_events]. While parked the socket is
+            // not being read, so the heartbeat watchdog pauses too; honest,
+            // because data IS flowing and the consumer is the bottleneck.
+            // Only a closed channel fails the send, and nothing closes it.
+            _events.trySendBlocking(SseEvent(id, type ?: "message", data))
         }
 
         override fun onClosed(eventSource: EventSource) {
@@ -1166,5 +1186,13 @@ class ConnectionEngine(
          * skill/bridge/config.js.
          */
         val DEFAULT_PROBE_PORTS: List<Int> = (7860..7869).toList()
+
+        /**
+         * In-flight frames buffered between OkHttp's reader thread and the
+         * event collector before the producer BLOCKS (issue #120). Small
+         * enough to bound memory on watch-class heaps; large enough that the
+         * reader only parks under a genuine burst, never routine chatter.
+         */
+        private const val EVENT_BUFFER = 256
     }
 }
