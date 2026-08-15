@@ -2174,6 +2174,74 @@ class BridgeViewModelTest {
         )
     }
 
+    /**
+     * Issue #127 (wear-net-4): a session's AUTHORITATIVE end releases its
+     * hidden id. ACP session ids are stable across Zed restarts (#89), so a
+     * hidden id that outlived its session pre-hid the same id's NEXT
+     * registration — whose `session running` re-announce deliberately does
+     * not un-hide (#53) and whose idle session emits no output to speak
+     * with: invisible on the wrist, no un-hide UI. The #53 semantics stand
+     * untouched on the live path (the resync/sync tests above): only a real
+     * end — the session LEAVING bridge state — releases the id.
+     */
+    @Test
+    fun aSessionsEndReleasesItsHiddenIdSoAReRegistrationStartsVisible() {
+        enqueuePing()
+        server.enqueue(
+            MockResponse().setBody("""{"token":"tok-1","bridgeId":"b-1","sessions":[]}"""),
+        )
+        val sseBody = buildString {
+            append(":connected\n\n")
+            append("id: 1\nevent: session\n")
+            append(
+                """data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj",""" +
+                    """"external":true,"sessionId":"s-ext"}""",
+            )
+            append("\n\n")
+            // Delayed behind padding so both land AFTER the hide below: the
+            // session's real end, then its later re-registration under the
+            // SAME id (an idle revival: a bare metadata announce, no output).
+            append(":pad\n\n".repeat(400))
+            append("id: 2\nevent: session\n")
+            append("""data: {"state":"ended","sessionId":"s-ext"}""")
+            append("\n\n")
+            append("id: 3\nevent: session\n")
+            append(
+                """data: {"state":"running","agent":"claude","cwd":"/tmp/proj","folderName":"proj",""" +
+                    """"external":true,"sessionId":"s-ext"}""",
+            )
+            append("\n\n")
+            append(":tail\n\n".repeat(40))
+        }
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .throttleBody(256, 100, TimeUnit.MILLISECONDS)
+                .setBody(sseBody),
+        )
+
+        viewModel.pair("127.0.0.1", server.port.toString(), "123456")
+        awaitState { it.bridge.sessions["s-ext"]?.external == true }
+        viewModel.hideSession("s-ext")
+        awaitState { it.hiddenSessions.contains("s-ext") }
+
+        // The end is the release: the id leaves the hidden set with the
+        // session — leaked, it would pre-hide the re-registration forever.
+        awaitState(timeoutMs = 60_000) { !it.hiddenSessions.contains("s-ext") }
+
+        // The re-registration under the same id starts VISIBLE, even though
+        // its bare `session running` announce is not "speaking" (#53).
+        val revived = awaitState(timeoutMs = 60_000) { it.bridge.sessions.containsKey("s-ext") }
+        assertFalse(
+            "a re-registered session must not inherit the dead one's hide",
+            revived.hiddenSessions.contains("s-ext"),
+        )
+        assertTrue(
+            "the re-registered session renders",
+            HaloModel.from(revived).sessions.any { s -> s.id == "s-ext" },
+        )
+    }
+
     // -- Discover-pairing LIST + code-less pair (issue #23 follow-up) ----------
 
     /**

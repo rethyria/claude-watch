@@ -187,7 +187,7 @@ class ConnectionEngineTest {
         // so the reconnect below must resume from the last SEEN + acked event.
         scope.launch {
             engine.events.collect {
-                it.id?.let { id -> engine.ackApplied(id) }
+                engine.ackApplied(it)
                 events.add(it)
             }
         }
@@ -259,7 +259,7 @@ class ConnectionEngineTest {
         scope.launch {
             engine.events.collect {
                 val n = it.id?.toIntOrNull()
-                if (n != null && n >= 6) engine.ackApplied(it.id!!)
+                if (n != null && n >= 6) engine.ackApplied(it)
                 seen.add(it)
             }
         }
@@ -290,6 +290,129 @@ class ConnectionEngineTest {
             assertEquals("/v1/events", it.path)
             assertEquals("6", it.getHeader("Last-Event-ID"))
         }
+    }
+
+    // -- Late acks across a re-pair (issue #127 wear-net-3) -----------------
+
+    /**
+     * Issue #127 (wear-net-3): an ack for a frame emitted under an OLD
+     * pairing, drained from the collector's backlog after a re-pair commits,
+     * must never move the fresh pairing's replay cursor. The commit resets
+     * the cursor to FULL_REPLAY exactly so the new stream replays the ring +
+     * terminal backlog; an unguarded late ack overwrote that reset (or, past
+     * openEvents, re-advanced the persisted cursor) — skipping the fresh
+     * replay this engine's own war stories built the reset for. The resume
+     * after a disconnect reads the PERSISTED cursor back, which is where the
+     * stale ack would surface: it must still say full-replay "0", never the
+     * dead backlog's "5".
+     */
+    @Test
+    fun aLateAckFromTheOldPairingsBacklogCannotMoveTheFreshPairingsCursor() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse()) // tok-1
+        // Pairing 1's stream delivers event 5, then dies → frozen backoff.
+        server.enqueue(sseEnding("id: 5\nevent: tool-output\ndata: {}\n\n"))
+        // The re-pair: fresh token, fresh FULL_REPLAY cursor, held stream.
+        server.enqueue(pingResponse())
+        server.enqueue(MockResponse().setBody("""{"token":"tok-2","bridgeId":"b-1","sessions":[]}"""))
+        server.enqueue(sseHeld(":connected\n\n"))
+
+        val engine = newEngine(backoff = BackoffPolicy(baseMs = 300_000, maxMs = 300_000))
+        val seen = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
+        scope.launch { engine.events.collect { seen.add(it) } } // acks withheld
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { seen.any { it.id == "5" } }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "654321", "wear-test") })
+        awaitCondition { engine.state.value == ConnectionState.Connected }
+        awaitCondition { credentialsInStore()?.token == "tok-2" }
+
+        // Only NOW does the old stream's frame ack — the late drain landing
+        // after the commit. Generation-stale: it must change nothing.
+        engine.ackApplied(seen.first { it.id == "5" })
+        Thread.sleep(500) // window for a wrongful cursor write/persist to land
+
+        // Resume from the persisted cursor: still the fresh pairing's full
+        // replay, never the dead backlog's id.
+        engine.disconnect()
+        awaitCondition { engine.state.value == ConnectionState.Stopped }
+        server.enqueue(pingResponse())
+        server.enqueue(sseHeld(":connected\n\n"))
+        engine.start()
+
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("0", takeRequest().getHeader("Last-Event-ID"))
+        assertEquals("/v1/ping", takeRequest().path)
+        assertEquals("/v1/pair", takeRequest().path)
+        assertEquals("0", takeRequest().getHeader("Last-Event-ID"))
+        assertEquals("/v1/ping", takeRequest().path)
+        takeRequest().let {
+            assertEquals("/v1/events", it.path)
+            assertEquals(
+                "a stale-generation ack must not survive into the fresh pairing's cursor",
+                "0",
+                it.getHeader("Last-Event-ID"),
+            )
+            assertEquals("Bearer tok-2", it.getHeader("Authorization"))
+        }
+    }
+
+    // -- Bursts larger than the event buffer (issue #120) -------------------
+
+    /**
+     * Issue #120: a wire-legal burst BIGGER than the client-side event buffer
+     * — the fresh-pair full replay, a radio stall unloading the bridge's
+     * socket buffering in one TCP burst — must lose NOTHING. The old
+     * SharedFlow buffer evicted the oldest frames under exactly this shape,
+     * and the ack cursor then advanced past the loss, so a permission-request
+     * in the dropped window vanished with no trace and no replay. The
+     * collector here is deliberately SLOW (a stand-in for the per-frame JSON
+     * parse + immutable state rebuild on watch-class cores) so the reader
+     * outruns it by hundreds of frames: backpressure must park the reader
+     * instead of dropping, and the permission-request near the burst's end
+     * still arrives — on the SAME stream, no forced resync.
+     */
+    @Test
+    fun aBurstLargerThanTheEventBufferDeliversEveryFrameInOrder() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse())
+        val burst = buildString {
+            for (n in 1..600) {
+                val type = if (n == 599) "permission-request" else "pty-output"
+                append("id: $n\nevent: $type\ndata: {\"n\":$n}\n\n")
+            }
+        }
+        server.enqueue(sseHeld(burst, pads = 300))
+
+        val engine = newEngine()
+        val events = CopyOnWriteArrayList<ConnectionEngine.SseEvent>()
+        scope.launch {
+            engine.events.collect {
+                Thread.sleep(2) // the watch-class per-frame reduce cost, scaled down
+                events.add(it)
+            }
+        }
+
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { events.size >= 600 }
+
+        assertEquals("no frame may be dropped under a wire-legal burst", 600, events.size)
+        assertEquals(
+            "frames arrive in wire order",
+            (1..600).map { it.toString() },
+            events.map { it.id },
+        )
+        assertEquals(
+            "the permission-request near the burst's end survives",
+            "permission-request",
+            events[598].type,
+        )
+        // The stream itself survived the burst — backpressure, not a forced
+        // reconnect: one ping, one pair, ONE events connect.
+        assertEquals(ConnectionState.Connected, engine.state.value)
+        assertEquals(3, server.requestCount)
     }
 
     // -- Connect-tail race --------------------------------------------------
@@ -338,7 +461,7 @@ class ConnectionEngineTest {
         val engine = newEngine(heartbeatMs = 1_500)
         // ACK applied frames like the ViewModel does (issue #48): the reconnect
         // cursor advances to the last SEEN event only because it was acked.
-        scope.launch { engine.events.collect { it.id?.let { id -> engine.ackApplied(id) } } }
+        scope.launch { engine.events.collect { engine.ackApplied(it) } }
         assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
 
         assertEquals("/v1/ping", takeRequest().path)
@@ -603,7 +726,7 @@ class ConnectionEngineTest {
         val engine = newEngine()
         // ACK applied frames like the ViewModel does (issue #48): only the
         // ack advances the persisted cursor the resume below must honor.
-        scope.launch { engine.events.collect { it.id?.let { id -> engine.ackApplied(id) } } }
+        scope.launch { engine.events.collect { engine.ackApplied(it) } }
 
         assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
         awaitCondition { engine.state.value == ConnectionState.Connected }
@@ -772,6 +895,121 @@ class ConnectionEngineTest {
         takeRequest().let {
             assertEquals("/v1/events", it.path)
             assertEquals("Bearer tok-old", it.getHeader("Authorization"))
+        }
+    }
+
+    /**
+     * Issue #123: the #106 RESUME verification must target the endpoint the
+     * user just TAPPED, never the persisted one. DHCP handed the old address
+     * to a FOREIGN bridge (the terminal BridgeMismatch), the user finds the
+     * real bridge at its new address and taps it; its window is locked → 403
+     * AlreadyPaired. Resuming against the STALE persisted endpoint meets the
+     * foreign bridge again and bounces straight back to BridgeMismatch — the
+     * correct re-pair swallowed with zero explanation, the user wedged until
+     * SIGUSR1 or an unpair. The resume must follow the just-verified address
+     * (and persist it via the cursor-preserving endpoint save).
+     */
+    @Test
+    fun a403AlreadyPairedResumeTargetsTheTappedEndpointNotTheStalePersistedOne() {
+        // The squatter: a foreign bridge (b-2) on the persisted address.
+        val squatted = MockWebServer().also { it.start() }
+        try {
+            runBlocking {
+                store.saveCredentials(BridgeCredentials("tok-old", "127.0.0.1", squatted.port, "b-1"))
+                store.saveLastEventId("42")
+            }
+            // Before the fix the resume preflighted the SQUATTED address and
+            // landed BridgeMismatch; honest b-2 pings keep that wrong path a
+            // deterministic failure rather than a hang.
+            repeat(4) {
+                squatted.enqueue(
+                    MockResponse().setBody("""{"proto":"3","bridgeId":"b-2","machineName":"squat"}"""),
+                )
+            }
+            // The REAL bridge (b-1) at its new address: pair preflight OK,
+            // window locked, then the resume's preflight + stream.
+            server.enqueue(pingResponse())
+            server.enqueue(alreadyPaired403())
+            server.enqueue(pingResponse())
+            server.enqueue(sseHeld(":connected\n\n"))
+
+            val engine = newEngine() // stopped: BridgeMismatch tore the engine down
+            assertNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+
+            // The verification resumes AT THE TAPPED ADDRESS: Connected,
+            // never BridgeMismatch, with the held token offered there.
+            awaitCondition { engine.state.value == ConnectionState.Connected }
+
+            assertEquals("/v1/ping", takeRequest().path)
+            assertEquals("/v1/pair", takeRequest().path)
+            assertEquals("/v1/ping", takeRequest().path)
+            takeRequest().let {
+                assertEquals("/v1/events", it.path)
+                assertEquals("Bearer tok-old", it.getHeader("Authorization"))
+                // Same bridge, new address: the replay cursor must SURVIVE
+                // the endpoint move — resume from the persisted ack, never a
+                // full replay.
+                assertEquals("42", it.getHeader("Last-Event-ID"))
+            }
+            // The verified endpoint is persisted; token, bridgeId and the
+            // cursor all survive (saveEndpoint, not saveCredentials).
+            val creds = credentialsInStore()!!
+            assertEquals(server.port, creds.port)
+            assertEquals("tok-old", creds.token)
+            assertEquals("b-1", creds.bridgeId)
+            assertEquals("42", runBlocking { store.read().lastEventId })
+            assertEquals("nothing may reach the squatter", 0, squatted.requestCount)
+        } finally {
+            squatted.shutdown()
+        }
+    }
+
+    /**
+     * Issue #123's live-engine half: the #106 RECONNECT verification must
+     * follow the tapped endpoint too. The engine is mid-backoff against the
+     * stale address (the bridge moved; the stream is down); the user taps the
+     * bridge at its new address and the locked window 403s. The verification
+     * connect must target the tapped address — reconnecting to the stale one
+     * just fails into another backoff round.
+     */
+    @Test
+    fun a403AlreadyPairedOnALiveButDownEngineVerifiesAtTheTappedEndpoint() {
+        server.enqueue(pingResponse())
+        server.enqueue(pairResponse()) // tok-1 at the ORIGINAL address
+        server.enqueue(sseEnding(":connected\n\n")) // opens, then dies → backoff
+        // Before the fix the verification reconnected to THIS stale address —
+        // fail it fast so the wrong path lands in Reconnecting, not a hang.
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
+
+        // Backoff far past the test horizon: only the verification kick may
+        // produce the reconnect below (the #106 tests' discipline).
+        val engine = newEngine(backoff = BackoffPolicy(baseMs = 300_000, maxMs = 300_000))
+        assertNotNull(runBlocking { engine.pair("127.0.0.1", server.port, "123456", "wear-test") })
+        awaitCondition { engine.state.value is ConnectionState.Reconnecting }
+
+        // The bridge now lives at a NEW address; the old one is dark.
+        val moved = MockWebServer().also { it.start() }
+        try {
+            moved.enqueue(pingResponse()) // the tap's pair preflight (same b-1)
+            moved.enqueue(alreadyPaired403())
+            moved.enqueue(pingResponse()) // the verification connect's preflight
+            moved.enqueue(sseHeld(":connected\n\n"))
+
+            assertNull(runBlocking { engine.pair("127.0.0.1", moved.port, "123456", "wear-test") })
+            awaitCondition { engine.state.value == ConnectionState.Connected }
+
+            assertEquals("/v1/ping", moved.takeRequest(10, TimeUnit.SECONDS)?.path)
+            assertEquals("/v1/pair", moved.takeRequest(10, TimeUnit.SECONDS)?.path)
+            assertEquals("/v1/ping", moved.takeRequest(10, TimeUnit.SECONDS)?.path)
+            (moved.takeRequest(10, TimeUnit.SECONDS) ?: throw AssertionError("no stream")).let {
+                assertEquals("/v1/events", it.path)
+                assertEquals("Bearer tok-1", it.getHeader("Authorization"))
+            }
+            // The move is persisted through the cursor-preserving save.
+            awaitCondition { credentialsInStore()?.port == moved.port }
+            assertEquals("tok-1", credentialsInStore()?.token)
+        } finally {
+            moved.shutdown()
         }
     }
 

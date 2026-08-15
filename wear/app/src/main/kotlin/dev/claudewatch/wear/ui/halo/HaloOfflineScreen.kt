@@ -65,26 +65,36 @@ import androidx.wear.input.RemoteInputIntentHelper
 import dev.claudewatch.wear.BridgeViewModel
 import dev.claudewatch.wear.net.BridgeDiscovery
 
-/** Which sub-screen the offline pairing flow is showing. */
-private enum class Pane { Choose, Manual, Discover }
+/**
+ * Which sub-screen the offline pairing flow is showing. Hoisted to the Halo
+ * root together with the paired-offline `revealed` flag (issue #127): the
+ * takeover is MODAL, so the system back must address ITS hierarchy — the
+ * root back handler owns the one-step walk (sub-pane → Choose → the quiet
+ * reconnecting headline) and needs the state to make it.
+ */
+internal enum class OfflinePane { Choose, Manual, Discover }
 
 @Composable
-fun HaloOfflineScreen(
+internal fun HaloOfflineScreen(
     ui: BridgeViewModel.UiState,
     onPair: (host: String, port: String, code: String) -> Unit,
     modifier: Modifier = Modifier,
     onDiscoverForPairing: () -> Unit = {},
     onDiscoverBridges: () -> Unit = {},
     onPairByDiscovery: (BridgeDiscovery.DiscoveredBridge) -> Unit = {},
+    // Choose is the entry pane when unpaired. Paired-but-offline (the engine
+    // is retrying on its own) hides the chooser behind a quiet "re-pair
+    // watch" chip ([revealed]) so it doesn't shout over "reconnecting". Both
+    // hoisted (issue #127) — the root back handler walks them; this screen
+    // only reports taps.
+    pane: OfflinePane = OfflinePane.Choose,
+    onPane: (OfflinePane) -> Unit = {},
+    revealed: Boolean = false,
+    onReveal: () -> Unit = {},
 ) {
     var host by remember { mutableStateOf("10.0.2.2") }
     var port by remember { mutableStateOf("7860") }
     var code by remember { mutableStateOf("") }
-    // Choose is the entry pane when unpaired. Paired-but-offline (the engine is
-    // retrying on its own) hides the chooser behind a quiet "re-pair watch"
-    // chip so it doesn't shout over "reconnecting".
-    var pane by remember { mutableStateOf(Pane.Choose) }
-    var revealed by remember { mutableStateOf(false) }
     val showChooser = !ui.paired || revealed
 
     // Issue #23 zero-typing: the Manual form pre-fills host/port from a single
@@ -94,18 +104,18 @@ fun HaloOfflineScreen(
     // (emulator/no-bridge never lands a discovery), and seeding is one-shot per
     // discovered value — a later manual edit is never clobbered because the
     // LaunchedEffect only re-fires when the discovered value itself changes.
-    LaunchedEffect(pane) { if (pane == Pane.Manual) onDiscoverForPairing() }
+    LaunchedEffect(pane) { if (pane == OfflinePane.Manual) onDiscoverForPairing() }
     LaunchedEffect(ui.discoveredHost) { ui.discoveredHost?.let { host = it } }
     LaunchedEffect(ui.discoveredPort) { ui.discoveredPort?.let { port = it.toString() } }
 
     Box(modifier = modifier.fillMaxSize()) {
         // The Discover LIST is a full-screen ScalingLazyColumn that owns the
         // whole surface; every other pane is the centered ring layout.
-        if (showChooser && pane == Pane.Discover && ui.discover is BridgeViewModel.DiscoverUi.Found) {
+        if (showChooser && pane == OfflinePane.Discover && ui.discover is BridgeViewModel.DiscoverUi.Found) {
             DiscoveredBridgeList(
                 bridges = ui.discover.bridges,
                 onSelect = onPairByDiscovery,
-                onBack = { pane = Pane.Choose },
+                onBack = { onPane(OfflinePane.Choose) },
             )
             return@Box
         }
@@ -126,7 +136,7 @@ fun HaloOfflineScreen(
                     OfflineHeadline(paired = true, ui = ui)
                     Spacer(Modifier.height(8.dp))
                     Chip(
-                        onClick = { revealed = true; pane = Pane.Choose },
+                        onClick = { onReveal(); onPane(OfflinePane.Choose) },
                         label = {
                             Text(
                                 "re-pair watch",
@@ -141,11 +151,11 @@ fun HaloOfflineScreen(
                     )
                 }
 
-                pane == Pane.Choose -> {
+                pane == OfflinePane.Choose -> {
                     OfflineHeadline(paired = ui.paired, ui = ui)
                     Spacer(Modifier.height(8.dp))
                     Chip(
-                        onClick = { pane = Pane.Manual },
+                        onClick = { onPane(OfflinePane.Manual) },
                         label = {
                             Text("Manual", fontSize = Halo.Type.Caption, color = Halo.Palette.ApproveText)
                         },
@@ -156,7 +166,7 @@ fun HaloOfflineScreen(
                     )
                     Spacer(Modifier.height(6.dp))
                     Chip(
-                        onClick = { pane = Pane.Discover; onDiscoverBridges() },
+                        onClick = { onPane(OfflinePane.Discover); onDiscoverBridges() },
                         label = {
                             Text("Discover", fontSize = Halo.Type.Caption, color = Halo.Palette.TextPrimary)
                         },
@@ -167,7 +177,7 @@ fun HaloOfflineScreen(
                     )
                 }
 
-                pane == Pane.Manual -> {
+                pane == OfflinePane.Manual -> {
                     OfflineHeadline(paired = ui.paired, ui = ui)
                     Spacer(Modifier.height(8.dp))
                     PairField("host", host, "host") { host = it }
@@ -191,18 +201,18 @@ fun HaloOfflineScreen(
                         textAlign = TextAlign.Center,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { pane = Pane.Choose }
+                            .clickable { onPane(OfflinePane.Choose) }
                             .testTag("manualBack")
                             .padding(vertical = 6.dp),
                     )
                 }
 
-                // pane == Pane.Discover, non-list states (Idle/Scanning/Empty/
-                // PairError). The Found list is handled full-screen above.
+                // pane == OfflinePane.Discover, non-list states (Idle/Scanning/
+                // Empty/PairError). The Found list is handled full-screen above.
                 else -> DiscoverStatusPane(
                     discover = ui.discover,
                     onScanAgain = onDiscoverBridges,
-                    onBack = { pane = Pane.Choose },
+                    onBack = { onPane(OfflinePane.Choose) },
                 )
             }
         }

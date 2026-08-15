@@ -8,11 +8,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.trySendBlocking
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -170,16 +173,35 @@ class ConnectionEngine(
     private val probePorts: List<Int> = DEFAULT_PROBE_PORTS,
 ) {
 
-    data class SseEvent(val id: String?, val type: String, val data: String)
+    /**
+     * One SSE frame as delivered to the collector. [generation] is the pair
+     * generation the frame was emitted under (issue #127): the collector is
+     * process-lifetime and keeps draining a torn-down stream's buffered
+     * frames after a re-pair commits, so [ackApplied] needs to know which
+     * pairing a frame's ack belongs to — an old pairing's ack must never
+     * move the fresh pairing's replay cursor.
+     */
+    data class SseEvent(val id: String?, val type: String, val data: String, val generation: Int)
 
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Stopped)
     val state: StateFlow<ConnectionState> = _state
 
-    private val _events = MutableSharedFlow<SseEvent>(
-        extraBufferCapacity = 256,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
-    )
-    val events: SharedFlow<SseEvent> = _events
+    // Issue #120: a bounded Channel with a BLOCKING producer, not a shared
+    // flow with DROP_OLDEST. Wire-legal bursts exceed any fixed buffer (the
+    // fresh-pair full replay alone runs hundreds of frames; a sub-heartbeat
+    // radio stall unloads the bridge's per-client socket buffering in one
+    // TCP burst), and an evicting buffer silently discarded the overflow —
+    // permission-requests and session ends included — while later acks moved
+    // the replay cursor PAST the loss, so not even a reconnect could restore
+    // it. When the collector lags now, the reader thread parks in
+    // trySendBlocking instead: the socket stops being read, TCP flow control
+    // pushes back to the bridge, and every frame still arrives in order.
+    // Deliberately NOT drop-detect-and-force-a-reconnect: the burst that
+    // overflows is usually the replay itself, and a reconnect just replays
+    // it again — Reconnecting churn on screen with no convergence guarantee
+    // the backpressure doesn't already give.
+    private val _events = Channel<SseEvent>(capacity = EVENT_BUFFER)
+    val events: Flow<SseEvent> = _events.receiveAsFlow()
 
     private val lock = Any()
     private var epoch = 0
@@ -405,7 +427,7 @@ class ConnectionEngine(
             // surface (Connected dismisses the screen; a revoked token lands
             // in the honest AuthExpired).
             if (result.status == 403 && holdsCredentialFor(ping.bridgeId)) {
-                verifyProbablyConnected(myPairGeneration)
+                verifyProbablyConnected(myPairGeneration, hostIp, port)
                 return@withContext PairOutcome.AlreadyPaired
             }
             failPair(myPairGeneration, ConnectionState.PairFailed("${result.status} $error".trim()))
@@ -558,8 +580,19 @@ class ConnectionEngine(
      * from the persisted credential. Every path ends in an honest state:
      * Connected dismisses the pairing screen, a dead token lands in
      * AuthExpired, an unreachable bridge keeps the ordinary retry loop.
+     *
+     * [hostIp]/[port] are the ATTEMPT's endpoint — the address whose ping
+     * just answered with the pinned bridgeId (issue #123). The verification
+     * targets THAT address, never the remembered one: after DHCP hands the
+     * stale address to a foreign bridge (BridgeMismatch), the remembered
+     * endpoint is exactly what verifying against would bounce off — the user
+     * tapped the real bridge at its new home, and resuming anywhere else
+     * re-manufactures the mismatch the tap was meant to fix. The move rides
+     * the same cursor-preserving endpoint save as every same-bridge
+     * relocation; connect()'s preflight still re-verifies the pinned
+     * identity there before the token is offered.
      */
-    private fun verifyProbablyConnected(myPairGeneration: Int) {
+    private suspend fun verifyProbablyConnected(myPairGeneration: Int, hostIp: String, port: Int) {
         val action = synchronized(lock) {
             // A stop() or another pair()'s commit raced this outcome:
             // whatever won owns the engine now — nothing to verify.
@@ -574,6 +607,14 @@ class ConnectionEngine(
                     // backoff wait; a failure re-enters the retry loop.
                     reconnectJob?.cancel()
                     reconnectJob = null
+                    // Follow the pinned bridge to the attempt's address
+                    // (issue #123). Cannot throw: the same hostIp/port
+                    // already built doPair's candidate client.
+                    if (pairedHost != hostIp || pairedPort != port) {
+                        client = clientFactory(hostIp, port)
+                        pairedHost = hostIp
+                        pairedPort = port
+                    }
                     Verify.RECONNECT
                 }
                 else -> {
@@ -586,8 +627,22 @@ class ConnectionEngine(
         }
         when (action) {
             Verify.NONE -> Unit
-            Verify.RECONNECT -> connect()
-            Verify.RESUME -> start()
+            Verify.RECONNECT -> {
+                persistSelfHealedEndpoint(hostIp, port)
+                connect()
+            }
+            Verify.RESUME -> {
+                // Point the resume at the attempt's endpoint BEFORE start()
+                // reads the store back (issue #123) — awaited, not launched,
+                // so the read can never outrun the write. Same mutex +
+                // liveness discipline as every persist; saveEndpoint keeps
+                // token, bridgeId and the replay cursor (same bridge).
+                persistMutex.withLock {
+                    val current = synchronized(lock) { pairGeneration == myPairGeneration }
+                    if (current) store.saveEndpoint(hostIp, port)
+                }
+                start()
+            }
         }
     }
 
@@ -694,11 +749,26 @@ class ConnectionEngine(
      * reconnect (a Rejected frame never acks — see BridgeViewModel.handleEvent).
      * Empty/keepalive ids carry nothing to resume from and are ignored.
      * Ordering is preserved by the single [persistCursor] collector.
+     *
+     * Generation-guarded (issue #127), the same idiom failPair and the pair
+     * commit stand behind: the collector keeps draining a torn-down stream's
+     * buffered frames after a re-pair commits, and an ack earned under the
+     * OLD pairing landing around the commit's FULL_REPLAY reset would either
+     * skip the fresh pairing's full ring replay (the exact loss the reset
+     * exists to prevent) or re-advance the persisted cursor behind its back.
+     * An ack whose emit-time generation is no longer current changes
+     * nothing. The trade: frames still buffered when a disconnect() lands
+     * are no longer acked either, so a later resume replays them — a
+     * bounded duplicate, against an unbounded skip.
      */
-    fun ackApplied(id: String) {
+    fun ackApplied(event: SseEvent) {
+        val id = event.id ?: return
         if (id.isEmpty()) return
-        lastEventId = id
-        persistCursor.tryEmit(id)
+        synchronized(lock) {
+            if (event.generation != pairGeneration) return
+            lastEventId = id
+            persistCursor.tryEmit(id)
+        }
     }
 
     private suspend fun authedCall(
@@ -1026,7 +1096,14 @@ class ConnectionEngine(
         }
 
         override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-            if (!isCurrent(myEpoch)) return
+            // The currency check also captures the pair generation this frame
+            // is emitted under (issue #127) — the collector may only drain it
+            // after a re-pair, and its ack must be attributable to THIS
+            // pairing, not whichever one is current by then.
+            val generation = synchronized(lock) {
+                if (stopped || epoch != myEpoch) return
+                pairGeneration
+            }
             // Issue #48: do NOT advance/persist the replay cursor on mere
             // receipt. The collector ACKs a frame back via [ackApplied] only
             // after the reducer has APPLIED it, so a reducer-REJECTED frame is
@@ -1034,7 +1111,13 @@ class ConnectionEngine(
             // restoring #16's replay-on-rejection guarantee across reconnects
             // (it had degraded to in-process only, because this engine cursor
             // won on reconnect regardless of what the reducer accepted).
-            _events.tryEmit(SseEvent(id, type ?: "message", data))
+            //
+            // The send BLOCKS this (OkHttp reader) thread when the collector
+            // lags (issue #120) — see [_events]. While parked the socket is
+            // not being read, so the heartbeat watchdog pauses too; honest,
+            // because data IS flowing and the consumer is the bottleneck.
+            // Only a closed channel fails the send, and nothing closes it.
+            _events.trySendBlocking(SseEvent(id, type ?: "message", data, generation))
         }
 
         override fun onClosed(eventSource: EventSource) {
@@ -1166,5 +1249,13 @@ class ConnectionEngine(
          * skill/bridge/config.js.
          */
         val DEFAULT_PROBE_PORTS: List<Int> = (7860..7869).toList()
+
+        /**
+         * In-flight frames buffered between OkHttp's reader thread and the
+         * event collector before the producer BLOCKS (issue #120). Small
+         * enough to bound memory on watch-class heaps; large enough that the
+         * reader only parks under a genuine burst, never routine chatter.
+         */
+        private const val EVENT_BUFFER = 256
     }
 }
