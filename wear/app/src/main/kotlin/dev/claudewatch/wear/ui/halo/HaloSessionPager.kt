@@ -161,9 +161,10 @@ fun HaloSessionPager(
     onSpawn: () -> Unit,
     modifier: Modifier = Modifier,
     /**
-     * False while an overlay (the spawn picker) owns rotary focus above this
-     * pager. Keying the focus claim on the flag re-requests the bezel when
-     * the overlay closes — the same reclaim pattern the retired list used.
+     * False while ANY overlay (picker, menu, card, voice, offline takeover)
+     * owns rotary focus above this pager (#121). Keying the focus claim on
+     * the flag re-requests the bezel when the overlay closes — the same
+     * reclaim pattern the retired list used.
      */
     rotaryActive: Boolean = true,
 ) {

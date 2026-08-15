@@ -510,6 +510,18 @@ private fun HaloAppBody(
         // overlays (cards, voice, spawn picker, offline) still cover it.
         HaloRingHost(inputs = HaloRingMath.ringInputs(nav, model, lastStepDir))
 
+        // The bezel-reclaim flag for the depth layers below (#121): EVERY
+        // overlay — spawn picker, actions menu, approval/question card, voice,
+        // the offline takeover's discovery list — claims rotary focus on entry
+        // and is then disposed, and Compose clears focus with the disposed
+        // node while restoring NOTHING (no fallback when no node is focused).
+        // So the pager and the feed key their focus claims on this flag: any
+        // overlay closing flips it true and re-requests the crown. Touch
+        // survives a dropped focus, which is exactly why a missing term here
+        // stays invisible to every tap-driven gate.
+        val rotaryActive = !spawnPickerOpen && !nav.menuOpen && !nav.cardOpen &&
+            !voiceOpen && !ui.isOffline()
+
         AnimatedContent(
             targetState = layerOf(nav),
             transitionSpec = { depthTransition() },
@@ -575,10 +587,7 @@ private fun HaloAppBody(
                     // Issue #56: the spawn card summons the target picker
                     // overlay; the actual onSpawn fires from a pick.
                     onSpawn = { spawnPickerOpen = true },
-                    // Reclaim the bezel when the picker or the actions menu
-                    // closes (each claims rotary focus while up and is then
-                    // disposed).
-                    rotaryActive = !spawnPickerOpen && !nav.menuOpen,
+                    rotaryActive = rotaryActive,
                 )
                 is Layer.Feed -> HaloSessionFeed(
                     model = model,
@@ -597,6 +606,7 @@ private fun HaloAppBody(
                     // the v3 purge); back() keeps the session as the pager
                     // selection (#95).
                     onBack = { nav = nav.back() },
+                    rotaryActive = rotaryActive,
                 )
             }
         }
