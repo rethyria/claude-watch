@@ -35,8 +35,8 @@ import org.junit.runner.RunWith
  * The v2 session-list pager (Halo v2 S5, #99; action arc → actions menu by
  * #114), driven with fixture UiStates — no bridge, no network. One session
  * per screen: entry from home and project pages lands on the scope's first
- * card, swipes and chevrons step with no wrap (the All scope ends on the
- * trailing spawn card, a project on its last session), stepping right at the
+ * card, swipes and chevrons step with no wrap (every scope ends on the
+ * trailing spawn card — a project's since #130), stepping right at the
  * start is BACK, a card tap opens the session-actions MENU (the feed lives
  * behind its "open feed" row) while the waiting card's Answer pill opens the
  * prompt OVER the pager (never falling through to the menu), the menu's
@@ -159,16 +159,24 @@ class HaloSessionPagerTest {
         compose.onNodeWithTag("haloRoot").performTouchInput { swipeRight() }
         compose.waitForIdle()
 
-        // Beta's page → ITS pager: the project scope's first (and only) card,
-        // with no trailing spawn slot — › is invisible on the true last card
-        // and no spawn card exists in a project scope.
+        // Beta's page → ITS pager: the project scope's first (and only)
+        // session card. #130: the project scope ends on the SAME trailing
+        // spawn card as All now, so › stays visible on the last session…
         onePageRight()
         onePageRight()
         compose.onNodeWithText("beta").assertIsDisplayed()
         drill()
         compose.onNodeWithTag("haloPagerCard-s-b1").assertIsDisplayed()
-        assertEquals("› hides on a project scope's last card", 0, textCount("›"))
-        assertEquals("a project scope has no spawn card", 0, tagCount("haloSpawn"))
+        compose.onNodeWithText("›").assertIsDisplayed()
+
+        // …one step lands on the spawn card — the true end, where › hides —
+        // and ‹ steps back onto the session, not out of the list (no wrap).
+        next()
+        compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
+        assertEquals("› hides on the project scope's spawn card", 0, textCount("›"))
+        compose.onNodeWithTag("haloPrev").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloPagerCard-s-b1").assertIsDisplayed()
     }
 
     @Test
@@ -432,6 +440,39 @@ class HaloSessionPagerTest {
         compose.onNodeWithTag("haloSpawnPicker").assertIsDisplayed()
         assertEquals(0, tagCount("haloSessionMenu"))
         assertEquals(0, tagCount("haloRowClose"))
+    }
+
+    @Test
+    fun projectScopeStepsToItsOwnSpawnCardAndOneConfirmSpawnsInItsCwd() {
+        val spawns = mutableListOf<Pair<String, String?>>()
+        compose.setContent {
+            HaloApp(
+                ui = ui(queue = emptyList()),
+                actions = HaloActions(onSpawn = { agent, cwd -> spawns += agent to cwd }),
+            )
+        }
+
+        // Alpha's page → ITS pager: the full #130 walk — s-a1 › s-a2 › the
+        // trailing spawn card (the true end, › hidden).
+        onePageRight()
+        drill()
+        compose.onNodeWithTag("haloPagerCard-s-a1").assertIsDisplayed()
+        next()
+        compose.onNodeWithTag("haloPagerCard-s-a2").assertIsDisplayed()
+        next()
+        compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
+        assertEquals(0, textCount("›"))
+
+        // The card opens the PICKER (the deliberate-action guard survives
+        // the scoping) with alpha preselected: ONE confirm tap, and the
+        // spawn request carries the PROJECT's cwd at the action boundary.
+        compose.onNodeWithTag("haloSpawn").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloSpawnPicker").assertIsDisplayed()
+        compose.onNodeWithTag("haloSpawnPick-alpha").assertIsDisplayed().performClick()
+        compose.waitForIdle()
+        assertEquals(listOf("claude" to "/home/dev/alpha"), spawns)
+        assertEquals("a pick closes the picker", 0, tagCount("haloSpawnPicker"))
     }
 
     @Test

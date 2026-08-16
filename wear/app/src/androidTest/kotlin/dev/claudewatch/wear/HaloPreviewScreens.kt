@@ -220,6 +220,35 @@ class HaloPreviewScreens {
         hold()
     }
 
+    /** #130: a PROJECT pager's true end — the same trailing spawn card, the
+     *  hero faded over the project's own dashed ring. Dot 4 is the second
+     *  project ("bridge", two sessions), so one visible step precedes it. */
+    @Test
+    fun projectPagerSpawn() {
+        previewEnabled()
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        compose.onNodeWithTag("haloDot-4").performClick()
+        compose.waitForIdle()
+        drillToList()
+        stepForward(2)
+        hold()
+    }
+
+    /** #130: the picker a project-scoped spawn card summons — "bridge"
+     *  hoisted to the top row, marked, one confirm tap from spawning in its
+     *  own root; the other targets and escapes reachable below. */
+    @Test
+    fun projectSpawnPickerPreselected() {
+        previewEnabled()
+        compose.setContent { HaloApp(ui = ui(), actions = HaloActions()) }
+        compose.onNodeWithTag("haloDot-4").performClick()
+        compose.waitForIdle()
+        drillToList()
+        stepForward(2)
+        compose.onNodeWithTag("haloSpawn").performClick()
+        hold()
+    }
+
     /** Card → the session-actions menu (#114) → its "open feed" row. */
     private fun openFeedFromCard(sessionId: String) {
         compose.onNodeWithTag("haloPagerCard-$sessionId").performClick()

@@ -60,7 +60,7 @@ data class HaloNavState(
     /**
      * The selected session. At [HaloDepth.SESSION] it is the open feed; at
      * [HaloDepth.LIST] it is the pager's selected card — null there means the
-     * trailing spawn card (All scope) or an empty scope, not "nothing". Always
+     * trailing spawn card or an empty scope, not "nothing". Always
      * null at [HaloDepth.PAGE]: a page has no selection, and a stale id would
      * leak into the next drill's keep-if-in-scope resolution.
      */
@@ -126,16 +126,16 @@ fun HaloNavState.drillToList(model: HaloModel): HaloNavState {
 /**
  * Swipe on the list pager: move the selection by [delta] slots (+1 next, −1
  * previous), NO wrap — both ends are hard stops, so the ring highlight never
- * teleports across midnight. All scope appends ONE trailing spawn slot
- * (`sessionId = null`) as the true end: last session → spawn card → no-op. A
- * project scope ends at its last session. Only meaningful at LIST depth, and
- * a no-op when the selection already vanished under us — repairing that is
- * the self-heal's job, not a swipe's.
+ * teleports across midnight. EVERY scope appends ONE trailing spawn slot
+ * (`sessionId = null`) as the true end: last session → spawn card → no-op
+ * (#130, superseding the epic's All-only slot — a project's known cwd made
+ * its pager the one place a spawn could NOT start from). Only meaningful at
+ * LIST depth, and a no-op when the selection already vanished under us —
+ * repairing that is the self-heal's job, not a swipe's.
  */
 fun HaloNavState.step(delta: Int, model: HaloModel): HaloNavState {
     if (depth != HaloDepth.LIST) return this
-    val slots: List<String?> = model.sessionsIn(listScope).map { it.id } +
-        if (listScope == ListScope.All) listOf(null) else emptyList()
+    val slots: List<String?> = model.sessionsIn(listScope).map { it.id } + listOf(null)
     val at = slots.indexOf(sessionId)
     if (at < 0) return this
     val to = at + delta
@@ -160,7 +160,7 @@ fun HaloNavState.stepPage(delta: Int, model: HaloModel): HaloNavState {
  * True on the FIRST pager slot of the current scope: there the UI maps
  * swipe-right/‹ to [back] instead of a step. With sessions present the spawn
  * card is the END, so a null selection is NOT the start; an empty scope's
- * sole slot (spawn card, or nothing) is trivially both — back must work.
+ * sole slot (the spawn card) is trivially both — back must work.
  */
 fun HaloNavState.atListStart(model: HaloModel): Boolean =
     sessionId == model.sessionsIn(listScope).firstOrNull()?.id
@@ -174,8 +174,10 @@ fun HaloNavState.atListStart(model: HaloModel): Boolean =
  * resolved to (tracked by the UI): the session now at that index is the dead
  * one's next-door neighbour, clamped to the last slot when the end was killed.
  * An emptied All scope lands on the spawn card (the sole remaining slot); an
- * emptied project scope has NO slots at all — its project just vanished from
- * the model — so it backs all the way out. In-scope selections, other depths
+ * emptied project scope backs all the way out instead — its project just
+ * vanished from the model (a project exists only through its sessions), so
+ * its spawn card would name a target the picker can no longer offer (#130
+ * keeps this asymmetry deliberately). In-scope selections, other depths
  * and the spawn card itself pass through untouched.
  */
 fun HaloNavState.healListSelection(model: HaloModel, rememberedIndex: Int): HaloNavState {

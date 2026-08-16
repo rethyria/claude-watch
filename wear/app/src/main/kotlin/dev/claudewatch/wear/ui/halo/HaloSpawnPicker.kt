@@ -8,9 +8,13 @@
 // trailing cancel row or the system back (the pull-down cancel died in the
 // v3 vertical purge, #109 — vertical drags scroll this list and nothing
 // else, so the once-passive "↓ cancel" label became the tappable escape).
+// A PROJECT pager's spawn card (#130) opens the same picker with its own
+// project preselected — hoisted first, marked — so the known cwd is one
+// confirm tap away without losing the pick-elsewhere and cancel escapes.
 package dev.claudewatch.wear.ui.halo
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -44,7 +48,30 @@ fun HaloSpawnPicker(
     onPick: (cwd: String) -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * The summoning PROJECT scope's name (#130), or null for the All flow.
+     * The matching target hoists to the top row, marked, so its root — the
+     * cwd the spawn request will carry — is one confirm tap away; every
+     * other target, the home entry and cancel stay reachable below (the
+     * picker still adds real choices with the project fixed, which is why
+     * this is a preselect and not a direct no-picker spawn). A name with no
+     * target (the project vanished mid-tap, or a spawn-rootless orphan)
+     * degrades to the plain picker rather than inventing a row.
+     */
+    preselect: String? = null,
 ) {
+    // Hoist-by-reorder, not a scroll: the preselected row must sit directly
+    // under the "new session in…" caption — a mid-list scroll would carry
+    // the caption (and the one-glance context it provides) off screen.
+    val preselected = preselect?.let { name ->
+        model.spawnTargets.firstOrNull { it.projectName == name }
+    }
+    val targets =
+        if (preselected == null) {
+            model.spawnTargets
+        } else {
+            listOf(preselected) + model.spawnTargets.filterNot { it.projectName == preselected.projectName }
+        }
     // Top-anchor the list so the first AND second rows are both on screen at once
     // — same round-screen fix as DiscoveredBridgeList. ScalingLazyColumn's default
     // autoCentering reserves ~half a screen above item 0 so it can reach center,
@@ -84,7 +111,7 @@ fun HaloSpawnPicker(
             )
         }
 
-        model.spawnTargets.forEach { target ->
+        targets.forEach { target ->
             // Namespaced away from the fixed home entry's key: a project
             // literally named "home" must not collide (duplicate lazy keys
             // crash at composition).
@@ -93,6 +120,7 @@ fun HaloSpawnPicker(
                     title = target.projectName,
                     subtitle = target.root,
                     tag = "haloSpawnPick-${target.projectName}",
+                    preselected = target.projectName == preselected?.projectName,
                     onPick = { onPick(target.root) },
                 )
             }
@@ -134,13 +162,20 @@ fun HaloSpawnPicker(
     }
 }
 
-/** One pick target as a quiet pill (same geometry family as the session rows). */
+/**
+ * One pick target as a quiet pill (same geometry family as the session rows).
+ * [preselected] (#130) marks the scoped project's own row: one surface step
+ * brighter with a warm hairline — the warm ramp is the one hue family the
+ * state colours don't use for signalling (the CodeChip precedent), so the
+ * mark reads as "yours, ready" rather than waiting/running.
+ */
 @Composable
 private fun SpawnTargetRow(
     title: String,
     subtitle: String,
     tag: String,
     onPick: () -> Unit,
+    preselected: Boolean = false,
 ) {
     val shape = RoundedCornerShape(Halo.Geo.RowRadius)
     Column(
@@ -148,7 +183,14 @@ private fun SpawnTargetRow(
         modifier = Modifier
             .fillMaxWidth()
             .defaultMinSize(minHeight = Halo.Geo.TouchMin)
-            .background(Halo.Palette.Surface, shape)
+            .background(if (preselected) Halo.Palette.Surface2 else Halo.Palette.Surface, shape)
+            .then(
+                if (preselected) {
+                    Modifier.border(1.dp, Halo.Palette.UserEntry, shape)
+                } else {
+                    Modifier
+                },
+            )
             .clickable(onClick = onPick)
             .testTag(tag)
             .padding(horizontal = 10.dp, vertical = 6.dp),

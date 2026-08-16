@@ -283,12 +283,15 @@ private fun HaloAppBody(
     val currentUi by rememberUpdatedState(ui)
     var lastSwipeAtMs by remember { mutableLongStateOf(0L) }
 
-    // Issue #56: the spawn picker overlay. The list's "+ new claude session"
-    // row OPENS it instead of firing blind; a pick spawns-and-closes, the
-    // cancel row (and the system back) closes without spawning. A plain flag
+    // Issue #56: the spawn picker overlay. The pager's "+ new session" card
+    // OPENS it instead of firing blind; a pick spawns-and-closes, the
+    // cancel row (and the system back) closes without spawning. Plain state
     // (like the overlays below, not a nav depth): it floats over the list it
-    // was summoned from and closing must land exactly there.
-    var spawnPickerOpen by remember { mutableStateOf(false) }
+    // was summoned from and closing must land exactly there. Non-null = open,
+    // carrying the summoning scope (#130): a PROJECT pager's card opens the
+    // picker with its own project preselected — the cwd is already known, so
+    // the confirm is ONE tap — while All's picker stays exactly the #56 flow.
+    var spawnPickerScope by remember { mutableStateOf<ListScope?>(null) }
 
     // Issue #127: the offline takeover's sub-pane state, hoisted from
     // HaloOfflineScreen so the root back handler below can drive the
@@ -495,7 +498,7 @@ private fun HaloAppBody(
                     offlineRevealed -> offlineRevealed = false
                     else -> Unit
                 }
-            } else when (val route = systemBack(nav, overlayOpen = voiceOpen || spawnPickerOpen, currentModel)) {
+            } else when (val route = systemBack(nav, overlayOpen = voiceOpen || spawnPickerScope != null, currentModel)) {
                 SystemBack.DismissOverlay -> when {
                     // The voice overlay renders ABOVE the picker (both can be
                     // up: an armed send can fail while the picker is open), so
@@ -505,7 +508,7 @@ private fun HaloAppBody(
                     // consumed — it must not navigate the hierarchy under a
                     // modal overlay.
                     voiceOpen -> if (currentUi.commandError == null) voiceOpen = false
-                    else -> spawnPickerOpen = false
+                    else -> spawnPickerScope = null
                 }
                 is SystemBack.Navigate -> nav = route.nav
                 // Settings at rest — the leftward chain's end: the deliberate
@@ -553,7 +556,7 @@ private fun HaloAppBody(
         // overlay closing flips it true and re-requests the crown. Touch
         // survives a dropped focus, which is exactly why a missing term here
         // stays invisible to every tap-driven gate.
-        val rotaryActive = !spawnPickerOpen && !nav.menuOpen && !nav.cardOpen &&
+        val rotaryActive = spawnPickerScope == null && !nav.menuOpen && !nav.cardOpen &&
             !voiceOpen && !ui.isOffline()
 
         AnimatedContent(
@@ -619,8 +622,10 @@ private fun HaloAppBody(
                     // this session's own prompt — never a feed drill.
                     onAnswer = { session -> nav = nav.openCardForListSession(session) },
                     // Issue #56: the spawn card summons the target picker
-                    // overlay; the actual onSpawn fires from a pick.
-                    onSpawn = { spawnPickerOpen = true },
+                    // overlay; the actual onSpawn fires from a pick. The
+                    // picker opens FOR this pager's scope (#130): a project
+                    // scope preselects its own project.
+                    onSpawn = { spawnPickerScope = layer.scope },
                     rotaryActive = rotaryActive,
                 )
                 is Layer.Feed -> HaloSessionFeed(
@@ -711,7 +716,7 @@ private fun HaloAppBody(
         // Issue #56: the spawn target picker, over the list that summoned it
         // and UNDER the approval card / offline takeover (a prompt or a
         // dropped stream outranks choosing a spawn directory).
-        if (spawnPickerOpen) {
+        spawnPickerScope?.let { pickerScope ->
             // NO gesture-swallowing wrapper: consuming the down in the Main
             // pass reads to the picker list's scrollable as "another detector
             // claimed this gesture", cancelling its drag recognition — which
@@ -736,11 +741,15 @@ private fun HaloAppBody(
                 CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
                     HaloSpawnPicker(
                         model = model,
+                        // #130: a project-scoped summons preselects its own
+                        // project — the cwd the spawn request will carry is
+                        // that project's spawn root, one confirm tap away.
+                        preselect = (pickerScope as? ListScope.Project)?.name,
                         onPick = { cwd ->
-                            spawnPickerOpen = false
+                            spawnPickerScope = null
                             actions.onSpawn("claude", cwd)
                         },
-                        onCancel = { spawnPickerOpen = false },
+                        onCancel = { spawnPickerScope = null },
                     )
                 }
             }

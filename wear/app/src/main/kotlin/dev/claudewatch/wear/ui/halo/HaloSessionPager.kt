@@ -2,7 +2,7 @@
 // one session per screen instead of scrolling rows. Each card is a wrapping
 // title + `model · mode · use%` subheading with the shared Answer pill on
 // waiting sessions; ‹ › chevrons and horizontal swipes step the selection
-// (no wrap — the All scope ends on the trailing "+ new session" card, and
+// (no wrap — every scope ends on the trailing "+ new session" card, and
 // stepping right at the start is BACK). Tapping a card opens the
 // session-actions MENU (HaloSessionMenu — the user's on-wrist verdict killed
 // the arc's five 26dp circles, and the feed moved behind the menu's "open
@@ -140,7 +140,7 @@ internal fun sessionDetailLine(branchLabel: String?, agentsRunning: Int): String
 
 /**
  * One session per screen. [selectedId] is nav's LIST selection verbatim —
- * null renders the trailing spawn card (All scope) or an empty scope. The
+ * null renders the trailing spawn card or an empty scope. The
  * at-start-goes-back decision is the caller's ([atStart], from the pinned
  * [HaloNavState.atListStart]): ‹ and a right swipe call [onBack] there,
  * [onStep] −1 otherwise. Rotary only ever steps — the nav's no-wrap makes
@@ -169,10 +169,10 @@ fun HaloSessionPager(
     rotaryActive: Boolean = true,
 ) {
     // The slot row this screen pages through: scope order (ring order == pager
-    // order, #95) plus the trailing spawn slot in All. Null slot = spawn card.
+    // order, #95) plus the trailing spawn slot — EVERY scope's true end since
+    // #130 (mirroring the nav's step slots). Null slot = spawn card.
     val sessions = model.sessionsIn(scope)
-    val slots: List<HaloSession?> =
-        if (scope == ListScope.All) sessions + listOf(null) else sessions
+    val slots: List<HaloSession?> = sessions + listOf(null)
     val selectedIndex = slots.indexOfFirst { it?.id == selectedId }
 
     // Gesture/rotary lambdas live in pointerInput(Unit)/remembered closures
@@ -278,8 +278,8 @@ fun HaloSessionPager(
         )
         StepChevron(
             glyph = "›",
-            // Invisible on the true last slot (the spawn card in All, the
-            // last session in a project) but the CELL stays, so the layout
+            // Invisible on the true last slot (the spawn card, every scope's
+            // end since #130) but the CELL stays, so the layout
             // never shifts as the end comes into view.
             visible = selectedIndex < slots.lastIndex,
             onClick = { step(1) },
@@ -445,9 +445,10 @@ private fun SessionCardText(session: HaloSession, modifier: Modifier = Modifier)
 }
 
 /**
- * The trailing "+ new session" card: the All scope's true end and the empty
- * scope's whole content. Same testTag as the retired spawn row — it is the
- * same affordance, opening the unchanged spawn target picker.
+ * The trailing "+ new session" card: every scope's true end (#130) and the
+ * empty scope's whole content. Same testTag as the retired spawn row — it is
+ * the same affordance, opening the spawn target picker (a project scope's
+ * picker arrives with that project preselected; the caller binds the scope).
  */
 @Composable
 private fun SpawnCard(onSpawn: () -> Unit) {

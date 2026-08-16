@@ -20,11 +20,11 @@ import org.junit.Test
  * guard to `== USAGE_PAGE` breaks the settings cases by name).
  *
  * The v2 list pager (Halo v2 S1, #95): the LIST depth carries a selection —
- * null there is the All scope's trailing spawn card, or an empty scope —
- * stepped with NO wrap, resolved on drill, PRESERVED by back-from-feed (the
- * shrink morph must land on the right ring segment) and cleared by
- * back-to-page. The pager's Answer pill pins the card over the LIST to that
- * session's own prompt, never the global front.
+ * null there is the trailing spawn card (EVERY scope's true end since #130),
+ * or an empty scope — stepped with NO wrap, resolved on drill, PRESERVED by
+ * back-from-feed (the shrink morph must land on the right ring segment) and
+ * cleared by back-to-page. The pager's Answer pill pins the card over the
+ * LIST to that session's own prompt, never the global front.
  */
 class HaloNavTest {
 
@@ -237,8 +237,9 @@ class HaloNavTest {
         val second = first.step(+1, model())
         assertEquals("s-a2", second.sessionId)
         assertEquals(first, second.step(-1, model()))
-        // A project scope has NO spawn slot: its last session is the hard end.
-        assertEquals(second, second.step(+1, model()))
+        // #130: the last session is no longer a project scope's hard end —
+        // its trailing spawn slot is (the project cases below pin it).
+        assertNull(second.step(+1, model()).sessionId)
     }
 
     @Test
@@ -256,6 +257,26 @@ class HaloNavTest {
         assertEquals(spawn, spawn.step(+1, model()))
         // And stepping back off it re-selects the last real session.
         assertEquals("s-b1", spawn.step(-1, model()).sessionId)
+    }
+
+    @Test
+    fun projectScopeStepsOntoItsOwnSpawnSlotThenStops() {
+        // #130 (superseding the epic's All-only slot): a project pager ends
+        // on the SAME trailing spawn slot — last session → spawn card →
+        // no-op, exactly the All walk above.
+        val last = HaloNavState(page = 1).drillToList(model()).step(+1, model())
+        assertEquals(ListScope.Project("alpha"), last.listScope)
+        assertEquals("s-a2", last.sessionId)
+
+        val spawn = last.step(+1, model())
+        assertEquals(HaloDepth.LIST, spawn.depth)
+        assertNull(spawn.sessionId)
+        assertEquals(spawn, spawn.step(+1, model()))
+        // Stepping back off it re-selects the project's last session.
+        assertEquals("s-a2", spawn.step(-1, model()).sessionId)
+        // And the spawn card is the END, never the start: ‹ there must step,
+        // not pop the list.
+        assertFalse(spawn.atListStart(model()))
     }
 
     @Test
@@ -297,8 +318,10 @@ class HaloNavTest {
         // empty list, not crash or borrow All's sessions.
         assertEquals(emptyList<HaloSession>(), model().sessionsIn(ListScope.Project("gone")))
         val stale = HaloNavState(depth = HaloDepth.LIST, listScope = ListScope.Project("gone"))
-        // No spawn slot outside All: nothing to step onto, trivially at start
-        // so back remains reachable.
+        // The sole slot is the spawn card (#130's unconditional append) —
+        // transient by construction: the app-level heal backs a vanished
+        // project out. Both ends are still hard stops and trivially the
+        // start, so back remains reachable.
         assertEquals(stale, stale.step(+1, model()))
         assertEquals(stale, stale.step(-1, model()))
         assertTrue(stale.atListStart(model()))
@@ -475,8 +498,11 @@ class HaloNavTest {
 
     @Test
     fun healBacksOutOfAnEmptiedProjectScope() {
-        // A project scope with no sessions has NO slots (no spawn card
-        // outside All): nothing to select, so the heal backs all the way out.
+        // An emptied project scope means the project itself vanished from
+        // the model (a project exists only through its sessions), so its
+        // spawn card would name a target the picker can no longer offer —
+        // the heal backs all the way out instead (#130 keeps this
+        // asymmetry with All's land-on-the-spawn-card deliberately).
         val stale = HaloNavState(
             depth = HaloDepth.LIST,
             listScope = ListScope.Project("gone"),
@@ -602,6 +628,19 @@ class HaloNavTest {
         val emptyList = HaloNavState(page = 0).drillToList(emptyModel)
         val out = (systemBack(emptyList, overlayOpen = false, emptyModel) as SystemBack.Navigate).nav
         assertEquals(HaloDepth.PAGE, out.depth)
+    }
+
+    @Test
+    fun systemBackOnAProjectSpawnCardStepsBackOntoItsLastSession() {
+        // #130 parity: the project pager's spawn slot routes back exactly as
+        // All's — a step onto the scope's last session, never a list pop.
+        val spawn = HaloNavState(page = 1).drillToList(model())
+            .step(+1, model()).step(+1, model())
+        assertEquals(ListScope.Project("alpha"), spawn.listScope)
+        assertNull(spawn.sessionId)
+        val last = (systemBack(spawn, overlayOpen = false, model()) as SystemBack.Navigate).nav
+        assertEquals(HaloDepth.LIST, last.depth)
+        assertEquals("s-a2", last.sessionId)
     }
 
     @Test

@@ -476,6 +476,13 @@ class HaloRingMathTest {
 
         val stale = spawn.copy(sessionId = "s-gone")
         assertEquals(-1, m.ringInputs(stale, model(), StepDir.NONE).selectedIndex)
+
+        // #130 parity: a PROJECT scope's spawn card fades the hero exactly as
+        // All's — same −1, while the dashed ring keeps the scope's sessions.
+        val projectSpawn = HaloNavState(depth = HaloDepth.LIST, listScope = ListScope.Project("alpha"))
+        val inputs = m.ringInputs(projectSpawn, model(), StepDir.NONE)
+        assertEquals(-1, inputs.selectedIndex)
+        assertEquals(listOf(SessionState.RUNNING, SessionState.IDLE), inputs.states)
     }
 
     @Test

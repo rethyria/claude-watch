@@ -29,7 +29,10 @@ import org.junit.runner.RunWith
  * (the MAIN checkout for a worktree-only project), "no project" fires the "~"
  * home sentinel, and the trailing cancel row (v3: the purged pull-down
  * cancel's tappable successor) spawns NOTHING — with the pager underneath
- * keeping its own gestures afterwards.
+ * keeping its own gestures afterwards. A PROJECT pager's spawn card (#130)
+ * opens the same picker with its own project PRESELECTED — hoisted to the
+ * top row — so the confirm is one tap and the request carries that
+ * project's spawn root.
  */
 @RunWith(AndroidJUnit4::class)
 class HaloSpawnPickerTest {
@@ -106,6 +109,22 @@ class HaloSpawnPickerTest {
         ).performScrollToNode(hasTestTag(tag))
     }
 
+    /** Project page → pager → its trailing spawn card → the SCOPED picker
+     *  (#130). Dot taps walk the pages (no swipe guard arms); dot slots are
+     *  settings 0, usage 1, All 2, then the projects — alpha 3, beta 4. */
+    private fun openScopedPicker(dot: Int, lastCardTag: String) {
+        compose.onNodeWithTag("haloDot-$dot").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloCenter").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag(lastCardTag).assertIsDisplayed()
+        compose.onNodeWithTag("haloNext").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloSpawn").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloSpawnPicker").assertIsDisplayed()
+    }
+
     private fun pickerCount(): Int =
         compose.onAllNodes(hasTestTag("haloSpawnPicker")).fetchSemanticsNodes().size
 
@@ -136,6 +155,51 @@ class HaloSpawnPickerTest {
 
         // "~" is the wire sentinel the bridge resolves to ITS user's home.
         assertEquals(listOf("claude" to "~"), spawns)
+        assertEquals(0, pickerCount())
+    }
+
+    @Test
+    fun projectScopedPickerHoistsThePreselectedProjectAboveModelOrder() {
+        val spawns = mutableListOf<Pair<String, String?>>()
+        setContent(spawns)
+        // Beta is SECOND in model order (alpha is first-seen): the scoped
+        // picker hoisting beta's row above alpha's is what proves the
+        // preselect, not just an accident of list order.
+        openScopedPicker(dot = 4, lastCardTag = "haloPagerCard-s-b")
+
+        val beta = compose.onNodeWithTag("haloSpawnPick-beta").fetchSemanticsNode().boundsInRoot
+        val alpha = compose.onNodeWithTag("haloSpawnPick-alpha").fetchSemanticsNode().boundsInRoot
+        assertTrue(
+            "the preselected project (top ${beta.top}) must render above the rest (${alpha.top})",
+            beta.top < alpha.top,
+        )
+        // Every other escape stays reachable below: the picker keeps real
+        // choices with the project fixed — the reason preselect beat a
+        // direct no-picker spawn (#130's recorded decision).
+        scrollPickerTo("haloSpawnPickHome")
+        compose.onNodeWithTag("haloSpawnPickHome").assertExists()
+        scrollPickerTo("haloSpawnCancel")
+        compose.onNodeWithTag("haloSpawnCancel").assertExists()
+
+        // The ONE confirm tap: the request carries beta's own root.
+        scrollPickerTo("haloSpawnPick-beta")
+        compose.onNodeWithTag("haloSpawnPick-beta").performClick()
+        compose.waitForIdle()
+        assertEquals(listOf("claude" to "/home/dev/beta"), spawns)
+        assertEquals("a pick closes the picker", 0, pickerCount())
+    }
+
+    @Test
+    fun projectScopedConfirmCarriesTheMainCheckoutForAWorktreeProject() {
+        val spawns = mutableListOf<Pair<String, String?>>()
+        setContent(spawns)
+        // Alpha exists only through a worktree session: the preselected
+        // confirm must carry the MAIN checkout — the same repoRoot-beats-cwd
+        // rule as the unscoped pick — never the throwaway worktree dir.
+        openScopedPicker(dot = 3, lastCardTag = "haloPagerCard-s-wt")
+        compose.onNodeWithTag("haloSpawnPick-alpha").assertIsDisplayed().performClick()
+        compose.waitForIdle()
+        assertEquals(listOf("claude" to "/home/dev/alpha"), spawns)
         assertEquals(0, pickerCount())
     }
 
