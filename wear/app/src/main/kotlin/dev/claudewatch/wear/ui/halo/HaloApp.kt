@@ -396,6 +396,28 @@ private fun HaloAppBody(
     // previous visit can never flip a fresh drill's first rotation.
     var lastStepDir by remember { mutableStateOf(StepDir.NONE) }
 
+    // #130 follow-through: a spawn fired from a pager's spawn card arms the
+    // id the bridge answered with; when that session registers into the
+    // still-parked scope, the pager moves onto its card instead of leaving
+    // the user on the "+" slot watching nothing happen. Disarmed the moment
+    // the user is anywhere but the slot — their place is never yanked.
+    var followSpawnId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(ui.sessionActionResult) {
+        if (ui.sessionActionResult?.startsWith("spawn:2") == true) followSpawnId = ui.sessionId
+    }
+    LaunchedEffect(model, nav, followSpawnId) {
+        val id = followSpawnId ?: return@LaunchedEffect
+        if (nav.depth != HaloDepth.LIST || nav.sessionId != null || nav.menuOpen || nav.cardOpen) {
+            followSpawnId = null
+            return@LaunchedEffect
+        }
+        val followed = nav.followSpawn(id, model)
+        if (followed !== nav) {
+            nav = followed
+            followSpawnId = null
+        }
+    }
+
     // The model can shrink under the navigation (session killed, project's
     // last session gone, queue resolved elsewhere): back out to something
     // that still exists rather than rendering a ghost.

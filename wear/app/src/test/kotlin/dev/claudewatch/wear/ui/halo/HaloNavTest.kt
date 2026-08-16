@@ -669,4 +669,48 @@ class HaloNavTest {
             systemBack(HaloNavState(), overlayOpen = false, model()),
         )
     }
+
+    // ── #130 follow-through: the pager follows a spawn it fired ──────────
+
+    @Test
+    fun followSpawnMovesOffTheParkedSpawnSlotOntoTheNewSession() {
+        val parked = HaloNavState(
+            page = 1, depth = HaloDepth.LIST,
+            listScope = ListScope.Project("alpha"), sessionId = null,
+        )
+        val followed = parked.followSpawn("s-a2", model())
+        assertEquals("s-a2", followed.sessionId)
+        assertEquals(HaloDepth.LIST, followed.depth)
+    }
+
+    @Test
+    fun followSpawnNeverYanksAUserWhoIsAnywhereElse() {
+        val m = model()
+        // A selected session card is a place the user chose: no-op.
+        val scope = ListScope.Project("alpha")
+        val onCard = HaloNavState(page = 1, depth = HaloDepth.LIST, listScope = scope, sessionId = "s-a1")
+        assertEquals(onCard, onCard.followSpawn("s-a2", m))
+        // Overlays over the slot: the slot is not "parked" any more.
+        val menuUp = HaloNavState(page = 1, depth = HaloDepth.LIST, listScope = scope, sessionId = null, menuOpen = true)
+        assertEquals(menuUp, menuUp.followSpawn("s-a2", m))
+        val cardUp = HaloNavState(page = 1, depth = HaloDepth.LIST, listScope = scope, sessionId = null, cardOpen = true)
+        assertEquals(cardUp, cardUp.followSpawn("s-a2", m))
+        // Other depths entirely.
+        val onPage = HaloNavState(page = 1)
+        assertEquals(onPage, onPage.followSpawn("s-a2", m))
+    }
+
+    @Test
+    fun followSpawnIgnoresASessionOutsideTheParkedScope() {
+        // Parked on alpha's slot; the spawn landed (or resurfaced) in beta:
+        // selecting it would render a ghost — the scope's list has no such id.
+        val parked = HaloNavState(
+            page = 1, depth = HaloDepth.LIST,
+            listScope = ListScope.Project("alpha"), sessionId = null,
+        )
+        assertEquals(parked, parked.followSpawn("s-b1", model()))
+        // Not present anywhere yet (200 answered before the register): no-op,
+        // the caller re-runs when the model gains it.
+        assertEquals(parked, parked.followSpawn("s-new", model()))
+    }
 }

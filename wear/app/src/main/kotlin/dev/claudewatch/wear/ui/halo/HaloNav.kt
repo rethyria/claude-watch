@@ -212,6 +212,21 @@ fun HaloNavState.openMenu(sessionId: String): HaloNavState {
     return copy(sessionId = sessionId, menuOpen = true)
 }
 
+/**
+ * A spawn this device fired has registered (#130 follow-through): the pager,
+ * still parked on the spawn card it was fired from, moves onto the new
+ * session's card. Deliberately narrow — only while STILL parked on the
+ * slot (sessionId null, no overlay) and only when the session actually
+ * joined this scope's list: a user who has navigated anywhere else since
+ * keeps their place, and a spawn that landed in another scope (or not yet)
+ * changes nothing.
+ */
+fun HaloNavState.followSpawn(id: String, model: HaloModel): HaloNavState {
+    if (depth != HaloDepth.LIST || sessionId != null || menuOpen || cardOpen) return this
+    if (model.sessionsIn(listScope).none { it.id == id }) return this
+    return copy(sessionId = id)
+}
+
 /** The menu's "open feed" row (and any hand-built feed drill): into the live
  *  feed, the menu closed BEHIND the drill — back from the feed must land on
  *  the pager card, not re-raise the launcher that was passed through. */

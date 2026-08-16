@@ -474,6 +474,51 @@ class HaloSessionPagerTest {
     }
 
     @Test
+    fun projectSpawnFollowsTheNewSessionWhenItRegisters() {
+        val spawns = mutableListOf<Pair<String, String?>>()
+        var state by mutableStateOf(ui(queue = emptyList()))
+        compose.setContent {
+            HaloApp(
+                ui = state,
+                actions = HaloActions(onSpawn = { agent, cwd -> spawns += agent to cwd }),
+            )
+        }
+
+        // Alpha's pager → the spawn card → fire.
+        onePageRight()
+        drill()
+        next()
+        next()
+        compose.onNodeWithTag("haloSpawn").assertIsDisplayed().performClick()
+        compose.waitForIdle()
+        assertEquals(listOf("claude" to "/home/dev/alpha"), spawns)
+        // Nothing registered yet: still honestly parked on the slot.
+        compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
+
+        // The bridge's 200 named the id, then the SSE register lands the
+        // session in alpha — the pager follows onto the new card (#130
+        // follow-through) instead of leaving the user on "+ new session".
+        state = state.copy(
+            sessionActionResult = "spawn:200",
+            sessionId = "s-a3",
+            bridge = state.bridge.copy(
+                sessions = state.bridge.sessions + (
+                    "s-a3" to SessionState(
+                        sessionId = "s-a3",
+                        agent = "claude",
+                        cwd = "/home/dev/alpha",
+                        folderName = "alpha",
+                        external = true,
+                        kind = "acp",
+                    )
+                    ),
+            ),
+        )
+        compose.waitForIdle()
+        compose.onNodeWithTag("haloPagerCard-s-a3").assertIsDisplayed()
+    }
+
+    @Test
     fun killUnderTheOpenMenuClosesItOntoTheHealedNeighbour() {
         var state by mutableStateOf(ui())
         compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
