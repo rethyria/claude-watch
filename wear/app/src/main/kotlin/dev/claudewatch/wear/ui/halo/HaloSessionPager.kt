@@ -447,8 +447,8 @@ private fun SessionCardText(session: HaloSession, modifier: Modifier = Modifier)
 /**
  * The trailing "+ new session" card: every scope's true end (#130) and the
  * empty scope's whole content. Same testTag as the retired spawn row — it is
- * the same affordance, opening the spawn target picker (a project scope's
- * picker arrives with that project preselected; the caller binds the scope).
+ * the same affordance. On All it opens the spawn target picker; on a project
+ * scope the caller spawns DIRECTLY into that project (user-directed #130).
  */
 @Composable
 private fun SpawnCard(onSpawn: () -> Unit) {

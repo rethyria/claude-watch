@@ -288,9 +288,9 @@ private fun HaloAppBody(
     // cancel row (and the system back) closes without spawning. Plain state
     // (like the overlays below, not a nav depth): it floats over the list it
     // was summoned from and closing must land exactly there. Non-null = open,
-    // carrying the summoning scope (#130): a PROJECT pager's card opens the
-    // picker with its own project preselected — the cwd is already known, so
-    // the confirm is ONE tap — while All's picker stays exactly the #56 flow.
+    // carrying the summoning scope. Project cards spawn DIRECTLY (#130,
+    // user-directed) and normally never open this; only All's #56 flow and
+    // the vanished-project fallback arrive here.
     var spawnPickerScope by remember { mutableStateOf<ListScope?>(null) }
 
     // Issue #127: the offline takeover's sub-pane state, hoisted from
@@ -621,11 +621,21 @@ private fun HaloAppBody(
                     // The Answer pill: the card OVER the list, pinned to
                     // this session's own prompt — never a feed drill.
                     onAnswer = { session -> nav = nav.openCardForListSession(session) },
-                    // Issue #56: the spawn card summons the target picker
-                    // overlay; the actual onSpawn fires from a pick. The
-                    // picker opens FOR this pager's scope (#130): a project
-                    // scope preselects its own project.
-                    onSpawn = { spawnPickerScope = layer.scope },
+                    // Issue #56: on the ALL scope the spawn card summons the
+                    // target picker overlay — the project genuinely needs
+                    // choosing. On a PROJECT scope the choice already
+                    // happened by navigating here, so the card spawns
+                    // DIRECTLY into the project's root (#130, user-directed:
+                    // "instantly spawn for that project, not a menu");
+                    // reaching the true end of the list and tapping IS the
+                    // deliberate act. A project whose spawn target vanished
+                    // mid-frame degrades to the picker rather than a dead tap.
+                    onSpawn = {
+                        val target = (layer.scope as? ListScope.Project)
+                            ?.let { p -> currentModel.spawnTargets.firstOrNull { it.projectName == p.name } }
+                        if (target != null) actions.onSpawn("claude", target.root)
+                        else spawnPickerScope = layer.scope
+                    },
                     rotaryActive = rotaryActive,
                 )
                 is Layer.Feed -> HaloSessionFeed(
@@ -739,12 +749,11 @@ private fun HaloAppBody(
                 // cancel's nested-scroll leftovers.)
                 @OptIn(ExperimentalFoundationApi::class)
                 CompositionLocalProvider(LocalOverscrollConfiguration provides null) {
+                    // Project scopes spawn directly (#130) — the picker only
+                    // opens for All or a vanished project, both genuine
+                    // choices, so no preselect survives here.
                     HaloSpawnPicker(
                         model = model,
-                        // #130: a project-scoped summons preselects its own
-                        // project — the cwd the spawn request will carry is
-                        // that project's spawn root, one confirm tap away.
-                        preselect = (pickerScope as? ListScope.Project)?.name,
                         onPick = { cwd ->
                             spawnPickerScope = null
                             actions.onSpawn("claude", cwd)

@@ -463,16 +463,14 @@ class HaloSessionPagerTest {
         compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
         assertEquals(0, textCount("›"))
 
-        // The card opens the PICKER (the deliberate-action guard survives
-        // the scoping) with alpha preselected: ONE confirm tap, and the
-        // spawn request carries the PROJECT's cwd at the action boundary.
+        // The tap spawns DIRECTLY (#130, user-directed: "instantly spawn for
+        // that project, not a menu") — navigating into the project WAS the
+        // choice, so no picker appears and the spawn request carries the
+        // PROJECT's cwd at the action boundary.
         compose.onNodeWithTag("haloSpawn").performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("haloSpawnPicker").assertIsDisplayed()
-        compose.onNodeWithTag("haloSpawnPick-alpha").assertIsDisplayed().performClick()
-        compose.waitForIdle()
         assertEquals(listOf("claude" to "/home/dev/alpha"), spawns)
-        assertEquals("a pick closes the picker", 0, tagCount("haloSpawnPicker"))
+        assertEquals("no picker for a project-scoped spawn", 0, tagCount("haloSpawnPicker"))
     }
 
     @Test

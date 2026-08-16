@@ -112,7 +112,10 @@ class HaloSpawnPickerTest {
     /** Project page → pager → its trailing spawn card → the SCOPED picker
      *  (#130). Dot taps walk the pages (no swipe guard arms); dot slots are
      *  settings 0, usage 1, All 2, then the projects — alpha 3, beta 4. */
-    private fun openScopedPicker(dot: Int, lastCardTag: String) {
+    // Walks a PROJECT pager to its trailing spawn card and taps it. Since
+    // #130's user-directed revision the tap spawns DIRECTLY — no picker —
+    // so this ends at the tap; callers assert the spawn that resulted.
+    private fun tapScopedSpawnCard(dot: Int, lastCardTag: String) {
         compose.onNodeWithTag("haloDot-$dot").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("haloCenter").performClick()
@@ -122,7 +125,6 @@ class HaloSpawnPickerTest {
         compose.waitForIdle()
         compose.onNodeWithTag("haloSpawn").performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("haloSpawnPicker").assertIsDisplayed()
     }
 
     private fun pickerCount(): Int =
@@ -159,46 +161,25 @@ class HaloSpawnPickerTest {
     }
 
     @Test
-    fun projectScopedPickerHoistsThePreselectedProjectAboveModelOrder() {
+    fun projectScopedSpawnCardSpawnsDirectlyInItsOwnProject() {
         val spawns = mutableListOf<Pair<String, String?>>()
         setContent(spawns)
-        // Beta is SECOND in model order (alpha is first-seen): the scoped
-        // picker hoisting beta's row above alpha's is what proves the
-        // preselect, not just an accident of list order.
-        openScopedPicker(dot = 4, lastCardTag = "haloPagerCard-s-b")
-
-        val beta = compose.onNodeWithTag("haloSpawnPick-beta").fetchSemanticsNode().boundsInRoot
-        val alpha = compose.onNodeWithTag("haloSpawnPick-alpha").fetchSemanticsNode().boundsInRoot
-        assertTrue(
-            "the preselected project (top ${beta.top}) must render above the rest (${alpha.top})",
-            beta.top < alpha.top,
-        )
-        // Every other escape stays reachable below: the picker keeps real
-        // choices with the project fixed — the reason preselect beat a
-        // direct no-picker spawn (#130's recorded decision).
-        scrollPickerTo("haloSpawnPickHome")
-        compose.onNodeWithTag("haloSpawnPickHome").assertExists()
-        scrollPickerTo("haloSpawnCancel")
-        compose.onNodeWithTag("haloSpawnCancel").assertExists()
-
-        // The ONE confirm tap: the request carries beta's own root.
-        scrollPickerTo("haloSpawnPick-beta")
-        compose.onNodeWithTag("haloSpawnPick-beta").performClick()
-        compose.waitForIdle()
+        // Beta is SECOND in model order (alpha is first-seen): beta's card
+        // spawning with beta's root proves the resolution is per-scope, not
+        // an accident of first-project order — and no picker ever composes.
+        tapScopedSpawnCard(dot = 4, lastCardTag = "haloPagerCard-s-b")
         assertEquals(listOf("claude" to "/home/dev/beta"), spawns)
-        assertEquals("a pick closes the picker", 0, pickerCount())
+        assertEquals("no picker for a project-scoped spawn", 0, pickerCount())
     }
 
     @Test
-    fun projectScopedConfirmCarriesTheMainCheckoutForAWorktreeProject() {
+    fun projectScopedSpawnCarriesTheMainCheckoutForAWorktreeProject() {
         val spawns = mutableListOf<Pair<String, String?>>()
         setContent(spawns)
-        // Alpha exists only through a worktree session: the preselected
-        // confirm must carry the MAIN checkout — the same repoRoot-beats-cwd
-        // rule as the unscoped pick — never the throwaway worktree dir.
-        openScopedPicker(dot = 3, lastCardTag = "haloPagerCard-s-wt")
-        compose.onNodeWithTag("haloSpawnPick-alpha").assertIsDisplayed().performClick()
-        compose.waitForIdle()
+        // Alpha exists only through a worktree session: the direct spawn
+        // must carry the MAIN checkout — the same repoRoot-beats-cwd rule
+        // as the unscoped pick — never the throwaway worktree dir.
+        tapScopedSpawnCard(dot = 3, lastCardTag = "haloPagerCard-s-wt")
         assertEquals(listOf("claude" to "/home/dev/alpha"), spawns)
         assertEquals(0, pickerCount())
     }
