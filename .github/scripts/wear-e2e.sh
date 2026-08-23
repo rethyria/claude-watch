@@ -68,8 +68,12 @@ cleanup() {
   # messages instead. A green run stays quiet.
   if [ "$status" -ne 0 ]; then
     echo "--- watch crashes/ANRs (empty is normal) ---"
-    adb logcat -d -v time -b crash 2>/dev/null | tail -60 || true
-    adb logcat -d -v time 2>/dev/null \
+    # timeout is load-bearing: with the device dead (the failure mode this
+    # dump exists for), adb can block indefinitely — a hung cleanup holds
+    # /tmp/wear-emu.lock for hours and starves every later run (lived it:
+    # the empty-log-exit-1 tell, twice in one day).
+    timeout 15 adb logcat -d -v time -b crash 2>/dev/null | tail -60 || true
+    timeout 15 adb logcat -d -v time 2>/dev/null \
       | grep -aE "FATAL EXCEPTION|ANR in|claudewatch" | tail -40 || true
   fi
   # The fake fork dies WITH the throwaway bridge — never before its spawn
