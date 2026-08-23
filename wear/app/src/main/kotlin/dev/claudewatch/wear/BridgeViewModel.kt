@@ -80,6 +80,10 @@ class BridgeViewModel(
         val options: List<PermissionOption>,
         val questions: List<AskUserQuestion> = emptyList(),
         val agentOptions: List<AgentPermissionOption> = emptyList(),
+        /** Plan-approval markdown (tool_input.plan) — the card renders it as
+         *  a scrollable prose body so the approval isn't blind. Null for
+         *  every ordinary tool permission. */
+        val planText: String? = null,
     )
 
     /**
@@ -1122,6 +1126,7 @@ class BridgeViewModel(
             sessionId = sessionId,
             toolName = toolName ?: "?",
             requestSummary = ToolOutputFormatter.describeToolRequest(toolName, toolInput),
+            planText = ToolOutputFormatter.planText(toolInput),
             sessionLabel = session?.folderName
                 ?: session?.agent
                 ?: sessionId?.take(8)

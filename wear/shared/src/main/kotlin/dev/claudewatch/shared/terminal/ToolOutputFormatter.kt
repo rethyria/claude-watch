@@ -39,6 +39,21 @@ object ToolOutputFormatter {
         }.take(MAX_LINE_CHARS)
     }
 
+    /**
+     * The plan markdown riding a plan-approval permission request, or null.
+     * Keyed on the PRESENCE of `tool_input.plan`, never the tool name: in
+     * production the wire's `tool_name` for ExitPlanMode is the display
+     * title "Ready to code?" (the adapter forwards the title; the raw name
+     * never reaches the bridge), so any name match would silently never
+     * fire. Uncapped — the card renders it scrollable; MAX_LINE_CHARS is a
+     * one-line-summary rule and truncating a plan would defeat reading it.
+     */
+    fun planText(toolInput: JsonObject?): String? =
+        (toolInput?.get("plan") as? JsonPrimitive)
+            ?.takeIf { it.isString }
+            ?.contentOrNull
+            ?.takeIf { it.isNotBlank() }
+
     /** Format one `tool-output` event into terminal lines. */
     fun format(event: ToolOutputEvent): List<TerminalLine> {
         val prefix = if (event.source == "codex") "[codex] " else ""

@@ -305,17 +305,34 @@ private fun DecisionLayer(
                 .border(1.dp, Halo.Palette.CommandWellBorder, RoundedCornerShape(Halo.Geo.CardRadius))
                 .padding(horizontal = 10.dp, vertical = 7.dp),
         ) {
-            Text(
-                text = card.requestSummary,
-                fontSize = Halo.Type.MonoCommand,
-                fontWeight = FontWeight.Medium,
-                fontFamily = FontFamily.Monospace,
-                color = Halo.Palette.TextPrimary,
-                textAlign = TextAlign.Center,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.testTag("haloSummary"),
-            )
+            if (card.planText != null) {
+                // A plan approval (#110 follow-up): the well holds the PLAN —
+                // rendered markdown, start-aligned, uncapped (the card's own
+                // scroll carries it) — because "[Ready to code?]" told the
+                // user nothing to approve AGAINST. #128's prose renderer:
+                // the plan IS markdown.
+                Text(
+                    text = rememberProseText(card.planText),
+                    fontSize = Halo.Type.Caption,
+                    color = Halo.Palette.TextPrimary,
+                    textAlign = TextAlign.Start,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("haloPlanBody"),
+                )
+            } else {
+                Text(
+                    text = card.requestSummary,
+                    fontSize = Halo.Type.MonoCommand,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = FontFamily.Monospace,
+                    color = Halo.Palette.TextPrimary,
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.testTag("haloSummary"),
+                )
+            }
             Text(
                 text = "${card.toolName} · agent is blocked",
                 fontSize = Halo.Type.Caption,
@@ -410,31 +427,16 @@ private fun DecisionLayer(
     }
 }
 
-/** Reading rank: the canonical card's own progression (Deny, Approve, then
- *  always-allow below), applied to N options — standing grants land LAST, at
- *  the far end of the scroll, never under the first stray tap. Within them a
- *  bypassPermissions mode switch ranks below its allow-always peers: the
- *  agent's own order leads the group with bypass (the adapter unshifts it
- *  first), which would seat a session-wide bypass DIRECTLY under the everyday
- *  allow_once target — a one-row mis-tap from granting everything. The id is
- *  Claude's permission-mode id, forwarded verbatim, so it is the one weight
- *  signal the wire carries; an id we don't know keeps its group's order. */
-private fun agentOptionRank(option: AgentPermissionOption): Int = when {
-    option.behavior == "deny" -> 0
-    option.behavior == "allow" -> 1
-    option.optionId == "bypassPermissions" -> 3
-    else -> 2
-}
-
 /**
  * The agent's own options as full-width pills (the question card's list
  * pattern), kind-styled: reject red, allow_once neutral, allow_always
  * emphasised in the waiting accent — a standing grant must never look like
- * just another row. Grouped by rank (stable sort keeps the agent's order
- * within a group) with extra air between groups: a fat-finger between
- * "manually approve" and any standing grant is a decision-grade mis-tap —
- * and bypassPermissions, a rank of its own at the very bottom, gets its own
- * gap even from the grants above it.
+ * just another row. Rendered in the AGENT'S ORDER, verbatim — the same order
+ * Zed shows. The v1 rank-sort (reject first, bypass reseated dead last) was
+ * REVOKED by the user after two field rounds ("the options are the wrong way
+ * round", 2026-08-21): cross-device muscle memory beats the mis-tap theory,
+ * and kind styling keeps every standing grant unmistakable. Extra air where
+ * the BEHAVIOR changes preserves the group legibility without reordering.
  */
 @Composable
 private fun AgentOptionList(
@@ -442,9 +444,8 @@ private fun AgentOptionList(
     enabled: Boolean,
     onDecideOption: (AgentPermissionOption) -> Unit,
 ) {
-    val ordered = options.sortedBy(::agentOptionRank)
-    ordered.forEachIndexed { index, option ->
-        if (index > 0 && agentOptionRank(option) != agentOptionRank(ordered[index - 1])) {
+    options.forEachIndexed { index, option ->
+        if (index > 0 && option.behavior != options[index - 1].behavior) {
             Spacer(Modifier.height(5.dp))
         }
         AgentOptionPill(

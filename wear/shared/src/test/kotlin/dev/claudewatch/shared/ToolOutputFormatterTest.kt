@@ -185,4 +185,24 @@ class ToolOutputFormatterTest {
     fun blankPtyKeepaliveProducesNoLines() {
         assertTrue(ToolOutputFormatter.formatPtyOutput("\r\n \u001B[0m \r\n").isEmpty())
     }
+
+    // ── plan-approval body (#110 follow-up) ─────────────────────────────
+
+    @Test
+    fun planTextIsKeyedOnPresenceNeverOnToolName() {
+        fun inputOf(json: String) =
+            (BridgeEventParser.parse("tool-output", json) as ToolOutputEvent).toolInput
+
+        // Production's tool_name for a plan approval is the display title
+        // ("Ready to code?"), so the extractor must not care what the tool
+        // is called — only that tool_input.plan is a non-blank string.
+        assertEquals(
+            "## The plan\n\n- step one",
+            ToolOutputFormatter.planText(inputOf("""{"tool_input":{"plan":"## The plan\n\n- step one"}}""")),
+        )
+        assertEquals(null, ToolOutputFormatter.planText(inputOf("""{"tool_input":{"command":"ls"}}""")))
+        assertEquals(null, ToolOutputFormatter.planText(inputOf("""{"tool_input":{"plan":42}}""")))
+        assertEquals(null, ToolOutputFormatter.planText(inputOf("""{"tool_input":{"plan":"   "}}""")))
+        assertEquals(null, ToolOutputFormatter.planText(null))
+    }
 }

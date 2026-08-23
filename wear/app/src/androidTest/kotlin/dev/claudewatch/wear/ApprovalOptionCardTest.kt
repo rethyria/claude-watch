@@ -6,8 +6,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -61,11 +63,14 @@ class ApprovalOptionCardTest {
     private val planPrompt = BridgeViewModel.PendingPermission(
         permissionId = "perm-plan",
         sessionId = "s-1",
-        toolName = "ExitPlanMode",
-        requestSummary = "Ready to code?",
+        // Production's wire tool_name for a plan approval is the display
+        // TITLE, not "ExitPlanMode" — the raw name never reaches the bridge.
+        toolName = "Ready to code?",
+        requestSummary = "[Ready to code?]",
         sessionLabel = "alpha",
         options = guardedOptions,
         agentOptions = planOptions,
+        planText = "## Fix the card\n\nRender the **plan** with `ProseMarkdown`.",
     )
 
     private val simplePrompt = BridgeViewModel.PendingPermission(
@@ -117,16 +122,15 @@ class ApprovalOptionCardTest {
         compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
         openCard()
 
-        // Every one of the agent's options is on the card, and the reading
-        // order is the canonical card's own progression: reject first,
-        // allow_once next, the standing grants LAST — and bypassPermissions
-        // DEAD last among them, despite the agent listing it first: keeping
-        // agent order would seat a session-wide bypass one 48dp row below the
-        // everyday "manually approve" target. Stable within a rank otherwise,
-        // so the agent's auto/acceptEdits order is kept.
-        // (Tree order, not pixel bounds: below-the-fold pills clip.)
+        // Every one of the agent's options is on the card, in the AGENT'S OWN
+        // order — the same order Zed shows (user-directed, 2026-08-21, after
+        // two field rounds against the old rank-sort: "the options are the
+        // wrong way round"). The earlier bypass-dead-last reseat (#110's
+        // review call) is REVOKED: cross-device muscle memory beats the
+        // mis-tap theory, and kind styling still makes every standing grant
+        // unmistakable. (Tree order, not pixel bounds: below-the-fold clips.)
         assertEquals(
-            listOf("plan", "default", "auto", "acceptEdits", "bypassPermissions")
+            listOf("bypassPermissions", "auto", "acceptEdits", "default", "plan")
                 .map { "haloAgentOption-$it" },
             compose.onAllNodes(anyAgentOption).fetchSemanticsNodes()
                 .map { it.config[SemanticsProperties.TestTag] },
@@ -141,6 +145,34 @@ class ApprovalOptionCardTest {
                 compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().size,
             )
         }
+    }
+
+    @Test
+    fun planCardRendersTheReadablePlanInsteadOfTheBracketSummary() {
+        var state by mutableStateOf(ui(listOf(planPrompt)))
+        compose.setContent { HaloApp(ui = state, actions = HaloActions()) }
+        openCard()
+
+        // The well holds the PLAN, rendered (markers consumed by #128's
+        // prose pipeline — "plan" appears bold, the backticks are gone), not
+        // the useless "[Ready to code?]" bracket summary.
+        compose.onNodeWithTag("haloPlanBody").assertIsDisplayed()
+        compose.onNodeWithTag("haloPlanBody").assert(
+            hasText("Fix the card", substring = true),
+        )
+        compose.onNodeWithTag("haloPlanBody").assert(
+            !hasText("**plan**", substring = true) and !hasText("`ProseMarkdown`", substring = true),
+        )
+        assertEquals(
+            "the bracket summary must not render on a plan card",
+            0,
+            compose.onAllNodes(hasTestTag("haloSummary")).fetchSemanticsNodes().size,
+        )
+        // The options still render below it, agent order intact.
+        assertEquals(
+            5,
+            compose.onAllNodes(anyAgentOption).fetchSemanticsNodes().size,
+        )
     }
 
     @Test
