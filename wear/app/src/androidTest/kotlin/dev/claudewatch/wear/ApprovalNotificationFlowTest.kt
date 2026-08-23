@@ -1,7 +1,6 @@
 package dev.claudewatch.wear
 
 import android.app.NotificationManager
-import android.app.RemoteInput
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -326,84 +325,23 @@ class ApprovalNotificationFlowTest {
         assertNotNull("perm-b must remain posted", approvalNotification("perm-b"))
     }
 
-    // ------------------------------------------------------------------
-    // Acceptance 4: a single-question AskUserQuestion prompt's RemoteInput
-    // reply answers with the entered text.
-    // ------------------------------------------------------------------
-
-    @Test
-    fun singleQuestionRemoteInputReplyAnswersWithTheText() {
-        val question =
-            """{"permissionId":"perm-q","sessionId":"s-1","tool_name":"AskUserQuestion",""" +
-                """"tool_input":{"questions":[{"question":"Ship it?","options":[{"label":"Yes please"}]}]}}"""
-        pair(
-            buildString {
-                append(":connected\n\n")
-                append(frame(1, "session", sessionEvent))
-                append(frame(2, "permission-request", question))
-                append(holdOpenPad())
-            },
-        )
-
-        waitFor("perm-q notification") { approvalNotification("perm-q") != null }
-        val posted = approvalNotification("perm-q")!!
-        val reply = posted.notification.actions.orEmpty()
-            .firstOrNull { !it.remoteInputs.isNullOrEmpty() }
-            ?: throw AssertionError("single-question prompt has no RemoteInput action")
-
-        // The reply surface speaks the AGENT's language and only that: the
-        // question's own option labels are the choice chips, and Wear's
-        // ML-generated Smart Replies are banned (live-demo lesson: "Good
-        // question" rendered as if the agent offered it, and a mis-tap
-        // answers a blocked session with Google's guess).
-        assertEquals(
-            listOf("Yes please"),
-            reply.remoteInputs!!.single().choices.orEmpty().map { it.toString() },
-        )
-        assertTrue(
-            "generated smart replies must be off on the reply action",
-            !reply.allowGeneratedReplies,
-        )
-
-        // Simulate the system UI delivering the typed/dictated reply: the
-        // results ride a fill-in intent exactly as RemoteInput specifies —
-        // which is also why the action's PendingIntent must be MUTABLE (an
-        // immutable one strips the fill-in on API 31+).
-        server.enqueue(MockResponse().setBody("""{"ok":true}"""))
-        val fillIn = Intent()
-        RemoteInput.addResultsToIntent(
-            reply.remoteInputs,
-            fillIn,
-            Bundle().apply {
-                putCharSequence(ApprovalNotifier.KEY_QUESTION_ANSWER, "yes please")
-            },
-        )
-        reply.actionIntent.send(context, 0, fillIn)
-
-        val request = takeRequest("answers POST")
-        assertEquals("/v1/command", request.path)
-        val body = JSONObject(request.body.readUtf8())
-        assertEquals("perm-q", body.getString("permissionId"))
-        val decision = body.getJSONObject("decision")
-        assertEquals("allow", decision.getString("behavior"))
-        val answers = decision.getJSONArray("answers")
-        assertEquals(1, answers.length())
-        assertEquals("yes please", answers.getString(0))
-
-        // And the ack-driven dismissal: answered means gone from the shade.
-        waitFor("perm-q cancelled") { approvalNotification("perm-q") == null }
-        assertTrue(
-            "no other approval notification may linger",
-            notificationManager.activeNotifications.none {
-                it.id == ApprovalNotifier.APPROVAL_NOTIFICATION_ID
-            },
-        )
-    }
+    /** A fully-formed prompt for driving collectors (and the notifier) directly. */
+    private fun pending(id: String) = BridgeViewModel.PendingPermission(
+        permissionId = id,
+        sessionId = "s-1",
+        toolName = "Bash",
+        requestSummary = "$ npm test",
+        sessionLabel = "proj",
+        options = listOf(
+            PermissionOption("allow", "Yes"),
+            PermissionOption("deny", "No"),
+        ),
+    )
 
     // ------------------------------------------------------------------
-    // Second live-demo lesson: setChoices chips render NOWHERE on this Wear
-    // image, so the option labels double as plain one-tap action BUTTONS —
-    // the only deterministically rendered surface. This leg drives one.
+    // A single-question prompt's option BUTTON answers with its label.
+    // (The RemoteInput reply lane was removed with the notification's Reply
+    // action — user-directed 2026-08-23; its tests left with it.)
     // ------------------------------------------------------------------
 
     @Test
@@ -424,11 +362,17 @@ class ApprovalNotificationFlowTest {
         waitFor("perm-opt notification") { approvalNotification("perm-opt") != null }
         val posted = approvalNotification("perm-opt")!!
         val actions = posted.notification.actions.orEmpty()
-        // Both option buttons + the free-text Reply, in that order — the
-        // full 3-action budget, never a truncated option menu.
+        // The option buttons and NOTHING else — no Reply action (removed
+        // user-directed 2026-08-23, see ApprovalNotificationModel's doc),
+        // and with it no RemoteInput for One UI to decorate with smart-reply
+        // junk between the question and the buttons.
         assertEquals(
-            listOf("Ship now", "Wait for review", "Reply"),
+            listOf("Ship now", "Wait for review"),
             actions.map { it.title.toString() },
+        )
+        assertTrue(
+            "no action may carry a RemoteInput",
+            actions.all { it.remoteInputs.isNullOrEmpty() },
         )
 
         // Tap the SECOND option's button: the answer POST must carry THAT
@@ -448,118 +392,6 @@ class ApprovalNotificationFlowTest {
 
         waitFor("perm-opt cancelled") { approvalNotification("perm-opt") == null }
     }
-
-    // ------------------------------------------------------------------
-    // Acceptance 4's guard rail: a blank or resultless RemoteInput delivery
-    // is DROPPED — "never answer with empty text". An accidental empty
-    // dictation must not become the agent's answer; before this test
-    // existed, a one-line sabotage (deleting the isNullOrEmpty guard or the
-    // trim in handleApprovalAnswer) passed the entire suite, because no
-    // test ever delivered a blank result (review finding).
-    // ------------------------------------------------------------------
-
-    @Test
-    fun blankOrResultlessRemoteInputReplyIsDroppedAndThePromptStaysQueued() {
-        val question =
-            """{"permissionId":"perm-q","sessionId":"s-1","tool_name":"AskUserQuestion",""" +
-                """"tool_input":{"questions":[{"question":"Ship it?","options":[{"label":"Yes please"}]}]}}"""
-        pair(
-            buildString {
-                append(":connected\n\n")
-                append(frame(1, "session", sessionEvent))
-                append(frame(2, "permission-request", question))
-                append(holdOpenPad())
-            },
-        )
-
-        waitFor("perm-q notification") { approvalNotification("perm-q") != null }
-        val posted = approvalNotification("perm-q")!!
-        val reply = posted.notification.actions.orEmpty()
-            .firstOrNull { !it.remoteInputs.isNullOrEmpty() }
-            ?: throw AssertionError("single-question prompt has no RemoteInput action")
-
-        // The accidental empty dictation: whitespace-only results. NOTHING
-        // is enqueued on the server — a POST would go unanswered and hang
-        // the engine's call, but more to the point the takeRequest below
-        // proves no POST was even attempted.
-        val blankFillIn = Intent()
-        RemoteInput.addResultsToIntent(
-            reply.remoteInputs,
-            blankFillIn,
-            Bundle().apply {
-                putCharSequence(ApprovalNotifier.KEY_QUESTION_ANSWER, "   ")
-            },
-        )
-        reply.actionIntent.send(context, 0, blankFillIn)
-
-        // The tapped notification still cancels IMMEDIATELY — the
-        // responsiveness contract (never re-raise; the in-app card is the
-        // retry surface) applies to dropped replies too. This wait doubles
-        // as the proof the first delivery was fully handled before the
-        // no-POST window below starts.
-        waitFor("perm-q cancelled on receipt despite the drop") {
-            approvalNotification("perm-q") == null
-        }
-
-        // And the degenerate delivery: no results bundle at all. The reply
-        // intent carries no behavior extra either, so BOTH answer routes
-        // must decline it.
-        reply.actionIntent.send(context, 0, Intent())
-
-        // Neither delivery may reach the bridge. pair() consumed the
-        // fixture's three requests (ping, pair, events), so ANY request
-        // arriving in this window would be an answer POST.
-        assertNull(
-            "a blank/resultless reply must never become an answer POST",
-            server.takeRequest(3, TimeUnit.SECONDS),
-        )
-
-        // Nothing was sent, so nothing was resolved: the prompt stays
-        // queued, and the in-app question card remains the way to answer it
-        // properly.
-        assertTrue(
-            "the unanswered prompt must stay queued in-app",
-            viewModel.state.value.permissionQueue.any { it.permissionId == "perm-q" },
-        )
-    }
-
-    // ------------------------------------------------------------------
-    // Issue #59 — restart edges. The scenarios below simulate a process
-    // kill WITHOUT onDestroy: no cancelAllPosted runs, so the shade keeps
-    // notifications that no fresh in-memory collector remembers.
-    // ------------------------------------------------------------------
-
-    /** A fully-formed prompt for driving collectors (and the notifier) directly. */
-    private fun pending(id: String) = BridgeViewModel.PendingPermission(
-        permissionId = id,
-        sessionId = "s-1",
-        toolName = "Bash",
-        requestSummary = "$ npm test",
-        sessionLabel = "proj",
-        options = listOf(
-            PermissionOption("allow", "Yes"),
-            PermissionOption("deny", "No"),
-        ),
-    )
-
-    // ------------------------------------------------------------------
-    // #59 edge 1: adoption. Collector A posts two prompts and dies WITHOUT
-    // teardown (job cancel = the process-kill stand-in; its posted-ids die
-    // with it). Collector B — same real NotificationManager, fresh memory —
-    // must adopt both survivors, hold fire through the pre-replay window
-    // (empty queue + Reconnecting), and once the post-Connected settle
-    // window (REPLAY_SETTLE_MS) closes, cancel exactly the one no replay
-    // emission re-confirmed. (Second-round review moved the verdict from
-    // "the first post-Connected queue emission" to this timer: the reducer
-    // emits once per replayed frame, so that first emission can be a
-    // PARTIAL pending set — adjudicating on it re-buzzed still-pending
-    // survivors — and an unchanged queue never re-emits at all, which left
-    // the resolved-while-dead orphan lingering forever.) The survivor's
-    // ORIGINAL notification must remain untouched: postTime is stamped by
-    // notify(), so an equal postTime across the whole dance proves no
-    // cancel+re-post cycle (which would also re-buzz — setOnlyAlertOnce
-    // does not survive a cancel).
-    // ------------------------------------------------------------------
 
     @Test
     fun processKillSurvivorsAreAdoptedAndAdjudicatedAfterTheSettleWindow() {

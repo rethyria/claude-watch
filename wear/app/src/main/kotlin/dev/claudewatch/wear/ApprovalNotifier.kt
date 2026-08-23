@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.core.app.NotificationCompat
-import androidx.core.app.RemoteInput
 import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.wear.net.ConnectionState
 import kotlinx.coroutines.CoroutineScope
@@ -60,49 +59,40 @@ internal const val MAX_WEAR_NOTIFICATION_ACTIONS = 3
  * [options] is the bridge's canonical behavior-keyed list VERBATIM (order
  * kept, capped at [MAX_WEAR_NOTIFICATION_ACTIONS]) — #17's rule: actions are
  * keyed by the machine-readable behavior, never inferred from labels or
- * position. [remoteInputQuestion] is true exactly for a SINGLE-question
- * AskUserQuestion prompt, which becomes one free-text Reply action; a
- * MULTI-question prompt gets NO actions at all — a wrist notification cannot
- * walk a multi-question form (buffered positional answers, per-question
- * option lists), the in-app question card owns that flow, so the content
- * tap opening the app is the only affordance.
+ * position.
  *
- * [replyChoices] are the single question's own option labels, surfaced as
- * the RemoteInput's choice chips. Live-demo lesson: without explicit
- * choices, Wear decorates the Reply action with ML-GENERATED Smart Replies
- * ("Still waiting", "Good question") that look exactly like agent options —
- * and a mis-tap sends Google's guess to a blocked session as a real answer.
- * The agent's labels are the only chips allowed on this surface.
+ * There is deliberately NO free-text Reply action. The RemoteInput lane was
+ * REMOVED (user-directed, 2026-08-23) after One UI defeated every mitigation
+ * in turn: without choices Wear decorated Reply with ML Smart Replies that
+ * look like agent options; setChoices rendered nowhere on this image; and
+ * setAllowGeneratedReplies(false) — set all along — was simply ignored, the
+ * shade still stuffing "Yes"/"No"/"Haha" between the question and the one
+ * affordance that matters. RemoteInput is unwinnable on this device; typed
+ * and dictated answers belong to the in-app question card.
  *
- * [optionAnswers] are those same labels AS PLAIN ACTION BUTTONS — the
- * second live-demo lesson: this Wear image renders RemoteInput choices
- * NOWHERE (not on the card, whose chip row belongs to the banned
- * smart-reply machinery, and not on the input screen), so setChoices alone
- * quietly degraded the wrist to free-text only. Plain actions are the one
- * surface that renders deterministically (the Approve/Deny buttons prove
- * it), so the option labels become one-tap answer buttons — but ONLY when
- * the FULL option set fits under the action cap alongside Reply
- * (single-select, ≤ [MAX_OPTION_ANSWER_ACTIONS] options). A truncated menu
- * would misrepresent the agent's question; past the cap (or multiSelect,
- * whose answer is a joined toggle set no single button expresses) the
- * wrist keeps free-text Reply and the in-app card owns the full set.
+ * [optionAnswers] are the single question's own option labels AS PLAIN
+ * ACTION BUTTONS — the one notification surface that renders
+ * deterministically (the Approve/Deny buttons prove it). Rendered ONLY when
+ * the FULL set fits under the action cap (single-select, ≤
+ * [MAX_OPTION_ANSWER_ACTIONS]): a truncated menu would misrepresent the
+ * agent's question. Past the cap, multiSelect (a joined toggle set no
+ * single button expresses), and multi-question forms all get NO actions —
+ * the content tap opens the app and the question card owns the answer.
  */
 data class ApprovalNotificationModel(
     val permissionId: String,
     val title: String,
     val text: String,
     val options: List<PermissionOption>,
-    val remoteInputQuestion: Boolean,
-    val replyChoices: List<String> = emptyList(),
     val optionAnswers: List<String> = emptyList(),
 )
 
 /**
- * How many option-answer buttons fit next to the free-text Reply under
- * Wear's 3-action cap. All-or-nothing: see [ApprovalNotificationModel
- * .optionAnswers].
+ * How many option-answer buttons fit under Wear's 3-action cap — the whole
+ * cap, now that the Reply action is gone. All-or-nothing: see
+ * [ApprovalNotificationModel.optionAnswers].
  */
-internal const val MAX_OPTION_ANSWER_ACTIONS = MAX_WEAR_NOTIFICATION_ACTIONS - 1
+internal const val MAX_OPTION_ANSWER_ACTIONS = MAX_WEAR_NOTIFICATION_ACTIONS
 
 /** Derive the wrist-rendered content for one queued prompt. Pure. */
 internal fun approvalNotificationModel(
@@ -133,19 +123,9 @@ internal fun approvalNotificationModel(
         } else {
             emptyList()
         },
-        remoteInputQuestion = questions.size == 1,
-        // The single question's own option labels ride into the RemoteInput
-        // as choice chips (see the field's doc); a choice-less question
-        // stays pure free text. Multi-question lists keep their options on
-        // the in-app card only, same as [options] above.
-        replyChoices = if (questions.size == 1) {
-            questions.single().options.map { it.label }
-        } else {
-            emptyList()
-        },
-        // ...and as one-tap action BUTTONS when the whole set fits (see the
-        // field's doc for the all-or-nothing rule and the multiSelect
-        // exclusion).
+        // The single question's option labels as one-tap action BUTTONS when
+        // the whole set fits (see the field's doc for the all-or-nothing
+        // rule, the multiSelect exclusion, and why there is no Reply).
         optionAnswers = questions.singleOrNull()
             ?.takeUnless { it.multiSelect }
             ?.options?.map { it.label }
@@ -337,18 +317,15 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
             // service re-announcing still-pending prompts), the same tag
             // replaces silently instead of buzzing again.
             .setOnlyAlertOnce(true)
-        if (model.remoteInputQuestion) {
-            // Option buttons FIRST (the agent's expected answers, one tap),
-            // free-text Reply last — ≤ 3 total by construction (see
-            // MAX_OPTION_ANSWER_ACTIONS).
-            for (label in model.optionAnswers) {
-                builder.addAction(optionAnswerAction(model.permissionId, label))
-            }
-            builder.addAction(replyAction(model))
-        } else {
-            for (option in model.options) {
-                builder.addAction(behaviorAction(model.permissionId, option))
-            }
+        // Exactly one of these lists is non-empty by construction: question
+        // prompts carry optionAnswers (or nothing — tap opens the app),
+        // plain permissions carry the canonical behavior options. No Reply
+        // action exists any more (see ApprovalNotificationModel's doc).
+        for (label in model.optionAnswers) {
+            builder.addAction(optionAnswerAction(model.permissionId, label))
+        }
+        for (option in model.options) {
+            builder.addAction(behaviorAction(model.permissionId, option))
         }
         manager.notify(model.permissionId, APPROVAL_NOTIFICATION_ID, builder.build())
     }
@@ -422,36 +399,6 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
     }
 
     /**
-     * The single-question AskUserQuestion reply: free text via RemoteInput
-     * (Wear renders voice/keyboard input straight off the action). MUTABLE is
-     * load-bearing: the system must write the RemoteInput results INTO the
-     * intent, and on API 31+ an immutable PendingIntent silently strips them
-     * — the service would receive a reply with no text and drop it.
-     */
-    private fun replyAction(model: ApprovalNotificationModel): NotificationCompat.Action {
-        val remoteInput = RemoteInput.Builder(KEY_QUESTION_ANSWER)
-            .setLabel(model.text) // the question itself prompts the input UI
-            // The AGENT's option labels are the choice chips; free text via
-            // keyboard/voice coexists with choices on the reply surface.
-            .apply { if (model.replyChoices.isNotEmpty()) setChoices(model.replyChoices.toTypedArray()) }
-            .build()
-        val pending = PendingIntent.getService(
-            context,
-            approvalActionRequestCode(model.permissionId, REPLY_DISCRIMINATOR),
-            answerIntent(model.permissionId, discriminator = REPLY_DISCRIMINATOR),
-            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        return NotificationCompat.Action.Builder(0, "Reply", pending)
-            .addRemoteInput(remoteInput)
-            // Live-demo lesson (see ApprovalNotificationModel.replyChoices):
-            // Wear's ML Smart Replies ("Good question") rendered as if they
-            // were the agent's options, and a mis-tap answers a blocked
-            // session with Google's guess. Only the agent speaks here.
-            .setAllowGeneratedReplies(false)
-            .build()
-    }
-
-    /**
      * The self-addressed answer intent. The data URI is the second identity
      * key (see [approvalActionRequestCode]): filterEquals compares data but
      * not extras, so the per-(prompt, behavior) URI keeps concurrent prompts'
@@ -480,14 +427,9 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
         /**
          * A pre-composed question answer riding an option-button tap (see
          * [ApprovalNotificationModel.optionAnswers]) — the service answers
-         * with this text through the same answerQuestions path as a typed
-         * RemoteInput reply.
+         * with this text through the answerQuestions path.
          */
         const val EXTRA_ANSWER_TEXT = "dev.claudewatch.wear.extra.ANSWER_TEXT"
-        const val KEY_QUESTION_ANSWER = "dev.claudewatch.wear.remoteinput.QUESTION_ANSWER"
-
-        /** Namespaces the reply action's requestCode/URI away from every behavior key. */
-        private const val REPLY_DISCRIMINATOR = "remote-input-reply"
     }
 }
 

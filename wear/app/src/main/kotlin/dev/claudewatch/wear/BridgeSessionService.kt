@@ -9,7 +9,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import androidx.core.app.RemoteInput
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.wear.ongoing.OngoingActivity
@@ -403,7 +402,7 @@ class BridgeSessionService : Service() {
     /**
      * A notification action's answer (issue #25). The intent carries the
      * permissionId plus EITHER a behavior extra (a plain option action) OR
-     * RemoteInput results (the single-question reply) OR a pre-composed
+     * a pre-composed
      * option label (EXTRA_ANSWER_TEXT); all routes answer through the SAME
      * ViewModel entry points as the in-app card
      * ([BridgeViewModel.answerPermission] / [BridgeViewModel.answerQuestions]
@@ -443,23 +442,12 @@ class BridgeSessionService : Service() {
         // retryably and the prompt simply stays queued in-app — tolerated:
         // never a silently swallowed decision, the card still renders it.
         vm.resume()
-        val results = RemoteInput.getResultsFromIntent(intent)
-        if (results != null) {
-            // Blank/null reply -> DROP, never answer with empty text: an
-            // accidental empty dictation must not become the agent's answer.
-            // The prompt stays queued (nothing was sent), and the in-app
-            // question card remains the way to answer it properly.
-            val text = results.getCharSequence(ApprovalNotifier.KEY_QUESTION_ANSWER)
-                ?.toString()?.trim()
-            if (!text.isNullOrEmpty()) {
-                answerWhenQueued(vm, permissionId) { vm.answerQuestions(permissionId, listOf(text)) }
-            }
-            return
-        }
         // An option BUTTON tap: the label rode the intent as-built
-        // (EXTRA_ANSWER_TEXT), answered through the exact same entry point
-        // as a typed reply — one wire shape, two input surfaces. Never
-        // blank: the labels come from the agent's own option list.
+        // (EXTRA_ANSWER_TEXT), answered through the answerQuestions entry
+        // point. Never blank: the labels come from the agent's own option
+        // list. (The RemoteInput reply branch that used to precede this was
+        // removed with the notification's Reply action — see
+        // ApprovalNotificationModel's doc.)
         val optionAnswer = intent.getStringExtra(ApprovalNotifier.EXTRA_ANSWER_TEXT)
         if (optionAnswer != null) {
             answerWhenQueued(vm, permissionId) { vm.answerQuestions(permissionId, listOf(optionAnswer)) }

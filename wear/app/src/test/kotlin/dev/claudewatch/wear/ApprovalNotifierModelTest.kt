@@ -56,7 +56,6 @@ class ApprovalNotifierModelTest {
         // Verbatim: the same behavior-keyed objects, in the bridge's order —
         // never re-sorted, never label-inferred.
         assertEquals(options, model.options)
-        assertFalse(model.remoteInputQuestion)
     }
 
     @Test
@@ -75,7 +74,7 @@ class ApprovalNotifierModelTest {
     }
 
     @Test
-    fun singleQuestionPromptBecomesAFreeTextReplyWithNoOptionActions() {
+    fun singleQuestionPromptBecomesOptionButtonsWithNoBehaviorActions() {
         val model = approvalNotificationModel(
             prompt(
                 id = "perm-q",
@@ -90,22 +89,18 @@ class ApprovalNotifierModelTest {
                 ),
             ),
         )
-        assertTrue(model.remoteInputQuestion)
         // The question is the text — "[AskUserQuestion]" answers nothing.
         assertEquals("Which database should the service use?", model.text)
         assertEquals("Question · alpha", model.title)
         assertEquals(
-            "a reply prompt must carry no behavior actions",
+            "a question prompt must carry no behavior actions",
             emptyList<PermissionOption>(),
             model.options,
         )
-        // The question's OWN option labels become the RemoteInput choice
-        // chips — live-demo lesson: without them Wear invents ML Smart
-        // Replies ("Good question") that masquerade as agent options.
-        assertEquals(listOf("PostgreSQL"), model.replyChoices)
-        // ...and one-tap action BUTTONS (second live-demo lesson: this Wear
-        // image renders setChoices chips nowhere — plain actions are the
-        // only deterministic surface).
+        // The question's OWN option labels become one-tap action BUTTONS —
+        // the only notification surface this device renders
+        // deterministically (there is no Reply action any more; see the
+        // model's doc for the One UI smart-reply defeat).
         assertEquals(listOf("PostgreSQL"), model.optionAnswers)
     }
 
@@ -127,28 +122,22 @@ class ApprovalNotifierModelTest {
                     ),
                 ),
             )
-        // Two options + Reply = the full 3-action budget: both render.
+        // With no Reply action the whole 3-action budget is buttons.
         assertEquals(listOf("A", "B"), questionWith(listOf("A", "B")).optionAnswers)
-        // Three options CANNOT all fit next to Reply — a truncated menu
-        // would misrepresent the agent's question, so none render (the
-        // in-app card owns the full set; Reply stays for free text).
-        assertEquals(emptyList<String>(), questionWith(listOf("A", "B", "C")).optionAnswers)
+        assertEquals(listOf("A", "B", "C"), questionWith(listOf("A", "B", "C")).optionAnswers)
+        // FOUR cannot fit — a truncated menu would misrepresent the agent's
+        // question, so none render and the content tap opens the card.
+        assertEquals(emptyList<String>(), questionWith(listOf("A", "B", "C", "D")).optionAnswers)
         // multiSelect answers are a JOINED toggle set — no single button
-        // expresses one, so the wrist keeps Reply + the card.
+        // expresses one, so the card owns it.
         assertEquals(
             emptyList<String>(),
             questionWith(listOf("A", "B"), multiSelect = true).optionAnswers,
         )
-        // The choice chips are unaffected by the button cap: they list every
-        // label wherever the platform renders them.
-        assertEquals(
-            listOf("A", "B", "C"),
-            questionWith(listOf("A", "B", "C")).replyChoices,
-        )
     }
 
     @Test
-    fun aChoicelessSingleQuestionStaysPureFreeText() {
+    fun aChoicelessSingleQuestionHasNoActionsOnlyTheContentTap() {
         val model = approvalNotificationModel(
             prompt(
                 id = "perm-open",
@@ -158,12 +147,12 @@ class ApprovalNotifierModelTest {
                 questions = listOf(AskUserQuestion(question = "What should it be called?")),
             ),
         )
-        assertTrue(model.remoteInputQuestion)
         assertEquals(
-            "no options on the question means no chips on the wrist",
+            "no options on the question means no buttons — the tap opens the card",
             emptyList<String>(),
-            model.replyChoices,
+            model.optionAnswers,
         )
+        assertEquals(emptyList<PermissionOption>(), model.options)
     }
 
     @Test
@@ -183,14 +172,13 @@ class ApprovalNotifierModelTest {
                 ),
             ),
         )
-        assertFalse(model.remoteInputQuestion)
         assertEquals(emptyList<PermissionOption>(), model.options)
-        assertEquals("2 questions — open to answer", model.text)
         assertEquals(
             "multi-question options belong to the in-app card only",
             emptyList<String>(),
-            model.replyChoices,
+            model.optionAnswers,
         )
+        assertEquals("2 questions — open to answer", model.text)
     }
 
     // ------------------------------------------------------------------
