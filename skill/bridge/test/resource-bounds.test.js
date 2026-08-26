@@ -58,7 +58,16 @@ test("oversized POST bodies are rejected pre-auth and the bridge survives", { ti
   assert.ok(pair.body.token, "pairing still works after oversized requests");
 });
 
-test("never-answered permission expires with no decision and leaves nothing pending", { timeout: 60_000 }, async (t) => {
+// This test used to pin the OPPOSITE: that an unanswered ACP prompt expired
+// on the bridge's timer. That timer was a hook-era rule applied to a lane it
+// never fitted, and it produced the reported bug — a question asked in Zed
+// vanished from the wrist ~9.5 minutes later while Zed's form was still open
+// and the fork still blocked, leaving the session showing its last activity
+// (green/RUNNING) with nothing to answer. ACP cards now live exactly as long
+// as their request: the fork retracts them on every exit, and its death drops
+// the inbox, which cancels them. What follows pins BOTH halves — the card
+// outlives the old window, and the fork's retraction still cleans it up.
+test("an unanswered ACP permission outlives the expiry window, then the fork's retraction clears it", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t, {
     env: { CLAUDE_WATCH_PERMISSION_TIMEOUT_MS: "1500" },
   });
@@ -107,23 +116,45 @@ test("never-answered permission expires with no decision and leaves nothing pend
   const permissionId = promptEvent.parsed.permissionId;
   assert.ok(permissionId, "permission-request carries a permissionId");
 
-  // The prompt expires on its own — with NO decision, so the agent's own
-  // dialog (Zed's) keeps the answer instead of recording a refusal (#63).
-  await bridge.waitForOutput(/expired after 1\.5s unanswered/);
-
-  // ...and the watch is told, so the card leaves the wrist. Before #63 the
-  // bridge dropped the permission silently and the prompt stayed rendered
-  // until the app was force-stopped.
-  const cleared = await sse.waitFor(
-    (e) => e.event === "permission-cleared" && e.parsed?.permissionId === permissionId,
+  // Well past the configured 1.5s window, the card is STILL live: nothing was
+  // cleared, and a reconnecting watch is still told about it by the
+  // authoritative connect-time sync — the request it mirrors is still open.
+  await new Promise((resolve) => setTimeout(resolve, 3_000));
+  assert.ok(
+    !sse.events.some((e) => e.event === "permission-cleared"),
+    "an open request's card must not be retracted out from under the wrist",
   );
-  assert.equal(cleared.parsed.reason, "expired");
+  const rejoin = connectSse(port, token);
+  t.after(() => rejoin.close());
+  assert.equal(await rejoin.statusCode(), 200);
+  const sync = await rejoin.waitFor((e) => e.event === "permission-sync");
+  assert.ok(
+    sync.parsed.permissionIds.includes(permissionId),
+    `the still-open prompt must survive the old expiry window; got ${JSON.stringify(sync.parsed)}`,
+  );
+
+  // Nothing was sent down the fork's inbox either: no decision was made, so
+  // the agent's own dialog (Zed's) still owns the answer (#63).
   assert.ok(
     !inbox.events.some((e) => e.event === "permission-decision"),
-    "expiry must send nothing down the fork's inbox — no decision was made",
+    "an unanswered prompt must send nothing down the fork's inbox",
   );
 
-  // The pending permission was cleaned up: a late decision finds nothing.
+  // The fork settles it elsewhere (the user answered in Zed) — THAT is what
+  // retires the card now, and it leaves nothing pending: a late decision
+  // finds nothing.
+  const resolved = await request(port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-expiry",
+      sessionId: "acp-expiry",
+      kind: "permission-resolved",
+      payload: { sessionId: "acp-expiry", toolCallId: "tc-expiry" },
+    },
+  });
+  assert.equal(resolved.status, 200);
+  await sse.waitFor(
+    (e) => e.event === "permission-cleared" && e.parsed?.permissionId === permissionId,
+  );
   const late = await request(port, "POST", "/command", {
     token,
     body: { permissionId, decision: { behavior: "allow" } },

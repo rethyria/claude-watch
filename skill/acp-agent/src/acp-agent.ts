@@ -128,7 +128,6 @@ import {
   BridgeChannel,
   PermissionDecision,
   InputDecision,
-  DETACHED_PERMISSION_TIMEOUT_MS,
   applyWristAskAnswers,
   createBridgeChannel,
   teeClientToBridge,
@@ -5285,19 +5284,16 @@ export class ClaudeAcpAgent {
         // elicitation outright, so the wrist is the ONLY surface. Mirror the
         // guard's requestPermission contract — park the expected rejection,
         // hold the race open for the wrist, and settle as an aborted tool use
-        // on turn cancel or after the backstop window, so an unanswered
-        // question can never wedge the turn forever.
+        // on turn cancel. There is deliberately no timed backstop: a detached
+        // session is watch-spawned, so being away IS the point, and a deadline
+        // on an AFK answer cancels exactly the turns the feature exists for
+        // (see the note above guardDetachedClient).
         zedLane.catch(() => {});
         const backstop = new Promise<never>((_, reject) => {
           const settle = () => reject(new Error("Tool use aborted"));
-          // unref'd: a pending backstop must not hold the process open past a
-          // Zed quit — the fork's lifetime belongs to the ACP connection.
-          const timer = setTimeout(settle, DETACHED_PERMISSION_TIMEOUT_MS);
-          timer.unref?.();
           if (signal.aborted) settle();
           else signal.addEventListener("abort", settle, { once: true });
           disposeBackstop = () => {
-            clearTimeout(timer);
             signal.removeEventListener("abort", settle);
           };
         });

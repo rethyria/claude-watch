@@ -548,7 +548,9 @@ drop is the contract, the wording is a courtesy). Known values:
   here — the agent's own prompt (Zed's dialog) keeps the answer. A client
   MUST NOT tell the user the prompt went "unanswered" or must still be
   answered; whatever the outcome, it lives on the computer, which is all a
-  client can honestly say.
+  client can honestly say. ACP-raised prompts never send this: they carry no
+  timer, because retracting a card whose request is still open leaves the
+  agent blocked with nothing on the wrist to answer.
 - `resolved` — a Codex synthetic approval was answered.
 
 The bridge never fabricates a decision. A `deny` in a bridge log is always a
@@ -916,9 +918,18 @@ Decision request (`POST /v1/command`):
 - Codex synthetic approvals accept the same behaviors (`allow-always`
   degrades to `allow` when the menu offers no trust entry).
 
-An unanswered permission expires after ~9.5 min with **no decision** — the
-prompt is retracted (`permission-cleared`, reason `expired`), nothing is sent
-to the agent, and the agent's own dialog keeps the answer.
+An ACP-raised prompt (a permission or a question card) lives exactly as long
+as the request it mirrors: it is registered even when **no client is
+streaming** — the connect-time snapshot replays it, so a watch whose stream
+was down when the agent asked still gets the card — and it carries **no expiry
+timer**. It is retracted only when the request settles: the fork sends
+`permission-resolved`/`input-resolved` on every exit (answered in Zed, turn
+cancelled, client failure), and a fork that dies without sending one drops its
+inbox, which cancels its sessions' cards. Either way the retraction reaches
+clients as `permission-cleared` and **no decision** is sent to the agent.
+
+Prompts from a lane with no retraction channel (the Codex synthetic menu)
+still expire after ~9.5 min with no decision, reason `expired`.
 
 ## ACP uplink (server-local)
 

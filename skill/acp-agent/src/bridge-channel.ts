@@ -876,13 +876,18 @@ export function createBridgeChannel(logger: Logger = console): BridgeChannel | n
   return new HttpBridgeChannel(logger);
 }
 
-/** How long a detached session's permission request — or AskUserQuestion
- *  input-request (#111) — may sit unanswered before the pending wait settles
- *  as cancelled. Slightly ABOVE the bridge's own wrist-card expiry (~9.5 min),
- *  so the wrist always gets the full window first; after it, the turn ends
- *  honestly ("Tool use aborted") instead of wedging forever in a session with
- *  no second surface to fall back to. */
-export const DETACHED_PERMISSION_TIMEOUT_MS = 600_000;
+// A detached session's permission request and AskUserQuestion input-request
+// used to settle as cancelled after a 10-minute backstop
+// (DETACHED_PERMISSION_TIMEOUT_MS, removed 2026-08-26 — user-directed). It was
+// sized to sit just above the bridge's own ~9.5-minute wrist-card expiry so
+// the wrist got the full window first; when that expiry went (an ACP card now
+// lives exactly as long as its request), the backstop became the one clock
+// left on an unanswered question — and it was pointed at the WRONG case. A
+// detached session is watch-spawned: being away IS the point, so a 10-minute
+// deadline on an AFK answer cancelled precisely the turns the feature exists
+// for. There is no clock now. A detached request waits for the wrist, for the
+// turn's own cancel signal, or for the session to be killed — the same terms
+// an attached session gets from Zed's form.
 
 /** Wrap an {@link AcpClient} so a DETACHED session — one spawned from the watch
  *  that no editor thread exists for yet — never reaches the editor. ACP routes
@@ -893,10 +898,10 @@ export const DETACHED_PERMISSION_TIMEOUT_MS = 600_000;
  *    - notifications (`sessionUpdate`, `extNotification`,
  *      `completeElicitation`) resolve without being sent;
  *    - `requestPermission` never asks the editor: it stays pending so the
- *      wrist lane of the #80 race is the only answerable surface, resolves
- *      `cancelled` when the tool call's signal aborts (turn cancel), and
- *      resolves `cancelled` after {@link DETACHED_PERMISSION_TIMEOUT_MS} as a
- *      backstop so an unanswered card can never wedge the turn forever;
+ *      wrist lane of the #80 race is the only answerable surface, and resolves
+ *      `cancelled` when the tool call's signal aborts (turn cancel). Nothing
+ *      else settles it — see the note above the guard for why the old
+ *      10-minute backstop went;
  *    - fs and elicitation REQUESTS reject, which every call site already
  *      catches and degrades gracefully (MCP elicitation → decline,
  *      AskUserQuestion → the wrist race parks the rejection and waits on the
@@ -922,14 +927,12 @@ export function guardDetachedClient(
       if (!isDetached(params.sessionId)) return inner.requestPermission(params, signal);
       return new Promise<RequestPermissionResponse>((resolve) => {
         const settle = () => {
-          clearTimeout(timer);
           signal?.removeEventListener("abort", settle);
           resolve({ outcome: { outcome: "cancelled" } });
         };
-        // unref'd: a pending backstop must not hold the process open past a
-        // Zed quit — the fork's lifetime belongs to the ACP connection.
-        const timer = setTimeout(settle, DETACHED_PERMISSION_TIMEOUT_MS);
-        timer.unref?.();
+        // The turn's own cancel is the only settle. Nothing here holds the
+        // process open: an unsettled promise is not a timer, so a Zed quit
+        // still tears the fork down on the ACP connection's terms.
         if (signal?.aborted) settle();
         else signal?.addEventListener("abort", settle, { once: true });
       });

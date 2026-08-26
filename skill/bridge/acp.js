@@ -23,7 +23,7 @@ import { ACP_INBOX_HEARTBEAT_MS, ACP_SPAWN_TIMEOUT_MS, ACP_CLOSE_TIMEOUT_MS } fr
 import { waitForPermission, canonicalPermissionOptions, cancelPermission } from "./permissions.js";
 import crypto from "node:crypto";
 import path from "node:path";
-import { pushSseEvent, sseClients } from "./transport-sse.js";
+import { pushSseEvent } from "./transport-sse.js";
 
 /** Live fork inboxes: connectionId -> { res, heartbeat }. The held SSE response
  *  the bridge writes `inject` frames to. */
@@ -844,19 +844,23 @@ function behaviorForAcpOption(option) {
  *
  *  Zed shows its own prompt for the same request no matter what we do, so this
  *  is a SECOND surface for one decision, not the only one — whichever answers
- *  first wins and the fork drops the loser. With no watch connected nobody can
- *  answer here, so we do not raise at all: a prompt nobody sees would just sit
- *  until it expired while the user answered in Zed anyway.
+ *  first wins and the fork drops the loser.
  *
- *  EXCEPT for a detached (watch-spawned, no editor thread) session: there the
- *  wrist is the ONLY surface, so the card is registered even with zero SSE
- *  clients — `pendingPermissionsSync` replays it the moment the watch
- *  connects. If nobody ever answers, the bridge card expires as a no-decision
- *  (nothing is sent down the inbox) and the FORK's own detached backstop
- *  settles the turn as cancelled shortly after — an honest ending, not a
- *  wedge. */
+ *  The card is registered even with ZERO SSE clients, so
+ *  `pendingPermissionsSync` replays it the moment a watch connects. The old
+ *  rule skipped the raise entirely when nobody was streaming — but the watch's
+ *  stream drops routinely (screen off, off-LAN, doze; the bridge log hits
+ *  "total: 0" several times a day), and a request raised inside one of those
+ *  gaps was then invisible to the wrist for its whole life even though the
+ *  watch was back seconds later. Registering costs nothing: the request is
+ *  live either way, and it is retracted the instant it settles anywhere.
+ *
+ *  It does NOT expire on a timer (see waitForPermission): the fork retracts it
+ *  on every exit, and its death drops the inbox, which cancels these cards. A
+ *  detached (watch-spawned, no editor thread) session — where the wrist is the
+ *  ONLY surface — is settled instead by the FORK's own detached backstop,
+ *  whose cancel arrives as a retraction here. */
 function raiseAcpPermission(sessionId, payload) {
-  if (sseClients.size === 0 && sessions.get(sessionId)?.detached !== true) return;
   const toolCallId = payload?.toolCall?.toolCallId;
   if (!toolCallId) return;
 
@@ -905,7 +909,7 @@ function raiseAcpPermission(sessionId, payload) {
   const optionByBehavior = new Map(unambiguous.map((o) => [o.behavior, o]));
 
   log("info", `ACP permission ${permissionId} raised on the wrist (session ${sessionId}, tool ${eventPayload.tool_name})`);
-  const decision = waitForPermission(permissionId, { sessionId, payload: eventPayload });
+  const decision = waitForPermission(permissionId, { sessionId, payload: eventPayload, timeoutMs: null });
   pushSseEvent("permission-request", eventPayload, sessionId);
 
   void decision.then((answer) => {
@@ -943,16 +947,22 @@ function raiseAcpPermission(sessionId, payload) {
  *  an answer…" is already its free-text lane, so the card is a full answering
  *  surface, not an honest subset.
  *
- *  Raise/no-raise mirrors raiseAcpPermission: Zed shows its own form
- *  regardless, so with no watch connected nothing is raised — EXCEPT for a
- *  detached session, whose card registers even with zero SSE clients because
- *  the wrist is the only surface (pendingPermissionsSync replays it on
- *  connect). The questions must be well-formed AS A SET: the watch answers by
+ *  Lifetime mirrors raiseAcpPermission: registered even with zero SSE clients
+ *  (replayed on connect) and never expired on a timer, because the fork's
+ *  `input-resolved` retracts it on every exit. Both rules were learned from
+ *  the same report — a question asked in Zed showed the session GREEN on the
+ *  wrist with no card to answer. Two ways that happened: the question was
+ *  raised while the watch's stream was momentarily down and was therefore
+ *  never registered, or it outlived the old 9.5-minute expiry, whose
+ *  permission-cleared retracted the card while Zed's form was still open and
+ *  the fork still blocked — leaving the session's only visible state its
+ *  last activity, RUNNING.
+ *
+ *  The questions must be well-formed AS A SET: the watch answers by
  *  position over its own leniently-filtered parse of this list, so forwarding
  *  a list with an unrenderable entry would misalign every answer after it —
  *  refuse the whole card instead and leave the question to Zed. */
 function raiseAcpInputRequest(sessionId, payload) {
-  if (sseClients.size === 0 && sessions.get(sessionId)?.detached !== true) return;
   const toolCallId = payload?.toolCallId;
   if (typeof toolCallId !== "string" || !toolCallId) return;
   const questions = payload?.questions;
@@ -969,7 +979,7 @@ function raiseAcpInputRequest(sessionId, payload) {
   };
 
   log("info", `ACP input request ${permissionId} raised on the wrist (session ${sessionId}, ${questions.length} question(s))`);
-  const decision = waitForPermission(permissionId, { sessionId, payload: eventPayload });
+  const decision = waitForPermission(permissionId, { sessionId, payload: eventPayload, timeoutMs: null });
   pushSseEvent("permission-request", eventPayload, sessionId);
 
   void decision.then((answer) => {
@@ -1004,14 +1014,19 @@ function positionalAskAnswers(questions, decision) {
   return answers.some((a) => a !== null) ? answers : null;
 }
 
-// A session's end expires its pending cards — question cards (#111) and
-// permission cards (#119) alike: the fork-side request died with the session,
-// so nobody is left to consume an answer, and a card left standing would
-// replay to every reconnecting watch until its ~9.5-minute expiry while
-// 200-okaying answers into a void. cancelPermission both retracts the wrist
-// card (permission-cleared) and resolves the waiter as a no-decision, keeping
-// the decision frames above unsent.
-registerSessionCleanupHook((sessionId) => {
+/** Retract every ACP card raised for a session — question cards (#111) and
+ *  permission cards (#119) alike: the fork-side request died, so nobody is
+ *  left to consume an answer and a card left standing would replay to every
+ *  reconnecting watch while 200-okaying answers into a void. cancelPermission
+ *  both retracts the wrist card (permission-cleared) and resolves the waiter
+ *  as a no-decision, keeping the decision frames above unsent.
+ *
+ *  This is the ONLY backstop now that ACP cards carry no expiry timer, so it
+ *  runs from both fork-death paths: the session cleanup hook below, and the
+ *  inbox close directly (a fork dying mid-handoff MIGRATES its session rather
+ *  than ending it — the session survives, but the elicitation the dead copy
+ *  was blocked on does not). */
+export function cancelAcpCardsForSession(sessionId) {
   for (const byToolCall of [acpInputsByToolCall, acpPermissionsByToolCall]) {
     for (const [toolCallId, pending] of byToolCall) {
       if (pending.sessionId !== sessionId) continue;
@@ -1019,6 +1034,10 @@ registerSessionCleanupHook((sessionId) => {
       cancelPermission(pending.permissionId);
     }
   }
+}
+
+registerSessionCleanupHook((sessionId) => {
+  cancelAcpCardsForSession(sessionId);
 });
 
 // A session's end also releases its transport state (#127). The binding: only
@@ -1166,6 +1185,13 @@ export function handleAcpInbox(req, res) {
     for (const [sid, conn] of sessionConnection) {
       if (conn !== connectionId) continue;
       sessionConnection.delete(sid);
+      // Every card this fork raised dies with it, migration or not: the
+      // elicitation lived in the dead process, so nothing is left to consume
+      // an answer. Unconditional and BEFORE the branch below, because the
+      // handoff path keeps the session alive — endAcpSession's cleanup hook
+      // would never run for it, and with no expiry timer the card would
+      // outlive its request forever (see cancelAcpCardsForSession).
+      cancelAcpCardsForSession(sid);
       // A fork dying mid-release (#89): the copy it was asked to hand over
       // died with it, which IS the release — same doctrine as a fork dying
       // mid-close settling the kill. The waiting registration completes the

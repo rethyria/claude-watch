@@ -935,6 +935,52 @@ test("an elicitation resolved in Zed retracts the question card (#111)", { timeo
   assert.equal(cleared.parsed.permissionId, prompt.parsed.permissionId);
 });
 
+// The reported bug, both halves. A question asked in Zed reached the wrist
+// only if a watch happened to be streaming at that instant, and even then the
+// card was retracted after the bridge's expiry window while Zed's form was
+// still open — so the session went back to showing its last activity (green,
+// RUNNING) with no card to answer and the agent still blocked.
+test("a question raised with no watch streaming survives the expiry window and replays on connect (#111)", { timeout: 60_000 }, async (t) => {
+  const bridge = await startBridge(t, {
+    env: { CLAUDE_WATCH_PERMISSION_TIMEOUT_MS: "1000" },
+  });
+  const token = await pair(bridge);
+  const cwd = realCwd(t, "askgap");
+
+  const inbox = connectInbox(bridge, "conn-askgap");
+  t.after(() => inbox.close());
+  assert.equal(await inbox.statusCode(), 200);
+  await registerAcp(bridge, { connection: "conn-askgap", sessionId: "acp-askgap", cwd });
+
+  // NO watch is streaming — the wrist's connection drops routinely (screen
+  // off, off-LAN, doze) and the question lands in one of those gaps.
+  await raiseInputRequest(bridge, { connection: "conn-askgap", sessionId: "acp-askgap", toolCallId: "tc-gap" });
+
+  // Well past the configured window: an expiry here would retract a card
+  // whose elicitation is still open, and nothing ever re-raises it.
+  await new Promise((resolve) => setTimeout(resolve, 2_500));
+
+  const sse = connectSse(bridge.port, token);
+  t.after(() => sse.close());
+  assert.equal(await sse.statusCode(), 200);
+  const card = await sse.waitFor(
+    (e) => e.event === "permission-request" && e.parsed?.tool_name === "AskUserQuestion",
+  );
+  assert.deepEqual(card.parsed.tool_input, { questions: ASK_QUESTIONS });
+
+  // And it is still answerable — the whole point of keeping it.
+  const answer = await request(bridge.port, "POST", "/command", {
+    token,
+    body: {
+      permissionId: card.parsed.permissionId,
+      decision: { behavior: "allow", answers: ["Green", "Tabs"] },
+    },
+  });
+  assert.equal(answer.status, 200);
+  const decision = await inbox.waitFor((e) => e.event === "input-decision");
+  assert.deepEqual(decision.parsed.answers, ["Green", "Tabs"]);
+});
+
 test("a session's end expires its pending question card (#111)", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   const token = await pair(bridge);
@@ -954,7 +1000,8 @@ test("a session's end expires its pending question card (#111)", { timeout: 60_0
   const prompt = await sse.waitFor((e) => e.event === "permission-request");
 
   // The fork closed the session (Zed quit, thread closed): nobody is left to
-  // consume an answer, so the card must not sit until the ~9.5-minute expiry.
+  // consume an answer, and there is no expiry timer to eventually sweep the
+  // card up — this cleanup is the ONLY thing that retires it.
   const dereg = await request(bridge.port, "POST", "/acp/deregister", {
     body: { connection: "conn-askend", sessionId: "acp-askend", reason: "acp-closed" },
   });

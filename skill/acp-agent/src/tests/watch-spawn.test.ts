@@ -293,6 +293,32 @@ describe("guardDetachedClient", () => {
     await expect(pending).resolves.toEqual({ outcome: { outcome: "cancelled" } });
   });
 
+  it("never settles a detached permission on a clock, however long the wrist takes", async () => {
+    const guarded = guardDetachedClient(makeMockClient(), isDetached);
+    const abort = new AbortController();
+
+    const pending = guarded.requestPermission(
+      { sessionId: "watch-1", toolCall: { toolCallId: "tc-1" }, options: [] } as any,
+      abort.signal,
+    );
+
+    // A detached session is watch-spawned: being away IS the point, so the
+    // old 10-minute backstop cancelled exactly the AFK turns the feature
+    // exists for. An hour of wall clock must change nothing.
+    vi.useFakeTimers();
+    try {
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+    const sentinel = Symbol("still pending");
+    expect(await Promise.race([pending, Promise.resolve(sentinel)])).toBe(sentinel);
+
+    // The turn's own cancel is still the settle.
+    abort.abort();
+    await expect(pending).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+  });
+
   it("settles an already-aborted signal immediately", async () => {
     const guarded = guardDetachedClient(makeMockClient(), isDetached);
     const abort = new AbortController();

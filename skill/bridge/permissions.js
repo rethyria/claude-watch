@@ -7,7 +7,7 @@ import { log } from "./util.js";
 import { PERMISSION_TIMEOUT_MS } from "./config.js";
 import { registerSseSyncProvider, pushSseEvent } from "./transport-sse.js";
 
-/** @type {Map<string, {resolve: Function, timer: ReturnType<typeof setTimeout>, sessionId: string | null, payload: Record<string, any> | null}>} */
+/** @type {Map<string, {resolve: Function, timer: ReturnType<typeof setTimeout> | null, sessionId: string | null, payload: Record<string, any> | null}>} */
 export const pendingPermissions = new Map();
 
 // ---------------------------------------------------------------------------
@@ -65,14 +65,28 @@ function voidPermission(permissionId, reason, { canceled = false } = {}) {
 // client that missed it — a pending permission-request can be evicted from
 // the SSE ring buffer by ordinary pty-output before a disconnected watch
 // reconnects.
-export function waitForPermission(permissionId, { sessionId = null, payload = null } = {}) {
+//
+// `timeoutMs: null` means the prompt NEVER expires on a timer — the raising
+// lane guarantees a retraction instead. Only the ACP lanes pass it, and they
+// earn it: the fork retracts every card in a `finally` that runs on EVERY
+// exit (answered in Zed, turn cancelled, client failure), and a fork that
+// dies without running it drops its inbox, which cancels its sessions' cards.
+// A timer there was actively WRONG — it retracted a card whose elicitation
+// was still open in Zed, and nothing ever re-raised it, so the agent sat
+// blocked while the wrist showed the session green (see raiseAcpInputRequest).
+// The hook-era and Codex lanes keep the timer: their blocked caller has no
+// retraction channel at all, so an unanswered prompt must eventually let go.
+export function waitForPermission(
+  permissionId,
+  { sessionId = null, payload = null, timeoutMs = PERMISSION_TIMEOUT_MS } = {},
+) {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
+    const timer = timeoutMs == null ? null : setTimeout(() => {
       // Deliberately out of the decision vocabulary: from here on a `deny` in
       // bridge.log means a human chose deny. Nothing else may mint one.
-      log("warn", `Permission ${permissionId} expired after ${PERMISSION_TIMEOUT_MS / 1000}s unanswered — returning no-decision (the agent's own prompt keeps the answer). Nothing was denied.`);
+      log("warn", `Permission ${permissionId} expired after ${timeoutMs / 1000}s unanswered — returning no-decision (the agent's own prompt keeps the answer). Nothing was denied.`);
       voidPermission(permissionId, "expired");
-    }, PERMISSION_TIMEOUT_MS);
+    }, timeoutMs);
 
     pendingPermissions.set(permissionId, { resolve, timer, sessionId, payload });
   });

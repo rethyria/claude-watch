@@ -383,7 +383,7 @@ test("a DETACHED session's permission is registered with zero SSE clients and re
   assert.equal(decision.parsed.sessionId, "det-perm");
 });
 
-test("an ATTACHED session's permission with zero SSE clients still stays Zed-only (no parked card)", { timeout: 60_000 }, async (t) => {
+test("an ATTACHED session's permission raised with zero SSE clients is parked and replayed too", { timeout: 60_000 }, async (t) => {
   const bridge = await startBridge(t);
   const token = await pair(bridge);
   const cwd = tempDir(t, "acp-perm-attached-");
@@ -404,12 +404,26 @@ test("an ATTACHED session's permission with zero SSE clients still stays Zed-onl
     },
   });
 
-  // A late-connecting watch sees NO card: Zed's own dialog owns the decision,
-  // and a parked card nobody could see would just expire into noise.
+  // The watch's stream drops routinely (screen off, off-LAN, doze), and it
+  // used to be that a request raised inside one of those gaps was invisible
+  // to the wrist for its whole life — the watch reconnected seconds later to
+  // no card at all while Zed sat blocked. The request is live either way, so
+  // the card is parked and the connect-time snapshot replays it. Zed still
+  // owns the same decision; whoever answers first wins.
   const sse = connectSse(bridge.port, token);
   t.after(() => sse.close());
-  const replayed = await sse
-    .waitFor((e) => e.event === "permission-request" && e.parsed?.sessionId === "att-perm", 1500)
-    .catch(() => null);
-  assert.equal(replayed, null, "no parked card for an attached session raised with zero clients");
+  const replayed = await sse.waitFor(
+    (e) => e.event === "permission-request" && e.parsed?.sessionId === "att-perm",
+  );
+  assert.ok(replayed.parsed.permissionId, "the parked card replays with its id");
+
+  // And it is answerable: the point of parking it is that the decision still
+  // reaches the fork, not that the wrist merely sees something.
+  const answer = await request(bridge.port, "POST", "/v1/command", {
+    token,
+    body: { permissionId: replayed.parsed.permissionId, decision: { behavior: "allow" } },
+  });
+  assert.equal(answer.status, 200);
+  const decision = await inbox.waitFor((e) => e.event === "permission-decision");
+  assert.equal(decision.parsed.optionId, "opt-a");
 });

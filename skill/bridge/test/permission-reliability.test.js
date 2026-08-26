@@ -166,9 +166,7 @@ test("connect-time snapshot includes sessions, terminal backlog, and pending per
 });
 
 test("connect-time sync retracts a prompt that died while the client was away", { timeout: 60_000 }, async (t) => {
-  const bridge = await startBridge(t, {
-    env: { CLAUDE_WATCH_PERMISSION_TIMEOUT_MS: "1000" },
-  });
+  const bridge = await startBridge(t);
   const { port } = bridge;
   const token = await pairAndToken(bridge);
 
@@ -182,10 +180,21 @@ test("connect-time sync retracts a prompt that died while the client was away", 
   );
   const permissionId = promptEvent.parsed.permissionId;
 
-  // The client goes away; the prompt then dies (expiry) and its
-  // permission-cleared is unobservable to the absent client.
+  // The client goes away; the prompt then dies — the user answered it in Zed,
+  // so the fork retracts it — and its permission-cleared is unobservable to
+  // the absent client. (This used to be driven by the bridge's expiry timer,
+  // which ACP cards no longer carry: a card now lives exactly as long as the
+  // request it mirrors.)
   sseA.close();
-  await bridge.waitForOutput(/expired after 1s unanswered/);
+  const resolved = await request(port, "POST", "/acp/update", {
+    body: {
+      connection: "conn-retract",
+      sessionId: "acp-retract",
+      kind: "permission-resolved",
+      payload: { sessionId: "acp-retract", toolCallId: "tc-retract" },
+    },
+  });
+  assert.equal(resolved.status, 200);
 
   // On reconnect the authoritative permission-sync must NOT list the dead id
   // — that absence is what tells the client to drop the card it still holds.
