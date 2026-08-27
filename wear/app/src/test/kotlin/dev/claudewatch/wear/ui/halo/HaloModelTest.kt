@@ -1,6 +1,7 @@
 package dev.claudewatch.wear.ui.halo
 
 import dev.claudewatch.shared.protocol.AgentsActivity
+import dev.claudewatch.shared.protocol.PermissionOption
 import dev.claudewatch.shared.protocol.SseFrame
 import dev.claudewatch.shared.state.BridgeEventReducer
 import dev.claudewatch.shared.state.BridgeState
@@ -60,6 +61,66 @@ class HaloModelTest {
         bridge = BridgeState(sessions = sessions.associateBy { it.sessionId }),
         hiddenSessions = hidden,
     )
+
+    /**
+     * The red ring, end to end from a bridge `error` frame. SessionState.ERROR
+     * had a colour and no producer before this — nothing in the app could ever
+     * make a session red, so the state was decorative.
+     */
+    @Test
+    fun anErroredSessionRendersRedAndClearsWhenItSpeaksAgain() {
+        fun modelAfter(vararg frames: SseFrame): HaloModel {
+            val state = frames.fold(BridgeState()) { acc, frame ->
+                (BridgeEventReducer.reduce(acc, frame, 1_000L) as BridgeEventReducer.Applied).state
+            }
+            return HaloModel.from(UiState(bridge = state))
+        }
+        val running = SseFrame(null, "session", """{"state":"running","agent":"claude","cwd":"/home/dev/proj","folderName":"proj","sessionId":"A"}""")
+        val errored = SseFrame(null, "error", """{"error":"boom","sessionId":"A"}""")
+
+        assertEquals(
+            Halo.SessionState.ERROR,
+            modelAfter(running, errored).sessions.single().state,
+        )
+        // Red outranks RUNNING: the session never left WORKING when it broke,
+        // and painting it green would bury the one thing worth surfacing.
+        assertEquals(
+            Halo.SessionState.RUNNING,
+            modelAfter(running).sessions.single().state,
+        )
+        // Speaking again clears it.
+        assertEquals(
+            Halo.SessionState.RUNNING,
+            modelAfter(
+                running,
+                errored,
+                SseFrame(null, "message", """{"role":"assistant","text":"carrying on","sessionId":"A"}"""),
+            ).sessions.single().state,
+        )
+    }
+
+    /** A BLOCKING prompt still outranks red — the card is the way out of it. */
+    @Test
+    fun aPendingPromptOutranksTheErroredRed() {
+        val model = HaloModel.from(
+            UiState(
+                bridge = BridgeState(
+                    sessions = mapOf("A" to session("A").copy(errored = true)),
+                ),
+                permissionQueue = listOf(
+                    PendingPermission(
+                        permissionId = "p-1",
+                        sessionId = "A",
+                        toolName = "Bash",
+                        requestSummary = "run it",
+                        sessionLabel = "proj",
+                        options = listOf(PermissionOption("allow", "Yes")),
+                    ),
+                ),
+            ),
+        )
+        assertEquals(Halo.SessionState.WAITING_PERM, model.sessions.single().state)
+    }
 
     @Test
     fun wireTitleIsPreferredOverTheAgentShortIdFallback() {

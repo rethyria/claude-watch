@@ -8,10 +8,9 @@
 // android.jar — no real Vibrator) can record the grammar instead of vibrating.
 package dev.claudewatch.wear
 
+import android.app.NotificationManager
 import android.content.Context
-import android.media.AudioAttributes
 import android.os.Build
-import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -51,7 +50,7 @@ interface Haptics {
 // assert the five effects are pairwise DISTINCT — the "can I classify this
 // buzz blind?" contract — and that the #20 command pair is byte-identical to
 // what shipped. Each verb differs from every other in pulse COUNT or duration
-// CLASS, never just amplitude: predefined click (ack) vs predefined tick
+// CLASS, never just amplitude: predefined click (ack) vs one short pulse
 // (finished) vs two shorts (failed) vs three longs (needs you) vs one lone
 // drone (went wrong).
 
@@ -72,12 +71,16 @@ internal fun needsYouEffect(): VibrationEffect =
     VibrationEffect.createWaveform(longArrayOf(0, 250, 120, 250, 120, 250), -1)
 
 /**
- * workFinished: the predefined TICK — the lightest touch the platform offers,
- * deliberately fainter than the ack CLICK so passive progress news never
- * outranks the user's own command feedback.
+ * workFinished: one 160 ms pulse. It was the predefined TICK — "the lightest
+ * touch the platform offers" — which is the right instinct for passive
+ * progress news and the wrong one for a wrist: on hardware it is not reliably
+ * felt at all unless you are still and paying attention, which is the opposite
+ * of what a glanceable progress signal is for (user-directed, 2026-08-27).
+ * A single pulse keeps it the quietest verb with a pulse COUNT of one, and its
+ * SHORT duration class is what separates it from wentWrong's lone 450 ms drone.
  */
 internal fun workFinishedEffect(): VibrationEffect =
-    VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK)
+    VibrationEffect.createWaveform(longArrayOf(0, 160), -1)
 
 /** wentWrong: one lone 450 ms drone — the only single LONG pulse in the grammar. */
 internal fun wentWrongEffect(): VibrationEffect =
@@ -95,6 +98,10 @@ class VibratorHaptics(context: Context) : Haptics {
             context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
 
+    /** Quiet-hours oracle for the attention verbs — see [attention]. */
+    private val notifications: NotificationManager =
+        context.getSystemService(NotificationManager::class.java)
+
     override fun commandAcked() {
         vibrator.vibrate(commandAckedEffect())
     }
@@ -110,27 +117,45 @@ class VibratorHaptics(context: Context) : Haptics {
     override fun wentWrong() = attention(wentWrongEffect())
 
     /**
-     * Attention verbs vibrate with NOTIFICATION-usage attribution (issue
-     * #129) so DND / bedtime / theater gate them exactly like notification
-     * alerts — an unsolicited buzz must obey the user's quiet hours. The
-     * typed VibrationAttributes overload exists from T; on 30–32 the same
-     * usage rides the AudioAttributes carrier (deprecated in T, which is
-     * precisely why the gate reads TIRAMISU). The COMMAND verbs stay
-     * unattributed on purpose: they are touch feedback for an action the
-     * user is performing right now, not an interruption to police.
+     * Attention verbs vibrate UNATTRIBUTED, and this method enforces quiet
+     * hours itself.
+     *
+     * They used to carry `VibrationAttributes.USAGE_NOTIFICATION`, so that DND
+     * / bedtime / theater would gate them exactly like notification alerts. The
+     * intent was right and the mechanism was fatal: an ordinary app on Wear is
+     * not permitted to vibrate as a notification, so the platform dropped every
+     * single one. Measured on the user's SM-L330 (2026-08-27,
+     * `dumpsys vibrator_manager`): 68 consecutive attention verbs, every one
+     * `ignored_app_ops`, DND on AND off — while the same app's unattributed
+     * COMMAND verbs played from the same process, and the system vibrated
+     * happily on the app's behalf for a posted notification 217 ms after one of
+     * the drops. The verbs had never once fired since they shipped.
+     *
+     * So the buzz goes out unattributed — the only usage class Wear actually
+     * plays for an app — and the DND policy the attribution was buying us is
+     * read explicitly instead. COMMAND verbs stay outside this gate on purpose:
+     * they are touch feedback for an action the user is performing right now,
+     * not an interruption to police.
      */
     private fun attention(effect: VibrationEffect) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            vibrator.vibrate(
-                effect,
-                VibrationAttributes.createForUsage(VibrationAttributes.USAGE_NOTIFICATION),
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(
-                effect,
-                AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION).build(),
-            )
-        }
+        if (isQuietHours()) return
+        vibrator.vibrate(effect)
+    }
+
+    /**
+     * Whether an unsolicited buzz would interrupt the user's quiet hours —
+     * DND, bedtime and theater mode all surface here as a non-ALL interruption
+     * filter. Reading the filter needs no permission (only CHANGING it does).
+     *
+     * FAILS OPEN on [NotificationManager.INTERRUPTION_FILTER_UNKNOWN]: an
+     * unreadable filter means "the platform did not tell us", and a stray buzz
+     * during quiet hours is a smaller failure than the one this whole method
+     * exists to undo — an attention channel that silently disappears and takes
+     * months to notice.
+     */
+    private fun isQuietHours(): Boolean = when (notifications.currentInterruptionFilter) {
+        NotificationManager.INTERRUPTION_FILTER_ALL,
+        NotificationManager.INTERRUPTION_FILTER_UNKNOWN -> false
+        else -> true
     }
 }

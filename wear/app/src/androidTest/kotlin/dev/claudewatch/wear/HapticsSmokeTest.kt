@@ -1,5 +1,6 @@
 package dev.claudewatch.wear
 
+import android.os.ParcelFileDescriptor
 import android.os.VibrationEffect
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -25,8 +26,9 @@ import javax.crypto.KeyGenerator
  *    the #20 command pair is exactly what shipped, asserted over the pure
  *    effect factories — VibrationEffect implements value equality, so this
  *    is deterministic — plus the real [VibratorHaptics] speaking all five
- *    through the device vibrator (the attention half rides the SDK-gated
- *    VibrationAttributes path, which only a device can exercise);
+ *    through the device vibrator, and the platform's own ledger asserting
+ *    they were not THROWN AWAY (see the ledger test: "it did not crash" is
+ *    what let the attention verbs ship dead for eleven days);
  *  - the #20 flows still speak the OLD verbs: a dictated send's 2xx ack and
  *    an injected 5xx route to commandAcked/commandFailed — through the real
  *    engine against an on-device MockWebServer bridge — with the recording
@@ -115,8 +117,7 @@ class HapticsSmokeTest {
             effects.getValue("commandFailed"),
         )
 
-        // And the real grammar speaks all five through the device vibrator —
-        // the attention verbs via the SDK-gated notification attribution.
+        // And the real grammar speaks all five through the device vibrator.
         val real = VibratorHaptics(InstrumentationRegistry.getInstrumentation().targetContext)
         real.commandAcked()
         real.commandFailed()
@@ -124,6 +125,62 @@ class HapticsSmokeTest {
         real.workFinished()
         real.wentWrong()
     }
+
+    /**
+     * The attention verbs must REACH the vibrator, not merely be dispatched
+     * without throwing.
+     *
+     * This is the regression pin for the eleven days the grammar was silently
+     * dead: every attention verb carried `VibrationAttributes.USAGE_NOTIFICATION`,
+     * which an ordinary app on Wear is not permitted to use, so the platform
+     * discarded all three as `ignored_app_ops` — on the emulator AND on real
+     * hardware, DND on and off, 68 consecutive drops observed on the user's
+     * SM-L330. Nothing in the suite noticed, because `vibrate()` fails
+     * SILENTLY: it returns void and the call site cannot tell a played effect
+     * from a binned one. Only the platform's own ledger can, so the test reads
+     * it.
+     *
+     * Scoped by DIFF (lines present after but not before), because the ledger
+     * retains entries across runs and installs — an assertion over the whole
+     * history would fail on any device that ever ran the broken build. Phrased
+     * as "nothing of ours was discarded" rather than "something of ours
+     * played", so it holds under quiet hours too: with DND on the new code
+     * skips the vibrate entirely, which adds no ledger line and is correct.
+     */
+    @Test
+    fun attentionVerbsAreNotDiscardedByThePlatform() {
+        val before = vibrationLedgerLines()
+        val real = VibratorHaptics(InstrumentationRegistry.getInstrumentation().targetContext)
+        real.needsYou()
+        real.workFinished()
+        real.wentWrong()
+        // The ledger is written by the system server on its own thread; give
+        // it a moment to catch up with three fire-and-forget calls.
+        Thread.sleep(1_000)
+
+        val pkg = InstrumentationRegistry.getInstrumentation().targetContext.packageName
+        val discarded = (vibrationLedgerLines() - before)
+            .filter { it.contains(pkg) && it.contains("ignored_app_ops") }
+        assertEquals(
+            "the platform discarded attention verbs instead of playing them: $discarded",
+            emptyList<String>(),
+            discarded,
+        )
+    }
+
+    /**
+     * `dumpsys vibrator_manager` as a set of lines. Shell access comes from
+     * UiAutomation — the instrumentation runs as the app, which cannot read
+     * this service directly. Returns empty on any failure (a device whose dump
+     * format or service name differs degrades to a vacuous pass rather than a
+     * false alarm).
+     */
+    private fun vibrationLedgerLines(): Set<String> = runCatching {
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        ParcelFileDescriptor.AutoCloseInputStream(
+            automation.executeShellCommand("dumpsys vibrator_manager"),
+        ).bufferedReader().useLines { lines -> lines.map { it.trim() }.toSet() }
+    }.getOrDefault(emptySet())
 
     @Test
     fun dictationAckAndFailureStillSpeakTheCommandVerbs() {

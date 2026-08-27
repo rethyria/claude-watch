@@ -278,10 +278,19 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
         context.getSystemService(NotificationManager::class.java)
 
     init {
-        // IMPORTANCE_HIGH is the buzz: heads-up + vibration come from the
-        // channel importance on Wear, so there is deliberately no custom
-        // vibration code here — the platform owns the pattern, the user's
-        // channel settings own the override.
+        // IMPORTANCE_HIGH is what makes this channel ALERT — heads-up, and on
+        // Wear a system-issued buzz for the posted notification.
+        //
+        // It is NOT what makes the channel vibrate, which is what the comment
+        // here used to claim: `NotificationChannel` defaults vibration to OFF
+        // whatever the importance, and on the device this channel duly reads
+        // `mVibrationEnabled=false` (checked on the user's SM-L330,
+        // 2026-08-27). Turning it on is deliberately NOT the fix — Wear's
+        // system UI vibrates for an alerting notification anyway, and the
+        // app's own attention grammar (Haptics.needsYou) already speaks for
+        // every prompt, so an enabled channel pattern would only add an
+        // unclassifiable second buzz on top of a classifiable first one. The
+        // grammar owns the wrist; this channel owns the card.
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Approvals", NotificationManager.IMPORTANCE_HIGH),
         )

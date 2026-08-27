@@ -118,6 +118,19 @@ data class SessionState(
     val frozenElapsedMs: Long? = null,
     val terminal: RingBuffer<TerminalLine> = RingBuffer(TERMINAL_BUFFER_LINES),
     val thinking: Boolean = false,
+    /**
+     * The session's last word was an ERROR (a bridge `error` frame addressed
+     * to it) and nothing has happened since. This is what turns the session
+     * red on the wrist — before this, `SessionState.ERROR` existed in the UI
+     * enum with a colour mapping and NOTHING ever produced it, so a session
+     * that broke kept whatever colour it had and the red was unreachable.
+     *
+     * Latched, not sticky: cleared by the session SPEAKING AGAIN — any event
+     * that marks it working (output, prose, a fresh turn). The error is news
+     * about a session that stopped, so it must not outlive the session
+     * starting to move again; the terminal keeps the error line either way.
+     */
+    val errored: Boolean = false,
 ) {
     /** Elapsed working time at [nowMs]: ticking while WORKING, frozen once idle. */
     fun elapsedMs(nowMs: Long): Long? =
@@ -291,10 +304,11 @@ object BridgeEventReducer {
             val live = event.permissionIds.toSet()
             state.copy(pendingPermissions = state.pendingPermissions.filter { it.permissionId in live })
         }
-        // A session-addressed bridge error surfaces in that terminal; global
-        // errors stay in the event log only.
+        // A session-addressed bridge error surfaces in that terminal AND turns
+        // the session red until it speaks again (markErrored); global errors
+        // stay in the event log only.
         is ErrorEvent -> appendTerminal(
-            state,
+            markErrored(state, event.sessionId),
             event.sessionId,
             listOfNotNull(event.error?.let { TerminalLine(it.take(ToolOutputFormatter.MAX_LINE_CHARS), TerminalLineType.ERROR) }),
             clearThinking = true,
@@ -607,17 +621,34 @@ object BridgeEventReducer {
     /** The mirror of [idled]: a turn started, so the elapsed clock runs again.
      *  Idempotent — an already-WORKING session keeps its existing span rather
      *  than restarting it, so a repeated `idle: false` cannot inflate the
-     *  clock. */
+     *  clock.
+     *
+     *  Speaking again also clears [SessionState.errored], and that half is NOT
+     *  conditional on the activity edge: a session that errors MID-TURN stays
+     *  WORKING, so gating the clear on the idle→working transition would strand
+     *  the red until the session next went idle and started up again. */
     private fun working(session: SessionState, nowMs: Long): SessionState =
         if (session.activity == SessionActivity.WORKING) {
-            session
+            if (session.errored) session.copy(errored = false) else session
         } else {
             session.copy(
                 activity = SessionActivity.WORKING,
                 activeSinceMs = nowMs,
                 frozenElapsedMs = null,
+                errored = false,
             )
         }
+
+    /** Latch the session red: its last word was a bridge `error` frame. An
+     *  error with no session (or for one we do not track) is global — the event
+     *  log carries it and no session turns red. Idempotent. */
+    private fun markErrored(state: BridgeState, sessionId: String?): BridgeState {
+        val session = sessionId?.let { state.sessions[it] } ?: return state
+        if (session.errored) return state
+        return state.copy(
+            sessions = state.sessions + (session.sessionId to session.copy(errored = true)),
+        )
+    }
 
     private fun markIdle(state: BridgeState, sessionId: String?, nowMs: Long): BridgeState {
         val session = sessionId?.let { state.sessions[it] } ?: return state
@@ -626,16 +657,13 @@ object BridgeEventReducer {
         return state.copy(sessions = state.sessions + (session.sessionId to next))
     }
 
+    /** Delegates to [working] rather than repeating it, so the errored-clear
+     *  above cannot drift away from the sync path that shares it. */
     private fun markWorking(state: BridgeState, sessionId: String?, nowMs: Long): BridgeState {
         val session = sessionId?.let { state.sessions[it] } ?: return state
-        if (session.activity == SessionActivity.WORKING) return state
-        return state.copy(
-            sessions = state.sessions + (session.sessionId to session.copy(
-                activity = SessionActivity.WORKING,
-                activeSinceMs = nowMs,
-                frozenElapsedMs = null,
-            )),
-        )
+        val next = working(session, nowMs)
+        if (next === session) return state
+        return state.copy(sessions = state.sessions + (session.sessionId to next))
     }
 
     // One human-readable log line per applied event — the typed replacement

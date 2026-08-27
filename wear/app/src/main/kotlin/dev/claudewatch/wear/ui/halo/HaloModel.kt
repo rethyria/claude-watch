@@ -150,6 +150,16 @@ data class HaloModel(
                 val state = when {
                     pending != null && pending.questions.isNotEmpty() -> SessionState.WAITING_Q
                     pending != null -> SessionState.WAITING_PERM
+                    // Red outranks every non-blocking state (issue #129's
+                    // third verb finally has a colour to match): a session
+                    // whose last word was an error is news the user has to
+                    // act on, and showing it as green/blue because a stray
+                    // frame arrived after the failure would bury exactly the
+                    // thing worth surfacing. A pending prompt still wins —
+                    // that one is BLOCKING, and the card is the way out of
+                    // it. The latch clears the moment the session speaks
+                    // again (BridgeStateReducer.working).
+                    s.errored -> SessionState.ERROR
                     // Subagents in flight (issue #55's counts) outrank RUNNING
                     // deliberately (issue #67). The original design gated blue
                     // on the session ALSO being idle — main loop stopped AND

@@ -186,6 +186,75 @@ class BridgeEventReducerTest {
     }
 
     // ------------------------------------------------------------------
+    // The errored latch (the red ring)
+    // ------------------------------------------------------------------
+
+    /**
+     * A session-addressed `error` latches the session red and only that
+     * session; a global error (no sessionId) reddens nobody. The latch is what
+     * gives SessionState.ERROR — a UI state that existed with a colour and no
+     * producer — something to key on.
+     */
+    @Test
+    fun aSessionAddressedErrorLatchesOnlyThatSessionRed() {
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "session", """{"state":"running","agent":"claude","cwd":"/b","folderName":"b","sessionId":"B"}"""),
+                SseFrame("3", "error", """{"error":"boom","sessionId":"A"}"""),
+                SseFrame("4", "error", """{"error":"global trouble"}"""),
+            ),
+        )
+        assertTrue(state.sessions.getValue("A").errored)
+        assertFalse(state.sessions.getValue("B").errored)
+        // The error is also still readable where it happened.
+        assertTrue(state.sessions.getValue("A").terminal.items.any { it.text.contains("boom") })
+    }
+
+    /**
+     * Speaking again clears the latch — including MID-TURN, where the session
+     * never leaves WORKING. Gating the clear on the idle→working edge would
+     * strand the red until the session next went idle and started up again,
+     * which for a long-running session is effectively forever.
+     */
+    @Test
+    fun theErroredLatchClearsWhenTheSessionSpeaksAgainEvenMidTurn() {
+        val errored = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "error", """{"error":"boom","sessionId":"A"}"""),
+            ),
+        )
+        assertTrue(errored.sessions.getValue("A").errored)
+        assertEquals(SessionActivity.WORKING, errored.sessions.getValue("A").activity)
+
+        val spoke = fold(
+            listOf(SseFrame("3", "message", """{"role":"assistant","text":"carrying on","sessionId":"A"}""")),
+            initial = errored,
+        )
+        assertFalse(spoke.sessions.getValue("A").errored)
+        // ...and the clear did not restart the elapsed span it was already in.
+        assertEquals(
+            errored.sessions.getValue("A").activeSinceMs,
+            spoke.sessions.getValue("A").activeSinceMs,
+        )
+    }
+
+    /** A turn ending does NOT clear it: idle is exactly when the red matters. */
+    @Test
+    fun goingIdleLeavesTheErroredLatchStanding() {
+        val state = fold(
+            listOf(
+                SseFrame("1", "session", """{"state":"running","agent":"claude","cwd":"/a","folderName":"a","sessionId":"A"}"""),
+                SseFrame("2", "error", """{"error":"boom","sessionId":"A"}"""),
+                SseFrame("3", "task-complete", """{"source":"claude","sessionId":"A"}"""),
+            ),
+        )
+        assertEquals(SessionActivity.IDLE, state.sessions.getValue("A").activity)
+        assertTrue(state.sessions.getValue("A").errored)
+    }
+
+    // ------------------------------------------------------------------
     // Two concurrent sessions: one ends, the other is untouched
     // ------------------------------------------------------------------
 
