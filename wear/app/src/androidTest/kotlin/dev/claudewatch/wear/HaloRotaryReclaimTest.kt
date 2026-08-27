@@ -50,18 +50,22 @@ class HaloRotaryReclaimTest {
     private val alpha = "5f0d2c9a-8b1e-4c3f-9a67-2e51b4c8d0aa"
     private val beta = "b7e3f1c2-4d5a-4b8e-a2f0-9c6d1e7a3b55"
 
-    /** Two running sessions; alpha carries enough history to scroll into. */
+    /** Two running sessions; alpha carries enough history to scroll into.
+     *  Beta announces FIRST so alpha leads the pager: projects render
+     *  newest-first (matching Zed), so announce order is the reverse of pager
+     *  order. These are crown-reclaim tests; the ordering contract itself
+     *  lives in HaloModelTest. */
     private fun fixtureFrames(): List<SseFrame> = listOf(
         SseFrame("1", "session", """{"state":"connected"}"""),
         SseFrame(
             "2",
             "session",
-            """{"state":"running","agent":"claude","cwd":"/home/dev/projects/alpha","folderName":"alpha","sessionId":"$alpha"}""",
+            """{"state":"running","agent":"claude","cwd":"/home/dev/projects/beta","folderName":"beta","sessionId":"$beta"}""",
         ),
         SseFrame(
             "3",
             "session",
-            """{"state":"running","agent":"claude","cwd":"/home/dev/projects/beta","folderName":"beta","sessionId":"$beta"}""",
+            """{"state":"running","agent":"claude","cwd":"/home/dev/projects/alpha","folderName":"alpha","sessionId":"$alpha"}""",
         ),
     ) + (0 until 30).map { i ->
         SseFrame("${10 + i}", "pty-output", """{"text":"history-line-$i\r\n","sessionId":"$alpha"}""")

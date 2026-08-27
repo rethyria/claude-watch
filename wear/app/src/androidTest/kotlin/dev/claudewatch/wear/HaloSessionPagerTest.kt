@@ -53,21 +53,19 @@ class HaloSessionPagerTest {
     @get:Rule
     val compose = createComposeRule()
 
-    /** alpha: two owned sessions (one waiting); beta: one EXTERNAL session. */
+    /**
+     * alpha: two owned sessions (one waiting); beta: one EXTERNAL session.
+     *
+     * BETA IS LISTED FIRST ON PURPOSE. Projects render newest-first (the
+     * bridge's insertion order read backwards, matching Zed), so registering
+     * beta first is what puts ALPHA at the front of the pager — which is the
+     * arrangement every test below navigates. These are pager-MECHANICS tests
+     * (stepping, healing, menus, spawn cards); the project-ordering contract
+     * itself is pinned in HaloModelTest, deliberately in one place instead of
+     * smeared across two dozen navigation assertions.
+     */
     private fun fixtureBridge(vararg ids: String) = BridgeState(
         sessions = listOf(
-            "s-a1" to SessionState(
-                sessionId = "s-a1",
-                agent = "claude",
-                cwd = "/home/dev/alpha",
-                folderName = "alpha",
-            ),
-            "s-a2" to SessionState(
-                sessionId = "s-a2",
-                agent = "claude",
-                cwd = "/home/dev/alpha",
-                folderName = "alpha",
-            ),
             "s-b1" to SessionState(
                 sessionId = "s-b1",
                 agent = "claude",
@@ -86,6 +84,18 @@ class HaloSessionPagerTest {
                 external = true,
                 kind = "acp",
                 dictatable = true,
+            ),
+            "s-a1" to SessionState(
+                sessionId = "s-a1",
+                agent = "claude",
+                cwd = "/home/dev/alpha",
+                folderName = "alpha",
+            ),
+            "s-a2" to SessionState(
+                sessionId = "s-a2",
+                agent = "claude",
+                cwd = "/home/dev/alpha",
+                folderName = "alpha",
             ),
         ).filter { it.first in ids }.toMap(),
     )

@@ -221,8 +221,9 @@ class HaloPreviewScreens {
     }
 
     /** #130: a PROJECT pager's true end — the same trailing spawn card, the
-     *  hero faded over the project's own dashed ring. Dot 4 is the second
-     *  project ("bridge", two sessions), so one visible step precedes it. */
+     *  hero faded over the project's own dashed ring. Dot 4 is the trailing
+     *  project page; projects run newest-first (matching Zed), so this is the
+     *  EARLIEST-opened project rather than the last-registered one. */
     @Test
     fun projectPagerSpawn() {
         previewEnabled()

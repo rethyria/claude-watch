@@ -111,7 +111,8 @@ class HaloSpawnPickerTest {
 
     /** Project page → pager → its trailing spawn card → the SCOPED picker
      *  (#130). Dot taps walk the pages (no swipe guard arms); dot slots are
-     *  settings 0, usage 1, All 2, then the projects — alpha 3, beta 4. */
+     *  settings 0, usage 1, All 2, then the projects NEWEST-FIRST (matching
+     *  Zed) — beta 3, alpha 4. */
     // Walks a PROJECT pager to its trailing spawn card and taps it. Since
     // #130's user-directed revision the tap spawns DIRECTLY — no picker —
     // so this ends at the tap; callers assert the spawn that resulted.
@@ -164,10 +165,11 @@ class HaloSpawnPickerTest {
     fun projectScopedSpawnCardSpawnsDirectlyInItsOwnProject() {
         val spawns = mutableListOf<Pair<String, String?>>()
         setContent(spawns)
-        // Beta is SECOND in model order (alpha is first-seen): beta's card
-        // spawning with beta's root proves the resolution is per-scope, not
-        // an accident of first-project order — and no picker ever composes.
-        tapScopedSpawnCard(dot = 4, lastCardTag = "haloPagerCard-s-b")
+        // Beta is FIRST in model order — projects run newest-first to match
+        // Zed, and beta was opened after alpha. Alpha's card at the far dot
+        // (the next test) spawning alpha's root is what proves the resolution
+        // is per-scope rather than an accident of leading-project order.
+        tapScopedSpawnCard(dot = 3, lastCardTag = "haloPagerCard-s-b")
         assertEquals(listOf("claude" to "/home/dev/beta"), spawns)
         assertEquals("no picker for a project-scoped spawn", 0, pickerCount())
     }
@@ -179,7 +181,7 @@ class HaloSpawnPickerTest {
         // Alpha exists only through a worktree session: the direct spawn
         // must carry the MAIN checkout — the same repoRoot-beats-cwd rule
         // as the unscoped pick — never the throwaway worktree dir.
-        tapScopedSpawnCard(dot = 3, lastCardTag = "haloPagerCard-s-wt")
+        tapScopedSpawnCard(dot = 4, lastCardTag = "haloPagerCard-s-wt")
         assertEquals(listOf("claude" to "/home/dev/alpha"), spawns)
         assertEquals(0, pickerCount())
     }
@@ -201,11 +203,13 @@ class HaloSpawnPickerTest {
         assertEquals("cancel closes the picker", 0, pickerCount())
 
         // The pager underneath is intact, still on the spawn card it was
-        // summoned from: ‹ steps back to the last session card…
+        // summoned from: ‹ steps back to the last session card — which is
+        // alpha's, since projects run newest-first (beta leads) and the All
+        // pager is the flatten of that grouping.
         compose.onNodeWithTag("haloSpawn").assertIsDisplayed()
         compose.onNodeWithTag("haloPrev").performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("haloPagerCard-s-b").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-s-wt").assertIsDisplayed()
 
         // …and the pager's own swipe-rights still walk out: card by card to
         // the first slot, then off the list to home. Frame-by-frame for the

@@ -82,19 +82,23 @@ class ApprovalFlowTest {
      * over the vanished session instead of chaining, which is not the
      * production shape these tests pin.
      */
+    /** Beta is REGISTERED first so alpha leads the pager: projects render
+     *  newest-first (matching Zed), so insertion order is the reverse of pager
+     *  order. These are approval-flow tests; the ordering contract itself
+     *  lives in HaloModelTest. */
     private val fixtureSessions = BridgeState(
         sessions = mapOf(
-            "s-1" to SessionState(
-                sessionId = "s-1",
-                agent = "claude",
-                cwd = "/home/dev/alpha",
-                folderName = "alpha",
-            ),
             "s-2" to SessionState(
                 sessionId = "s-2",
                 agent = "claude",
                 cwd = "/home/dev/beta",
                 folderName = "beta",
+            ),
+            "s-1" to SessionState(
+                sessionId = "s-1",
+                agent = "claude",
+                cwd = "/home/dev/alpha",
+                folderName = "alpha",
             ),
         ),
     )

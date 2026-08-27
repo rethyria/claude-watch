@@ -43,19 +43,23 @@ class HaloAnswerPillTest {
     @get:Rule
     val compose = createComposeRule()
 
+    /** Beta is REGISTERED first so alpha leads the pager: projects render
+     *  newest-first (matching Zed), so insertion order is the reverse of pager
+     *  order. These are answer-pill scoping tests; the ordering contract
+     *  itself lives in HaloModelTest. */
     private fun fixtureBridge() = BridgeState(
         sessions = mapOf(
-            "s-1" to SessionState(
-                sessionId = "s-1",
-                agent = "claude",
-                cwd = "/home/dev/alpha",
-                folderName = "alpha",
-            ),
             "s-2" to SessionState(
                 sessionId = "s-2",
                 agent = "claude",
                 cwd = "/home/dev/beta",
                 folderName = "beta",
+            ),
+            "s-1" to SessionState(
+                sessionId = "s-1",
+                agent = "claude",
+                cwd = "/home/dev/alpha",
+                folderName = "alpha",
             ),
         ),
     )

@@ -74,21 +74,26 @@ class HaloSystemBackTest {
 
     /** Two projects, one session each — alpha (s-1) first in the All order.
      *  dictatable is set the way the reducer would (a non-external session is
-     *  reachable): the voice-overlay leg needs s-1's Dictate pill. */
+     *  reachable): the voice-overlay leg needs s-1's Dictate pill.
+     *
+     *  Beta is REGISTERED first so that alpha leads: projects render
+     *  newest-first to match Zed, so insertion order is the reverse of pager
+     *  order. These are back-navigation tests; the ordering contract itself
+     *  lives in HaloModelTest. */
     private fun fixtureBridge() = BridgeState(
         sessions = mapOf(
-            "s-1" to SessionState(
-                sessionId = "s-1",
-                agent = "claude",
-                cwd = "/home/dev/alpha",
-                folderName = "alpha",
-                dictatable = true,
-            ),
             "s-2" to SessionState(
                 sessionId = "s-2",
                 agent = "claude",
                 cwd = "/home/dev/beta",
                 folderName = "beta",
+                dictatable = true,
+            ),
+            "s-1" to SessionState(
+                sessionId = "s-1",
+                agent = "claude",
+                cwd = "/home/dev/alpha",
+                folderName = "alpha",
                 dictatable = true,
             ),
         ),

@@ -110,17 +110,29 @@ class HaloNavigationTest {
      * Step the pager to a session's card. One session per screen now: an
      * out-of-view session isn't a lazy-list row to scroll to but a slot to
      * STEP to — chevron clicks, so the card-tap swipe guard never arms.
+     *
+     * Sweeps FORWARD then BACK, and stops at whichever end runs out of
+     * chevron: the target may sit either side of wherever the pager currently
+     * is, and a caller should not have to know the model's order to reach a
+     * session by id. (It used to walk forward only, which quietly depended on
+     * alpha-then-beta — so flipping the project order to newest-first stranded
+     * every caller whose target was behind it.)
      */
     private fun stepToCard(sessionId: String) {
-        var steps = 0
-        while (
-            steps < 10 &&
-            compose.onAllNodes(hasTestTag("haloPagerCard-$sessionId")).fetchSemanticsNodes().isEmpty()
-        ) {
-            compose.onNodeWithTag("haloNext").performClick()
+        fun onScreen() =
+            compose.onAllNodes(hasTestTag("haloPagerCard-$sessionId")).fetchSemanticsNodes().isNotEmpty()
+
+        fun step(chevron: String): Boolean {
+            if (compose.onAllNodes(hasTestTag(chevron)).fetchSemanticsNodes().isEmpty()) return false
+            compose.onNodeWithTag(chevron).performClick()
             compose.waitForIdle()
-            steps++
+            return true
         }
+
+        var steps = 0
+        while (steps < 10 && !onScreen() && step("haloNext")) steps++
+        steps = 0
+        while (steps < 10 && !onScreen() && step("haloPrev")) steps++
     }
 
     private fun openFeed(sessionId: String) {
@@ -146,9 +158,11 @@ class HaloNavigationTest {
         compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithText("2 projects · 2 sessions").assertIsDisplayed()
 
-        // Tap the face: the pager lands on the scope's first card (alpha).
+        // Tap the face: the pager lands on the scope's first card — beta's,
+        // since projects run newest-first (matching Zed) and beta registered
+        // after alpha.
         drillToList()
-        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-$beta").assertIsDisplayed()
 
         // Alpha's feed — human-readable, ANSI-stripped lines, no
         // cross-contamination from beta.
@@ -189,11 +203,12 @@ class HaloNavigationTest {
         fingerDrag("haloRoot", Offset(0f, -30f))
         compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
 
-        // Swipe down on the pager: still the pager — no back.
+        // Swipe down on the pager: still the pager — no back. (The landing
+        // card is beta's: projects run newest-first.)
         drillToList()
-        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-$beta").assertIsDisplayed()
         fingerDrag("haloRoot", Offset(0f, 30f))
-        compose.onNodeWithTag("haloPagerCard-$alpha").assertIsDisplayed()
+        compose.onNodeWithTag("haloPagerCard-$beta").assertIsDisplayed()
     }
 
     /** A real finger's frame-by-frame drag on [tag]: distinct timestamped
@@ -371,11 +386,12 @@ class HaloNavigationTest {
         compose.setContent { HaloApp(ui = ui(bridge), actions = HaloActions()) }
         compose.onNodeWithTag("haloCensus", useUnmergedTree = true).assertIsDisplayed()
 
-        // Last dot: the second project's page (5 pages — settings, usage, home,
-        // alpha, beta).
+        // Last dot: the trailing project's page (5 pages — settings, usage,
+        // home, then the projects NEWEST-FIRST to match Zed: beta, alpha).
+        // Alpha registered first, so alpha is the one at the far end now.
         compose.onNodeWithTag("haloDot-4").performClick()
         compose.waitForIdle()
-        compose.onNodeWithText("beta").assertIsDisplayed()
+        compose.onNodeWithText("alpha").assertIsDisplayed()
 
         // First dot: settings, the far end of the arc.
         compose.onNodeWithTag("haloDot-0").performClick()

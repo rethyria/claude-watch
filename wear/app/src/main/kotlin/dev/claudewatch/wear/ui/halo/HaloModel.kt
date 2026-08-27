@@ -242,7 +242,9 @@ data class HaloModel(
             val all = (halo + orphans).filterNot { it.id in ui.hiddenSessions }
 
             // Stable project order: first-seen wins, so the ring/pager don't
-            // reshuffle as sessions transition state.
+            // reshuffle as sessions transition state. A project's place is
+            // therefore its EARLIEST live session — when the project showed
+            // up, not what it has been doing since.
             val projects = LinkedHashMap<String, MutableList<HaloSession>>()
             for (session in all) {
                 projects.getOrPut(session.projectName) { mutableListOf() }.add(session)
@@ -253,7 +255,20 @@ data class HaloModel(
             val byId = all.associateBy { it.id }
             val queue = ui.permissionQueue.mapNotNull { p -> byId[p.sessionId ?: "prompt:${p.permissionId}"] }
 
-            val grouped = projects.map { (name, sessions) -> HaloProject(name, sessions) }
+            // NEWEST PROJECT FIRST, to match Zed — which lists projects in the
+            // order they were opened with the most recent at the top. The wrist
+            // had the same sequence upside down: a fork registers with the
+            // bridge when Zed starts its agent, so bridge-insertion order IS
+            // opening order, and reading it forwards put the project opened
+            // longest ago at the front of the pager.
+            //
+            // Reversing the PROJECT list (not the session iteration) is what
+            // keeps first-seen-wins intact: each project stays pinned to its
+            // earliest session, so this is the same stable sequence read from
+            // the other end, not a re-key onto whatever spoke last.
+            val grouped = projects.entries.reversed().map { (name, sessions) ->
+                HaloProject(name, sessions)
+            }
             return HaloModel(
                 projects = grouped,
                 // The flatten of the grouping, NOT bridge-insertion order: a

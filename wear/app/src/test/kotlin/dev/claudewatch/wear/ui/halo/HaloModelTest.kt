@@ -63,6 +63,49 @@ class HaloModelTest {
     )
 
     /**
+     * Projects run NEWEST FIRST, matching Zed's own list (opened order, most
+     * recent at the top). A fork registers with the bridge when Zed starts its
+     * agent for a project, so bridge-insertion order is opening order — the
+     * wrist was reading that same sequence forwards and putting the
+     * longest-ago project at the front of the pager.
+     */
+    @Test
+    fun projectsRunNewestFirstToMatchZed() {
+        val model = HaloModel.from(
+            uiState(
+                session("s-old", folderName = "opened-first", cwd = "/home/dev/opened-first"),
+                session("s-mid", folderName = "opened-second", cwd = "/home/dev/opened-second"),
+                session("s-new", folderName = "opened-third", cwd = "/home/dev/opened-third"),
+            ),
+        )
+        assertEquals(
+            listOf("opened-third", "opened-second", "opened-first"),
+            model.projects.map { it.name },
+        )
+    }
+
+    /**
+     * ...and a project keeps the place its FIRST session gave it. Reversing the
+     * project list rather than the session iteration is what preserves that: a
+     * later sibling must not drag its project to the front, or the pager would
+     * reshuffle under the user every time an existing project spawned a
+     * session.
+     */
+    @Test
+    fun aLaterSiblingDoesNotDragItsProjectForward() {
+        val model = HaloModel.from(
+            uiState(
+                session("s-a1", folderName = "alpha", cwd = "/home/dev/alpha"),
+                session("s-b1", folderName = "beta", cwd = "/home/dev/beta"),
+                // alpha speaks again, most recently of all...
+                session("s-a2", folderName = "alpha", cwd = "/home/dev/alpha"),
+            ),
+        )
+        // ...and beta still leads, because beta was OPENED more recently.
+        assertEquals(listOf("beta", "alpha"), model.projects.map { it.name })
+    }
+
+    /**
      * The red ring, end to end from a bridge `error` frame. SessionState.ERROR
      * had a colour and no producer before this — nothing in the app could ever
      * make a session red, so the state was decorative.
@@ -458,10 +501,11 @@ class HaloModelTest {
                 session("s-b2", folderName = "beta", cwd = "/home/dev/beta"),
             ),
         )
+        // Newest project first, like every other project-ordered surface.
         assertEquals(
             listOf(
-                SpawnTarget("alpha", "/home/dev/alpha"),
                 SpawnTarget("beta", "/home/dev/beta"),
+                SpawnTarget("alpha", "/home/dev/alpha"),
             ),
             model.spawnTargets,
         )
@@ -514,9 +558,10 @@ class HaloModelTest {
                 session("s-a2", folderName = "alpha", cwd = "/home/dev/alpha"),
             ),
         )
-        // Bridge insertion order was a1, b1, a2; project grouping (first-seen
-        // project order) regroups a2 next to its sibling.
-        assertEquals(listOf("s-a1", "s-a2", "s-b1"), model.sessions.map { it.id })
+        // Bridge insertion order was a1, b1, a2. Grouping regroups a2 next to
+        // its sibling, and the PROJECTS come newest-first to match Zed — beta
+        // was opened after alpha, so beta leads.
+        assertEquals(listOf("s-b1", "s-a1", "s-a2"), model.sessions.map { it.id })
         // Ring (model.sessions), pager (sessionsIn(All)), and grouped list
         // (projects flattened) are the SAME list by construction — assert the
         // identities, not three hand-copied orders.
