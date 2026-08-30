@@ -248,7 +248,15 @@ object AppVisibility {
  * with the UI invisible — the visible-UI swallow would go untested entirely.
  */
 interface ApprovalNotificationSink {
-    fun post(model: ApprovalNotificationModel)
+    /**
+     * [alert] false posts silently (no heads-up, no system buzz): a RE-post.
+     * The collector re-posts a still-pending prompt every time the app
+     * backgrounds again after cancel-on-return (see [ApprovalNotificationCollector]
+     * edge 4), and on One UI the activity stops on EVERY wrist-down — an
+     * alerting re-post would buzz the same prompt on every glance cycle.
+     * Each permissionId alerts the shade at most once.
+     */
+    fun post(model: ApprovalNotificationModel, alert: Boolean = true)
     fun cancel(permissionId: String)
 
     /**
@@ -296,7 +304,7 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
         )
     }
 
-    override fun post(model: ApprovalNotificationModel) {
+    override fun post(model: ApprovalNotificationModel, alert: Boolean) {
         // Content tap always opens MainActivity: the in-app card renders the
         // full prompt (every option past the action cap, multi-question
         // walks, failure surfaces). Same intent for every prompt, so one
@@ -326,6 +334,12 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
             // service re-announcing still-pending prompts), the same tag
             // replaces silently instead of buzzing again.
             .setOnlyAlertOnce(true)
+        // A re-post (alert=false) must not buzz: setOnlyAlertOnce alone
+        // cannot help because cancel-on-return removed the previous
+        // notification — to the system this is a brand-new post. setSilent
+        // suppresses the heads-up and the system buzz outright; the prompt
+        // already alerted (shade or wrist) when it first arrived.
+        if (!alert) builder.setSilent(true)
         // Exactly one of these lists is non-empty by construction: question
         // prompts carry optionAnswers (or nothing — tap opens the app),
         // plain permissions carry the canonical behavior options. No Reply
@@ -515,6 +529,18 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
  *     "the user already has it on screen" was never true for replayed
  *     arrivals. Uniform rule for replayed and live arrivals: withhold
  *     while visible, post on the visible→hidden edge if still pending.
+ *  4. CANCEL-ON-RETURN, edge 3's missing symmetry (live-diagnosed on the
+ *     SM-L330, 2026-08-30). On One UI the activity fully STOPS on every
+ *     wrist-down/screen-timeout — no ambient keep-alive like stock Wear —
+ *     so a prompt arriving mid-glance-away posts legitimately… and then sat
+ *     in the shade over the very in-app card rendering the same prompt when
+ *     the wrist came back up ("I get notifications even when the app is
+ *     open"). The hidden→visible edge now cancels every posted card: the
+ *     app owns its prompts whenever it is the surface. Still-pending
+ *     prompts re-post on the next hidden edge — SILENTLY ([alertedIds]):
+ *     each permissionId alerts the shade at most once per collector,
+ *     because on One UI the hidden edge recurs on every glance cycle and an
+ *     alerting re-post would buzz the same prompt indefinitely.
  */
 class ApprovalNotificationCollector(
     private val sink: ApprovalNotificationSink,
@@ -545,6 +571,14 @@ class ApprovalNotificationCollector(
 
     private var knownIds: Set<String> = emptySet()
     private val postedIds = mutableSetOf<String>()
+
+    /**
+     * Ids that have already alerted the shade once (edge 4): the first post
+     * alerts, every re-post after a cancel-on-return is silent. Adopted
+     * survivors enter pre-alerted — their original notification alerted in
+     * the previous process's life.
+     */
+    private val alertedIds = mutableSetOf<String>()
 
     /**
      * Adopted survivors whose fate the queue cannot yet vouch for (edge 2
@@ -619,7 +653,15 @@ class ApprovalNotificationCollector(
         if (tags.isEmpty()) return
         knownIds = knownIds + tags
         postedIds += tags
+        alertedIds += tags // the surviving notification alerted when first posted
         adoptedAwaitingReplay += tags
+    }
+
+    /** Post [prompt], alerting only the first time this id reaches the shade (edge 4). */
+    private fun post(prompt: BridgeViewModel.PendingPermission) {
+        val id = prompt.permissionId
+        sink.post(approvalNotificationModel(prompt), alert = alertedIds.add(id))
+        postedIds += id
     }
 
     /**
@@ -646,24 +688,32 @@ class ApprovalNotificationCollector(
     }
 
     /**
-     * Visibility edge (edge 3): on visible→hidden, post every prompt that is
-     * still queued but was withheld while the UI was on screen (known,
-     * never posted, still in [lastQueue]). Everything else is a no-op: the
-     * initial emission and hidden→visible change nothing, a withheld prompt
-     * that already DEPARTED is simply absent from lastQueue, and a
-     * posted-then-departed id is out of postedIds AND lastQueue by the time
-     * the edge fires.
+     * Visibility edges. Visible→hidden (edge 3): post every prompt that is
+     * still queued but not in the shade (known, unposted, still in
+     * [lastQueue]) — first arrival alerts, a re-post after cancel-on-return
+     * is silent. Hidden→visible (edge 4): cancel every posted card — the
+     * in-app card is the surface again, and a shade card over it is exactly
+     * the "notifications even when the app is open" defect. The cancelled
+     * ids stay known (and, when adopted, keep awaiting adjudication), so a
+     * later hidden edge re-posts whatever is still pending. No-edge calls
+     * change nothing; a withheld prompt that already DEPARTED is simply
+     * absent from lastQueue, and a posted-then-departed id is out of
+     * postedIds AND lastQueue by the time an edge fires.
      */
     internal fun onVisibility(visible: Boolean) {
         val wasVisible = lastVisible
         lastVisible = visible
-        if (!wasVisible || visible) return
+        if (visible == wasVisible) return
+        if (visible) {
+            for (id in postedIds.toList()) {
+                sink.cancel(id)
+                postedIds -= id
+            }
+            return
+        }
         for (prompt in lastQueue) {
             val id = prompt.permissionId
-            if (id in knownIds && id !in postedIds) {
-                sink.post(approvalNotificationModel(prompt))
-                postedIds += id
-            }
+            if (id in knownIds && id !in postedIds) post(prompt)
         }
     }
 
@@ -688,8 +738,7 @@ class ApprovalNotificationCollector(
         }
         for (prompt in diff.toPost) {
             if (!visibility.value) {
-                sink.post(approvalNotificationModel(prompt))
-                postedIds += prompt.permissionId
+                post(prompt)
             }
             // While the UI is visible the in-app card is the surface: the
             // prompt is deliberately NOT posted here. knownIds still records

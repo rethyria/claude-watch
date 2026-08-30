@@ -62,10 +62,14 @@ class ApprovalNotificationCollectorTest {
      */
     private class RecordingSink : ApprovalNotificationSink {
         val posted = mutableListOf<String>()
+
+        /** The alert=false subset of [posted] — re-posts that must not buzz (edge 4). */
+        val silently = mutableListOf<String>()
         val cancelled = mutableListOf<String>()
         val shade = mutableSetOf<String>()
-        override fun post(model: ApprovalNotificationModel) {
+        override fun post(model: ApprovalNotificationModel, alert: Boolean) {
             posted += model.permissionId
+            if (!alert) silently += model.permissionId
             shade += model.permissionId
         }
         override fun cancel(permissionId: String) {
@@ -243,41 +247,85 @@ class ApprovalNotificationCollectorTest {
 
     @Test
     fun postedThenDepartedWhileVisibleCancelsOnlyAndTheEdgeAddsNothing() {
-        // Posted while hidden, then the UI opens and the prompt resolves:
-        // the departure cancels the real notification, and the following
-        // background edge must not resurrect it.
+        // Posted while hidden, then the UI opens (cancel-on-return takes the
+        // card down — edge 4) and the prompt resolves while visible: the
+        // departure's unconditional cancel is an idempotent second cancel,
+        // and the following background edge must not resurrect the departed
+        // prompt.
         attach()
         emitQueue(prompt("perm-a"))
         assertEquals(listOf("perm-a"), sink.posted)
         visible.value = true
+        assertEquals("cancel-on-return owns the card", listOf("perm-a"), sink.cancelled)
         emitQueue()
-        assertEquals(listOf("perm-a"), sink.cancelled)
+        assertEquals(listOf("perm-a", "perm-a"), sink.cancelled)
         visible.value = false
         assertEquals(listOf("perm-a"), sink.posted)
     }
 
     @Test
     fun backgroundEdgePostIsBookkeptSoLaterEdgesAndTeardownOwnIt() {
-        // Pins the `postedIds += id` line in onVisibility (review finding:
-        // it was deletable with the whole suite staying green). Without it
-        // the edge-posted notification is invisible to the ownership
-        // bookkeeping, which breaks in BOTH directions asserted here: every
-        // later visible→hidden cycle re-posts (re-BUZZES) the same
-        // still-pending prompt, and cancelAllPosted — the graceful-death
-        // sweep — misses it, leaving a zombie whose action PendingIntents
-        // point at a dead instance: the exact class #24/#25 exist to kill.
+        // Pins the post() bookkeeping in onVisibility. Under edge 4 the
+        // glance cycle is post → cancel-on-return → silent re-post: the
+        // FIRST post alerts, every re-post of the same still-pending prompt
+        // is silent (alertedIds), and the graceful-death sweep owns
+        // whatever re-post is currently in the shade.
         attach()
         visible.value = true
         emitQueue(prompt("perm-a"))
         visible.value = false
         assertEquals(listOf("perm-a"), sink.posted)
-        // Open and background again with perm-a still queued: exactly once.
+        assertEquals("first arrival alerts", emptyList<String>(), sink.silently)
+        // Open (cancel-on-return) and background again with perm-a still
+        // queued: it re-posts — silently, never a second buzz.
         visible.value = true
-        visible.value = false
-        assertEquals("a later background edge must not re-post", listOf("perm-a"), sink.posted)
-        // And the graceful sweep owns what the edge posted.
-        collector.cancelAllPosted()
         assertEquals(listOf("perm-a"), sink.cancelled)
+        visible.value = false
+        assertEquals(listOf("perm-a", "perm-a"), sink.posted)
+        assertEquals("re-posts never alert", listOf("perm-a"), sink.silently)
+        // And the graceful sweep owns the re-posted card.
+        collector.cancelAllPosted()
+        assertEquals(listOf("perm-a", "perm-a"), sink.cancelled)
+    }
+
+    // ------------------------------------------------------------------
+    // Cancel-on-return (edge 4) — the SM-L330 diagnosis of 2026-08-30:
+    // One UI stops the activity on every wrist-down, so cards posted
+    // during a glance-away sat in the shade over the reopened app.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun returningToVisibleTakesThePostedCardDown() {
+        // A prompt arrives mid-glance-away (hidden: posts + alerts). The
+        // wrist comes back up with the app still front: the shade card goes
+        // — the in-app card is the surface — and the prompt stays known and
+        // pending, not re-posted, while the UI stays visible.
+        attach()
+        emitQueue(prompt("perm-a"))
+        assertEquals(listOf("perm-a"), sink.posted)
+        visible.value = true
+        assertEquals(listOf("perm-a"), sink.cancelled)
+        assertEquals("no re-post while visible", listOf("perm-a"), sink.posted)
+        // Still pending on the next glance-away: silent re-post.
+        visible.value = false
+        assertEquals(listOf("perm-a", "perm-a"), sink.posted)
+        assertEquals(listOf("perm-a"), sink.silently)
+    }
+
+    @Test
+    fun adoptedSurvivorEntersPreAlertedSoItsRepostAfterReturnIsSilent() {
+        // The survivor's original notification alerted in the previous
+        // process's life; after the app opens (cancel-on-return) and closes
+        // again, the re-post must not buzz what already buzzed once.
+        sink.shade += setOf("perm-a")
+        attach()
+        connection.value = ConnectionState.Connected
+        emitQueue(prompt("perm-a")) // replay re-confirms: graduates
+        visible.value = true
+        assertEquals(listOf("perm-a"), sink.cancelled)
+        visible.value = false
+        assertEquals(listOf("perm-a"), sink.posted)
+        assertEquals("adopted ids never re-alert", listOf("perm-a"), sink.silently)
     }
 
     // ------------------------------------------------------------------
