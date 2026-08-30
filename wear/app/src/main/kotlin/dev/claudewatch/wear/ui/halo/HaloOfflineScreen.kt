@@ -26,11 +26,10 @@
 // inert and this screen behaves exactly as before.
 package dev.claudewatch.wear.ui.halo
 
-import android.app.Activity
-import android.app.RemoteInput
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -41,12 +40,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -78,7 +80,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.wear.compose.material.Chip
 import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.Text
-import androidx.wear.input.RemoteInputIntentHelper
 import dev.claudewatch.wear.BridgeViewModel
 import dev.claudewatch.wear.net.BridgeDiscovery
 import dev.claudewatch.wear.net.LocalNetworkPermission
@@ -113,6 +114,13 @@ internal fun HaloOfflineScreen(
     var host by remember { mutableStateOf("10.0.2.2") }
     var port by remember { mutableStateOf("7860") }
     var code by remember { mutableStateOf("") }
+    // Which pairing field the digit pad is editing (null = no pad). Local, not
+    // hoisted with `pane` (#127): the pad is a leaf of the Manual pane, and its
+    // own BackHandler dismisses it before the root back-walk runs. Cleared when
+    // the pane changes underneath it (a root back-walk to Choose) so Manual
+    // never re-opens onto a stale pad.
+    var editing by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(pane) { if (pane != OfflinePane.Manual) editing = null }
     val showChooser = !ui.paired || revealed
 
     // Issue #29: the local-network gate. Inert on every current watch
@@ -173,6 +181,36 @@ internal fun HaloOfflineScreen(
                 bridges = ui.discover.bridges,
                 onSelect = onPairByDiscovery,
                 onBack = { onPane(OfflinePane.Choose) },
+            )
+            return@Box
+        }
+
+        // The digit pad owns the whole surface while a pairing field is being
+        // edited — same full-screen takeover the Discover list gets.
+        val editingField = editing
+        if (editingField != null && showChooser && pane == OfflinePane.Manual) {
+            DigitPadPane(
+                label = editingField,
+                initial = when (editingField) {
+                    "host" -> host
+                    "port" -> port
+                    else -> code
+                },
+                allowDot = editingField == "host",
+                maxLen = when (editingField) {
+                    "host" -> 15 // xxx.xxx.xxx.xxx
+                    "port" -> 5
+                    else -> 6
+                },
+                onDone = { entered ->
+                    when (editingField) {
+                        "host" -> host = entered
+                        "port" -> port = entered
+                        else -> code = entered
+                    }
+                    editing = null
+                },
+                onCancel = { editing = null },
             )
             return@Box
         }
@@ -244,9 +282,9 @@ internal fun HaloOfflineScreen(
                 pane == OfflinePane.Manual -> {
                     OfflineHeadline(paired = ui.paired, ui = ui)
                     Spacer(Modifier.height(8.dp))
-                    PairField("host", host, "host") { host = it }
-                    PairField("port", port, "port") { port = it }
-                    PairField("code", code, "code") { code = it }
+                    PairField("host", host, "host", onEdit = { editing = "host" }) { host = it }
+                    PairField("port", port, "port", onEdit = { editing = "port" }) { port = it }
+                    PairField("code", code, "code", onEdit = { editing = "code" }) { code = it }
                     Chip(
                         onClick = { onPair(host.trim(), port.trim(), code.trim()) },
                         label = {
@@ -615,51 +653,40 @@ private fun DiscoveredBridgeRow(
  * cannot reliably drive the system IME — the Samsung keyboard streams input
  * through the composing region, which the Compose BasicTextField interop
  * drops on this device (the caret moves but the glyphs never stick), so a
- * real finger could tap and type and end up with an empty field. Instead the
- * field is a tappable row that launches the Wear RemoteInput activity — the
- * platform's own full-screen input surface (keyboard + voice) — which hands
- * the finished string back as an activity result. No inline editing, no
- * composing-region interop, so no keyboard can corrupt it mid-type; this is
- * the input path Wear itself recommends over embedded text fields. The tag
- * stays on the tappable row so the instrumented pairing leg can still find
- * it (it drives the value through a test seam, not the real IME — the IME
- * cannot run headless anyway).
+ * real finger could tap and type and end up with an empty field. This used
+ * to launch the Wear RemoteInput activity instead, but the system surface it
+ * lands on is whatever keyboard the OEM ships, and the Samsung qwerty offers
+ * NO route to a digit (no ?123 toggle; long-press yields accents) — a live
+ * pairing attempt dead-ended on it. All three fields are digits-and-dots, so
+ * the fix is to keep every IME out of the loop: the row opens the in-app
+ * [DigitPadPane], which composes the value from plain buttons. The tag stays
+ * on the tappable row so the instrumented pairing leg can still find it (it
+ * drives the value through a test seam, not the pad).
  */
 @Composable
-private fun PairField(label: String, value: String, tag: String, onChange: (String) -> Unit) {
-    val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            RemoteInput.getResultsFromIntent(result.data)
-                ?.getCharSequence(REMOTE_INPUT_KEY)
-                ?.toString()
-                ?.let { onChange(it.trim()) }
-        }
-    }
+private fun PairField(
+    label: String,
+    value: String,
+    tag: String,
+    onEdit: () -> Unit,
+    onChange: (String) -> Unit,
+) {
     Text(label, fontSize = Halo.Type.Min, color = Halo.Palette.TextSecondary)
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .background(Halo.Palette.Surface, RoundedCornerShape(8.dp))
             .clickable {
-                // The instrumented pairing leg cannot drive the Wear
-                // RemoteInput activity (no headless IME) and the field is no
-                // longer an inline node performTextInput can fill, so a test
-                // seam short-circuits the tap to a canned value (see
-                // PairFieldInput). Production leaves the seam null and takes
-                // the real RemoteInput path — the only path a finger takes.
+                // The instrumented pairing leg predates the pad and fills the
+                // value through this seam on tap (see PairFieldInput).
+                // Production leaves the seam null and opens the digit pad —
+                // the only path a finger takes.
                 val seam = PairFieldInput.override
                 if (seam != null) {
                     seam(label)?.let { onChange(it.trim()) }
                     return@clickable
                 }
-                val remoteInput = RemoteInput.Builder(REMOTE_INPUT_KEY)
-                    .setLabel(label)
-                    .build()
-                val intent = RemoteInputIntentHelper.createActionRemoteInputIntent()
-                RemoteInputIntentHelper.putRemoteInputsExtra(intent, listOf(remoteInput))
-                launcher.launch(intent)
+                onEdit()
             }
             .padding(horizontal = 8.dp, vertical = 8.dp)
             .testTag(tag),
@@ -673,16 +700,96 @@ private fun PairField(label: String, value: String, tag: String, onChange: (Stri
     Spacer(Modifier.height(4.dp))
 }
 
-private const val REMOTE_INPUT_KEY = "pair_field_value"
+/**
+ * Full-screen digit pad for one pairing field. Host, port and code are all
+ * digits (host adds dots), so twelve on-screen buttons cover the entire input
+ * alphabet with no IME anywhere in the loop. Commit is explicit (the tick);
+ * swipe-back/system back cancels, leaving the field as it was. Key sizes are
+ * squeezed so the 4-row grid + value line + tick fit a 1.2" round face
+ * without scrolling — a keypad that scrolls under a typing finger is worse
+ * than small keys.
+ */
+@Composable
+private fun DigitPadPane(
+    label: String,
+    initial: String,
+    allowDot: Boolean,
+    maxLen: Int,
+    onDone: (String) -> Unit,
+    onCancel: () -> Unit,
+) {
+    var value by remember(label) { mutableStateOf(initial) }
+    BackHandler { onCancel() }
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+        modifier = Modifier.fillMaxSize().testTag("digitPad"),
+    ) {
+        Row(verticalAlignment = Alignment.Bottom) {
+            Text("$label ", fontSize = Halo.Type.Min, color = Halo.Palette.TextSecondary)
+            Text(
+                text = value.ifEmpty { " " }, // figure space holds the line height
+                fontSize = Halo.Type.Body,
+                color = Halo.Palette.TextPrimary,
+                maxLines = 1,
+                modifier = Modifier.testTag("padValue"),
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        val rows = listOf(
+            listOf("1", "2", "3"),
+            listOf("4", "5", "6"),
+            listOf("7", "8", "9"),
+            listOf(if (allowDot) "." else "", "0", "⌫"),
+        )
+        for (row in rows) {
+            Row {
+                for (key in row) {
+                    if (key.isEmpty()) {
+                        Spacer(Modifier.size(width = 44.dp, height = 34.dp))
+                        continue
+                    }
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .padding(horizontal = 2.dp, vertical = 1.dp)
+                            .size(width = 40.dp, height = 32.dp)
+                            .background(Halo.Palette.Surface, RoundedCornerShape(8.dp))
+                            .clickable {
+                                value = when {
+                                    key == "⌫" -> value.dropLast(1)
+                                    value.length >= maxLen -> value
+                                    else -> value + key
+                                }
+                            }
+                            .testTag(if (key == "⌫") "padDel" else "padKey$key"),
+                    ) {
+                        Text(key, fontSize = Halo.Type.Body, color = Halo.Palette.TextPrimary)
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(width = 128.dp, height = 30.dp)
+                .background(Halo.Palette.WaitingForYou, RoundedCornerShape(15.dp))
+                .clickable { onDone(value.trim()) }
+                .testTag("padDone"),
+        ) {
+            Text("✓", fontSize = Halo.Type.Body, color = Halo.Palette.ApproveText)
+        }
+    }
+}
 
 /**
  * Test seam for [PairField] (the resolver-seam idiom used by
  * BridgeSessionService/GlanceStateSource). When [override] is non-null,
  * tapping a pairing field routes to it — returning the string to fill, or
- * null to leave the field unchanged (a cancelled input) — instead of
- * launching the Wear RemoteInput activity, which needs a real IME and does
- * not exist in the instrumented harness. Production never sets it, so a real
- * finger always gets the real system input surface.
+ * null to leave the field unchanged (a cancelled input) — instead of opening
+ * the in-app [DigitPadPane], sparing the harness a screenful of key taps.
+ * Production never sets it, so a real finger always gets the pad.
  */
 internal object PairFieldInput {
     @Volatile
