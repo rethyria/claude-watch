@@ -19,7 +19,7 @@ import java.util.concurrent.TimeUnit
  * (SSE via okhttp-sse, which buffers correctly across chunks by construction).
  *
  * All requests go to http://bridge.internal:<port> with the hostname's DNS
- * pinned to [hostIp], which must be an RFC1918/loopback IPv4 literal — see
+ * pinned to [hostIp], which must be an RFC1918/RFC6598/loopback IPv4 literal — see
  * [PrivateHosts] and res/xml/network_security_config.xml for why.
  *
  * [heartbeatTimeoutMs] is the SSE watchdog: the bridge writes a `:heartbeat`
@@ -49,7 +49,7 @@ open class BridgeClient(
 
     private val address: InetAddress = PrivateHosts.parsePrivateIpv4(hostIp)
         ?: throw IllegalArgumentException(
-            "Bridge host must be a private (RFC1918) or loopback IPv4 address, got: $hostIp",
+            "Bridge host must be a private (RFC1918), shared (RFC6598), or loopback IPv4 address, got: $hostIp",
         )
 
     private val pinnedDns = object : Dns {

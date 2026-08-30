@@ -16,14 +16,25 @@ object PrivateHosts {
 
     /**
      * Parses [host] as an IPv4 literal and returns it when it is a private
-     * (RFC1918) or loopback address; returns null for anything else,
-     * including hostnames and public addresses. Never performs DNS.
+     * (RFC1918), carrier-shared (RFC6598), or loopback address; returns null
+     * for anything else, including hostnames and public addresses. Never
+     * performs DNS.
      *
      * Allowed ranges:
      *  - 10.0.0.0/8      (includes the emulator host alias 10.0.2.2)
      *  - 172.16.0.0/12
      *  - 192.168.0.0/16
+     *  - 100.64.0.0/10   (RFC6598 shared space — Tailscale/WireGuard tailnet
+     *                     addresses, the off-LAN path through the phone's BT
+     *                     proxy + VPN; see epic #32)
      *  - 127.0.0.0/8     (loopback, for `adb reverse` setups)
+     *
+     * 100.64/10 is deliberately the widest concession here: it is also
+     * carrier CGNAT space, so if the phone's VPN is down and the proxy rides
+     * bare cellular, a cleartext request could in principle reach a stranger's
+     * CGNAT-assigned host. Accepted for a personal sideloaded app — the
+     * operator enters the address once, at pair time, knowing it is their
+     * tailnet — and the durable answer remains TLS (#31, deferred).
      */
     fun parsePrivateIpv4(host: String): InetAddress? {
         val parts = host.trim().split(".")
@@ -40,6 +51,7 @@ object PrivateHosts {
         val allowed = octets[0] == 10 ||
             (octets[0] == 172 && octets[1] in 16..31) ||
             (octets[0] == 192 && octets[1] == 168) ||
+            (octets[0] == 100 && octets[1] in 64..127) ||
             octets[0] == 127
         if (!allowed) return null
         return InetAddress.getByAddress(

@@ -15,6 +15,9 @@ class PrivateHostsTest {
             "172.16.0.1",
             "172.31.255.254",
             "192.168.1.10",
+            "100.64.0.0", // RFC6598 shared space (tailnet addresses) — low edge
+            "100.100.7.9",
+            "100.127.255.255", // RFC6598 high edge
             "127.0.0.1",
         )) {
             val address = PrivateHosts.parsePrivateIpv4(host)
@@ -30,7 +33,7 @@ class PrivateHostsTest {
 
     @Test
     fun rejectsPublicAddresses() {
-        for (host in listOf("8.8.8.8", "1.2.3.4", "100.64.0.1", "9.255.255.255", "11.0.0.1")) {
+        for (host in listOf("8.8.8.8", "1.2.3.4", "9.255.255.255", "11.0.0.1")) {
             assertNull("expected $host to be rejected", PrivateHosts.parsePrivateIpv4(host))
         }
     }
@@ -39,6 +42,12 @@ class PrivateHostsTest {
     fun rejectsAddressesJustOutsideThe172Slash12Range() {
         assertNull(PrivateHosts.parsePrivateIpv4("172.15.0.1"))
         assertNull(PrivateHosts.parsePrivateIpv4("172.32.0.1"))
+    }
+
+    @Test
+    fun rejectsAddressesJustOutsideThe100Slash10SharedRange() {
+        assertNull(PrivateHosts.parsePrivateIpv4("100.63.255.255"))
+        assertNull(PrivateHosts.parsePrivateIpv4("100.128.0.0"))
     }
 
     @Test

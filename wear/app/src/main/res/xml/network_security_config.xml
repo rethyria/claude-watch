@@ -13,7 +13,9 @@
   2. All bridge traffic is sent to http://bridge.internal:<port>, and
      BridgeClient pins that name's DNS answer to an operator-entered IPv4
      address that PrivateHosts has validated as RFC1918 (10/8, 172.16/12,
-     192.168/16) or loopback. A non-private address never gets a socket.
+     192.168/16), RFC6598 shared space (100.64/10 — tailnet addresses for
+     the off-LAN BT-proxy+VPN path, epic #32), or loopback. Anything else
+     never gets a socket.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />

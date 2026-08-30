@@ -1008,7 +1008,7 @@ class ConnectionEngine(
         val newClient = try {
             clientFactory(found.hostIp, found.port)
         } catch (_: IllegalArgumentException) {
-            return // resolved a non-RFC1918 address: ignore it
+            return // resolved an address outside the PrivateHosts gate: ignore it
         }
         val applied = synchronized(lock) {
             // A stop()/pair()/401 that raced the scan wins: discard the result.
