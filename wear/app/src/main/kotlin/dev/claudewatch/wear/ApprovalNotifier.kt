@@ -302,6 +302,17 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Approvals", NotificationManager.IMPORTANCE_HIGH),
         )
+        // The RE-POST channel (edge 4). setSilent(true) alone is not enough
+        // on One UI: the SM-L330 buzzed for every SILENT-flagged re-post
+        // (notification_alert followed each enqueue in the platform's own
+        // event log, 2026-08-31 — the "buzz every 5 seconds" loop, one buzz
+        // per AoD glance cycle). Channel importance is the one alerting
+        // signal every OEM honours: LOW never vibrates, never heads-ups. A
+        // re-posted card carries the same content and actions — it is only
+        // quieter about arriving, which is the entire point.
+        manager.createNotificationChannel(
+            NotificationChannel(QUIET_CHANNEL_ID, "Approvals (re-posted)", NotificationManager.IMPORTANCE_LOW),
+        )
     }
 
     override fun post(model: ApprovalNotificationModel, alert: Boolean) {
@@ -316,7 +327,7 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
             Intent(context, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
-        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, if (alert) CHANNEL_ID else QUIET_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_bridge_chip)
             .setContentTitle(model.title)
             .setContentText(model.text)
@@ -336,9 +347,10 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
             .setOnlyAlertOnce(true)
         // A re-post (alert=false) must not buzz: setOnlyAlertOnce alone
         // cannot help because cancel-on-return removed the previous
-        // notification — to the system this is a brand-new post. setSilent
-        // suppresses the heads-up and the system buzz outright; the prompt
-        // already alerted (shade or wrist) when it first arrived.
+        // notification — to the system this is a brand-new post. The real
+        // silencer is the QUIET channel above (One UI buzzed straight
+        // through this flag); setSilent stays as the belt for OEMs that do
+        // honour it. The prompt already alerted when it first arrived.
         if (!alert) builder.setSilent(true)
         // Exactly one of these lists is non-empty by construction: question
         // prompts carry optionAnswers (or nothing — tap opens the app),
@@ -435,6 +447,9 @@ class ApprovalNotifier(private val context: Context) : ApprovalNotificationSink 
 
     companion object {
         const val CHANNEL_ID = "approvals"
+
+        /** IMPORTANCE_LOW home for silent re-posts — see the init comment. */
+        const val QUIET_CHANNEL_ID = "approvals_quiet"
 
         /**
          * The fixed notification id; the TAG (the permissionId) is what
