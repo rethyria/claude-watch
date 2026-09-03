@@ -96,12 +96,23 @@ class ApprovalNotificationCollectorTest {
     private val visible = MutableStateFlow(false)
     private val connection = MutableStateFlow<ConnectionState>(ConnectionState.Stopped)
     private val state = MutableStateFlow(BridgeViewModel.UiState())
+    /**
+     * Virtual clock for the alert-burst window (edge 5). Fixed by default, so
+     * every test that posts more than one prompt exercises the collapse — and
+     * tests that care about the window's EDGES advance it explicitly.
+     */
+    private var now = 10_000L
+
     // visibilityDebounceMs = 0: delay(0) never suspends, so the flap filter
     // is transparent under Unconfined and every flow-driven edge stays
     // synchronous. The filter itself is pinned by the virtual-time test
     // [activityRecreationFlapNeverPostsOverTheVisibleUi].
-    private val collector =
-        ApprovalNotificationCollector(sink, visibility = visible, visibilityDebounceMs = 0L)
+    private val collector = ApprovalNotificationCollector(
+        sink,
+        visibility = visible,
+        visibilityDebounceMs = 0L,
+        clock = { now },
+    )
 
     // Unconfined: attach()'s collectors run each emission synchronously on
     // the writer's thread — the JVM-deterministic stand-in for the service's
@@ -509,6 +520,77 @@ class ApprovalNotificationCollectorTest {
         assertEquals(emptyList<String>(), sink.posted) // known: never re-posted
         emitQueue()
         assertEquals(listOf("perm-a"), sink.cancelled)
+    }
+
+    // ------------------------------------------------------------------
+    // Alert-burst collapse (edge 5) — reported 2026-08-31: "1 buzz per
+    // question per turn; 3 questions in the same turn get 3 buzzes". Each
+    // prompt is its own permissionId, so each posted its own ALERTING card
+    // and the system buzzed once per card, while the app's own haptic
+    // grammar had collapsed the same burst to a single needsYou. The two
+    // layers are one attention budget; the shade now collapses too.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun oneTurnRaisingThreePromptsShowsThreeCardsAndAlertsOnce() {
+        // The reported scenario. All three cards must still POST — each is a
+        // separate decision with its own actions — but the wrist is told
+        // "something needs you" exactly once.
+        attach()
+        emitQueue(prompt("perm-a"), prompt("perm-b"), prompt("perm-c"))
+        assertEquals(listOf("perm-a", "perm-b", "perm-c"), sink.posted)
+        assertEquals(
+            "only the first of a burst alerts",
+            listOf("perm-b", "perm-c"),
+            sink.silently,
+        )
+    }
+
+    @Test
+    fun promptsArrivingAsSeparateEmissionsInsideTheWindowStillAlertOnce() {
+        // A turn's prompts need not land in ONE emission — the reducer
+        // applies each frame separately (the same property that forced the
+        // settle window's per-emission graduation). The collapse is
+        // time-based, so it holds across emissions.
+        attach()
+        emitQueue(prompt("perm-a"))
+        now += ApprovalNotificationCollector.ALERT_BURST_WINDOW_MS - 1
+        emitQueue(prompt("perm-a"), prompt("perm-b"))
+        assertEquals(listOf("perm-a", "perm-b"), sink.posted)
+        assertEquals("still inside the window", listOf("perm-b"), sink.silently)
+    }
+
+    @Test
+    fun aGenuinelySeparateAskPastTheWindowAlertsAgain() {
+        // The collapse must not mute the NEXT real ask: two unrelated
+        // prompts minutes apart are two pieces of news.
+        attach()
+        emitQueue(prompt("perm-a"))
+        now += ApprovalNotificationCollector.ALERT_BURST_WINDOW_MS
+        emitQueue(prompt("perm-a"), prompt("perm-b"))
+        assertEquals(listOf("perm-a", "perm-b"), sink.posted)
+        assertEquals("past the window: it alerts", emptyList<String>(), sink.silently)
+    }
+
+    @Test
+    fun aBurstSuppressedPromptIsCollapsedNotDeferred() {
+        // The AttentionHaptics rule, mirrored: a suppressed id is RECORDED
+        // as alerted, so it never alerts later either — a card whose buzz
+        // was folded into its batch-mate's must not buzz on the next
+        // glance-away cycle (that would be the buzz loop, one window late).
+        attach()
+        emitQueue(prompt("perm-a"), prompt("perm-b"))
+        assertEquals(listOf("perm-b"), sink.silently)
+        now += ApprovalNotificationCollector.ALERT_BURST_WINDOW_MS * 10
+        // A glance cycle: cancel-on-return, then re-post on the way out.
+        visible.value = true
+        visible.value = false
+        assertEquals(listOf("perm-a", "perm-b", "perm-a", "perm-b"), sink.posted)
+        assertEquals(
+            "re-posts stay silent even long past the window",
+            listOf("perm-b", "perm-a", "perm-b"),
+            sink.silently,
+        )
     }
 
     // ------------------------------------------------------------------

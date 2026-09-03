@@ -582,6 +582,12 @@ class ApprovalNotificationCollector(
      * reason as [settleMs]: virtual-time tests pin the cancel-vs-fire glue.
      */
     private val visibilityDebounceMs: Long = VISIBILITY_FLAP_DEBOUNCE_MS,
+    /**
+     * Clock behind the alert-burst window (edge 5). Injected for the same
+     * reason AttentionHaptics injects one: the burst rule is a TIME rule,
+     * and a test that cannot move time can only pin it with sleeps.
+     */
+    private val clock: () -> Long = System::currentTimeMillis,
 ) {
 
     private var knownIds: Set<String> = emptySet()
@@ -594,6 +600,12 @@ class ApprovalNotificationCollector(
      * the previous process's life.
      */
     private val alertedIds = mutableSetOf<String>()
+
+    /**
+     * When the shade last ALERTED, for the burst collapse (edge 5). Null =
+     * never — a fresh collector's first arrival always alerts.
+     */
+    private var lastAlertMs: Long? = null
 
     /**
      * Adopted survivors whose fate the queue cannot yet vouch for (edge 2
@@ -672,10 +684,22 @@ class ApprovalNotificationCollector(
         adoptedAwaitingReplay += tags
     }
 
-    /** Post [prompt], alerting only the first time this id reaches the shade (edge 4). */
+    /**
+     * Post [prompt]. It alerts only if BOTH hold: this id has never reached
+     * the shade before (edge 4 — a re-post after cancel-on-return is
+     * silent), and no other card alerted inside the burst window (edge 5 —
+     * one turn raising three prompts is ONE piece of news). A
+     * burst-suppressed id still enters [alertedIds]: collapsed, not
+     * deferred, exactly as AttentionHaptics records a suppressed prompt.
+     */
     private fun post(prompt: BridgeViewModel.PendingPermission) {
         val id = prompt.permissionId
-        sink.post(approvalNotificationModel(prompt), alert = alertedIds.add(id))
+        val now = clock()
+        val firstSighting = alertedIds.add(id)
+        val outsideBurst = lastAlertMs.let { it == null || now - it >= ALERT_BURST_WINDOW_MS }
+        val alert = firstSighting && outsideBurst
+        if (alert) lastAlertMs = now
+        sink.post(approvalNotificationModel(prompt), alert = alert)
         postedIds += id
     }
 
@@ -820,5 +844,16 @@ class ApprovalNotificationCollector(
          * the user's actual wrist-lowering gesture.
          */
         internal const val VISIBILITY_FLAP_DEBOUNCE_MS = 400L
+
+        /**
+         * The alert-burst window (edge 5). Deliberately the same 3 s as
+         * [AttentionHaptics.BURST_WINDOW_MS], for the same reason and with
+         * the same semantics — the two layers are one attention budget, and
+         * a user cannot tell which of them buzzed their wrist. Sized to
+         * cover a single turn's prompts (they land together) and a
+         * reconnect replay's frames (~1 s on hardware), while two genuinely
+         * separate asks minutes apart each still alert.
+         */
+        internal const val ALERT_BURST_WINDOW_MS = 3_000L
     }
 }
