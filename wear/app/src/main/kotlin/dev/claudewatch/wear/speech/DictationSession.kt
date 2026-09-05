@@ -41,6 +41,15 @@ object DictationSession {
         data class Error(val failure: Failure) : Event
         /** The binding's bounded wait after StopListening expired with no final result. */
         data object StopTimeout : Event
+        /**
+         * The binding's wall clock says nothing has been heard for
+         * [DictationController]'s silence limit: park the text (or cancel an
+         * empty session) rather than hold the mic and the screen forever.
+         * Wall-clock because a turn's length depends on the service's mode —
+         * ~2s in segmented mode, ~5s in plain — so turn counts alone can't
+         * express "two minutes".
+         */
+        data object LongSilence : Event
         /** User: tap — finish and SEND what was heard. */
         data object Stop : Event
         /** User: back — finish and REVIEW before sending. */
@@ -114,8 +123,14 @@ object DictationSession {
     /** Consecutive turns that ended without the mic ever opening before we give up. */
     const val MAX_IDLE_RESTARTS = 5
 
-    /** Consecutive mic-open-but-silent turns before the session parks itself (~1–2 min). */
-    const val MAX_SILENT_TURNS = 8
+    /**
+     * Backstop for a binding without a clock: consecutive mic-open-but-silent
+     * turns before the session parks itself. Generous on purpose — segmented
+     * mode ends a silent turn every ~2s (seen live on the SM-L330), so a
+     * small count parked a user who was merely thinking. The real limit is
+     * the binding's wall-clock [Event.LongSilence].
+     */
+    const val MAX_SILENT_TURNS = 90
 
     const val NOTE_STOPPED_EARLY = "recognition stopped early"
     const val NOTE_SILENCE = "stopped after a long silence"
@@ -150,6 +165,7 @@ object DictationSession {
         Event.Stop -> Step(state.copy(phase = Phase.Stopping(review = false)), listOf(Effect.StopListening))
         Event.Review -> Step(state.copy(phase = Phase.Stopping(review = true)), listOf(Effect.StopListening))
         Event.Discard -> Step(state.copy(phase = Phase.Cancelled), listOf(Effect.Release))
+        Event.LongSilence -> silence(state)
         Event.Send, Event.StopTimeout -> Step(state)
     }
 
@@ -163,7 +179,7 @@ object DictationSession {
         Event.Discard -> Step(state.copy(phase = Phase.Cancelled), listOf(Effect.Release))
         // Already stopping; a repeat tap changes nothing, a back now just
         // downgrades send to review (the safer of the two).
-        Event.Stop, Event.Send -> Step(state)
+        Event.Stop, Event.Send, Event.LongSilence -> Step(state)
         Event.Review -> Step(state.copy(phase = Phase.Stopping(review = true)))
     }
 
@@ -197,15 +213,18 @@ object DictationSession {
             idle >= MAX_IDLE_RESTARTS ->
                 if (state.transcript.isBlank()) fail(state, "Speech recognizer keeps stopping")
                 else park(state, NOTE_STOPPED_EARLY)
-            silent >= MAX_SILENT_TURNS ->
-                if (state.transcript.isBlank()) Step(state.copy(phase = Phase.Cancelled), listOf(Effect.Release))
-                else park(state, NOTE_SILENCE)
+            silent >= MAX_SILENT_TURNS -> silence(state)
             else -> Step(
                 state.copy(partial = "", turnReady = false, turnHeard = false, idleRestarts = idle, silentTurns = silent),
                 listOf(Effect.Restart),
             )
         }
     }
+
+    /** Nothing heard for too long: park the text, or cancel an empty session. */
+    private fun silence(state: State): Step =
+        if (state.transcript.isBlank()) Step(state.copy(phase = Phase.Cancelled), listOf(Effect.Release))
+        else park(state, NOTE_SILENCE)
 
     /** Stop early but keep the text: the review hold with [note] explaining why. */
     private fun park(state: State, note: String): Step =

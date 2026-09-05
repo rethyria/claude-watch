@@ -60,11 +60,16 @@ class DictationController(private val context: Context) {
 
     val running: Boolean get() = _state.value != null
 
+    /** Wall clock of the last speech heard (or the session start). */
+    private var lastSpeechAt = 0L
+
     companion object {
         private const val TAG = "Dictation"
         /** How long to wait for the final segment after stopListening before finishing with the partial. */
         private const val STOP_GRACE_MS = 1500L
         private const val BUSY_RETRY_MS = 300L
+        /** Nothing heard for this long → the session parks itself (Event.LongSilence). */
+        const val SILENCE_LIMIT_MS = 120_000L
 
         /**
          * Can this device run the in-app path at all? False on the emulator
@@ -86,6 +91,7 @@ class DictationController(private val context: Context) {
             return
         }
         this.outcome = outcome
+        lastSpeechAt = android.os.SystemClock.elapsedRealtime()
         _state.value = DictationSession.State()
         val r = create()
         if (r == null) {
@@ -143,7 +149,10 @@ class DictationController(private val context: Context) {
                 RecognizerIntent.EXTRA_SEGMENTED_SESSION,
                 RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
             )
-            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+            // An Int, not a Long: Google's service reads it with getInt and
+            // logs "not set with positive value; ignoring EXTRA_SEGMENTED_SESSION"
+            // for a Long (seen live on the SM-L330, 2026-09-05).
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000)
             segmentedAttempted = true
         }
         try {
@@ -163,12 +172,13 @@ class DictationController(private val context: Context) {
 
         override fun onPartialResults(partialResults: Bundle?) {
             val text = partialResults.firstResult() ?: return
+            lastSpeechAt = android.os.SystemClock.elapsedRealtime()
             dispatch(DictationSession.Event.Partial(text))
         }
 
         override fun onResults(results: Bundle?) {
             lastPathSeen = "onResults"
-            results.firstResult()?.let { dispatch(DictationSession.Event.Segment(it)) }
+            results.firstResult()?.let { heard(it) }
             // Plain mode: the turn is over with this callback.
             dispatch(DictationSession.Event.SessionEnded)
         }
@@ -176,7 +186,7 @@ class DictationController(private val context: Context) {
         @RequiresApi(33)
         override fun onSegmentResults(segmentResults: Bundle) {
             lastPathSeen = "onSegmentResults"
-            segmentResults.firstResult()?.let { dispatch(DictationSession.Event.Segment(it)) }
+            segmentResults.firstResult()?.let { heard(it) }
         }
 
         @RequiresApi(33)
@@ -202,6 +212,11 @@ class DictationController(private val context: Context) {
         override fun onEvent(eventType: Int, params: Bundle?) = Unit
     }
 
+    private fun heard(segment: String) {
+        lastSpeechAt = android.os.SystemClock.elapsedRealtime()
+        dispatch(DictationSession.Event.Segment(segment))
+    }
+
     private fun Bundle?.firstResult(): String? =
         this?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.takeIf { it.isNotBlank() }
 
@@ -224,6 +239,10 @@ class DictationController(private val context: Context) {
     private fun perform(effect: DictationSession.Effect, outcome: Outcome?) {
         when (effect) {
             DictationSession.Effect.Restart -> {
+                if (android.os.SystemClock.elapsedRealtime() - lastSpeechAt > SILENCE_LIMIT_MS) {
+                    dispatch(DictationSession.Event.LongSilence)
+                    return
+                }
                 val delay = if (lastErrorWasBusy) BUSY_RETRY_MS else 0L
                 handler.postDelayed({ if (_state.value?.phase == DictationSession.Phase.Listening) startTurn() }, delay)
             }

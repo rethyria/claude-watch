@@ -186,6 +186,16 @@ class DictationSessionTest {
     }
 
     @Test
+    fun `the binding's wall-clock silence parks text or cancels an empty session`() {
+        val (parked, effects) = run(Event.Ready, Event.Segment("kept"), Event.SessionEnded, Event.Ready, Event.LongSilence)
+        assertEquals(Phase.Review(DictationSession.NOTE_SILENCE), parked.phase)
+        assertEquals("kept", parked.transcript)
+        assertEquals(Effect.Release, effects.last())
+        val (empty, _) = run(Event.Ready, Event.LongSilence)
+        assertEquals(Phase.Cancelled, empty.phase)
+    }
+
+    @Test
     fun `speech resets the silence count`() {
         var state = State()
         repeat(DictationSession.MAX_SILENT_TURNS - 1) {

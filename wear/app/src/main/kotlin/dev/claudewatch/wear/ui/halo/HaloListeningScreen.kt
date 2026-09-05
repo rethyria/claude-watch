@@ -42,6 +42,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material.Text
 import dev.claudewatch.wear.speech.DictationSession
@@ -148,18 +149,26 @@ private fun Listening(
             )
         }
         Spacer(Modifier.height(6.dp))
+        // Two lines, not one: session titles run long on the watch and a
+        // single "to {title} · tap to send" line lost the affordance first.
         Text(
-            text = when {
-                stopping -> "finishing…"
-                targetSessionTitle != null -> "to $targetSessionTitle · tap to send"
-                else -> "tap to send"
-            },
+            text = if (stopping) "finishing…" else "tap to send",
             fontSize = Halo.Type.Min,
             color = Halo.Palette.TextSecondary,
             textAlign = TextAlign.Center,
             maxLines = 1,
             modifier = Modifier.testTag("haloListeningHint"),
         )
+        if (targetSessionTitle != null) {
+            Text(
+                text = "to $targetSessionTitle",
+                fontSize = Halo.Type.Min,
+                color = Halo.Palette.TextFaint,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
