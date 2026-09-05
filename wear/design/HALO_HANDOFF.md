@@ -114,20 +114,27 @@ shown as sent until the bridge ACKs.** Success: feed entry "you: … ✓". Failu
 (no ack in ~3s): red-dashed transcript, "not delivered — bridge didn't ack",
 Retry / Discard. (Existing ViewModel already enforces ack-gating.)
 
-> **Implementation deviation (accepted):** the LISTENING phase is the system
-> recognizer activity (`RecognizerIntent.ACTION_RECOGNIZE_SPEECH`), not a
-> custom screen — Wear's recognizer intent offers no partial-result stream
-> for a live transcript, covers the whole display, and auto-submits on
-> end-of-speech, so the concentric circles, the styled live transcript, and
-> the tap-to-send affordance are not implemented. The target-naming intent
-> survives as the recognizer's prompt line ("To {session}"), set at launch
-> from the summoning surface's session. Everything AFTER transcription —
-> sending hold, ack gating, failure with Retry/Discard — follows this spec
-> verbatim (`HaloVoiceScreen.kt`, overlay lifecycle in `HaloApp.kt`). The
-> failed state is modal (Retry/Discard are the only exits) and Cancel during
-> sending keeps the overlay armed so an eventual failure reopens it: no other
-> Halo surface renders the restored draft, and the text must never be lost
-> silently.
+> **Implementation note (issue #134):** the LISTENING phase is in-app
+> (`HaloListeningScreen.kt`) on a raw `SpeechRecognizer` bound to the watch's
+> recognition service, driven by the pure `DictationSession` reducer. It holds
+> the screen on for the whole dictation and STITCHES recogniser turns — every
+> final segment appends, listening restarts — until the user's own stop: tap
+> = send (the spec's affordance), back = a Send/Discard review hold (a long
+> dictation must never die to an edge swipe). The concentric circles are 75/52/
+> 32 dp (150/104/64 px ref) with a slow breathing pulse (frozen in ambient).
+> Known cost: punctuation across a stitch is worse than one continuous
+> utterance. The earlier deviation — the system recogniser activity
+> (`RecognizerIntent.ACTION_RECOGNIZE_SPEECH`), which covers the display, lets
+> the watch sleep at 15s mid-sentence and auto-submits on its own silence
+> detection — survives only as the FALLBACK on devices with no recognition
+> service (the emulator) or a denied microphone permission; there the
+> target-naming intent rides the recogniser's prompt line ("To {session}").
+> Everything AFTER transcription — sending hold, ack gating, failure with
+> Retry/Discard — follows this spec verbatim (`HaloVoiceScreen.kt`, overlay
+> lifecycle in `HaloApp.kt`). The failed state is modal (Retry/Discard are the
+> only exits) and Cancel during sending keeps the overlay armed so an eventual
+> failure reopens it: no other Halo surface renders the restored draft, and
+> the text must never be lost silently.
 
 ### 8. Offline / re-pair
 Ring hollow grey (same geometry, drained). "Bridge offline" (30, `#E5484D`),

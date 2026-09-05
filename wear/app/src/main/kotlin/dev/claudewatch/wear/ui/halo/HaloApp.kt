@@ -141,6 +141,16 @@ data class HaloActions(
     /** Voice-overlay Discard: drop the failed draft AND its error together. */
     val onDiscardCommand: () -> Unit = {},
     /**
+     * In-app listening phase (issue #134; rendered while [HaloApp]'s
+     * `listening` is non-null): tap = stop and send, back = stop and review,
+     * review Send / Discard. No-op defaults keep fixture-driven tests
+     * source-compatible.
+     */
+    val onListeningStop: () -> Unit = {},
+    val onListeningReview: () -> Unit = {},
+    val onListeningSend: () -> Unit = {},
+    val onListeningDiscard: () -> Unit = {},
+    /**
      * Spawn a fresh [agent] session at [cwd] — a project root chosen in the
      * spawn picker (issue #56), `"~"` for a no-project home session, or null
      * for the bridge's default cwd chain.
@@ -247,6 +257,11 @@ fun HaloApp(
     // Wrist-down (issue #24). Defaulted false so every existing call site and
     // fixture-driven test stays source-compatible.
     ambient: Boolean = false,
+    // Issue #134: the in-app dictation in progress, null when none. Owned by
+    // MainActivity's DictationController (it needs the Activity context and
+    // the main thread); rendered here as the topmost modal overlay below the
+    // offline takeover.
+    listening: dev.claudewatch.wear.speech.DictationSession.State? = null,
 ) {
     // The flag also rides a CompositionLocal so DEEP consumers (the usage
     // skeleton's pulse) can read it without a parameter chain through every
@@ -263,6 +278,7 @@ fun HaloApp(
             ui = ui,
             actions = actions,
             ambient = ambient,
+            listening = listening,
             systemBackInFlight = systemBackInFlight,
         )
     }
@@ -273,6 +289,7 @@ private fun HaloAppBody(
     ui: BridgeViewModel.UiState,
     actions: HaloActions,
     ambient: Boolean,
+    listening: dev.claudewatch.wear.speech.DictationSession.State?,
     systemBackInFlight: MutableState<Boolean>,
 ) {
     val model = HaloModel.from(ui)
@@ -281,6 +298,9 @@ private fun HaloAppBody(
     // restart; these keep them reading the current state, not a stale capture.
     val currentModel by rememberUpdatedState(model)
     val currentUi by rememberUpdatedState(ui)
+    // Same reason as the two above: the predictive-back lambda is frozen for
+    // the gesture's duration, and `listening` flips underneath it.
+    val currentListening by rememberUpdatedState(listening)
     var lastSwipeAtMs by remember { mutableLongStateOf(0L) }
 
     // Issue #56: the spawn picker overlay. The pager's "+ new session" card
@@ -325,9 +345,10 @@ private fun HaloAppBody(
     var shownCardId by remember { mutableStateOf<String?>(null) }
     var exitingCardId by remember { mutableStateOf<String?>(null) }
 
-    // §7 voice overlay. The listening phase is the system recognizer activity
-    // (it covers the screen; see HaloVoiceScreen's header), so the overlay's
-    // lifecycle keys off the SEND: armed when a Halo surface launches
+    // §7 voice overlay. The listening phase is rendered separately (the
+    // `listening` overlay below — in-app since issue #134, or the system
+    // recognizer activity on devices without a recognition service), so this
+    // overlay's lifecycle keys off the SEND: armed when a Halo surface launches
     // dictation, opened when its send goes in flight OR its launch/send is
     // refused (commandError with no new send — e.g. no recognizer on the
     // watch, busy refusal), held open on failure (Retry/Discard), closed on
@@ -336,9 +357,10 @@ private fun HaloAppBody(
     // because nothing else in Halo renders the restored draft — closing for
     // good would silently lose the text at the rendering layer. Question-card
     // dictation never arms it: those transcriptions are answer buffer
-    // entries, not sends. All of it rememberSaveable: the recognizer result
-    // is redelivered across activity recreation, and plain remember would
-    // drop the armed overlay for a send that is still very much in flight.
+    // entries, not sends. All of it rememberSaveable: the fallback
+    // recognizer's result is redelivered across activity recreation, and
+    // plain remember would drop the armed overlay for a send that is still
+    // very much in flight.
     var voiceArmed by rememberSaveable { mutableStateOf(false) }
     var voiceOpen by rememberSaveable { mutableStateOf(false) }
     // True once this arm's send/failure has reached the overlay: gates the
@@ -358,6 +380,24 @@ private fun HaloAppBody(
         voiceArmed = true
         voiceWatched = false
         actions.onDictate(sessionId)
+    }
+    // Issue #134: an in-app dictation that ended WITHOUT a send (nothing
+    // heard on tap, review Discard, silence park then Discard) must disarm
+    // the overlay — armed, it would open over the NEXT unrelated send, and
+    // that send's Retry would re-target the abandoned dictation's session.
+    // The send path flips commandInFlightText/commandError synchronously
+    // before its network launch, so at the composition where `listening`
+    // has gone null a delivered dictation already shows one of them.
+    var wasListening by remember { mutableStateOf(false) }
+    if (listening != null) {
+        wasListening = true
+    } else if (wasListening) {
+        wasListening = false
+        if (voiceArmed && !voiceWatched &&
+            ui.commandInFlightText == voicePriorInFlight && ui.commandError == null
+        ) {
+            voiceArmed = false
+        }
     }
     // Idempotent snapshot writes (same discipline as cardHold below).
     if (voiceArmed && !voiceOpen) {
@@ -504,7 +544,19 @@ private fun HaloAppBody(
         systemBackInFlight.value = true
         try {
             progress.collect { event -> systemBackProgress = event.progress }
-            if (currentUi.isOffline()) {
+            val listeningNow = currentListening
+            if (listeningNow != null) {
+                // Issue #134: the listening overlay sits above EVERYTHING,
+                // the offline takeover included (a dictation in progress must
+                // stay reachable — see the overlay's comment). Back while
+                // listening finishes into REVIEW (a long dictation must not
+                // die to an edge swipe); in review, back is consumed —
+                // Send/Discard are the only exits, the same modality as the
+                // failed send.
+                if (listeningNow.phase is dev.claudewatch.wear.speech.DictationSession.Phase.Listening) {
+                    actions.onListeningReview()
+                }
+            } else if (currentUi.isOffline()) {
                 // Issue #127: the offline takeover is MODAL — routing the
                 // completion through systemBack here walked the INVISIBLE
                 // hierarchy underneath (closing hidden cards, stepping hidden
@@ -578,7 +630,7 @@ private fun HaloAppBody(
         // overlay closing flips it true and re-requests the crown. Touch
         // survives a dropped focus, which is exactly why a missing term here
         // stays invisible to every tap-driven gate.
-        val rotaryActive = spawnPickerScope == null && !nav.menuOpen && !nav.cardOpen &&
+        val rotaryActive = listening == null && spawnPickerScope == null && !nav.menuOpen && !nav.cardOpen &&
             !voiceOpen && !ui.isOffline()
 
         AnimatedContent(
@@ -1012,6 +1064,39 @@ private fun HaloAppBody(
                     onPane = { offlinePane = it },
                     revealed = offlineRevealed,
                     onReveal = { offlineRevealed = true },
+                )
+            }
+        }
+
+        // §7 listening phase (issue #134), above EVERYTHING — the offline
+        // takeover included: the dictation is still being spoken, and a
+        // bridge drop mid-sentence must not bury a live microphone under a
+        // screen with no stop, no review and no discard (the session would
+        // then hold the mic and keepScreenOn indefinitely and refuse every
+        // later dictation). Send while offline is refused by the send path
+        // like any typed send; the text lands in the draft, and the voice
+        // overlay surfaces the failure once the takeover lifts. Modal like
+        // the card.
+        if (listening != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Halo.Palette.Background)
+                    .pointerInput(Unit) {},
+            ) {
+                HaloListeningScreen(
+                    state = listening,
+                    targetSessionTitle = voiceTarget?.let { id ->
+                        model.sessions.firstOrNull { it.id == id }?.title
+                    },
+                    onStop = actions.onListeningStop,
+                    onSend = actions.onListeningSend,
+                    onDiscard = {
+                        actions.onListeningDiscard()
+                        voiceArmed = false
+                        voiceWatched = false
+                    },
+                    ambient = ambient,
                 )
             }
         }

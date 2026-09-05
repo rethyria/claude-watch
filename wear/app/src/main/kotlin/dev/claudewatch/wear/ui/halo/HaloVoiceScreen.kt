@@ -1,8 +1,7 @@
 // Handoff §7 — the ack-gated voice send. The LISTENING phase (concentric
-// rings, live transcript) lives in the system recognizer activity
-// (RecognizerIntent.ACTION_RECOGNIZE_SPEECH covers the screen and offers no
-// partial-result stream; the deviation is recorded in HALO_HANDOFF.md §7),
-// so this screen owns everything AFTER transcription: the "sending… waiting
+// rings, live transcript) is HaloListeningScreen (in-app since issue #134;
+// the system recognizer activity remains the fallback on devices without a
+// recognition service), so this screen owns everything AFTER transcription: the "sending… waiting
 // for ack" hold — the text is NEVER shown as sent until the bridge ACKs (the
 // ViewModel enforces this; here it is rendered honestly) — and the
 // not-delivered failure with Retry/Discard. A failure with no transcript at
@@ -202,7 +201,7 @@ private fun TranscriptWell(text: String, failed: Boolean) {
 }
 
 @Composable
-private fun VoicePill(
+internal fun VoicePill(
     label: String,
     tag: String,
     filled: Boolean,

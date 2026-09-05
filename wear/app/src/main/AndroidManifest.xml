@@ -6,6 +6,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Haptic feedback grammar for command acks/failures (issue #20). -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Issue #134: the in-app listening screen records through SpeechRecognizer
+         (runtime-granted on first dictation; denial falls back to the system
+         recognizer activity, which records under its own permission). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <!-- Held-Wi-Fi escalation when the BT-proxy path to the bridge is broken:
          ConnectivityManager.requestNetwork(TRANSPORT_WIFI) in WifiNetworkEscalator. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

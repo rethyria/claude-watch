@@ -532,9 +532,16 @@ class BridgeViewModel(
     }
 
     /** The watch has no speech recognizer activity: surface it, send nothing. */
-    fun dictationUnavailable() {
+    fun dictationUnavailable() = dictationFailed("No speech recognizer on this watch — type the command")
+
+    /**
+     * The in-app listening session (issue #134) broke with nothing kept:
+     * surface [reason] through the same voice-overlay error the fallback's
+     * refusal uses; nothing is sent.
+     */
+    fun dictationFailed(reason: String) {
         haptics.commandFailed()
-        _state.update { it.copy(commandError = "No speech recognizer on this watch — type the command") }
+        _state.update { it.copy(commandError = reason) }
     }
 
     /**

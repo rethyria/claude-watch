@@ -13,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -31,6 +32,7 @@ import androidx.wear.compose.material.MaterialTheme
 import dev.claudewatch.wear.ui.halo.HaloActions
 import dev.claudewatch.wear.ui.halo.HaloApp
 import dev.claudewatch.wear.ui.halo.HaloModel
+import dev.claudewatch.wear.speech.DictationController
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
@@ -150,12 +152,17 @@ fun WatchApp(
     // grammar at construction (#129) — a composition-scoped swap would leave
     // a sticky-service-revived process on the silent no-op.
     val state by viewModel.state.collectAsState()
-    // Voice input rides the system recognizer activity
-    // (RecognizerIntent.ACTION_RECOGNIZE_SPEECH) — never a raw
-    // SpeechRecognizer on Wear. The transcription follows the exact same
-    // ack-gated send path as typed text (BridgeViewModel.dictationResult);
-    // a cancelled or empty recognition sends nothing.
-    // The recognizer round-trips through an activity result, so the session
+    // Voice input (issue #134): an IN-APP listening screen on a raw
+    // SpeechRecognizer bound to the watch's recognition service — our own
+    // window, so it can hold the screen on and stitch recogniser turns until
+    // the user's own stop (DictationController). The system recognizer
+    // activity (RecognizerIntent.ACTION_RECOGNIZE_SPEECH) remains the
+    // FALLBACK for devices with no recognition service (the emulator) and for
+    // a denied microphone permission (it records under its own permission).
+    // Either way the transcription follows the exact same ack-gated send path
+    // as typed text (BridgeViewModel.dictationResult); a cancelled or empty
+    // recognition sends nothing.
+    // The fallback round-trips through an activity result, so the session
     // the dictation was started FOR is captured at launch and re-attached to
     // the transcription here — the ViewModel's own default is the most
     // recently WORKING session, which is the wrong target when the user
@@ -176,26 +183,32 @@ fun WatchApp(
     // cannot be saved; a redelivered answer with no sink is DROPPED (the
     // still-queued prompt simply re-prompts) rather than mis-routed.
     val dictationSink = remember { mutableStateOf<((String) -> Unit)?>(null) }
-    val speech = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { result ->
+    // Where a finished transcription goes — shared by the in-app session and
+    // the fallback's activity result.
+    fun deliverTranscription(spoken: String?) {
         val sink = dictationSink.value
         dictationSink.value = null
         val wasAnswer = dictationIsAnswer.value
         dictationIsAnswer.value = false
+        if (spoken.isNullOrBlank()) return
+        when {
+            !wasAnswer -> viewModel.dictationResult(spoken, dictationTarget.value)
+            sink != null -> sink(spoken)
+            // An ANSWER redelivered after recreation: the card's buffer is
+            // gone. Sending it as a command would poke the wrong session
+            // while the agent stays blocked — so it is NOT sent, and since
+            // the user may have watched it transcribe on our own screen
+            // (issue #134), the loss is said out loud rather than silent.
+            else -> viewModel.dictationFailed("Answer not delivered — dictate it again from the question")
+        }
+    }
+    val speech = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
         val spoken = result.data
             ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
             ?.firstOrNull()
-        if (result.resultCode == Activity.RESULT_OK && !spoken.isNullOrBlank()) {
-            when {
-                !wasAnswer -> viewModel.dictationResult(spoken, dictationTarget.value)
-                sink != null -> sink(spoken)
-                // An ANSWER redelivered after recreation: the card's buffer
-                // is gone. Sending it as a command would poke the wrong
-                // session while the agent stays blocked — drop it instead.
-                else -> Unit
-            }
-        }
+        deliverTranscription(if (result.resultCode == Activity.RESULT_OK) spoken else null)
     }
     fun launchRecognizer(prompt: String) {
         try {
@@ -215,9 +228,65 @@ fun WatchApp(
             viewModel.dictationUnavailable()
         }
     }
+    // The in-app session (issue #134). Activity-scoped like the launchers
+    // above: SpeechRecognizer wants a foreground context and the main thread.
+    val dictation = remember { DictationController(context) }
+    val listening by dictation.state.collectAsState()
+    // Composition gone (activity recreation): no screen is left to render
+    // or finish the session — release the microphone rather than leak it.
+    DisposableEffect(dictation) { onDispose { if (dictation.running) dictation.discard() } }
+    // The prompt of the dictation waiting on the microphone permission
+    // dialog; the target/answer slots above already hold its routing.
+    val pendingPrompt = rememberSaveable { mutableStateOf<String?>(null) }
+    fun startInApp(prompt: String) {
+        dictation.start(object : DictationController.Outcome {
+            override fun onText(text: String) = deliverTranscription(text)
+            override fun onFailed(reason: String, beforeSpeech: Boolean) {
+                // A dead start (the service never opened the mic) loses
+                // nothing yet: the system recognizer activity gets its turn.
+                // A failure mid-speech with no text kept is surfaced as such.
+                if (beforeSpeech) launchRecognizer(prompt) else {
+                    dictationSink.value = null
+                    dictationIsAnswer.value = false
+                    viewModel.dictationFailed(reason)
+                }
+            }
+        })
+    }
+    val micPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        val prompt = pendingPrompt.value ?: return@rememberLauncherForActivityResult
+        pendingPrompt.value = null
+        // Denied: the fallback records under the recognizer app's own grant.
+        if (granted) startInApp(prompt) else launchRecognizer(prompt)
+    }
+    fun beginDictation(prompt: String) {
+        when {
+            !DictationController.recognitionAvailable(context) -> launchRecognizer(prompt)
+            !DictationController.hasMicPermission(context) -> {
+                pendingPrompt.value = prompt
+                micPermission.launch(Manifest.permission.RECORD_AUDIO)
+            }
+            else -> startInApp(prompt)
+        }
+    }
+    // Leaving the activity mid-dictation (wrist gesture, notification) parks
+    // the text in REVIEW rather than letting the recogniser run unattended
+    // in the background or dropping what was said.
+    DisposableEffect(lifecycleOwner, dictation) {
+        val observer = object : DefaultLifecycleObserver {
+            override fun onStop(owner: LifecycleOwner) {
+                if (dictation.running) dictation.review()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     HaloApp(
         ui = state,
         ambient = ambient,
+        listening = listening,
         actions = HaloActions(
             onPair = viewModel::pair,
             onDiscoverForPairing = viewModel::discoverForPairing,
@@ -238,12 +307,21 @@ fun WatchApp(
                 val title = sessionId?.let { id ->
                     HaloModel.from(state).sessions.firstOrNull { it.id == id }?.title
                 }
-                launchRecognizer(if (title != null) "To $title" else "Command for the agent")
+                beginDictation(if (title != null) "To $title" else "Command for the agent")
             },
             onDictateAnswer = { onResult ->
                 dictationSink.value = onResult
                 dictationIsAnswer.value = true
-                launchRecognizer("Answer the agent's question")
+                beginDictation("Answer the agent's question")
+            },
+            onListeningStop = dictation::stop,
+            onListeningReview = dictation::review,
+            onListeningSend = dictation::send,
+            onListeningDiscard = {
+                // Nothing will be delivered: drop the routing with the text.
+                dictationSink.value = null
+                dictationIsAnswer.value = false
+                dictation.discard()
             },
             onAnswerPermission = viewModel::answerPermission,
             onAnswerOption = viewModel::answerAgentOption,
