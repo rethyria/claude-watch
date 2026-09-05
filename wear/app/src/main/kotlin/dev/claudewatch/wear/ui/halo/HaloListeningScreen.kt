@@ -160,13 +160,16 @@ private fun Listening(
             modifier = Modifier.testTag("haloListeningHint"),
         )
         if (targetSessionTitle != null) {
+            // Two lines: session titles on the watch run long, and a single
+            // line ran off the round edge (user report, 2026-09-05).
             Text(
                 text = "to $targetSessionTitle",
                 fontSize = Halo.Type.Min,
                 color = Halo.Palette.TextFaint,
                 textAlign = TextAlign.Center,
-                maxLines = 1,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }

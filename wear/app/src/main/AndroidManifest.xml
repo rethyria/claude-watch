@@ -90,7 +90,15 @@
          See the PredictiveBackHandler in HaloApp.kt for the routing itself.
          Below API 33 the attribute is ignored and the legacy
          dismiss-from-anywhere stands. -->
+    <!-- allowBackup=false (issue #134 follow-up): the platform's auto-backup
+         binds its FullBackupAgent INSIDE this process and SIGKILLs it on
+         teardown — seen live on the SM-L330 killing the app mid-dictation
+         while it was the TOP foreground activity ("FullBackup_native
+         measured …" then "Sending signal SIG: 9"). Nothing here is worth
+         backing up anyway: the pairing token is sealed with a Keystore key
+         that never leaves this device, so a restore could not use it. -->
     <application
+        android:allowBackup="false"
         android:label="@string/app_name"
         android:icon="@android:drawable/sym_def_app_icon"
         android:networkSecurityConfig="@xml/network_security_config"
